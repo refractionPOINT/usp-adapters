@@ -10,9 +10,12 @@ import (
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-const defaultWriteTimeout = 60 * 10
+const (
+	defaultWriteTimeout = 60 * 10
+)
 
 type SyslogAdapter struct {
 	conf         SyslogConfig
@@ -129,9 +132,11 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
 	readBufferSize := 1024 * 16
+	st := utils.StreamTokenizer{
+		ExpectedSize: readBufferSize * 2,
+	}
 
 	readBuffer := make([]byte, readBufferSize)
-	currentData := make([]byte, 0, readBufferSize*2)
 	for atomic.LoadUint32(&a.isRunning) == 1 {
 		sizeRead, err := conn.Read(readBuffer[:])
 		if err != nil {
@@ -142,26 +147,13 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn) {
 		}
 
 		data := readBuffer[:sizeRead]
-		dataStart := 0
 
-		for i, b := range data {
-			if b == 0x0a {
-				// Found a newline, so we can use what we
-				// have accumulated before plus this as
-				// a message.
-				if i-1 > dataStart {
-					currentData = append(currentData, data[dataStart:i]...)
-				}
-				dataStart = i + 1
-				a.handleLine(currentData)
-				currentData = make([]byte, 0, readBufferSize*2)
-				continue
-			}
-			if len(data)-1 == i {
-				// This is the end of the buffer and
-				// we got no newline, keep it for later.
-				currentData = append(currentData, data[dataStart:i+1]...)
-			}
+		chunks, err := st.Add(data)
+		if err != nil {
+			a.dbgLog(fmt.Sprintf("tokenizer: %v", err))
+		}
+		for _, chunk := range chunks {
+			a.handleLine(chunk)
 		}
 	}
 }
