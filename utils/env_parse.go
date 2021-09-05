@@ -7,6 +7,10 @@ import (
 	"strings"
 )
 
+// Parses a list of tokens (like from a CLI) into
+// a struct, using json.Unmarshal. Simplifies the
+// population of configuration structs via CLI
+// of a container without a custom container.
 func ParseCLI(args []string, out interface{}) error {
 	data := map[string]interface{}{}
 	for _, k := range args {
