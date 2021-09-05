@@ -5,6 +5,7 @@ import "errors"
 type StreamTokenizer struct {
 	MaxSize      int
 	ExpectedSize int
+	Token        byte
 	currentData  []byte
 }
 
@@ -16,7 +17,7 @@ func (t *StreamTokenizer) Add(data []byte) ([][]byte, error) {
 	toReport := [][]byte{}
 
 	for i, b := range data {
-		if b == 0x0a {
+		if b == t.Token {
 			// Found a newline, so we can use what we
 			// have accumulated before plus this as
 			// a message.

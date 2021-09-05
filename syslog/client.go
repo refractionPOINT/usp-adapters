@@ -134,6 +134,7 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn) {
 	readBufferSize := 1024 * 16
 	st := utils.StreamTokenizer{
 		ExpectedSize: readBufferSize * 2,
+		Token:        0x0a,
 	}
 
 	readBuffer := make([]byte, readBufferSize)
