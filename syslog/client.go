@@ -167,8 +167,17 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn) {
 }
 
 func (a *SyslogAdapter) handleLine(line []byte) {
-	if err := a.uspClient.Ship(&uspclient.UspDataMessage{}, a.writeTimeout); err != nil {
-
+	msg := &uspclient.UspDataMessage{
+		TextPayload: string(line),
+		EventType:   "text",
+		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
-
+	err := a.uspClient.Ship(msg, a.writeTimeout)
+	if err == uspclient.ErrorBufferFull {
+		a.dbgLog("stream falling behind")
+		err = a.uspClient.Ship(msg, 0)
+	}
+	if err != nil {
+		a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+	}
 }
