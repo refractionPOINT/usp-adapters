@@ -1,4 +1,4 @@
-package general_adapter
+package main
 
 import (
 	"fmt"
