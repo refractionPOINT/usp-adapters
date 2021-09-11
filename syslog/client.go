@@ -46,6 +46,7 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, error) {
 			}
 			conf.ClientOptons.DebugLog(s)
 		},
+		isRunning: 1,
 	}
 
 	if a.conf.WriteTimeoutSec == 0 {
@@ -91,6 +92,7 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, error) {
 }
 
 func (a *SyslogAdapter) Close() error {
+	a.dbgLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	err1 := a.listener.Close()
 	_, err2 := a.uspClient.Close()
@@ -129,6 +131,7 @@ func (a *SyslogAdapter) handleConnections() {
 }
 
 func (a *SyslogAdapter) handleConnection(conn net.Conn) {
+	a.dbgLog(fmt.Sprintf("handling new connection from %+v", conn))
 	defer conn.Close()
 
 	readBufferSize := 1024 * 16
