@@ -171,7 +171,6 @@ func (a *SyslogAdapter) handleLine(line []byte) {
 	}
 	msg := &uspclient.UspDataMessage{
 		TextPayload: string(line),
-		EventType:   "text",
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
 	err := a.uspClient.Ship(msg, a.writeTimeout)
