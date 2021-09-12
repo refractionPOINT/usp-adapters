@@ -1,0 +1,20 @@
+steps:
+- name: 'gcr.io/cloud-builders/gcloud'
+  args:
+  - kms
+  - decrypt
+  - --ciphertext-file=build_conf/cloudbuild-github.enc
+  - --plaintext-file=/workspace/id_rsa
+  - --location=global
+  - --keyring=external-repos
+  - --key=github
+- name: 'gcr.io/cloud-builders/docker'
+  args:
+  - build
+  - --network
+  - cloudbuild
+  - -t
+  - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapter:$TAG_NAME
+  - .
+images:
+  - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapter:$TAG_NAME
