@@ -132,7 +132,10 @@ func (a *SyslogAdapter) handleConnections() {
 
 func (a *SyslogAdapter) handleConnection(conn net.Conn) {
 	a.dbgLog(fmt.Sprintf("handling new connection from %+v", conn))
-	defer conn.Close()
+	defer func() {
+		a.dbgLog(fmt.Sprintf("connection from %+v leaving", conn))
+		conn.Close()
+	}()
 
 	readBufferSize := 1024 * 16
 	st := utils.StreamTokenizer{
