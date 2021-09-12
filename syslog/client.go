@@ -166,6 +166,9 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn) {
 }
 
 func (a *SyslogAdapter) handleLine(line []byte) {
+	if len(line) == 0 {
+		return
+	}
 	msg := &uspclient.UspDataMessage{
 		TextPayload: string(line),
 		EventType:   "text",
