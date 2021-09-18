@@ -11,8 +11,8 @@ github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZb
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20210901012122-480388145bf4 h1:JfVMPuKAkSto2FOu2kzqbCCTCrBiA2YYKMXwODBeNWk=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20210901012122-480388145bf4/go.mod h1:5mF9lmWN1FdIcr6x9isB/09Ch76txHQF+KAOrgTJo8s=
-github.com/refractionPOINT/go-uspclient v0.0.0-20210913231455-19cbfc58f7da h1:w72EPszr2i6QO8ikaer1oKiOKTrzlN30IdSTLnzafNk=
-github.com/refractionPOINT/go-uspclient v0.0.0-20210913231455-19cbfc58f7da/go.mod h1:tOOozP6jQBG/Di3my0BkOiCbxzvvqMBiElzfogX6Dm0=
+github.com/refractionPOINT/go-uspclient v0.0.0-20210914010231-4b38893f5494 h1:nQ5c96YgIOJAb32PsZKv+mq5pcReYWI34OxRiOHQwc8=
+github.com/refractionPOINT/go-uspclient v0.0.0-20210914010231-4b38893f5494/go.mod h1:tOOozP6jQBG/Di3my0BkOiCbxzvvqMBiElzfogX6Dm0=
 github.com/rs/xid v1.2.1/go.mod h1:+uKXf+4Djp6Md1KODXJxgGQPKngRmWyn10oCKFzNHOQ=
 github.com/rs/zerolog v1.20.0 h1:38k9hgtUBdxFwE34yS8rTHmHBa4eN16E4DJlv177LNs=
 github.com/rs/zerolog v1.20.0/go.mod h1:IzD0RJ65iWH0w97OQQebJEvTZYvsCUm9WVLWBQrJRjo=
