@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
@@ -17,6 +18,7 @@ type USPClient interface {
 type GeneralConfigs struct {
 	IsDebug string                  `json:"debug" yaml:"debug"`
 	Syslog  usp_syslog.SyslogConfig `json:"syslog" yaml:"syslog"`
+	PubSub  usp_pubsub.PubSubConfig `json:"pubsub" yaml:"pubsub"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -41,7 +43,7 @@ func main() {
 	}
 
 	if configs.IsDebug != "" {
-		configs.Syslog.ClientOptons.DebugLog = func(msg string) {
+		configs.Syslog.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
 		}
 	}
@@ -51,6 +53,8 @@ func main() {
 
 	if adapterType == "syslog" {
 		client, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
+	} else if adapterType == "pubsub" {
+		client, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)

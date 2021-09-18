@@ -29,7 +29,7 @@ type SyslogAdapter struct {
 }
 
 type SyslogConfig struct {
-	ClientOptons    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Port            uint16                  `json:"port" yaml:"port"`
 	Interface       string                  `json:"iface" yaml:"iface"`
 	SslCertPath     string                  `json:"ssl_cert" yaml:"ssl_cert"`
@@ -41,10 +41,10 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, error) {
 	a := &SyslogAdapter{
 		conf: conf,
 		dbgLog: func(s string) {
-			if conf.ClientOptons.DebugLog == nil {
+			if conf.ClientOptions.DebugLog == nil {
 				return
 			}
-			conf.ClientOptons.DebugLog(s)
+			conf.ClientOptions.DebugLog(s)
 		},
 		isRunning: 1,
 	}
@@ -74,7 +74,7 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, error) {
 		return nil, err
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptons)
+	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		l.Close()
 		return nil, err
