@@ -32,7 +32,7 @@ type PubSubConfig struct {
 	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	SubscriptionName    string                  `json:"sub_name" yaml:"sub_name"`
 	ProjectName         string                  `json:"project_name" yaml:"project_name"`
-	ServiceAccountCreds string                  `json:"service_account_creds" yaml:"service_account_creds"`
+	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 }
 
 func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, error) {
@@ -48,8 +48,14 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, error) {
 	}
 
 	var err error
-	if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsJSON([]byte(a.conf.ServiceAccountCreds))); err != nil {
-		return nil, err
+	if a.conf.ServiceAccountCreds == "" {
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName); err != nil {
+			return nil, err
+		}
+	} else {
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsJSON([]byte(a.conf.ServiceAccountCreds))); err != nil {
+			return nil, err
+		}
 	}
 
 	a.buildSub = a.psClient.Subscription(a.conf.SubscriptionName)
