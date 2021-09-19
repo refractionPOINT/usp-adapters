@@ -46,6 +46,9 @@ func main() {
 		configs.Syslog.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
 		}
+		configs.PubSub.ClientOptions.DebugLog = func(msg string) {
+			log(msg)
+		}
 	}
 
 	var client USPClient
