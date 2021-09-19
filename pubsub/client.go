@@ -58,6 +58,12 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, error) {
 		}
 	}
 
+	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	if err != nil {
+		a.psClient.Close()
+		return nil, err
+	}
+
 	a.buildSub = a.psClient.Subscription(a.conf.SubscriptionName)
 	pubsubCtx, pubsubCancel := context.WithCancel(a.ctx)
 	a.stopSub = pubsubCancel
@@ -78,6 +84,8 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, error) {
 	// working without any errors.
 	time.Sleep(2 * time.Second)
 	if subErr != nil {
+		a.psClient.Close()
+		a.uspClient.Close()
 		return nil, subErr
 	}
 
@@ -96,8 +104,16 @@ func (a *PubSubAdapter) Close() error {
 }
 
 func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Message) {
-	if err := a.uspClient.Ship(&uspclient.UspDataMessage{}, 10*time.Second); err != nil {
+	msg := &uspclient.UspDataMessage{}
+	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 		message.Nack()
+		if err == uspclient.ErrorBufferFull {
+			a.dbgLog("stream falling behind")
+			err = a.uspClient.Ship(msg, 0)
+		}
+		if err != nil {
+			a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+		}
 		return
 	}
 	message.Ack()
