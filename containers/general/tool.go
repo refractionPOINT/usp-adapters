@@ -37,6 +37,11 @@ func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 }
 
+func printConfig(c interface{}) {
+	b, _ := yaml.Marshal(c)
+	log("Configs in use:\n%s", string(b))
+}
+
 func main() {
 	log("starting")
 	configs := GeneralConfigs{}
@@ -91,16 +96,14 @@ func main() {
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 
-	// Log the config used.
-	b, _ := yaml.Marshal(configs)
-	log("Configs in use:\n%s", string(b))
-
 	var client USPClient
 	var err error
 
 	if adapterType == "syslog" {
+		printConfig(configs.Syslog)
 		client, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
 	} else if adapterType == "pubsub" {
+		printConfig(configs.PubSub)
 		client, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
