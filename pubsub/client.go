@@ -105,7 +105,10 @@ func (a *PubSubAdapter) Close() error {
 }
 
 func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Message) {
-	msg := &protocol.DataMessage{}
+	msg := &protocol.DataMessage{
+		TextPayload: string(message.Data),
+		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+	}
 	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 		message.Nack()
 		if err == uspclient.ErrorBufferFull {
