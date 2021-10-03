@@ -1,13 +1,18 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
 
+	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
+
+	"gopkg.in/yaml.v2"
 )
 
 type USPClient interface {
@@ -17,6 +22,7 @@ type USPClient interface {
 type GeneralConfigs struct {
 	IsDebug string                  `json:"debug" yaml:"debug"`
 	Syslog  usp_syslog.SyslogConfig `json:"syslog" yaml:"syslog"`
+	PubSub  usp_pubsub.PubSubConfig `json:"pubsub" yaml:"pubsub"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -27,30 +33,78 @@ func log(format string, elems ...interface{}) {
 	fmt.Printf(format+"\n", elems...)
 }
 
+func printUsage() {
+	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+}
+
+func printConfig(c interface{}) {
+	b, _ := yaml.Marshal(c)
+	log("Configs in use:\n%s", string(b))
+}
+
 func main() {
 	log("starting")
 	configs := GeneralConfigs{}
-	if len(os.Args) <= 3 {
-		logError("Usage: ./adapter adapter_type")
+	if len(os.Args) < 2 {
+		printUsage()
 		os.Exit(1)
 	}
 	adapterType := os.Args[1]
-	if err := utils.ParseCLI(os.Args[2:], &configs); err != nil {
-		logError("ParseCLI(): %v", err)
-		os.Exit(1)
+	if len(os.Args) == 3 {
+		// Read the config from disk.
+		f, err := os.Open(os.Args[2])
+		if err != nil {
+			logError("os.Open(): %v", err)
+			printUsage()
+			os.Exit(1)
+		}
+		b, err := io.ReadAll(f)
+		if err != nil {
+			logError("io.ReadAll(): %v", err)
+			printUsage()
+			os.Exit(1)
+		}
+		if err := json.Unmarshal(b, &configs); err != nil {
+			err2 := yaml.Unmarshal(b, &configs)
+			if err2 != nil {
+				logError("json.Unmarshal(): %v", err)
+				logError("yaml.Unmarshal(): %v", err2)
+				printUsage()
+				os.Exit(1)
+			}
+		}
+	} else {
+		// Read the config from the CLI.
+		if err := utils.ParseCLI(os.Args[2:], &configs); err != nil {
+			logError("ParseCLI(): %v", err)
+			printUsage()
+			os.Exit(1)
+		}
 	}
 
+	// Stamp in the debug to all the configs.
 	if configs.IsDebug != "" {
-		configs.Syslog.ClientOptons.DebugLog = func(msg string) {
+		configs.Syslog.ClientOptions.DebugLog = func(msg string) {
+			log(msg)
+		}
+		configs.PubSub.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
 		}
 	}
+
+	// Enforce the usp_adapter Architecture on all configs.
+	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
+	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var err error
 
 	if adapterType == "syslog" {
+		printConfig(configs.Syslog)
 		client, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
+	} else if adapterType == "pubsub" {
+		printConfig(configs.PubSub)
+		client, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
@@ -62,7 +116,7 @@ func main() {
 	}
 
 	osSignals := make(chan os.Signal, 1)
-	signal.Notify(osSignals, os.Interrupt, os.Kill, syscall.SIGTERM)
+	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
 	_ = <-osSignals
 	log("received signal to exit")
 
