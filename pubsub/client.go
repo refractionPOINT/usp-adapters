@@ -9,6 +9,7 @@ import (
 	"google.golang.org/api/option"
 
 	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
 )
 
 const (
@@ -104,7 +105,7 @@ func (a *PubSubAdapter) Close() error {
 }
 
 func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Message) {
-	msg := &uspclient.UspDataMessage{}
+	msg := &protocol.DataMessage{}
 	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 		message.Nack()
 		if err == uspclient.ErrorBufferFull {

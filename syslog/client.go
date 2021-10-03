@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -169,7 +170,7 @@ func (a *SyslogAdapter) handleLine(line []byte) {
 	if len(line) == 0 {
 		return
 	}
-	msg := &uspclient.UspDataMessage{
+	msg := &protocol.DataMessage{
 		TextPayload: string(line),
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}

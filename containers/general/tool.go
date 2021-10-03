@@ -42,6 +42,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Stamp in the debug to all the configs.
 	if configs.IsDebug != "" {
 		configs.Syslog.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
@@ -50,6 +51,10 @@ func main() {
 			log(msg)
 		}
 	}
+
+	// Enforce the usp_adapter Architecture on all configs.
+	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
+	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var err error
