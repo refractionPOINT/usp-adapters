@@ -33,11 +33,15 @@ func log(format string, elems ...interface{}) {
 	fmt.Printf(format+"\n", elems...)
 }
 
+func printUsage() {
+	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+}
+
 func main() {
 	log("starting")
 	configs := GeneralConfigs{}
 	if len(os.Args) < 2 {
-		logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+		printUsage()
 		os.Exit(1)
 	}
 	adapterType := os.Args[1]
@@ -46,13 +50,13 @@ func main() {
 		f, err := os.Open(os.Args[2])
 		if err != nil {
 			logError("os.Open(): %v", err)
-			logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+			printUsage()
 			os.Exit(1)
 		}
 		b, err := io.ReadAll(f)
 		if err != nil {
 			logError("io.ReadAll(): %v", err)
-			logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+			printUsage()
 			os.Exit(1)
 		}
 		if err := json.Unmarshal(b, &configs); err != nil {
@@ -60,7 +64,7 @@ func main() {
 			if err2 != nil {
 				logError("json.Unmarshal(): %v", err)
 				logError("yaml.Unmarshal(): %v", err2)
-				logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+				printUsage()
 				os.Exit(1)
 			}
 		}
@@ -68,7 +72,7 @@ func main() {
 		// Read the config from the CLI.
 		if err := utils.ParseCLI(os.Args[2:], &configs); err != nil {
 			logError("ParseCLI(): %v", err)
-			logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+			printUsage()
 			os.Exit(1)
 		}
 	}
