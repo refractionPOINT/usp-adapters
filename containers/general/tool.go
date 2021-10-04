@@ -39,7 +39,7 @@ func printUsage() {
 
 func printConfig(c interface{}) {
 	b, _ := yaml.Marshal(c)
-	log("Configs in use:\n%s", string(b))
+	log("Configs in use:\n----------------------------------\n%s\n----------------------------------\n", string(b))
 }
 
 func main() {
