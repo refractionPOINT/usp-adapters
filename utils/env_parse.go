@@ -15,9 +15,9 @@ func ParseCLI(args []string, out interface{}) error {
 	data := map[string]interface{}{}
 	for _, k := range args {
 		tmp := data
-		components := strings.Split(k, "=")
-		if len(components) != 2 {
-			return fmt.Errorf("invalid format: %s", k)
+		components := strings.SplitN(k, "=", 2)
+		if len(components) < 2 {
+			continue
 		}
 		varPath := components[0]
 		val := components[1]
