@@ -80,6 +80,12 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
+		// Read the config from the Env.
+		if err := utils.ParseCLI(os.Environ(), &configs); err != nil {
+			logError("ParseEnv(): %v", err)
+			printUsage()
+			os.Exit(1)
+		}
 	}
 
 	// Stamp in the debug to all the configs.
