@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/refractionPOINT/usp-adapters/pubsub"
+	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
 
@@ -23,6 +24,7 @@ type GeneralConfigs struct {
 	IsDebug string                  `json:"debug" yaml:"debug"`
 	Syslog  usp_syslog.SyslogConfig `json:"syslog" yaml:"syslog"`
 	PubSub  usp_pubsub.PubSubConfig `json:"pubsub" yaml:"pubsub"`
+	S3      usp_s3.S3Config         `json:"s3" yaml:"s3"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -96,11 +98,15 @@ func main() {
 		configs.PubSub.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
 		}
+		configs.S3.ClientOptions.DebugLog = func(msg string) {
+			log(msg)
+		}
 	}
 
 	// Enforce the usp_adapter Architecture on all configs.
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
+	configs.S3.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var err error
@@ -111,6 +117,9 @@ func main() {
 	} else if adapterType == "pubsub" {
 		printConfig(configs.PubSub)
 		client, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
+	} else if adapterType == "s3" {
+		printConfig(configs.S3)
+		client, err = usp_s3.NewS3Adapter(configs.S3)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
