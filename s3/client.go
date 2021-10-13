@@ -58,9 +58,14 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, error) {
 	}
 
 	var err error
+	var region string
+
+	if region, err = a.getRegion(); err != nil {
+		return nil, err
+	}
 
 	a.awsConfig = &aws.Config{
-		Region:      aws.String("us-east-1"),
+		Region:      aws.String(region),
 		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
 	}
 
@@ -92,6 +97,10 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, error) {
 	}()
 
 	return a, nil
+}
+
+func (a *S3Adapter) getRegion() (string, error) {
+	return s3manager.GetBucketRegion(a.ctx, session.Must(session.NewSession(&aws.Config{})), a.conf.BucketName, "us-east-1")
 }
 
 func (a *S3Adapter) Close() error {
