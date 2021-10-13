@@ -38,7 +38,7 @@ type SyslogConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 }
 
-func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, error) {
+func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
 	a := &SyslogAdapter{
 		conf: conf,
 		dbgLog: func(s string) {
@@ -62,7 +62,7 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, error) {
 		var cert tls.Certificate
 		cert, err = tls.LoadX509KeyPair(conf.SslCertPath, conf.SslKeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("error loading certificate with cert path '%s' and key path '%s': %s", conf.SslCertPath, conf.SslKeyPath, err)
+			return nil, nil, fmt.Errorf("error loading certificate with cert path '%s' and key path '%s': %s", conf.SslCertPath, conf.SslKeyPath, err)
 		}
 		tlsConfig := tls.Config{
 			Certificates: []tls.Certificate{cert},
@@ -72,24 +72,26 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, error) {
 		l, err = net.Listen("tcp", addr)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		l.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
 	a.listener = l
 
+	chStopped := make(chan struct{})
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer close(chStopped)
 		a.handleConnections()
 	}()
 
-	return a, nil
+	return a, chStopped, nil
 }
 
 func (a *SyslogAdapter) Close() error {

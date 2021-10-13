@@ -109,17 +109,18 @@ func main() {
 	configs.S3.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
+	var chRunning chan struct{}
 	var err error
 
 	if adapterType == "syslog" {
 		printConfig(configs.Syslog)
-		client, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
+		client, chRunning, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
 	} else if adapterType == "pubsub" {
 		printConfig(configs.PubSub)
-		client, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
+		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
 	} else if adapterType == "s3" {
 		printConfig(configs.S3)
-		client, err = usp_s3.NewS3Adapter(configs.S3)
+		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
@@ -132,8 +133,15 @@ func main() {
 
 	osSignals := make(chan os.Signal, 1)
 	signal.Notify(osSignals, os.Interrupt, syscall.SIGTERM)
-	_ = <-osSignals
-	log("received signal to exit")
+
+	select {
+	case <-osSignals:
+		log("received signal to exit")
+		break
+	case <-chRunning:
+		log("client stopped")
+		break
+	}
 
 	if err := client.Close(); err != nil {
 		logError("error closing client: %v", err)

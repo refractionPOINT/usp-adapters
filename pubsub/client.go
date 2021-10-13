@@ -36,7 +36,7 @@ type PubSubConfig struct {
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 }
 
-func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, error) {
+func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) {
 	a := &PubSubAdapter{
 		conf: conf,
 		dbgLog: func(s string) {
@@ -51,25 +51,27 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, error) {
 	var err error
 	if a.conf.ServiceAccountCreds == "" {
 		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	} else {
 		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsJSON([]byte(a.conf.ServiceAccountCreds))); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		a.psClient.Close()
-		return nil, err
+		return nil, nil, err
 	}
 
 	a.buildSub = a.psClient.Subscription(a.conf.SubscriptionName)
 	pubsubCtx, pubsubCancel := context.WithCancel(a.ctx)
 	a.stopSub = pubsubCancel
+	chStopped := make(chan struct{})
 	var subErr error
 	go func() {
+		defer close(chStopped)
 		for {
 			if err := a.buildSub.Receive(pubsubCtx, a.processEvent); err != nil {
 				a.dbgLog(fmt.Sprintf("buildSub.Receive: %v", err))
@@ -87,10 +89,10 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, error) {
 	if subErr != nil {
 		a.psClient.Close()
 		a.uspClient.Close()
-		return nil, subErr
+		return nil, nil, subErr
 	}
 
-	return a, nil
+	return a, chStopped, nil
 }
 
 func (a *PubSubAdapter) Close() error {

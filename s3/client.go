@@ -43,9 +43,10 @@ type S3Config struct {
 	BucketName    string                  `json:"bucket_name" yaml:"bucket_name"`
 	AccessKey     string                  `json:"access_key" yaml:"access_key"`
 	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
+	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
 }
 
-func NewS3Adapter(conf S3Config) (*S3Adapter, error) {
+func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	a := &S3Adapter{
 		conf: conf,
 		dbgLog: func(s string) {
@@ -61,7 +62,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, error) {
 	var region string
 
 	if region, err = a.getRegion(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	a.awsConfig = &aws.Config{
@@ -70,14 +71,23 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, error) {
 	}
 
 	if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	a.awsS3 = s3.New(a.awsSession)
+	a.awsDownloader = s3manager.NewDownloader(a.awsSession)
+
+	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	chStopped := make(chan struct{})
 
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
+		defer close(chStopped)
 
 		for {
 			isFilesFound := false
@@ -86,7 +96,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, error) {
 			}
 
 			isFilesFound, err = a.lookForFiles()
-			if err != nil {
+			if err != nil || a.conf.IsOneTimeLoad {
 				break
 			}
 
@@ -96,7 +106,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, error) {
 		}
 	}()
 
-	return a, nil
+	return a, chStopped, nil
 }
 
 func (a *S3Adapter) getRegion() (string, error) {
@@ -168,20 +178,21 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 }
 
 func (a *S3Adapter) processEvent(data []byte) bool {
-	msg := &protocol.DataMessage{
-		TextPayload: string(data),
-		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-	}
-	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-		if err == uspclient.ErrorBufferFull {
-			a.dbgLog("stream falling behind")
-			err = a.uspClient.Ship(msg, 0)
+	for _, line := range strings.Split(string(data), "\n") {
+		msg := &protocol.DataMessage{
+			TextPayload: line,
+			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 		}
-		if err != nil {
-			a.dbgLog(fmt.Sprintf("Ship(): %v", err))
-			return false
+		if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+			if err == uspclient.ErrorBufferFull {
+				a.dbgLog("stream falling behind")
+				err = a.uspClient.Ship(msg, 0)
+			}
+			if err != nil {
+				a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+				return false
+			}
 		}
-		return true
 	}
 	return true
 }
