@@ -44,6 +44,7 @@ type S3Config struct {
 	AccessKey     string                  `json:"access_key" yaml:"access_key"`
 	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
 	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
+	Prefix        string                  `json:"prefix" yaml:"prefix"`
 }
 
 func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
@@ -121,7 +122,10 @@ func (a *S3Adapter) Close() error {
 }
 
 func (a *S3Adapter) lookForFiles() (bool, error) {
-	resp, err := a.awsS3.ListObjectsV2(&s3.ListObjectsV2Input{Bucket: aws.String(a.conf.BucketName)})
+	resp, err := a.awsS3.ListObjectsV2(&s3.ListObjectsV2Input{
+		Bucket: aws.String(a.conf.BucketName),
+		Prefix: &a.conf.Prefix,
+	})
 	if err != nil {
 		a.dbgLog(fmt.Sprintf("s3.ListObjectsV2(): %v", err))
 		// Ignore the error upstream so that we just keep retrying.
@@ -161,6 +165,12 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		if !a.processEvent(event) {
 			continue
 		}
+
+		if a.conf.IsOneTimeLoad {
+			// In one time loads we don't delete the contents.
+			continue
+		}
+
 		if _, err := a.awsS3.DeleteObject(&s3.DeleteObjectInput{
 			Bucket: aws.String(a.conf.BucketName),
 			Key:    aws.String(*item.Key),
@@ -179,6 +189,9 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 
 func (a *S3Adapter) processEvent(data []byte) bool {
 	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
 		msg := &protocol.DataMessage{
 			TextPayload: line,
 			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
