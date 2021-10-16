@@ -134,6 +134,9 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 
 	isDataFound := false
 	for _, item := range resp.Contents {
+		if atomic.LoadUint32(&a.isStop) == 1 {
+			break
+		}
 		a.dbgLog(fmt.Sprintf("processing file %s (%d)", *item.Key, *item.Size))
 
 		writerAt := aws.NewWriteAtBuffer([]byte{})
