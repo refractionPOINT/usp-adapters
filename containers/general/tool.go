@@ -135,6 +135,7 @@ func main() {
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 	configs.S3.ClientOptions.Architecture = "usp_adapter"
+	configs.Stdin.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var chRunning chan struct{}
