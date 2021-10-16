@@ -10,6 +10,7 @@ import (
 
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
+	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
 
@@ -25,6 +26,7 @@ type GeneralConfigs struct {
 	Syslog  usp_syslog.SyslogConfig `json:"syslog" yaml:"syslog"`
 	PubSub  usp_pubsub.PubSubConfig `json:"pubsub" yaml:"pubsub"`
 	S3      usp_s3.S3Config         `json:"s3" yaml:"s3"`
+	Stdin   usp_stdin.StdinConfig   `json:"stdin" yaml:"stdin"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -92,14 +94,40 @@ func main() {
 
 	// Stamp in the debug to all the configs.
 	if configs.IsDebug != "" {
+		// Syslog
 		configs.Syslog.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
 		}
+		configs.Syslog.ClientOptions.BufferOptions.BufferCapacity = 4096
+		configs.Syslog.ClientOptions.BufferOptions.OnBackPressure = func() {
+			log("experiencing back pressure")
+		}
+
+		// Pubsub
 		configs.PubSub.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
 		}
+		configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 4096
+		configs.PubSub.ClientOptions.BufferOptions.OnBackPressure = func() {
+			log("experiencing back pressure")
+		}
+
+		// S3
 		configs.S3.ClientOptions.DebugLog = func(msg string) {
 			log(msg)
+		}
+		configs.S3.ClientOptions.BufferOptions.BufferCapacity = 4096
+		configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
+			log("experiencing back pressure")
+		}
+
+		// Stdin
+		configs.Stdin.ClientOptions.DebugLog = func(msg string) {
+			log(msg)
+		}
+		configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 4096
+		configs.Stdin.ClientOptions.BufferOptions.OnBackPressure = func() {
+			log("experiencing back pressure")
 		}
 	}
 
@@ -121,6 +149,9 @@ func main() {
 	} else if adapterType == "s3" {
 		printConfig(configs.S3)
 		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
+	} else if adapterType == "stdin" {
+		printConfig(configs.Stdin)
+		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
