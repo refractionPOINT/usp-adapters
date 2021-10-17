@@ -23,5 +23,5 @@ journalctl -f -q | netcat 127.0.0.1 4444
 ### Stdin
 
 ```
-./adapter stdin debug=true stdin.client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d stdin.client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd stdin.client_options.platform=text "stdin.client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" stdin.client_options.sensor_seed_key=testclient3 stdin.client_options.mapping.sensor_key_path
+./adapter stdin debug=true stdin.client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d stdin.client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd stdin.client_options.platform=text "stdin.client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" stdin.client_options.sensor_seed_key=testclient3 stdin.client_options.mapping.event_type_path=exe
 ```
