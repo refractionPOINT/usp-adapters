@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"reflect"
+	"strings"
 	"syscall"
 
 	"github.com/refractionPOINT/usp-adapters/pubsub"
@@ -36,8 +38,36 @@ func log(format string, elems ...interface{}) {
 	fmt.Printf(format+"\n", elems...)
 }
 
+func printStruct(prefix string, s interface{}, isTop bool) {
+	val := reflect.ValueOf(s)
+	for i := 0; i < val.Type().NumField(); i++ {
+		// logError("%#v", val.Type().Field(i))
+		tag := val.Type().Field(i).Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		components := strings.Split(tag, ",")
+		p := components[0]
+		if prefix != "" {
+			p = fmt.Sprintf("%s.%s", prefix, p)
+		}
+		if isTop {
+			logError("\nFor %s\n----------------------------------", p)
+			p = ""
+		}
+		e := val.Field(i)
+		if e.Kind() == reflect.Struct {
+			printStruct(p, e.Interface(), false)
+		} else {
+			logError(p)
+		}
+	}
+}
+
 func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+	logError("Available configs:\n")
+	printStruct("", GeneralConfigs{}, true)
 }
 
 func printConfig(adapterType string, c interface{}) {
