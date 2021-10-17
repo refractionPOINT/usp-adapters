@@ -22,11 +22,10 @@ type USPClient interface {
 }
 
 type GeneralConfigs struct {
-	IsDebug string                  `json:"debug" yaml:"debug"`
-	Syslog  usp_syslog.SyslogConfig `json:"syslog" yaml:"syslog"`
-	PubSub  usp_pubsub.PubSubConfig `json:"pubsub" yaml:"pubsub"`
-	S3      usp_s3.S3Config         `json:"s3" yaml:"s3"`
-	Stdin   usp_stdin.StdinConfig   `json:"stdin" yaml:"stdin"`
+	Syslog usp_syslog.SyslogConfig `json:"syslog" yaml:"syslog"`
+	PubSub usp_pubsub.PubSubConfig `json:"pubsub" yaml:"pubsub"`
+	S3     usp_s3.S3Config         `json:"s3" yaml:"s3"`
+	Stdin  usp_stdin.StdinConfig   `json:"stdin" yaml:"stdin"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -41,9 +40,9 @@ func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 }
 
-func printConfig(c interface{}) {
+func printConfig(adapterType string, c interface{}) {
 	b, _ := yaml.Marshal(c)
-	log("Configs in use:\n----------------------------------\n%s\n----------------------------------\n", string(b))
+	log("Configs in use (%s):\n----------------------------------\n%s\n----------------------------------\n", adapterType, string(b))
 }
 
 func main() {
@@ -79,56 +78,53 @@ func main() {
 		}
 	} else {
 		// Read the config from the CLI.
-		if err := utils.ParseCLI(os.Args[2:], &configs); err != nil {
+		if err := utils.ParseCLI(os.Args[1], os.Args[2:], &configs); err != nil {
 			logError("ParseCLI(): %v", err)
 			printUsage()
 			os.Exit(1)
 		}
 		// Read the config from the Env.
-		if err := utils.ParseCLI(os.Environ(), &configs); err != nil {
+		if err := utils.ParseCLI(os.Args[1], os.Environ(), &configs); err != nil {
 			logError("ParseEnv(): %v", err)
 			printUsage()
 			os.Exit(1)
 		}
 	}
 
-	// Stamp in the debug to all the configs.
-	if configs.IsDebug != "" {
-		// Syslog
-		configs.Syslog.ClientOptions.DebugLog = func(msg string) {
-			log(msg)
-		}
-		configs.Syslog.ClientOptions.BufferOptions.BufferCapacity = 4096
-		configs.Syslog.ClientOptions.BufferOptions.OnBackPressure = func() {
-			log("experiencing back pressure")
-		}
+	// Syslog
+	configs.Syslog.ClientOptions.DebugLog = func(msg string) {
+		log(msg)
+	}
+	configs.Syslog.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.Syslog.ClientOptions.BufferOptions.OnBackPressure = func() {
+		log("experiencing back pressure")
+	}
 
-		// Pubsub
-		configs.PubSub.ClientOptions.DebugLog = func(msg string) {
-			log(msg)
-		}
-		configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 4096
-		configs.PubSub.ClientOptions.BufferOptions.OnBackPressure = func() {
-			log("experiencing back pressure")
-		}
+	// Pubsub
+	configs.PubSub.ClientOptions.DebugLog = func(msg string) {
+		log(msg)
+	}
+	configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.PubSub.ClientOptions.BufferOptions.OnBackPressure = func() {
+		log("experiencing back pressure")
+	}
 
-		// S3
-		configs.S3.ClientOptions.DebugLog = func(msg string) {
-			log(msg)
-		}
-		configs.S3.ClientOptions.BufferOptions.BufferCapacity = 4096
-		configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
-			log("experiencing back pressure")
-		}
+	// S3
+	configs.S3.ClientOptions.DebugLog = func(msg string) {
+		log(msg)
+	}
+	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
+		log("experiencing back pressure")
+	}
 
-		// Stdin
-		configs.Stdin.ClientOptions.DebugLog = func(msg string) {
-			log(msg)
-		}
-		configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 4096
-		configs.Stdin.ClientOptions.BufferOptions.OnBackPressure = func() {
-			log("experiencing back pressure")
-		}
+	// Stdin
+	configs.Stdin.ClientOptions.DebugLog = func(msg string) {
+		log(msg)
+	}
+	configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.Stdin.ClientOptions.BufferOptions.OnBackPressure = func() {
+		log("experiencing back pressure")
 	}
 
 	// Enforce the usp_adapter Architecture on all configs.
@@ -142,16 +138,16 @@ func main() {
 	var err error
 
 	if adapterType == "syslog" {
-		printConfig(configs.Syslog)
+		printConfig(adapterType, configs.Syslog)
 		client, chRunning, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
 	} else if adapterType == "pubsub" {
-		printConfig(configs.PubSub)
+		printConfig(adapterType, configs.PubSub)
 		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
 	} else if adapterType == "s3" {
-		printConfig(configs.S3)
+		printConfig(adapterType, configs.S3)
 		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
 	} else if adapterType == "stdin" {
-		printConfig(configs.Stdin)
+		printConfig(adapterType, configs.Stdin)
 		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)

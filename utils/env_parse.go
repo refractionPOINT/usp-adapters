@@ -11,7 +11,7 @@ import (
 // a struct, using json.Unmarshal. Simplifies the
 // population of configuration structs via CLI
 // of a container without a custom container.
-func ParseCLI(args []string, out interface{}) error {
+func ParseCLI(prefix string, args []string, out interface{}) error {
 	data := map[string]interface{}{}
 	for _, k := range args {
 		tmp := data
@@ -22,6 +22,7 @@ func ParseCLI(args []string, out interface{}) error {
 		varPath := components[0]
 		val := components[1]
 		pathElems := strings.Split(varPath, ".")
+		pathElems = append([]string{prefix}, pathElems...)
 		for i, v := range pathElems {
 			if i == len(pathElems)-1 {
 				if num, err := strconv.ParseInt(val, 10, 64); err == nil {
