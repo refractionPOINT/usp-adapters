@@ -3,9 +3,12 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 )
+
+var arrayIndexRE = regexp.MustCompile(`(.+)\[(\d+)\]$`)
 
 // Parses a list of tokens (like from a CLI) into
 // a struct, using json.Unmarshal. Simplifies the
@@ -22,8 +25,48 @@ func ParseCLI(prefix string, args []string, out interface{}) error {
 		varPath := components[0]
 		val := components[1]
 		pathElems := strings.Split(varPath, ".")
-		pathElems = append([]string{prefix}, pathElems...)
+		if prefix != "" {
+			pathElems = append([]string{prefix}, pathElems...)
+		}
 		for i, v := range pathElems {
+			if matches := arrayIndexRE.FindStringSubmatch(v); len(matches) == 3 {
+				index, err := strconv.Atoi(matches[2])
+				if err != nil {
+					continue
+				}
+				actualKey := matches[1]
+				existing, ok := tmp[actualKey]
+				if !ok {
+					tmp[actualKey] = make([]interface{}, index+1)
+					existing = tmp[actualKey]
+				}
+				existingArray := existing.([]interface{})
+				if len(existingArray) <= index {
+					for x := len(existingArray); x <= index; x++ {
+						tmp[actualKey] = append(existingArray, nil)
+					}
+				}
+				if i == len(pathElems)-1 {
+					if num, err := strconv.ParseInt(val, 10, 64); err == nil {
+						tmp[actualKey].([]interface{})[index] = num
+					} else {
+						tmp[actualKey].([]interface{})[index] = val
+					}
+				} else {
+					if tmp[actualKey].([]interface{})[index] != nil {
+						existingDict, ok := tmp[actualKey].([]interface{})[index].(map[string]interface{})
+						if !ok {
+							return fmt.Errorf("namespace collision: %v", v)
+						}
+						tmp = existingDict
+						continue
+					}
+					newDict := map[string]interface{}{}
+					tmp[actualKey].([]interface{})[index] = newDict
+					tmp = newDict
+				}
+				continue
+			}
 			if i == len(pathElems)-1 {
 				if num, err := strconv.ParseInt(val, 10, 64); err == nil {
 					tmp[v] = num
