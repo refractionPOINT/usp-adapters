@@ -56,7 +56,7 @@ Data sent via USP can be formatted in many different ways. Data is processed in 
 #### Syslog
 Start the container listening for Syslog. This example uses the syslog from a Debian box.
 ```
-docker run --rm -it -p 4444:4444 usp-adapters syslog port=4444 client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=text "client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" client_options.sensor_seed_key=testclient1
+docker run --rm -it -p 4444:4444 usp-adapters syslog port=4444 client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=text "client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" client_options.sensor_seed_key=testclient1 "client_options.mapping.mapping[0].src_field=host" "client_options.mapping.mapping[0].dst_field=syslog_hostname"
 ```
 
 Pipe the syslog from a Debian box to the container.
