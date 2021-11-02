@@ -26,6 +26,8 @@ steps:
   - -t
   - refractionpoint/lc-adapter:$TAG_NAME
   - .
+  - -f
+  - ./containers/general/Dockerfile
   waitFor: ['get-github-keys', 'login-dockerhub']
 - name: 'golang'
   id: build-linux64
