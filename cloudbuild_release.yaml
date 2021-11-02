@@ -17,15 +17,8 @@ steps:
   waitFor: ['-']
 - name: 'gcr.io/cloud-builders/docker'
   id: build-docker
-  args:
-  - build
-  - --network
-  - cloudbuild
-  - -t
-  - refractionpoint/lc-adapter:$TAG_NAME
-  - .
-  - -f
-  - ./containers/general/Dockerfile
+  entrypoint: 'bash'
+  args: ['-c', 'docker build -f ./containers/general/Dockerfile -t refractionpoint/lc-adapter:$TAG_NAME .']
   waitFor: ['get-github-keys', 'login-dockerhub']
 - name: 'golang'
   id: build-linux64
