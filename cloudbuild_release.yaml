@@ -1,5 +1,6 @@
 steps:
 - name: 'gcr.io/cloud-builders/gcloud'
+  id: get-github-keys
   args:
   - kms
   - decrypt
@@ -9,6 +10,7 @@ steps:
   - --keyring=external-repos
   - --key=github
 - name: 'gcr.io/cloud-builders/docker'
+  id: build-docker
   args:
   - build
   - --network
@@ -18,28 +20,41 @@ steps:
   - -t
   - refractionpoint/lc-adapter:$TAG_NAME
   - .
+  waitFor: ['get-github-keys']
 - name: 'golang'
+  id: build-linux64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64_$TAG_NAME', './containers/general']
+  waitFor: ['get-github-keys']
 - name: 'golang'
+  id: build-win64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64_$TAG_NAME.exe', './containers/general']
   env:
     - 'GOOS=windows'
     - 'GOARCH=amd64'
+  waitFor: ['get-github-keys']
 - name: 'golang'
+  id: build-macos64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=darwin'
     - 'GOARCH=amd64'
+  waitFor: ['get-github-keys']
 - name: 'golang'
+  id: build-macosarm64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=darwin'
     - 'GOARCH=arm64'
+  waitFor: ['get-github-keys']
 - name: 'gcr.io/cloud-builders/gsutil'
+  id: copy-binary-adapters
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
+  waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64']
 - name: 'gcr.io/cloud-builders/docker'
-    entrypoint: 'bash'
-    args: ['-c', 'docker push refractionpoint/lc-adapter:$TAG_NAME']
+  id: copy-docker-adapter
+  entrypoint: 'bash'
+  args: ['-c', 'docker push refractionpoint/lc-adapter:$TAG_NAME']
+  waitFor: 'build-docker'
 availableSecrets:
   secretManager:
   - versionName: projects/${PROJECT_ID}/secrets/DOCKERHUB/versions/latest
