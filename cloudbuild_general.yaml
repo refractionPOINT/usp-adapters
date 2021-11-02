@@ -2,19 +2,19 @@ steps:
   - name: 'golang'
     args: ['go', 'test', '-race', './...', '-v']
   - name: 'golang'
-    args: ['go', 'build', '-v', './containers/general', '-o', 'lc_adapter_linux_64']
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64', './containers/general']
   - name: 'golang'
-    args: ['go', 'build', '-v', './containers/general', '-o', 'lc_adapter_windows_64.exe']
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64.exe', './containers/general']
     env:
       - 'GOOS=windows'
       - 'GOARCH=amd64'
   - name: 'golang'
-    args: ['go', 'build', '-v', './containers/general', '-o', 'lc_adapter_macos_64']
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64', './containers/general']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=amd64'
   - name: 'golang'
-    args: ['go', 'build', '-v', './containers/general', '-o', 'lc_adapter_macos_arm64']
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64', './containers/general']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
