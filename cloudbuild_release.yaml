@@ -22,8 +22,6 @@ steps:
   - --network
   - cloudbuild
   - -t
-  - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapter:$TAG_NAME
-  - -t
   - refractionpoint/lc-adapter:$TAG_NAME
   - .
   - -f
@@ -69,5 +67,3 @@ availableSecrets:
     env: 'PASSWORD'
   - versionName: projects/${PROJECT_ID}/secrets/DOCKERHUB_USERNAME/versions/latest
     env: 'USERNAME'
-images:
-  - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapter:$TAG_NAME
