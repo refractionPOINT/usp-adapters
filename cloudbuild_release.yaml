@@ -10,6 +10,12 @@ steps:
   - --keyring=external-repos
   - --key=github
 - name: 'gcr.io/cloud-builders/docker'
+  id: login-dockerhub
+  entrypoint: 'bash'
+  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD']
+  secretEnv: ['USERNAME', 'PASSWORD']
+  waitFor: ['-']
+- name: 'gcr.io/cloud-builders/docker'
   id: build-docker
   args:
   - build
@@ -20,7 +26,7 @@ steps:
   - -t
   - refractionpoint/lc-adapter:$TAG_NAME
   - .
-  waitFor: ['get-github-keys']
+  waitFor: ['get-github-keys', 'login-dockerhub']
 - name: 'golang'
   id: build-linux64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64_$TAG_NAME', './containers/general']
