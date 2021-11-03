@@ -125,7 +125,7 @@ func main() {
 	configs.Syslog.ClientOptions.DebugLog = func(msg string) {
 		log(msg)
 	}
-	configs.Syslog.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.Syslog.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Syslog.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
@@ -134,7 +134,7 @@ func main() {
 	configs.PubSub.ClientOptions.DebugLog = func(msg string) {
 		log(msg)
 	}
-	configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.PubSub.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
@@ -143,7 +143,7 @@ func main() {
 	configs.S3.ClientOptions.DebugLog = func(msg string) {
 		log(msg)
 	}
-	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
@@ -152,7 +152,7 @@ func main() {
 	configs.Stdin.ClientOptions.DebugLog = func(msg string) {
 		log(msg)
 	}
-	configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 4096
+	configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Stdin.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
