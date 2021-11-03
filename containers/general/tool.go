@@ -129,6 +129,9 @@ func main() {
 	configs.Syslog.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
+	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
+		log("received data ack from limacharlie")
+	}
 
 	// Pubsub
 	configs.PubSub.ClientOptions.DebugLog = func(msg string) {
@@ -137,6 +140,9 @@ func main() {
 	configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.PubSub.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
+	}
+	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
+		log("received data ack from limacharlie")
 	}
 
 	// S3
@@ -147,6 +153,9 @@ func main() {
 	configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
+	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
+		log("received data ack from limacharlie")
+	}
 
 	// Stdin
 	configs.Stdin.ClientOptions.DebugLog = func(msg string) {
@@ -155,6 +164,9 @@ func main() {
 	configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Stdin.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
+	}
+	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
+		log("received data ack from limacharlie")
 	}
 
 	// Enforce the usp_adapter Architecture on all configs.
