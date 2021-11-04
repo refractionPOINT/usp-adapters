@@ -149,7 +149,7 @@ func main() {
 	configs.S3.ClientOptions.DebugLog = func(msg string) {
 		log(msg)
 	}
-	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 50000
+	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 100 // lower capacity because this uses Bundles
 	configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
