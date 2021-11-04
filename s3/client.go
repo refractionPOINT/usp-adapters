@@ -1,12 +1,8 @@
 package usp_s3
 
 import (
-	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -150,23 +146,14 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			continue
 		}
 
-		var reader io.Reader
-		reader = bytes.NewBuffer(writerAt.Bytes())
+		isCompressed := false
+		isDataFound = true
 
 		if strings.HasSuffix(*item.Key, ".gz") {
-			if reader, err = gzip.NewReader(reader); err != nil {
-				a.dbgLog(fmt.Sprintf("gzip.NewReader(): %v", err))
-				continue
-			}
+			isCompressed = true
 		}
 
-		event, err := ioutil.ReadAll(reader)
-		if err != nil {
-			a.dbgLog(fmt.Sprintf("ioutil.ReadAll(): %v", err))
-			continue
-		}
-		isDataFound = true
-		if !a.processEvent(event) {
+		if !a.processEvent(writerAt.Bytes(), isCompressed) {
 			continue
 		}
 
@@ -193,24 +180,31 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 	return isDataFound, nil
 }
 
-func (a *S3Adapter) processEvent(data []byte) bool {
-	for _, line := range strings.Split(string(data), "\n") {
-		if line == "" {
-			continue
+func (a *S3Adapter) processEvent(data []byte, isCompressed bool) bool {
+	// Since we're dealing with files, we use the
+	// bundle payloads to avoid having to go through
+	// the whole unmarshal+marshal roundtrip.
+	var msg *protocol.DataMessage
+	if isCompressed {
+		msg = &protocol.DataMessage{
+			CompressedBundlePayload: data,
+			TimestampMs:             uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 		}
-		msg := &protocol.DataMessage{
-			TextPayload: line,
-			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+	} else {
+		msg = &protocol.DataMessage{
+			BundlePayload: data,
+			TimestampMs:   uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 		}
-		if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-			if err == uspclient.ErrorBufferFull {
-				a.dbgLog("stream falling behind")
-				err = a.uspClient.Ship(msg, 0)
-			}
-			if err != nil {
-				a.dbgLog(fmt.Sprintf("Ship(): %v", err))
-				return false
-			}
+	}
+
+	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+		if err == uspclient.ErrorBufferFull {
+			a.dbgLog("stream falling behind")
+			err = a.uspClient.Ship(msg, 0)
+		}
+		if err != nil {
+			a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+			return false
 		}
 	}
 	return true
