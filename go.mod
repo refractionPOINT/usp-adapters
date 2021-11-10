@@ -9,7 +9,7 @@ require (
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20210908184532-d51651c5f02d // indirect
-	github.com/refractionPOINT/go-uspclient v0.0.0-20211104034151-c680065b4371
+	github.com/refractionPOINT/go-uspclient v0.0.0-20211110003224-12b2b5856cd9
 	github.com/rs/zerolog v1.25.0 // indirect
 	golang.org/x/net v0.0.0-20211011170408-caeb26a5c8c0 // indirect
 	golang.org/x/oauth2 v0.0.0-20211005180243-6b3c2da341f1 // indirect
