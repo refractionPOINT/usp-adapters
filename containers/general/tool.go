@@ -141,7 +141,7 @@ func main() {
 	configs.PubSub.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
-	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
+	configs.PubSub.ClientOptions.BufferOptions.OnAck = func() {
 		log("received data ack from limacharlie")
 	}
 
@@ -153,9 +153,6 @@ func main() {
 	configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
-	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
-		log("received data ack from limacharlie")
-	}
 
 	// Stdin
 	configs.Stdin.ClientOptions.DebugLog = func(msg string) {
@@ -165,7 +162,7 @@ func main() {
 	configs.Stdin.ClientOptions.BufferOptions.OnBackPressure = func() {
 		log("experiencing back pressure")
 	}
-	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
+	configs.Stdin.ClientOptions.BufferOptions.OnAck = func() {
 		log("received data ack from limacharlie")
 	}
 

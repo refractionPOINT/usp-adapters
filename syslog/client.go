@@ -2,10 +2,12 @@ package usp_syslog
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,10 +38,49 @@ type SyslogConfig struct {
 	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Port            uint16                  `json:"port" yaml:"port"`
 	Interface       string                  `json:"iface" yaml:"iface"`
-	IsUDP           bool                    `json:"is_udp" yaml:"is_udp"`
+	IsUDP           bool                    `json:"is_udp,omitempty" yaml:"is_udp,omitempty"`
 	SslCertPath     string                  `json:"ssl_cert" yaml:"ssl_cert"`
 	SslKeyPath      string                  `json:"ssl_key" yaml:"ssl_key"`
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
+}
+
+// This custom JSON Unmarshaler permits the `IsUDP` value to be
+// loaded either from a bool or a string (from an environment variable for example).
+type tempSyslogConfig SyslogConfig
+
+func (sc *SyslogConfig) UnmarshalJSON(data []byte) error {
+	// First get all the fields parsed in a dictionary.
+	d := map[string]interface{}{}
+	if err := json.Unmarshal(data, &d); err != nil {
+		return err
+	}
+
+	// Check if the `rename_only` field is present and if
+	// it is, is it a string?
+	var err error
+	if iu, ok := d["is_udp"]; ok {
+		if ius, ok := iu.(string); ok {
+			if d["is_udp"], err = strconv.ParseBool(ius); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Re-marshal to JSON so that we can
+	// do another single-pass Unmarshal.
+	t, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+
+	// Finally extract to a temporary type
+	// (to bypass this custom Unmarshaler).
+	tsc := tempSyslogConfig(*sc)
+	if err := json.Unmarshal(t, &tsc); err != nil {
+		return err
+	}
+	*sc = SyslogConfig(tsc)
+	return nil
 }
 
 func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
