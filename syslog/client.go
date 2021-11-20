@@ -2,6 +2,7 @@ package usp_syslog
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,11 +17,13 @@ import (
 
 const (
 	defaultWriteTimeout = 60 * 10
+	udpBufferSize       = 64 * 1024
 )
 
 type SyslogAdapter struct {
 	conf         SyslogConfig
 	listener     net.Listener
+	udpListener  *net.UDPConn
 	connMutex    sync.Mutex
 	wg           sync.WaitGroup
 	isRunning    uint32
@@ -33,6 +36,7 @@ type SyslogConfig struct {
 	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Port            uint16                  `json:"port" yaml:"port"`
 	Interface       string                  `json:"iface" yaml:"iface"`
+	IsUDP           bool                    `json:"is_udp" yaml:"is_udp"`
 	SslCertPath     string                  `json:"ssl_cert" yaml:"ssl_cert"`
 	SslKeyPath      string                  `json:"ssl_key" yaml:"ssl_key"`
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
@@ -55,8 +59,13 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 	}
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
+	if conf.IsUDP && (conf.SslCertPath != "" || conf.SslKeyPath != "") {
+		return nil, nil, errors.New("ssl cannot be enabled for udp")
+	}
+
 	addr := fmt.Sprintf("%s:%d", conf.Interface, conf.Port)
 	var l net.Listener
+	var ul *net.UDPConn
 	var err error
 	if conf.SslCertPath != "" && conf.SslKeyPath != "" {
 		var cert tls.Certificate
@@ -68,6 +77,15 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 			Certificates: []tls.Certificate{cert},
 		}
 		l, err = tls.Listen("tcp", addr, &tlsConfig)
+	} else if conf.IsUDP {
+		var udpAddr *net.UDPAddr
+		if udpAddr, err = net.ResolveUDPAddr("udp", addr); err != nil {
+			return nil, nil, err
+		}
+		ul, err = net.ListenUDP("udp", udpAddr)
+		if err == nil {
+			ul.SetReadBuffer(udpBufferSize)
+		}
 	} else {
 		l, err = net.Listen("tcp", addr)
 	}
@@ -77,18 +95,27 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
-		l.Close()
+		if l != nil {
+			l.Close()
+		} else {
+			ul.Close()
+		}
 		return nil, nil, err
 	}
 
 	a.listener = l
+	a.udpListener = ul
 
 	chStopped := make(chan struct{})
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
 		defer close(chStopped)
-		a.handleConnections()
+		if conf.IsUDP {
+			a.handleConnection(a.udpListener)
+		} else {
+			a.handleTCPConnections()
+		}
 	}()
 
 	return a, chStopped, nil
@@ -97,7 +124,12 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 func (a *SyslogAdapter) Close() error {
 	a.dbgLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
-	err1 := a.listener.Close()
+	var err1 error
+	if a.listener != nil {
+		err1 = a.listener.Close()
+	} else {
+		err1 = a.udpListener.Close()
+	}
 	_, err2 := a.uspClient.Close()
 	if err1 != nil {
 		return err1
@@ -105,7 +137,7 @@ func (a *SyslogAdapter) Close() error {
 	return err2
 }
 
-func (a *SyslogAdapter) handleConnections() {
+func (a *SyslogAdapter) handleTCPConnections() {
 	a.dbgLog(fmt.Sprintf("listening for connections on %s:%d", a.conf.Interface, a.conf.Port))
 
 	var err error
