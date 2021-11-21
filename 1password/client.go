@@ -56,7 +56,7 @@ type OnePasswordConfig struct {
 	Endpoint      string                  `json:"endpoint" yaml:"endpoint"`
 }
 
-func NewPubSubAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
+func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
 	var err error
 	a := &OnePasswordAdapter{
 		conf: conf,
@@ -167,6 +167,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]es
 	if lastCursor != "" {
 		reqData.Cursor = lastCursor
 	} else {
+		a.dbgLog(fmt.Sprintf("requesting from %s starting now", url))
 		reqData.StartTime = time.Now().Format(time.RFC3339)
 	}
 	b, err := json.Marshal(reqData)
