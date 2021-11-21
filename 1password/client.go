@@ -132,23 +132,9 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 		}
 
 		for _, item := range items {
-			ts := uint64(0)
-			if tsString, ok := item.GetString("timestamp"); ok && tsString != "" {
-				if t, err := time.Parse(time.RFC3339, tsString); err == nil {
-					ts = uint64(t.UnixNano() / int64(time.Millisecond))
-				}
-			}
-			if ts == 0 {
-				ts = uint64(time.Now().UnixNano() / int64(time.Millisecond))
-			}
-			et := item.FindOneString("category")
-			if et == "" {
-				et = "item_usage"
-			}
 			msg := &protocol.DataMessage{
 				JsonPayload: item,
-				TimestampMs: ts,
-				EventType:   et,
+				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 			}
 			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 				if err == uspclient.ErrorBufferFull {
