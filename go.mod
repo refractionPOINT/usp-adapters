@@ -6,8 +6,7 @@ require (
 	cloud.google.com/go v0.97.0 // indirect
 	cloud.google.com/go/pubsub v1.17.0
 	github.com/aws/aws-sdk-go v1.41.1
-	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
+	github.com/refractionPOINT/go-essentials v0.0.0-20211115195223-eec2e80a8964
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20210908184532-d51651c5f02d // indirect
 	github.com/refractionPOINT/go-uspclient v0.0.0-20211116161949-35572328cbf0
 	github.com/rs/zerolog v1.25.0 // indirect
@@ -19,5 +18,4 @@ require (
 	google.golang.org/genproto v0.0.0-20211012143446-e1d23e1da178 // indirect
 	google.golang.org/grpc v1.41.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0
-	gopkg.in/yaml.v3 v3.0.0-20210107192922-496545a6307b // indirect
 )
