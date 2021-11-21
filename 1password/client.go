@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/refractionPOINT/go-essentials"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -46,7 +46,7 @@ type OnePasswordAdapter struct {
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
-	doStop    *essentials.Event
+	doStop    *utils.Event
 
 	ctx context.Context
 }
@@ -68,7 +68,7 @@ func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan s
 			conf.ClientOptions.DebugLog(s)
 		},
 		ctx:    context.Background(),
-		doStop: essentials.NewEvent(),
+		doStop: utils.NewEvent(),
 	}
 
 	if strings.HasPrefix(conf.Endpoint, "https://") {
@@ -165,7 +165,7 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 	}
 }
 
-func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]essentials.Dict, string) {
+func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]utils.Dict, string) {
 	// Prepare the request body.
 	reqData := opRequest{}
 	if lastCursor != "" {
@@ -206,7 +206,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]es
 	}
 
 	// Parse the response.
-	respData := essentials.Dict{}
+	respData := utils.Dict{}
 	jsonDecoder := json.NewDecoder(resp.Body)
 	if err := jsonDecoder.Decode(&respData); err != nil {
 		a.dbgLog(fmt.Sprintf("1password api invalid json: %v", err))
