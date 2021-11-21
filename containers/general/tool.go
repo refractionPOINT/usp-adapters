@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/stdin"
@@ -24,10 +25,11 @@ type USPClient interface {
 }
 
 type GeneralConfigs struct {
-	Syslog usp_syslog.SyslogConfig `json:"syslog" yaml:"syslog"`
-	PubSub usp_pubsub.PubSubConfig `json:"pubsub" yaml:"pubsub"`
-	S3     usp_s3.S3Config         `json:"s3" yaml:"s3"`
-	Stdin  usp_stdin.StdinConfig   `json:"stdin" yaml:"stdin"`
+	Syslog      usp_syslog.SyslogConfig         `json:"syslog" yaml:"syslog"`
+	PubSub      usp_pubsub.PubSubConfig         `json:"pubsub" yaml:"pubsub"`
+	S3          usp_s3.S3Config                 `json:"s3" yaml:"s3"`
+	Stdin       usp_stdin.StdinConfig           `json:"stdin" yaml:"stdin"`
+	OnePassword usp_1password.OnePasswordConfig `json:"1password" yaml:"1password"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -166,11 +168,24 @@ func main() {
 		log("received data ack from limacharlie")
 	}
 
+	// 1Password
+	configs.OnePassword.ClientOptions.DebugLog = func(msg string) {
+		log(msg)
+	}
+	configs.OnePassword.ClientOptions.BufferOptions.BufferCapacity = 50000
+	configs.OnePassword.ClientOptions.BufferOptions.OnBackPressure = func() {
+		log("experiencing back pressure")
+	}
+	configs.OnePassword.ClientOptions.BufferOptions.OnAck = func() {
+		log("received data ack from limacharlie")
+	}
+
 	// Enforce the usp_adapter Architecture on all configs.
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 	configs.S3.ClientOptions.Architecture = "usp_adapter"
 	configs.Stdin.ClientOptions.Architecture = "usp_adapter"
+	configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var chRunning chan struct{}
@@ -188,6 +203,9 @@ func main() {
 	} else if adapterType == "stdin" {
 		printConfig(adapterType, configs.Stdin)
 		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
+	} else if adapterType == "1password" {
+		printConfig(adapterType, configs.OnePassword)
+		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
