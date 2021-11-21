@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"strings"
@@ -140,9 +141,14 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 			if ts == 0 {
 				ts = uint64(time.Now().UnixNano() / int64(time.Millisecond))
 			}
+			et := item.FindOneString("category")
+			if et == "" {
+				et = "item_usage"
+			}
 			msg := &protocol.DataMessage{
 				JsonPayload: item,
 				TimestampMs: ts,
+				EventType:   et,
 			}
 			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 				if err == uspclient.ErrorBufferFull {
@@ -161,14 +167,13 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 
 func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]essentials.Dict, string) {
 	// Prepare the request body.
-	reqData := opRequest{
-		Limit: 1000,
-	}
+	reqData := opRequest{}
 	if lastCursor != "" {
 		reqData.Cursor = lastCursor
 	} else {
 		a.dbgLog(fmt.Sprintf("requesting from %s starting now", url))
 		reqData.StartTime = time.Now().Format(time.RFC3339)
+		reqData.Limit = 1000
 	}
 	b, err := json.Marshal(reqData)
 	if err != nil {
@@ -195,7 +200,8 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]es
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		a.dbgLog(fmt.Sprintf("1password api non-200: %s", resp.Status))
+		body, _ := ioutil.ReadAll(resp.Body)
+		a.dbgLog(fmt.Sprintf("1password api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
 		return nil, lastCursor
 	}
 
