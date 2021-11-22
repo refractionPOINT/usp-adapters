@@ -76,6 +76,8 @@ func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 	logError("Available configs:\n")
 	printStruct("", GeneralConfigs{}, true)
+	logError("\nGlobal Runtime Options\n----------------------------------")
+	printStruct("", RuntimeConfig{}, false)
 }
 
 func printConfig(adapterType string, c interface{}) {
