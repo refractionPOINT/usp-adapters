@@ -24,6 +24,12 @@ type USPClient interface {
 	Close() error
 }
 
+// These configs are top level and cannot
+// be used by underlying adapters.
+type RuntimeConfig struct {
+	Healthcheck int `json:"healthcheck" yaml:"healthcheck"`
+}
+
 type GeneralConfigs struct {
 	Syslog      usp_syslog.SyslogConfig         `json:"syslog" yaml:"syslog"`
 	PubSub      usp_pubsub.PubSubConfig         `json:"pubsub" yaml:"pubsub"`
@@ -70,6 +76,8 @@ func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 	logError("Available configs:\n")
 	printStruct("", GeneralConfigs{}, true)
+	logError("\nGlobal Runtime Options\n----------------------------------")
+	printStruct("", RuntimeConfig{}, false)
 }
 
 func printConfig(adapterType string, c interface{}) {
@@ -79,6 +87,7 @@ func printConfig(adapterType string, c interface{}) {
 
 func main() {
 	log("starting")
+	runtimeConfigs := RuntimeConfig{}
 	configs := GeneralConfigs{}
 	if len(os.Args) < 2 {
 		printUsage()
@@ -108,6 +117,15 @@ func main() {
 				os.Exit(1)
 			}
 		}
+		if err := json.Unmarshal(b, &runtimeConfigs); err != nil {
+			err2 := yaml.Unmarshal(b, &runtimeConfigs)
+			if err2 != nil {
+				logError("json.Unmarshal(): %v", err)
+				logError("yaml.Unmarshal(): %v", err2)
+				printUsage()
+				os.Exit(1)
+			}
+		}
 	} else {
 		// Read the config from the CLI.
 		if err := utils.ParseCLI(os.Args[1], os.Args[2:], &configs); err != nil {
@@ -115,8 +133,20 @@ func main() {
 			printUsage()
 			os.Exit(1)
 		}
+		// Get the runtime configs.
+		if err := utils.ParseCLI("", os.Args[2:], &runtimeConfigs); err != nil {
+			logError("ParseCLI(): %v", err)
+			printUsage()
+			os.Exit(1)
+		}
 		// Read the config from the Env.
 		if err := utils.ParseCLI(os.Args[1], os.Environ(), &configs); err != nil {
+			logError("ParseEnv(): %v", err)
+			printUsage()
+			os.Exit(1)
+		}
+		// Get the runtime configs.
+		if err := utils.ParseCLI("", os.Environ(), &runtimeConfigs); err != nil {
 			logError("ParseEnv(): %v", err)
 			printUsage()
 			os.Exit(1)
@@ -214,6 +244,14 @@ func main() {
 	if err != nil {
 		logError("error instantiating client: %v", err)
 		os.Exit(1)
+	}
+
+	// If healthchecks were requested, start it.
+	if runtimeConfigs.Healthcheck != 0 {
+		if err := startHealthChecks(runtimeConfigs.Healthcheck); err != nil {
+			logError("error starting healthchecks: %v", err)
+			os.Exit(1)
+		}
 	}
 
 	osSignals := make(chan os.Signal, 1)
