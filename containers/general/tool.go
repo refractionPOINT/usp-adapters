@@ -10,6 +10,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -154,61 +155,24 @@ func main() {
 	}
 
 	// Syslog
-	configs.Syslog.ClientOptions.DebugLog = func(msg string) {
-		log(msg)
-	}
+	configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
 	configs.Syslog.ClientOptions.BufferOptions.BufferCapacity = 50000
-	configs.Syslog.ClientOptions.BufferOptions.OnBackPressure = func() {
-		log("experiencing back pressure")
-	}
-	configs.Syslog.ClientOptions.BufferOptions.OnAck = func() {
-		log("received data ack from limacharlie")
-	}
 
 	// Pubsub
-	configs.PubSub.ClientOptions.DebugLog = func(msg string) {
-		log(msg)
-	}
+	configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
 	configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 50000
-	configs.PubSub.ClientOptions.BufferOptions.OnBackPressure = func() {
-		log("experiencing back pressure")
-	}
-	configs.PubSub.ClientOptions.BufferOptions.OnAck = func() {
-		log("received data ack from limacharlie")
-	}
 
 	// S3
-	configs.S3.ClientOptions.DebugLog = func(msg string) {
-		log(msg)
-	}
 	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 100 // lower capacity because this uses Bundles
-	configs.S3.ClientOptions.BufferOptions.OnBackPressure = func() {
-		log("experiencing back pressure")
-	}
+	configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
 
 	// Stdin
-	configs.Stdin.ClientOptions.DebugLog = func(msg string) {
-		log(msg)
-	}
 	configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 50000
-	configs.Stdin.ClientOptions.BufferOptions.OnBackPressure = func() {
-		log("experiencing back pressure")
-	}
-	configs.Stdin.ClientOptions.BufferOptions.OnAck = func() {
-		log("received data ack from limacharlie")
-	}
+	configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
 
 	// 1Password
-	configs.OnePassword.ClientOptions.DebugLog = func(msg string) {
-		log(msg)
-	}
 	configs.OnePassword.ClientOptions.BufferOptions.BufferCapacity = 50000
-	configs.OnePassword.ClientOptions.BufferOptions.OnBackPressure = func() {
-		log("experiencing back pressure")
-	}
-	configs.OnePassword.ClientOptions.BufferOptions.OnAck = func() {
-		log("received data ack from limacharlie")
-	}
+	configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
 
 	// Enforce the usp_adapter Architecture on all configs.
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
@@ -271,4 +235,23 @@ func main() {
 		os.Exit(1)
 	}
 	log("exited")
+}
+
+func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
+	o.DebugLog = func(msg string) {
+		log(fmt.Sprintf("DBG: %s", msg))
+	}
+	o.OnWarning = func(msg string) {
+		log(fmt.Sprintf("WRN: %s", msg))
+	}
+	o.OnError = func(err error) {
+		logError(fmt.Sprintf("ERR: %s", err.Error()))
+	}
+	o.BufferOptions.OnBackPressure = func() {
+		log("FLO: experiencing back pressure")
+	}
+	o.BufferOptions.OnAck = func() {
+		log("FLO: received data ack from limacharlie")
+	}
+	return o
 }

@@ -11,7 +11,7 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e // indirect
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20210908184532-d51651c5f02d // indirect
-	github.com/refractionPOINT/go-uspclient v0.0.0-20211116161949-35572328cbf0
+	github.com/refractionPOINT/go-uspclient v0.0.0-20211123235408-1215c5018537
 	github.com/rs/zerolog v1.25.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/net v0.0.0-20211011170408-caeb26a5c8c0 // indirect
