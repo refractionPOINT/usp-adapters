@@ -57,3 +57,6 @@ availableSecrets:
     env: 'PASSWORD'
   - versionName: projects/${PROJECT_ID}/secrets/DOCKERHUB_USERNAME/versions/latest
     env: 'USERNAME'
+options:
+  machineType: 'N1_HIGHCPU_8'
+timeout: 15m

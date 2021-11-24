@@ -23,3 +23,6 @@ steps:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
+options:
+  machineType: 'N1_HIGHCPU_8'
+timeout: 15m
