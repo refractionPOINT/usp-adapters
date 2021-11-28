@@ -134,7 +134,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			break
 		}
 		startTime := time.Now().UTC()
-		a.dbgLog(fmt.Sprintf("%s processing file %s (%d)", startTime.Format(time.Stamp), *item.Key, *item.Size))
+		a.dbgLog(fmt.Sprintf("processing file %s (%d)", *item.Key, *item.Size))
 
 		writerAt := aws.NewWriteAtBuffer([]byte{})
 
@@ -157,7 +157,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			continue
 		}
 
-		a.dbgLog(fmt.Sprintf("%s file %s processed in %v (%d)", time.Now().UTC().Format(time.Stamp), *item.Key, time.Since(startTime), *item.Size))
+		a.dbgLog(fmt.Sprintf("file %s processed in %v (%d)", *item.Key, time.Since(startTime), *item.Size))
 
 		if a.conf.IsOneTimeLoad {
 			// In one time loads we don't delete the contents.
