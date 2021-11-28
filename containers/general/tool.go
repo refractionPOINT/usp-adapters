@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
@@ -239,19 +240,19 @@ func main() {
 
 func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 	o.DebugLog = func(msg string) {
-		log(fmt.Sprintf("DBG: %s", msg))
+		log("DBG %s: %s", time.Now().Format(time.Stamp), msg)
 	}
 	o.OnWarning = func(msg string) {
-		log(fmt.Sprintf("WRN: %s", msg))
+		log("WRN %s: %s", time.Now().Format(time.Stamp), msg)
 	}
 	o.OnError = func(err error) {
-		logError(fmt.Sprintf("ERR: %s", err.Error()))
+		logError("ERR %s: %s", time.Now().Format(time.Stamp), err.Error())
 	}
 	o.BufferOptions.OnBackPressure = func() {
-		log("FLO: experiencing back pressure")
+		log("FLO %s: experiencing back pressure", time.Now().Format(time.Stamp))
 	}
 	o.BufferOptions.OnAck = func() {
-		log("FLO: received data ack from limacharlie")
+		log("FLO %s: received data ack from limacharlie", time.Now().Format(time.Stamp))
 	}
 	return o
 }
