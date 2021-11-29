@@ -207,9 +207,9 @@ func (a *SyslogAdapter) handleTCPConnections() {
 }
 
 func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
-	a.dbgLog(fmt.Sprintf("handling new connection from %+v", conn))
+	a.dbgLog(fmt.Sprintf("handling new connection from %+v", conn.RemoteAddr()))
 	defer func() {
-		a.dbgLog(fmt.Sprintf("connection from %+v leaving", conn))
+		a.dbgLog(fmt.Sprintf("connection from %+v leaving", conn.RemoteAddr()))
 		conn.Close()
 	}()
 
