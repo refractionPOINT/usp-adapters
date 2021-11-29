@@ -153,7 +153,7 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 		defer a.wg.Done()
 		defer close(chStopped)
 		if conf.IsUDP {
-			a.handleConnection(a.udpListener)
+			a.handleConnection(a.udpListener, true)
 		} else {
 			a.handleTCPConnections()
 		}
@@ -201,12 +201,12 @@ func (a *SyslogAdapter) handleTCPConnections() {
 		a.connMutex.Unlock()
 		go func() {
 			defer a.wg.Done()
-			a.handleConnection(conn)
+			a.handleConnection(conn, false)
 		}()
 	}
 }
 
-func (a *SyslogAdapter) handleConnection(conn net.Conn) {
+func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
 	a.dbgLog(fmt.Sprintf("handling new connection from %+v", conn))
 	defer func() {
 		a.dbgLog(fmt.Sprintf("connection from %+v leaving", conn))
@@ -230,6 +230,12 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn) {
 		}
 
 		data := readBuffer[:sizeRead]
+
+		if isDatagram {
+			// Datagram syslog contains one record per datagram.
+			a.handleLine(data)
+			continue
+		}
 
 		chunks, err := st.Add(data)
 		if err != nil {

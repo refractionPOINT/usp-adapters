@@ -23,6 +23,19 @@ steps:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm', './containers/general']
+    env:
+      - 'GOOS=linux'
+      - 'GOARCH=arm'
+      - 'GOARM=5'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64', './containers/general']
+    env:
+      - 'GOOS=linux'
+      - 'GOARCH=arm64'
+    waitFor: ['run-tests']
 options:
   machineType: 'N1_HIGHCPU_8'
 timeout: 15m
