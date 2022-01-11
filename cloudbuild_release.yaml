@@ -12,7 +12,7 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   id: build-docker
   entrypoint: 'bash'
-  args: ['-c', 'docker build -f ./containers/general/Dockerfile -t refractionpoint/lc-adapter:$TAG_NAME -t gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME .']
+  args: ['-c', 'docker build -f ./containers/general/Dockerfile -t refractionpoint/lc-adapter:$TAG_NAME -t gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME -t refractionpoint/lc-adapter:latest .']
   waitFor: ['get-github-keys']
 - name: 'golang'
   id: build-linux64
@@ -61,7 +61,7 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter
   entrypoint: 'bash'
-  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter:$TAG_NAME']
+  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter:$TAG_NAME && docker push refractionpoint/lc-adapter:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
   waitFor: ['build-docker']
 images:
