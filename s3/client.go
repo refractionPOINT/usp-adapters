@@ -165,7 +165,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		item := e.(*s3.Object)
 
 		startTime := time.Now().UTC()
-		a.dbgLog(fmt.Sprintf("processing file %s (%d)", *item.Key, *item.Size))
+		a.dbgLog(fmt.Sprintf("downloading file %s (%d)", *item.Key, *item.Size))
 
 		writerAt := aws.NewWriteAtBuffer([]byte{})
 
