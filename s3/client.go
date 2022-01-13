@@ -53,6 +53,9 @@ type s3LocalFile struct {
 }
 
 func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
+	if conf.ParallelFetch <= 0 {
+		conf.ParallelFetch = 1
+	}
 	a := &S3Adapter{
 		conf: conf,
 		dbgLog: func(s string) {
@@ -109,6 +112,10 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 			if !isFilesFound {
 				time.Sleep(5 * time.Second)
 			}
+		}
+
+		if err != nil {
+			a.dbgLog(fmt.Sprintf("s3 stoppped with error: %v", err))
 		}
 	}()
 
