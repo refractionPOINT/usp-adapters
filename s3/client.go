@@ -208,6 +208,9 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		if err != nil {
 			break
 		}
+		if newFile == nil {
+			break
+		}
 		localFile := newFile.(*s3LocalFile)
 
 		if localFile.Err != nil {
