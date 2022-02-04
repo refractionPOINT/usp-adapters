@@ -90,3 +90,28 @@ func TestStreamTokenizerMaxSize(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamTokenizerBounds(t *testing.T) {
+	s := StreamTokenizer{
+		MaxSize: 1024,
+		Token:   0x0a,
+	}
+
+	testData := []string{
+		"this is line 1\n",
+		"and 2\n",
+		"and a longer one and a longer oneand a longer one and a longer one and a longer one\n",
+	}
+	for i, b := range testData {
+		elems, err := s.Add([]byte(b))
+		if err != nil {
+			t.Errorf("Add(): %v", err)
+		}
+		if len(elems) != 1 {
+			t.Errorf("Unexepcted chunks: %+v", elems)
+		}
+		if string(elems[0]) != testData[i][0:len(testData[i])-1] {
+			t.Errorf("Unexpected chunk value: %s", string(elems[0]))
+		}
+	}
+}
