@@ -13,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
+	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/stdin"
@@ -38,6 +39,7 @@ type GeneralConfigs struct {
 	S3          usp_s3.S3Config                 `json:"s3" yaml:"s3"`
 	Stdin       usp_stdin.StdinConfig           `json:"stdin" yaml:"stdin"`
 	OnePassword usp_1password.OnePasswordConfig `json:"1password" yaml:"1password"`
+	Office365   usp_o365.Office365Config        `json:"office365" yaml:"office365"`
 }
 
 func logError(format string, elems ...interface{}) {
