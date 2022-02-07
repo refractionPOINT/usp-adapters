@@ -120,7 +120,9 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 			a.dbgLog(fmt.Sprintf("failed to register subscription to %s: %v", url, err))
 			continue
 		}
-		a.dbgLog(fmt.Sprintf("subscription: %+v", sub))
+		if len(sub) != 0 {
+			a.dbgLog(fmt.Sprintf("subscription created: %+v", sub))
+		}
 
 		nCollecting++
 
@@ -173,20 +175,22 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		isFirstRun = false
 		var items []listItem
 		items, nextPage = a.makeOneListRequest(nextPage)
-		if items == nil {
+		if len(items) == 0 {
 			continue
 		}
 
+		nFetched := 0
 		for _, item := range items {
 			if _, ok := lastContent[item.ContentID]; ok {
 				newContent[item.ContentID] = struct{}{}
 				continue
 			}
 			events := a.makeOneContentRequest(item.ContentURI)
-			if events == nil {
+			if len(events) == 0 {
 				continue
 			}
 
+			nFetched++
 			newContent[item.ContentID] = struct{}{}
 
 			for _, event := range events {
@@ -210,6 +214,8 @@ func (a *Office365Adapter) fetchEvents(url string) {
 
 		lastContent = newContent
 		newContent = map[string]struct{}{}
+
+		a.dbgLog(fmt.Sprintf("fetched %d events", nFetched))
 	}
 }
 
@@ -304,7 +310,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 
 	nextPage := resp.Header.Get("NextPageUri")
 
-	a.dbgLog(fmt.Sprintf("received list (%s): %+v", nextPage, respData))
+	a.dbgLog(fmt.Sprintf("listed %d events (with page: %v)", len(respData), nextPage != ""))
 
 	return respData, nextPage
 }
@@ -341,7 +347,6 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
 		a.dbgLog(fmt.Sprintf("office365 content api invalid json: %v", err))
 		return nil
 	}
-	a.dbgLog(fmt.Sprintf("received content: %+v", respData))
 
 	return respData
 }
