@@ -14,6 +14,7 @@ require (
 	github.com/rs/zerolog v1.25.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/net v0.0.0-20211011170408-caeb26a5c8c0 // indirect
+	golang.org/x/oauth2 v0.0.0-20211104180415-d3ed0bb246c8
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	golang.org/x/sys v0.0.0-20211007075335-d3039528d8ac // indirect
 	golang.org/x/text v0.3.7 // indirect

@@ -86,7 +86,7 @@ func printUsage() {
 
 func printConfig(adapterType string, c interface{}) {
 	b, _ := yaml.Marshal(c)
-	log("Configs in use (%s):\n----------------------------------\n%s\n----------------------------------\n", adapterType, string(b))
+	log("Configs in use (%s):\n----------------------------------\n%s----------------------------------\n", adapterType, string(b))
 }
 
 func main() {
@@ -177,12 +177,17 @@ func main() {
 	configs.OnePassword.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
 
+	// Office365
+	configs.Office365.ClientOptions.BufferOptions.BufferCapacity = 50000
+	configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
+
 	// Enforce the usp_adapter Architecture on all configs.
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 	configs.S3.ClientOptions.Architecture = "usp_adapter"
 	configs.Stdin.ClientOptions.Architecture = "usp_adapter"
 	configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
+	configs.Office365.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var chRunning chan struct{}
@@ -203,6 +208,9 @@ func main() {
 	} else if adapterType == "1password" {
 		printConfig(adapterType, configs.OnePassword)
 		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
+	} else if adapterType == "office365" {
+		printConfig(adapterType, configs.Office365)
+		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
