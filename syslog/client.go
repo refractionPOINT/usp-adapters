@@ -29,7 +29,6 @@ type SyslogAdapter struct {
 	connMutex    sync.Mutex
 	wg           sync.WaitGroup
 	isRunning    uint32
-	dbgLog       func(string)
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 }
@@ -85,13 +84,7 @@ func (sc *SyslogConfig) UnmarshalJSON(data []byte) error {
 
 func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
 	a := &SyslogAdapter{
-		conf: conf,
-		dbgLog: func(s string) {
-			if conf.ClientOptions.DebugLog == nil {
-				return
-			}
-			conf.ClientOptions.DebugLog(s)
-		},
+		conf:      conf,
 		isRunning: 1,
 	}
 
@@ -163,7 +156,7 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 }
 
 func (a *SyslogAdapter) Close() error {
-	a.dbgLog("closing")
+	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	var err1 error
 	if a.listener != nil {
@@ -179,11 +172,11 @@ func (a *SyslogAdapter) Close() error {
 }
 
 func (a *SyslogAdapter) handleTCPConnections() {
-	a.dbgLog(fmt.Sprintf("listening for connections on %s:%d", a.conf.Interface, a.conf.Port))
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("listening for connections on %s:%d", a.conf.Interface, a.conf.Port))
 
 	var err error
 
-	defer a.dbgLog(fmt.Sprintf("stopped listening for connections on %s:%d (%v)", a.conf.Interface, a.conf.Port, err))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("stopped listening for connections on %s:%d (%v)", a.conf.Interface, a.conf.Port, err))
 
 	for atomic.LoadUint32(&a.isRunning) == 1 {
 		var conn net.Conn
@@ -207,9 +200,9 @@ func (a *SyslogAdapter) handleTCPConnections() {
 }
 
 func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
-	a.dbgLog(fmt.Sprintf("handling new connection from %+v", conn.RemoteAddr()))
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("handling new connection from %+v", conn.RemoteAddr()))
 	defer func() {
-		a.dbgLog(fmt.Sprintf("connection from %+v leaving", conn.RemoteAddr()))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("connection from %+v leaving", conn.RemoteAddr()))
 		conn.Close()
 	}()
 
@@ -224,7 +217,7 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
 		sizeRead, err := conn.Read(readBuffer[:])
 		if err != nil {
 			if err != io.EOF {
-				a.dbgLog(fmt.Sprintf("conn.Read(): %v", err))
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("conn.Read(): %v", err))
 			}
 			return
 		}
@@ -239,7 +232,7 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
 
 		chunks, err := st.Add(data)
 		if err != nil {
-			a.dbgLog(fmt.Sprintf("tokenizer: %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("tokenizer: %v", err))
 		}
 		for _, chunk := range chunks {
 			a.handleLine(chunk)
@@ -257,10 +250,10 @@ func (a *SyslogAdapter) handleLine(line []byte) {
 	}
 	err := a.uspClient.Ship(msg, a.writeTimeout)
 	if err == uspclient.ErrorBufferFull {
-		a.dbgLog("stream falling behind")
+		a.conf.ClientOptions.OnWarning("stream falling behind")
 		err = a.uspClient.Ship(msg, 0)
 	}
 	if err != nil {
-		a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 	}
 }

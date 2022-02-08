@@ -21,7 +21,6 @@ import (
 
 type S3Adapter struct {
 	conf      S3Config
-	dbgLog    func(string)
 	uspClient *uspclient.Client
 
 	ctx context.Context
@@ -58,13 +57,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	}
 	a := &S3Adapter{
 		conf: conf,
-		dbgLog: func(s string) {
-			if conf.ClientOptions.DebugLog == nil {
-				return
-			}
-			conf.ClientOptions.DebugLog(s)
-		},
-		ctx: context.Background(),
+		ctx:  context.Background(),
 	}
 
 	var err error
@@ -115,7 +108,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 		}
 
 		if err != nil {
-			a.dbgLog(fmt.Sprintf("s3 stoppped with error: %v", err))
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("s3 stoppped with error: %v", err))
 		}
 	}()
 
@@ -127,7 +120,7 @@ func (a *S3Adapter) getRegion() (string, error) {
 }
 
 func (a *S3Adapter) Close() error {
-	a.dbgLog("closing")
+	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isStop, 1)
 	a.wg.Wait()
 	return nil
@@ -139,7 +132,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		Prefix: &a.conf.Prefix,
 	})
 	if err != nil {
-		a.dbgLog(fmt.Sprintf("s3.ListObjectsV2(): %v", err))
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("s3.ListObjectsV2(): %v", err))
 		// Ignore the error upstream so that we just keep retrying.
 		return false, nil
 	}
@@ -165,7 +158,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		item := e.(*s3.Object)
 
 		startTime := time.Now().UTC()
-		a.dbgLog(fmt.Sprintf("downloading file %s (%d)", *item.Key, *item.Size))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s (%d)", *item.Key, *item.Size))
 
 		writerAt := aws.NewWriteAtBuffer([]byte{})
 
@@ -173,7 +166,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			Bucket: aws.String(a.conf.BucketName),
 			Key:    aws.String(*item.Key),
 		}); err != nil {
-			a.dbgLog(fmt.Sprintf("s3.Download(): %v", err))
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("s3.Download(): %v", err))
 			return &s3LocalFile{
 				Obj:  item,
 				Data: nil,
@@ -187,7 +180,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			isCompressed = true
 		}
 
-		a.dbgLog(fmt.Sprintf("file %s downloaded in %v (%d)", *item.Key, time.Since(startTime), *item.Size))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", *item.Key, time.Since(startTime), *item.Size))
 
 		return &s3LocalFile{
 			Obj:          item,
@@ -223,11 +216,11 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		startTime := time.Now().UTC()
 
 		if !a.processEvent(localFile.Data, localFile.IsCompressed) {
-			a.dbgLog(fmt.Sprintf("file %s NOT processed in %v (%d)", *localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s NOT processed in %v (%d)", *localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
 			continue
 		}
 
-		a.dbgLog(fmt.Sprintf("file %s processed in %v (%d)", *localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s processed in %v (%d)", *localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
 
 		if a.conf.IsOneTimeLoad {
 			// In one time loads we don't delete the contents.
@@ -238,11 +231,11 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			Bucket: aws.String(a.conf.BucketName),
 			Key:    aws.String(*localFile.Obj.Key),
 		}); err != nil {
-			a.dbgLog(fmt.Sprintf("s3.DeleteObject(): %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("s3.DeleteObject(): %v", err))
 			// Since we rely on object deletion to prevent re-ingesting
 			// the same files over and over again, we need to abort
 			// if we cannot delete a file.
-			a.dbgLog("aborting because files cannot be deleted")
+			a.conf.ClientOptions.OnWarning("aborting because files cannot be deleted")
 			break
 		}
 		isDataFound = true
@@ -270,11 +263,11 @@ func (a *S3Adapter) processEvent(data []byte, isCompressed bool) bool {
 
 	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 		if err == uspclient.ErrorBufferFull {
-			a.dbgLog("stream falling behind")
+			a.conf.ClientOptions.OnWarning("stream falling behind")
 			err = a.uspClient.Ship(msg, 0)
 		}
 		if err != nil {
-			a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 			return false
 		}
 	}

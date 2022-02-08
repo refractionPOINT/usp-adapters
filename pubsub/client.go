@@ -18,7 +18,6 @@ const (
 
 type PubSubAdapter struct {
 	conf      PubSubConfig
-	dbgLog    func(string)
 	uspClient *uspclient.Client
 
 	psClient *pubsub.Client
@@ -39,13 +38,7 @@ type PubSubConfig struct {
 func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) {
 	a := &PubSubAdapter{
 		conf: conf,
-		dbgLog: func(s string) {
-			if conf.ClientOptions.DebugLog == nil {
-				return
-			}
-			conf.ClientOptions.DebugLog(s)
-		},
-		ctx: context.Background(),
+		ctx:  context.Background(),
 	}
 
 	var err error
@@ -74,7 +67,7 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 		defer close(chStopped)
 		for {
 			if err := a.buildSub.Receive(pubsubCtx, a.processEvent); err != nil {
-				a.dbgLog(fmt.Sprintf("buildSub.Receive: %v", err))
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("buildSub.Receive: %v", err))
 				subErr = err
 			}
 			time.Sleep(2 * time.Second)
@@ -96,7 +89,7 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 }
 
 func (a *PubSubAdapter) Close() error {
-	a.dbgLog("closing")
+	a.conf.ClientOptions.DebugLog("closing")
 	a.stopSub()
 	err1 := a.psClient.Close()
 	_, err2 := a.uspClient.Close()
@@ -114,11 +107,11 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 		message.Nack()
 		if err == uspclient.ErrorBufferFull {
-			a.dbgLog("stream falling behind")
+			a.conf.ClientOptions.DebugLog("stream falling behind")
 			err = a.uspClient.Ship(msg, 0)
 		}
 		if err != nil {
-			a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
 		return
 	}

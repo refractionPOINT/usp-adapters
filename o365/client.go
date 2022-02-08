@@ -38,7 +38,6 @@ var URL = map[string]string{
 
 type Office365Adapter struct {
 	conf       Office365Config
-	dbgLog     func(string)
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -66,13 +65,7 @@ type Office365Config struct {
 func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}, error) {
 	var err error
 	a := &Office365Adapter{
-		conf: conf,
-		dbgLog: func(s string) {
-			if conf.ClientOptions.DebugLog == nil {
-				return
-			}
-			conf.ClientOptions.DebugLog(s)
-		},
+		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 	}
@@ -111,16 +104,16 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 		if ct == "" {
 			continue
 		}
-		a.dbgLog(fmt.Sprintf("starting to fetch %s events", ct))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch %s events", ct))
 
 		url := fmt.Sprintf("%s%s/activity/feed/subscriptions/start?contentType=%s&PublisherIdentifier=%s", a.endpoint, a.conf.TenantID, ct, a.conf.PublisherID)
 		sub, err := a.makeOneRegistrationRequest(url)
 		if err != nil {
-			a.dbgLog(fmt.Sprintf("failed to register subscription to %s: %v", url, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to register subscription to %s: %v", url, err))
 			continue
 		}
 		if len(sub) != 0 {
-			a.dbgLog(fmt.Sprintf("subscription created: %+v", sub))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("subscription created: %+v", sub))
 		}
 
 		nCollecting++
@@ -143,7 +136,7 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 }
 
 func (a *Office365Adapter) Close() error {
-	a.dbgLog("closing")
+	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	_, err := a.uspClient.Close()
@@ -154,7 +147,7 @@ func (a *Office365Adapter) Close() error {
 
 func (a *Office365Adapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
-	defer a.dbgLog(fmt.Sprintf("fetching of events exiting"))
+	defer a.conf.ClientOptions.DebugLog("fetching of events exiting")
 
 	lastContent := map[string]struct{}{}
 	newContent := map[string]struct{}{}
@@ -199,11 +192,11 @@ func (a *Office365Adapter) fetchEvents(url string) {
 				}
 				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 					if err == uspclient.ErrorBufferFull {
-						a.dbgLog("stream falling behind")
+						a.conf.ClientOptions.OnWarning("stream falling behind")
 						err = a.uspClient.Ship(msg, 0)
 					}
 					if err != nil {
-						a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 					}
 					a.doStop.Set()
 					return
@@ -214,7 +207,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		lastContent = newContent
 		newContent = map[string]struct{}{}
 
-		a.dbgLog(fmt.Sprintf("fetched %d events", nFetched))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d events", nFetched))
 	}
 }
 
@@ -238,7 +231,7 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 	req, err := http.NewRequest("POST", url, &bytes.Buffer{})
 	if err != nil {
 		a.doStop.Set()
-		a.dbgLog(fmt.Sprintf("http.NewRequest(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -246,7 +239,7 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 	// Issue the request.
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		a.dbgLog(fmt.Sprintf("http.Client.Do(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -259,7 +252,7 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		a.dbgLog(fmt.Sprintf("office365 start api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 start api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil, errors.New(resp.Status)
 	}
 
@@ -267,7 +260,7 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 	respData := utils.Dict{}
 	jsonDecoder := json.NewDecoder(resp.Body)
 	if err := jsonDecoder.Decode(&respData); err != nil {
-		a.dbgLog(fmt.Sprintf("office365 start api invalid json: %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api invalid json: %v", err))
 		return nil, err
 	}
 
@@ -279,7 +272,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 	req, err := http.NewRequest("GET", url, &bytes.Buffer{})
 	if err != nil {
 		a.doStop.Set()
-		a.dbgLog(fmt.Sprintf("http.NewRequest(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
 		return nil, ""
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -287,7 +280,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 	// Issue the request.
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		a.dbgLog(fmt.Sprintf("http.Client.Do(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 		return nil, ""
 	}
 	defer resp.Body.Close()
@@ -295,7 +288,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		a.dbgLog(fmt.Sprintf("office365 list api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 list api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil, url
 	}
 
@@ -303,13 +296,13 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 	respData := []listItem{}
 	jsonDecoder := json.NewDecoder(resp.Body)
 	if err := jsonDecoder.Decode(&respData); err != nil {
-		a.dbgLog(fmt.Sprintf("office365 list api invalid json: %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api invalid json: %v", err))
 		return nil, ""
 	}
 
 	nextPage := resp.Header.Get("NextPageUri")
 
-	a.dbgLog(fmt.Sprintf("listed %d events (with page: %v)", len(respData), nextPage != ""))
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("listed %d events (with page: %v)", len(respData), nextPage != ""))
 
 	return respData, nextPage
 }
@@ -319,7 +312,7 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
 	req, err := http.NewRequest("GET", url, &bytes.Buffer{})
 	if err != nil {
 		a.doStop.Set()
-		a.dbgLog(fmt.Sprintf("http.NewRequest(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
 		return nil
 	}
 	req.Header.Set("Content-Type", "application/json")
@@ -327,7 +320,7 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
 	// Issue the request.
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		a.dbgLog(fmt.Sprintf("http.Client.Do(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 		return nil
 	}
 	defer resp.Body.Close()
@@ -335,7 +328,7 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		a.dbgLog(fmt.Sprintf("office365 content api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil
 	}
 
@@ -343,7 +336,7 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
 	respData := []utils.Dict{}
 	jsonDecoder := json.NewDecoder(resp.Body)
 	if err := jsonDecoder.Decode(&respData); err != nil {
-		a.dbgLog(fmt.Sprintf("office365 content api invalid json: %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api invalid json: %v", err))
 		return nil
 	}
 
