@@ -43,7 +43,6 @@ type Office365Adapter struct {
 	httpClient *http.Client
 
 	endpoint string
-	token    string
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -162,12 +161,12 @@ func (a *Office365Adapter) fetchEvents(url string) {
 
 	nextPage := ""
 	isFirstRun := true
-	for isFirstRun || nextPage != "" || !a.doStop.WaitFor(5 * time.Minute) {
+	for isFirstRun || nextPage != "" || !a.doStop.WaitFor(5*time.Minute) {
 		if nextPage == "" {
 			now := time.Now().UTC()
 			start := a.conf.StartTime
 			if !isFirstRun || start == "" {
-				start = now.Add(-3*time.Hour).Format("2006-01-02T15:04:05")
+				start = now.Add(-3 * time.Hour).Format("2006-01-02T15:04:05")
 			}
 			end := now.Format("2006-01-02T15:04:05")
 			nextPage = fmt.Sprintf("%s&startTime=%s&endTime=%s", url, start, end)
