@@ -60,13 +60,7 @@ type OnePasswordConfig struct {
 func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
 	var err error
 	a := &OnePasswordAdapter{
-		conf: conf,
-		dbgLog: func(s string) {
-			if conf.ClientOptions.DebugLog == nil {
-				return
-			}
-			conf.ClientOptions.DebugLog(s)
-		},
+		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 	}
@@ -108,7 +102,7 @@ func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan s
 }
 
 func (a *OnePasswordAdapter) Close() error {
-	a.dbgLog("closing")
+	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	_, err := a.uspClient.Close()
@@ -119,7 +113,7 @@ func (a *OnePasswordAdapter) Close() error {
 
 func (a *OnePasswordAdapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
-	defer a.dbgLog(fmt.Sprintf("fetching of %s events exiting", url))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastCursor := ""
 	for !a.doStop.WaitFor(30 * time.Second) {
@@ -138,11 +132,11 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 			}
 			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 				if err == uspclient.ErrorBufferFull {
-					a.dbgLog("stream falling behind")
+					a.conf.ClientOptions.OnWarning("stream falling behind")
 					err = a.uspClient.Ship(msg, 0)
 				}
 				if err != nil {
-					a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 				}
 				a.doStop.Set()
 				return
@@ -157,7 +151,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	if lastCursor != "" {
 		reqData.Cursor = lastCursor
 	} else {
-		a.dbgLog(fmt.Sprintf("requesting from %s starting now", url))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s starting now", url))
 		reqData.StartTime = time.Now().Format(time.RFC3339)
 		reqData.Limit = 1000
 	}
@@ -179,7 +173,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	// Issue the request.
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		a.dbgLog(fmt.Sprintf("http.Client.Do(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 		return nil, lastCursor
 	}
 	defer resp.Body.Close()
@@ -187,7 +181,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		a.dbgLog(fmt.Sprintf("1password api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("1password api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
 		return nil, lastCursor
 	}
 
@@ -195,7 +189,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	respData := utils.Dict{}
 	jsonDecoder := json.NewDecoder(resp.Body)
 	if err := jsonDecoder.Decode(&respData); err != nil {
-		a.dbgLog(fmt.Sprintf("1password api invalid json: %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("1password api invalid json: %v", err))
 		return nil, lastCursor
 	}
 

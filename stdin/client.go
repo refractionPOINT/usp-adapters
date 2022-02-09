@@ -21,7 +21,6 @@ type StdinAdapter struct {
 	conf         StdinConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
-	dbgLog       func(string)
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 }
@@ -33,13 +32,7 @@ type StdinConfig struct {
 
 func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
 	a := &StdinAdapter{
-		conf: conf,
-		dbgLog: func(s string) {
-			if conf.ClientOptions.DebugLog == nil {
-				return
-			}
-			conf.ClientOptions.DebugLog(s)
-		},
+		conf:      conf,
 		isRunning: 1,
 	}
 
@@ -66,7 +59,7 @@ func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
 }
 
 func (a *StdinAdapter) Close() error {
-	a.dbgLog("closing")
+	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	_, err := a.uspClient.Close()
 	if err != nil {
@@ -87,7 +80,7 @@ func (a *StdinAdapter) handleInput() {
 		sizeRead, err := os.Stdin.Read(readBuffer[:])
 		if err != nil {
 			if err != io.EOF {
-				a.dbgLog(fmt.Sprintf("os.Stdin.Read(): %v", err))
+				a.conf.ClientOptions.OnError(fmt.Errorf("os.Stdin.Read(): %v", err))
 			}
 			return
 		}
@@ -96,7 +89,7 @@ func (a *StdinAdapter) handleInput() {
 
 		chunks, err := st.Add(data)
 		if err != nil {
-			a.dbgLog(fmt.Sprintf("tokenizer: %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("tokenizer: %v", err))
 		}
 		for _, chunk := range chunks {
 			a.handleLine(chunk)
@@ -114,10 +107,10 @@ func (a *StdinAdapter) handleLine(line []byte) {
 	}
 	err := a.uspClient.Ship(msg, a.writeTimeout)
 	if err == uspclient.ErrorBufferFull {
-		a.dbgLog("stream falling behind")
+		a.conf.ClientOptions.OnWarning("stream falling behind")
 		err = a.uspClient.Ship(msg, 0)
 	}
 	if err != nil {
-		a.dbgLog(fmt.Sprintf("Ship(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 	}
 }
