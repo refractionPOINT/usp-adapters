@@ -169,6 +169,9 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		var items []listItem
 		items, nextPage = a.makeOneListRequest(nextPage)
 		if len(items) == 0 {
+			// No bundles at all, we can just reset the
+			// content seen before.
+			contentSeen = map[string]struct{}{}
 			continue
 		}
 
