@@ -109,8 +109,14 @@ func Pipeliner(it PipelinerGenerator, nParallel int, proc PipelinerMapper) (Pipe
 	// as needed to avoid deadlocks.
 	go func() {
 		wg.Wait()
+		// We use the mArr lock to ensure a
+		// consumer does not have a race when
+		// checking if the entire pipeline is
+		// done vs just waiting for new item.
+		mArr.Lock()
 		evReady.Set()
 		evDone.Set()
+		mArr.Unlock()
 	}()
 
 	// Return an in-order consumer from the
@@ -145,7 +151,7 @@ func Pipeliner(it PipelinerGenerator, nParallel int, proc PipelinerMapper) (Pipe
 			// If element 0 is nil, it means it's
 			// not ready to be consumed so reset
 			// the event.
-			if arr[0].e == nil && arr[0].err == nil {
+			if !evDone.IsSet() && arr[0].e == nil && arr[0].err == nil {
 				evReady.Clear()
 			}
 

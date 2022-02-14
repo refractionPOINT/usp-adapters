@@ -149,8 +149,9 @@ func (a *Office365Adapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog("fetching of events exiting")
 
-	lastContent := map[string]struct{}{}
-	newContent := map[string]struct{}{}
+	lastBundles := map[string]map[string]struct{}{}
+	newBundles := map[string]map[string]struct{}{}
+	contentSeen := map[string]struct{}{}
 
 	nextPage := ""
 	isFirstRun := true
@@ -168,13 +169,18 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		var items []listItem
 		items, nextPage = a.makeOneListRequest(nextPage)
 		if len(items) == 0 {
+			// No bundles at all, we can just reset the
+			// content seen before.
+			contentSeen = map[string]struct{}{}
 			continue
 		}
 
 		nFetched := 0
+		nShipped := 0
+		contentIDsThisPass := map[string]struct{}{}
 		for _, item := range items {
-			if _, ok := lastContent[item.ContentID]; ok {
-				newContent[item.ContentID] = struct{}{}
+			if _, ok := lastBundles[item.ContentID]; ok {
+				newBundles[item.ContentID] = lastBundles[item.ContentID]
 				continue
 			}
 			events := a.makeOneContentRequest(item.ContentURI)
@@ -183,9 +189,15 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			}
 
 			nFetched++
-			newContent[item.ContentID] = struct{}{}
+			newBundles[item.ContentID] = map[string]struct{}{}
 
 			for _, event := range events {
+				eventID, _ := event.GetString("Id")
+				contentIDsThisPass[eventID] = struct{}{}
+				if _, ok := contentSeen[eventID]; ok {
+					continue
+				}
+
 				msg := &protocol.DataMessage{
 					JsonPayload: event,
 					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
@@ -201,13 +213,31 @@ func (a *Office365Adapter) fetchEvents(url string) {
 					a.doStop.Set()
 					return
 				}
+				newBundles[item.ContentID][eventID] = struct{}{}
+				contentSeen[eventID] = struct{}{}
+				nShipped++
 			}
 		}
 
-		lastContent = newContent
-		newContent = map[string]struct{}{}
+		for bundleID := range lastBundles {
+			if _, ok := newBundles[bundleID]; ok {
+				continue
+			}
+			// This bundle has disappeared, cull its
+			// contentIDs unless they were seen in
+			// this current pass.
+			for cid := range lastBundles[bundleID] {
+				if _, ok := contentIDsThisPass[cid]; ok {
+					continue
+				}
+				delete(contentSeen, cid)
+			}
+		}
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d events", nFetched))
+		lastBundles = newBundles
+		newBundles = map[string]map[string]struct{}{}
+
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: %+v", nFetched, nShipped, lastBundles))
 	}
 }
 
