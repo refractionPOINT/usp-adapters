@@ -5,7 +5,6 @@ package usp_wel
 import (
 	"fmt"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
@@ -20,6 +19,7 @@ type WELAdapter struct {
 	conf         WELConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
+	mRunning     sync.RWMutex
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 
@@ -45,15 +45,17 @@ func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
 
 	a.hSub, err = EvtSubscribe(NULL, NULL, a.conf.ChannelPath, a.conf.Query, NULL, NULL, a.handleEvent, EvtSubscribeToFutureEvents)
 	if a.hSub == NULL || err != nil {
-		return nil, nil, fmt.Errorf("failed creating event subscription: %v", err)
+		err = fmt.Errorf("failed creating event subscription: %v", err)
+		a.conf.ClientOptions.OnError(err)
+		return nil, nil, err
 	}
+	a.conf.ClientOptions.DebugLog("EvtSubscribe successful")
 
 	chStopped := make(chan struct{})
 	a.wg.Add(1)
 	go func() {
-		defer a.wg.Done()
+		a.wg.Wait()
 		defer close(chStopped)
-		defer EvtClose(a.hSub)
 	}()
 
 	return a, chStopped, nil
@@ -61,7 +63,17 @@ func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
 
 func (a *WELAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
-	atomic.StoreUint32(&a.isRunning, 0)
+
+	EvtClose(a.hSub)
+	a.conf.ClientOptions.DebugLog("EvtClose")
+
+	a.mRunning.Lock()
+	a.isRunning = 0
+	a.mRunning.Unlock()
+
+	a.wg.Done()
+	a.wg.Wait()
+
 	_, err := a.uspClient.Close()
 	if err != nil {
 		return err
@@ -70,6 +82,16 @@ func (a *WELAdapter) Close() error {
 }
 
 func (a *WELAdapter) handleEvent(Action EVT_SUBSCRIBE_NOTIFY_ACTION, UserContext PVOID, Event EVT_HANDLE) uintptr {
+	// The lock pattern is a bit more complex than usual
+	// because we're dealing with an async API we don't control.
+	a.mRunning.RLock()
+	if a.isRunning == 0 {
+		return 0
+	}
+	a.wg.Add(1)
+	a.mRunning.RUnlock()
+	defer a.wg.Done()
+
 	if Action == EvtSubscribeActionError {
 		return 0
 	}
