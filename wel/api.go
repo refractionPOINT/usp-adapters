@@ -6,6 +6,7 @@ package usp_wel
 // to subscribe to real-time WEL.
 
 import (
+	"golang.org/x/text/encoding/unicode"
 	"syscall"
 	"unsafe"
 )
@@ -96,5 +97,14 @@ func EvtRenderXML(Context EVT_HANDLE) ([]byte, error) {
 	if BOOL(isSuccess) == FALSE {
 		return nil, err
 	}
-	return buffer[:BufferUsed], nil
+
+	// The data is returned as a UTF16 Windows string.
+	// We need to convert it to UTF8.
+	b := buffer[:BufferUsed]
+	b, err = unicode.UTF16(unicode.LittleEndian, unicode.UseBOM).NewDecoder().Bytes(b)
+	if err != nil {
+		return nil, err
+	}
+
+	return b, nil
 }

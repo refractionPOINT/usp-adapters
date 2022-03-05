@@ -3,7 +3,9 @@
 package usp_wel
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +25,7 @@ type WELAdapter struct {
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 
-	hSub EVT_HANDLE
+	hSubs []EVT_HANDLE
 }
 
 func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
@@ -43,13 +45,30 @@ func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
 		return nil, nil, err
 	}
 
-	a.hSub, err = EvtSubscribe(NULL, NULL, a.conf.ChannelPath, a.conf.Query, NULL, NULL, a.handleEvent, EvtSubscribeToFutureEvents)
-	if a.hSub == NULL || err != nil {
-		err = fmt.Errorf("failed creating event subscription: %v", err)
-		a.conf.ClientOptions.OnError(err)
-		return nil, nil, err
+	if a.conf.EvtSources == "" {
+		return nil, nil, errors.New("missing evt_sources, a csv of SOURCE-NAME:FILTER")
 	}
-	a.conf.ClientOptions.DebugLog("EvtSubscribe successful")
+
+	for _, src := range strings.Split(a.conf.EvtSources, ",") {
+		components := strings.SplitN(src, ":", 2)
+		srcName := components[0]
+		flt := ""
+		if len(components) > 1 {
+			flt = components[1]
+		}
+		if flt == "" {
+			flt = "*"
+		}
+
+		hSub, err := EvtSubscribe(NULL, NULL, srcName, flt, NULL, NULL, a.handleEvent, EvtSubscribeToFutureEvents)
+		if hSub == NULL || err != nil {
+			err = fmt.Errorf("failed creating event subscription: %v", err)
+			a.conf.ClientOptions.OnError(err)
+			return nil, nil, err
+		}
+		a.hSubs = append(a.hSubs, hSub)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("EvtSubscribe successful: %s:%s", srcName, flt))
+	}
 
 	chStopped := make(chan struct{})
 	a.wg.Add(1)
@@ -64,8 +83,10 @@ func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
 func (a *WELAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 
-	EvtClose(a.hSub)
-	a.conf.ClientOptions.DebugLog("EvtClose")
+	for _, hSub := range a.hSubs {
+		EvtClose(hSub)
+		a.conf.ClientOptions.DebugLog("EvtClose")
+	}
 
 	a.mRunning.Lock()
 	a.isRunning = 0
@@ -109,6 +130,7 @@ func (a *WELAdapter) handleEvent(Action EVT_SUBSCRIBE_NOTIFY_ACTION, UserContext
 		TextPayload: string(renderedEvent),
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
+
 	err = a.uspClient.Ship(msg, a.writeTimeout)
 	if err == uspclient.ErrorBufferFull {
 		a.conf.ClientOptions.OnWarning("stream falling behind")

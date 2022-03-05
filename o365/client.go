@@ -98,6 +98,11 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 		return nil, nil, err
 	}
 
+	// Set sane default for the content types.
+	if a.conf.ContentTypes == "" {
+		a.conf.ContentTypes = "Audit.AzureActiveDirectory,Audit.Exchange,Audit.SharePoint,Audit.General,DLP.All"
+	}
+
 	nCollecting := 0
 	for _, ct := range strings.Split(a.conf.ContentTypes, ",") {
 		ct = strings.TrimSpace(ct)
