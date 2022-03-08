@@ -19,6 +19,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
+	"github.com/refractionPOINT/usp-adapters/wel"
 
 	"gopkg.in/yaml.v2"
 )
@@ -40,6 +41,7 @@ type GeneralConfigs struct {
 	Stdin       usp_stdin.StdinConfig           `json:"stdin" yaml:"stdin"`
 	OnePassword usp_1password.OnePasswordConfig `json:"1password" yaml:"1password"`
 	Office365   usp_o365.Office365Config        `json:"office365" yaml:"office365"`
+	Wel         usp_wel.WELConfig               `json:"wel" yaml:"wel"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -181,6 +183,10 @@ func main() {
 	configs.Office365.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
 
+	// Windows Event Logs
+	configs.Wel.ClientOptions.BufferOptions.BufferCapacity = 50000
+	configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
+
 	// Enforce the usp_adapter Architecture on all configs.
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
@@ -188,6 +194,7 @@ func main() {
 	configs.Stdin.ClientOptions.Architecture = "usp_adapter"
 	configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 	configs.Office365.ClientOptions.Architecture = "usp_adapter"
+	configs.Wel.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var chRunning chan struct{}
@@ -211,6 +218,9 @@ func main() {
 	} else if adapterType == "office365" {
 		printConfig(adapterType, configs.Office365)
 		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
+	} else if adapterType == "wel" {
+		printConfig(adapterType, configs.Wel)
+		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
