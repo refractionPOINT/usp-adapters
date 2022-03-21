@@ -13,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
+	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -35,13 +36,14 @@ type RuntimeConfig struct {
 }
 
 type GeneralConfigs struct {
-	Syslog      usp_syslog.SyslogConfig         `json:"syslog" yaml:"syslog"`
-	PubSub      usp_pubsub.PubSubConfig         `json:"pubsub" yaml:"pubsub"`
-	S3          usp_s3.S3Config                 `json:"s3" yaml:"s3"`
-	Stdin       usp_stdin.StdinConfig           `json:"stdin" yaml:"stdin"`
-	OnePassword usp_1password.OnePasswordConfig `json:"1password" yaml:"1password"`
-	Office365   usp_o365.Office365Config        `json:"office365" yaml:"office365"`
-	Wel         usp_wel.WELConfig               `json:"wel" yaml:"wel"`
+	Syslog        usp_syslog.SyslogConfig            `json:"syslog" yaml:"syslog"`
+	PubSub        usp_pubsub.PubSubConfig            `json:"pubsub" yaml:"pubsub"`
+	S3            usp_s3.S3Config                    `json:"s3" yaml:"s3"`
+	Stdin         usp_stdin.StdinConfig              `json:"stdin" yaml:"stdin"`
+	OnePassword   usp_1password.OnePasswordConfig    `json:"1password" yaml:"1password"`
+	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
+	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
+	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
 }
 
 func logError(format string, elems ...interface{}) {
@@ -187,6 +189,10 @@ func main() {
 	configs.Wel.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
 
+	// Azure Event Hub
+	configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
+	configs.AzureEventHub.ClientOptions.BufferOptions.BufferCapacity = 50000
+
 	// Enforce the usp_adapter Architecture on all configs.
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
@@ -195,6 +201,7 @@ func main() {
 	configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 	configs.Office365.ClientOptions.Architecture = "usp_adapter"
 	configs.Wel.ClientOptions.Architecture = "usp_adapter"
+	configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
 
 	var client USPClient
 	var chRunning chan struct{}
@@ -221,6 +228,9 @@ func main() {
 	} else if adapterType == "wel" {
 		printConfig(adapterType, configs.Wel)
 		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
+	} else if adapterType == "azure_event_hub" {
+		printConfig(adapterType, configs.Wel)
+		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
