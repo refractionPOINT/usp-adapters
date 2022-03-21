@@ -70,9 +70,11 @@ func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, e
 			}
 			a.hub.Close(a.ctx)
 			a.uspClient.Close()
+			a.conf.ClientOptions.OnError(err)
 			return nil, nil, err
 		}
 		a.listeners = append(a.listeners, listenerHandle)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("partition listener for %s started", partitionID))
 	}
 
 	return a, a.chStopped, nil

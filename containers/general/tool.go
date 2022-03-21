@@ -229,7 +229,7 @@ func main() {
 		printConfig(adapterType, configs.Wel)
 		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
 	} else if adapterType == "azure_event_hub" {
-		printConfig(adapterType, configs.Wel)
+		printConfig(adapterType, configs.AzureEventHub)
 		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
