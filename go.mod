@@ -16,7 +16,7 @@ require (
 	github.com/mitchellh/mapstructure v1.4.3 // indirect
 	github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e // indirect
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20210908184532-d51651c5f02d // indirect
-	github.com/refractionPOINT/go-uspclient v0.0.0-20220114011040-2380441fec43
+	github.com/refractionPOINT/go-uspclient v0.0.0-20220325195105-3705db66ef6d
 	github.com/rs/zerolog v1.25.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/crypto v0.0.0-20220321153916-2c7772ba3064 // indirect
