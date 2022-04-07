@@ -170,7 +170,7 @@ func main() {
 	configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 50000
 
 	// S3
-	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 100 // lower capacity because this uses Bundles
+	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 50 // lower capacity because this uses Bundles
 	configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
 
 	// Stdin
