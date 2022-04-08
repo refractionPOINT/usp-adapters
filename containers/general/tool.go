@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,6 +45,12 @@ type GeneralConfigs struct {
 	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
+}
+
+type AdapterStats struct {
+	m                sync.Mutex
+	lastAck          time.Time
+	lastBackPressure time.Time
 }
 
 func logError(format string, elems ...interface{}) {
@@ -261,6 +268,11 @@ func main() {
 }
 
 func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
+	stats := &AdapterStats{
+		lastAck:          time.Now(),
+		lastBackPressure: time.Now(),
+	}
+
 	o.DebugLog = func(msg string) {
 		log("DBG %s: %s", time.Now().Format(time.Stamp), msg)
 	}
@@ -271,10 +283,24 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 		logError("ERR %s: %s", time.Now().Format(time.Stamp), err.Error())
 	}
 	o.BufferOptions.OnBackPressure = func() {
-		log("FLO %s: experiencing back pressure", time.Now().Format(time.Stamp))
+		stats.m.Lock()
+		defer stats.m.Unlock()
+		stats.lastBackPressure = time.Now()
 	}
 	o.BufferOptions.OnAck = func() {
-		log("FLO %s: received data ack from limacharlie", time.Now().Format(time.Stamp))
+		stats.m.Lock()
+		defer stats.m.Unlock()
+		stats.lastAck = time.Now()
 	}
+
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			stats.m.Lock()
+			log("FLO %s: last_ack=%s last_pressure=%s", time.Now().Format(time.Stamp), stats.lastAck.Format(time.Stamp), stats.lastBackPressure.Format(time.Stamp))
+			stats.m.Unlock()
+		}
+	}()
+
 	return o
 }
