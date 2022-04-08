@@ -163,35 +163,27 @@ func main() {
 
 	// Syslog
 	configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
-	configs.Syslog.ClientOptions.BufferOptions.BufferCapacity = 50000
 
 	// Pubsub
 	configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
-	configs.PubSub.ClientOptions.BufferOptions.BufferCapacity = 50000
 
 	// S3
-	configs.S3.ClientOptions.BufferOptions.BufferCapacity = 50 // lower capacity because this uses Bundles
 	configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
 
 	// Stdin
-	configs.Stdin.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
 
 	// 1Password
-	configs.OnePassword.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
 
 	// Office365
-	configs.Office365.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
 
 	// Windows Event Logs
-	configs.Wel.ClientOptions.BufferOptions.BufferCapacity = 50000
 	configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
 
 	// Azure Event Hub
 	configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
-	configs.AzureEventHub.ClientOptions.BufferOptions.BufferCapacity = 50000
 
 	// Enforce the usp_adapter Architecture on all configs.
 	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
