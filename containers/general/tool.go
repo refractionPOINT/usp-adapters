@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -44,6 +45,12 @@ type GeneralConfigs struct {
 	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
+}
+
+type AdapterStats struct {
+	m                sync.Mutex
+	lastAck          time.Time
+	lastBackPressure time.Time
 }
 
 func logError(format string, elems ...interface{}) {
@@ -161,66 +168,48 @@ func main() {
 		}
 	}
 
-	// Syslog
-	configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
-
-	// Pubsub
-	configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
-
-	// S3
-	configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
-
-	// Stdin
-	configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
-
-	// 1Password
-	configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
-
-	// Office365
-	configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
-
-	// Windows Event Logs
-	configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
-
-	// Azure Event Hub
-	configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
-
-	// Enforce the usp_adapter Architecture on all configs.
-	configs.Syslog.ClientOptions.Architecture = "usp_adapter"
-	configs.PubSub.ClientOptions.Architecture = "usp_adapter"
-	configs.S3.ClientOptions.Architecture = "usp_adapter"
-	configs.Stdin.ClientOptions.Architecture = "usp_adapter"
-	configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
-	configs.Office365.ClientOptions.Architecture = "usp_adapter"
-	configs.Wel.ClientOptions.Architecture = "usp_adapter"
-	configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
-
 	var client USPClient
 	var chRunning chan struct{}
 	var err error
 
 	if adapterType == "syslog" {
+		configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
+		configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Syslog)
 		client, chRunning, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
 	} else if adapterType == "pubsub" {
+		configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
+		configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.PubSub)
 		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
 	} else if adapterType == "s3" {
+		configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
+		configs.S3.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.S3)
 		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
 	} else if adapterType == "stdin" {
+		configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
+		configs.Stdin.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Stdin)
 		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
 	} else if adapterType == "1password" {
+		configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
+		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.OnePassword)
 		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
 	} else if adapterType == "office365" {
+		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
+		configs.Office365.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Office365)
 		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
 	} else if adapterType == "wel" {
+		configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
+		configs.Wel.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Wel)
 		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
 	} else if adapterType == "azure_event_hub" {
+		configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
+		configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.AzureEventHub)
 		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
 	} else {
@@ -261,6 +250,11 @@ func main() {
 }
 
 func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
+	stats := &AdapterStats{
+		lastAck:          time.Now(),
+		lastBackPressure: time.Now(),
+	}
+
 	o.DebugLog = func(msg string) {
 		log("DBG %s: %s", time.Now().Format(time.Stamp), msg)
 	}
@@ -271,10 +265,24 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 		logError("ERR %s: %s", time.Now().Format(time.Stamp), err.Error())
 	}
 	o.BufferOptions.OnBackPressure = func() {
-		log("FLO %s: experiencing back pressure", time.Now().Format(time.Stamp))
+		stats.m.Lock()
+		defer stats.m.Unlock()
+		stats.lastBackPressure = time.Now()
 	}
 	o.BufferOptions.OnAck = func() {
-		log("FLO %s: received data ack from limacharlie", time.Now().Format(time.Stamp))
+		stats.m.Lock()
+		defer stats.m.Unlock()
+		stats.lastAck = time.Now()
 	}
+
+	go func() {
+		for {
+			time.Sleep(10 * time.Second)
+			stats.m.Lock()
+			log("FLO %s: last_ack=%s last_pressure=%s", time.Now().Format(time.Stamp), stats.lastAck.Format(time.Stamp), stats.lastBackPressure.Format(time.Stamp))
+			stats.m.Unlock()
+		}
+	}()
+
 	return o
 }
