@@ -9,6 +9,7 @@ require (
 	github.com/Azure/go-amqp v0.17.4 // indirect
 	github.com/Azure/go-autorest/autorest v0.11.24 // indirect
 	github.com/aws/aws-sdk-go v1.41.1
+	github.com/duosecurity/duo_api_golang v0.0.0-20220407154329-46fb282896c8
 	github.com/golang-jwt/jwt/v4 v4.4.0 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
