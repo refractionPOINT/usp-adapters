@@ -38,7 +38,6 @@ var URL = map[string]string{
 
 type OnePasswordAdapter struct {
 	conf       OnePasswordConfig
-	dbgLog     func(string)
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -135,9 +134,10 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 					a.conf.ClientOptions.OnWarning("stream falling behind")
 					err = a.uspClient.Ship(msg, 0)
 				}
-				if err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				if err == nil {
+					continue
 				}
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 				a.doStop.Set()
 				return
 			}

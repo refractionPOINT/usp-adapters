@@ -15,6 +15,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
+	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -45,6 +46,7 @@ type GeneralConfigs struct {
 	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
+	Duo           usp_duo.DuoConfig                  `json:"duo" yaml:"duo"`
 }
 
 type AdapterStats struct {
@@ -212,6 +214,11 @@ func main() {
 		configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.AzureEventHub)
 		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
+	} else if adapterType == "duo" {
+		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
+		configs.Duo.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.Duo)
+		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
