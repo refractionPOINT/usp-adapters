@@ -46,6 +46,10 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName); err != nil {
 			return nil, nil, err
 		}
+	} else if a.conf.ServiceAccountCreds == "-" {
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithoutAuthentication()); err != nil {
+			return nil, nil, err
+		}
 	} else {
 		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsJSON([]byte(a.conf.ServiceAccountCreds))); err != nil {
 			return nil, nil, err
