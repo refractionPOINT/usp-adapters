@@ -5,14 +5,14 @@ go 1.18
 require (
 	cloud.google.com/go/pubsub v1.21.1
 	github.com/Azure/azure-event-hubs-go/v3 v3.3.18
-	github.com/aws/aws-sdk-go v1.44.10
+	github.com/aws/aws-sdk-go v1.44.11
 	github.com/duosecurity/duo_api_golang v0.0.0-20220428205559-fa137a8ef05b
-	github.com/refractionPOINT/go-uspclient v0.0.0-20220428011945-77be422cdde1
+	github.com/refractionPOINT/go-uspclient v0.0.0-20220510194902-e8bba99a8ef5
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.0.0-20220411215720-9780585627b5
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	golang.org/x/text v0.3.7
-	google.golang.org/api v0.78.0
+	google.golang.org/api v0.79.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
