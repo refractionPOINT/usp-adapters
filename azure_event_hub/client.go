@@ -63,7 +63,7 @@ func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, e
 		// Receive blocks while attempting to connect to hub, then runs until listenerHandle.Close() is called
 		// <- listenerHandle.Done() signals listener has stopped
 		// listenerHandle.Err() provides the last error the receiver encountered
-		listenerHandle, err := a.hub.Receive(a.ctx, partitionID, a.processEvent)
+		listenerHandle, err := a.hub.Receive(a.ctx, partitionID, a.processEvent, eventhub.ReceiveWithLatestOffset())
 		if err != nil {
 			for _, l := range a.listeners {
 				l.Close(a.ctx)
@@ -74,6 +74,15 @@ func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, e
 			return nil, nil, err
 		}
 		a.listeners = append(a.listeners, listenerHandle)
+
+		// Listen for termination of this handle. Whenever
+		// any of them fails, we will stop the client.
+		go func(h *eventhub.ListenerHandle) {
+			ch := h.Done()
+			<-ch
+			a.conf.ClientOptions.OnError(fmt.Errorf("ListenerHandle.Err(): %v", h.Err()))
+			a.chStopped <- struct{}{}
+		}(listenerHandle)
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("partition listener for %s started", partitionID))
 	}
 
