@@ -214,9 +214,9 @@ func (a *Office365Adapter) fetchEvents(url string) {
 					}
 					if err != nil {
 						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+						a.doStop.Set()
+						return
 					}
-					a.doStop.Set()
-					return
 				}
 				newBundles[item.ContentID][eventID] = struct{}{}
 				contentSeen[eventID] = struct{}{}
