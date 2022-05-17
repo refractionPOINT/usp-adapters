@@ -116,8 +116,8 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 		}
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			return
 		}
-		return
 	}
 	message.Ack()
 }
