@@ -16,6 +16,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	"github.com/refractionPOINT/usp-adapters/duo"
+	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -47,6 +48,7 @@ type GeneralConfigs struct {
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
 	Duo           usp_duo.DuoConfig                  `json:"duo" yaml:"duo"`
+	Gcs           usp_gcs.GCSConfig                  `json:"gcs" yaml:"gcs"`
 }
 
 type AdapterStats struct {
@@ -184,6 +186,11 @@ func main() {
 		configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.PubSub)
 		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
+	} else if adapterType == "gcs" {
+		configs.Gcs.ClientOptions = applyLogging(configs.Gcs.ClientOptions)
+		configs.Gcs.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.Gcs)
+		client, chRunning, err = usp_gcs.NewGCSAdapter(configs.Gcs)
 	} else if adapterType == "s3" {
 		configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
 		configs.S3.ClientOptions.Architecture = "usp_adapter"
