@@ -3,6 +3,7 @@ package usp_pubsub
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/pubsub"
@@ -48,6 +49,10 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 		}
 	} else if a.conf.ServiceAccountCreds == "-" {
 		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithoutAuthentication()); err != nil {
+			return nil, nil, err
+		}
+	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsFile(a.conf.ServiceAccountCreds)); err != nil {
 			return nil, nil, err
 		}
 	} else {

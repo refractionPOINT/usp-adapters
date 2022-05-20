@@ -67,6 +67,10 @@ func NewGCSAdapter(conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
 		if a.client, err = storage.NewClient(a.ctx, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
+	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
+		if a.client, err = storage.NewClient(a.ctx, option.WithCredentialsFile(conf.ServiceAccountCreds)); err != nil {
+			return nil, nil, err
+		}
 	} else {
 		if a.client, err = storage.NewClient(a.ctx, option.WithCredentialsJSON([]byte(conf.ServiceAccountCreds))); err != nil {
 			return nil, nil, err
@@ -150,7 +154,7 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 		startTime := time.Now().UTC()
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s (%d)", attrs.Name, attrs.Size))
 
-		obj := a.bucket.Object(attrs.Name)
+		obj := a.bucket.Object(attrs.Name).ReadCompressed(true)
 		r, err := obj.NewReader(a.ctx)
 		if err != nil {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("gcs.NewReader(): %v", err))
