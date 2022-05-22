@@ -123,7 +123,14 @@ func (a *S3Adapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isStop, 1)
 	a.wg.Wait()
-	return nil
+	err1 := a.uspClient.Drain(1 * time.Minute)
+	_, err2 := a.uspClient.Close()
+
+	if err1 != nil {
+		return err1
+	}
+
+	return err2
 }
 
 func (a *S3Adapter) lookForFiles() (bool, error) {

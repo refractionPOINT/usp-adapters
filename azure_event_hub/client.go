@@ -95,11 +95,15 @@ func (a *EventHubAdapter) Close() error {
 		l.Close(a.ctx)
 	}
 	err1 := a.hub.Close(a.ctx)
-	_, err2 := a.uspClient.Close()
+	err2 := a.uspClient.Drain(1 * time.Minute)
+	_, err3 := a.uspClient.Close()
 	if err1 != nil {
 		return err1
 	}
-	return err2
+	if err2 != nil {
+		return err2
+	}
+	return err3
 }
 
 func (a *EventHubAdapter) processEvent(ctx context.Context, message *eventhub.Event) error {

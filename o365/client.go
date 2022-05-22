@@ -144,10 +144,15 @@ func (a *Office365Adapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
-	_, err := a.uspClient.Close()
+	err1 := a.uspClient.Drain(1 * time.Minute)
+	_, err2 := a.uspClient.Close()
 	a.httpClient.CloseIdleConnections()
 
-	return err
+	if err1 != nil {
+		return err1
+	}
+
+	return err2
 }
 
 func (a *Office365Adapter) fetchEvents(url string) {
