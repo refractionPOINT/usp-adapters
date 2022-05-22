@@ -61,11 +61,14 @@ func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
 func (a *StdinAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
-	_, err := a.uspClient.Close()
-	if err != nil {
-		return err
+	err1 := a.uspClient.Drain(1 * time.Minute)
+	_, err2 := a.uspClient.Close()
+
+	if err1 != nil {
+		return err1
 	}
-	return nil
+
+	return err2
 }
 
 func (a *StdinAdapter) handleInput() {

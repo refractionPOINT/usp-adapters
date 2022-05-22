@@ -120,7 +120,14 @@ func (a *GCSAdapter) Close() error {
 	atomic.StoreUint32(&a.isStop, 1)
 	a.wg.Wait()
 	a.client.Close()
-	return nil
+	err1 := a.uspClient.Drain(1 * time.Minute)
+	_, err2 := a.uspClient.Close()
+
+	if err1 != nil {
+		return err1
+	}
+
+	return err2
 }
 
 func (a *GCSAdapter) lookForFiles() (bool, error) {

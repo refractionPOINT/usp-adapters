@@ -6,9 +6,9 @@ require (
 	cloud.google.com/go/pubsub v1.21.1
 	cloud.google.com/go/storage v1.22.1
 	github.com/Azure/azure-event-hubs-go/v3 v3.3.18
-	github.com/aws/aws-sdk-go v1.44.18
+	github.com/aws/aws-sdk-go v1.44.19
 	github.com/duosecurity/duo_api_golang v0.0.0-20220428205559-fa137a8ef05b
-	github.com/refractionPOINT/go-uspclient v0.0.0-20220512165805-f0576c126bfe
+	github.com/refractionPOINT/go-uspclient v0.0.0-20220522020747-deb8e771d751
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.0.0-20220411215720-9780585627b5
 	golang.org/x/sync v0.0.0-20220513210516-0976fa681c29
@@ -55,12 +55,12 @@ require (
 	go.opencensus.io v0.23.0 // indirect
 	golang.org/x/crypto v0.0.0-20220518034528-6f7dac969898 // indirect
 	golang.org/x/net v0.0.0-20220520000938-2e3eb7b945c2 // indirect
-	golang.org/x/sys v0.0.0-20220519141025-dcacdad47464 // indirect
+	golang.org/x/sys v0.0.0-20220520151302-bc2c85ada10a // indirect
 	golang.org/x/xerrors v0.0.0-20220517211312-f3a8303e98df // indirect
 	google.golang.org/appengine v1.6.7 // indirect
 	google.golang.org/genproto v0.0.0-20220519153652-3a47de7e79bd // indirect
 	google.golang.org/grpc v1.46.2 // indirect
 	google.golang.org/protobuf v1.28.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20200902074654-038fdea0a05b // indirect
-	gopkg.in/yaml.v3 v3.0.0-20220512140231-539c8e751b99 // indirect
+	gopkg.in/yaml.v3 v3.0.0 // indirect
 )

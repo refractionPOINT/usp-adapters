@@ -101,11 +101,18 @@ func (a *PubSubAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	a.stopSub()
 	err1 := a.psClient.Close()
-	_, err2 := a.uspClient.Close()
+	err2 := a.uspClient.Drain(1 * time.Minute)
+	_, err3 := a.uspClient.Close()
+
 	if err1 != nil {
 		return err1
 	}
-	return err2
+
+	if err2 != nil {
+		return err2
+	}
+
+	return err3
 }
 
 func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Message) {
