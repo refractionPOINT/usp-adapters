@@ -2,6 +2,7 @@ package usp_azure_event_hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -80,7 +81,9 @@ func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, e
 		go func(h *eventhub.ListenerHandle) {
 			ch := h.Done()
 			<-ch
-			a.conf.ClientOptions.OnError(fmt.Errorf("ListenerHandle.Err(): %v", h.Err()))
+			if err := h.Err(); err != nil && !errors.Is(err, context.Canceled) {
+				a.conf.ClientOptions.OnError(fmt.Errorf("ListenerHandle.Err(): %v", err))
+			}
 			a.chStopped <- struct{}{}
 		}(listenerHandle)
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("partition listener for %s started", partitionID))
