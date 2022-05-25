@@ -82,7 +82,7 @@ func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, e
 			ch := h.Done()
 			<-ch
 			if err := h.Err(); err != nil && !errors.Is(err, context.Canceled) {
-				a.conf.ClientOptions.OnError(fmt.Errorf("ListenerHandle.Err(): %v", h.Err()))
+				a.conf.ClientOptions.OnError(fmt.Errorf("ListenerHandle.Err(): %v", err))
 			}
 			a.chStopped <- struct{}{}
 		}(listenerHandle)
