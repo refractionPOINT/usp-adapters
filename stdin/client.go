@@ -30,6 +30,13 @@ type StdinConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 }
 
+func (c *StdinConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	return nil
+}
+
 func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
 	a := &StdinAdapter{
 		conf:      conf,

@@ -2,6 +2,7 @@ package usp_pubsub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -23,10 +24,9 @@ type PubSubAdapter struct {
 
 	psClient *pubsub.Client
 
-	ctx        context.Context
-	buildTopic *pubsub.Topic
-	buildSub   *pubsub.Subscription
-	stopSub    context.CancelFunc
+	ctx      context.Context
+	buildSub *pubsub.Subscription
+	stopSub  context.CancelFunc
 }
 
 type PubSubConfig struct {
@@ -34,6 +34,22 @@ type PubSubConfig struct {
 	SubscriptionName    string                  `json:"sub_name" yaml:"sub_name"`
 	ProjectName         string                  `json:"project_name" yaml:"project_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
+}
+
+func (c *PubSubConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.SubscriptionName == "" {
+		return errors.New("missing sub_name")
+	}
+	if c.ProjectName == "" {
+		return errors.New("missing project_name")
+	}
+	if c.ServiceAccountCreds == "" {
+		return errors.New("missing service_account_creds")
+	}
+	return nil
 }
 
 func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) {

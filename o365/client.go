@@ -62,6 +62,35 @@ type Office365Config struct {
 	StartTime     string                  `json:"start_time" yaml:"start_time"`
 }
 
+func (c *Office365Config) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.Domain == "" {
+		return errors.New("missing domain")
+	}
+	if c.TenantID == "" {
+		return errors.New("missing tenant_id")
+	}
+	if c.PublisherID == "" {
+		return errors.New("missing publisher_id")
+	}
+	if c.ClientID == "" {
+		return errors.New("missing client_id")
+	}
+	if c.ClientSecret == "" {
+		return errors.New("missing client_secret")
+	}
+	if c.Endpoint == "" {
+		return errors.New("missing endpoint")
+	}
+	_, ok := URL[c.Endpoint]
+	if !strings.HasPrefix(c.Endpoint, "https://") && !ok {
+		return fmt.Errorf("invalid endpoint, not https or in %v", URL)
+	}
+	return nil
+}
+
 func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}, error) {
 	var err error
 	a := &Office365Adapter{

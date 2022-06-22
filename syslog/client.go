@@ -43,6 +43,16 @@ type SyslogConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 }
 
+func (c *SyslogConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.Port == 0 {
+		return errors.New("missing port")
+	}
+	return nil
+}
+
 // This custom JSON Unmarshaler permits the `IsUDP` value to be
 // loaded either from a bool or a string (from an environment variable for example).
 type tempSyslogConfig SyslogConfig

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -54,6 +55,23 @@ type OnePasswordConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
 	Endpoint      string                  `json:"endpoint" yaml:"endpoint"`
+}
+
+func (c *OnePasswordConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.Token == "" {
+		return errors.New("missing token")
+	}
+	if c.Endpoint == "" {
+		return errors.New("missing endpoint")
+	}
+	_, ok := URL[c.Endpoint]
+	if !strings.HasPrefix(c.Endpoint, "https://") && !ok {
+		return fmt.Errorf("invalid endpoint, not https or in %v", URL)
+	}
+	return nil
 }
 
 func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
