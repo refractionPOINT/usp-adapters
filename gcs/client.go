@@ -2,6 +2,7 @@ package usp_gcs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -38,6 +39,16 @@ type GCSConfig struct {
 	IsOneTimeLoad       bool                    `json:"single_load" yaml:"single_load"`
 	Prefix              string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch       int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
+}
+
+func (c *GCSConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.BucketName == "" {
+		return errors.New("missing bucket_name")
+	}
+	return nil
 }
 
 type gcsLocalFile struct {

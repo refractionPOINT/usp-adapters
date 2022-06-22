@@ -32,6 +32,16 @@ type EventHubConfig struct {
 	ConnectionString string                  `json:"connection_string" yaml:"connection_string"`
 }
 
+func (c *EventHubConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.ConnectionString == "" {
+		return errors.New("missing connection_string")
+	}
+	return nil
+}
+
 func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
 	a := &EventHubAdapter{
 		conf: conf,

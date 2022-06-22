@@ -2,6 +2,7 @@ package usp_duo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -36,6 +37,22 @@ type DuoConfig struct {
 	IntegrationKey string                  `json:"integration_key" yaml:"integration_key"`
 	SecretKey      string                  `json:"secret_key" yaml:"secret_key"`
 	APIHostname    string                  `json:"api_hostname" yaml:"api_hostname"`
+}
+
+func (c *DuoConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.IntegrationKey == "" {
+		return errors.New("missing integration_key")
+	}
+	if c.SecretKey == "" {
+		return errors.New("missing secret_key")
+	}
+	if c.APIHostname == "" {
+		return errors.New("missing api_hostname")
+	}
+	return nil
 }
 
 func NewDuoAdapter(conf DuoConfig) (*DuoAdapter, chan struct{}, error) {

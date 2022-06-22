@@ -2,6 +2,7 @@ package usp_s3
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -42,6 +43,22 @@ type S3Config struct {
 	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
 	Prefix        string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
+}
+
+func (c *S3Config) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.BucketName == "" {
+		return errors.New("missing bucket_name")
+	}
+	if c.AccessKey == "" {
+		return errors.New("missing access_key")
+	}
+	if c.SecretKey == "" {
+		return errors.New("missing secret_key")
+	}
+	return nil
 }
 
 type s3LocalFile struct {
