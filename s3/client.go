@@ -190,7 +190,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			Bucket: aws.String(a.conf.BucketName),
 			Key:    aws.String(*item.Key),
 		}); err != nil {
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("s3.Download(): %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
 			return &s3LocalFile{
 				Obj:  item,
 				Data: nil,
