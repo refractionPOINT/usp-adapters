@@ -156,7 +156,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		Prefix: &a.conf.Prefix,
 	})
 	if err != nil {
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf("s3.ListObjectsV2(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2(): %v", err))
 		// Ignore the error upstream so that we just keep retrying.
 		return false, nil
 	}
