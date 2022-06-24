@@ -321,7 +321,7 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 start api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil, errors.New(resp.Status)
 	}
 
@@ -357,7 +357,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 list api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil, url
 	}
 
@@ -397,7 +397,7 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil
 	}
 
