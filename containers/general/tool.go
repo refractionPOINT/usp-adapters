@@ -20,6 +20,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
+	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
@@ -49,6 +50,7 @@ type GeneralConfigs struct {
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
 	Duo           usp_duo.DuoConfig                  `json:"duo" yaml:"duo"`
 	Gcs           usp_gcs.GCSConfig                  `json:"gcs" yaml:"gcs"`
+	Slack         usp_slack.SlackConfig              `json:"slack" yaml:"slack"`
 }
 
 type AdapterStats struct {
@@ -226,6 +228,11 @@ func main() {
 		configs.Duo.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Duo)
 		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
+	} else if adapterType == "slack" {
+		configs.Slack.ClientOptions = applyLogging(configs.Slack.ClientOptions)
+		configs.Slack.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.Slack)
+		client, chRunning, err = usp_slack.NewSlackAdapter(configs.Slack)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
