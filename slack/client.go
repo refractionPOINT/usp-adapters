@@ -110,16 +110,22 @@ func (a *SlackAdapter) fetchEvents() {
 	lastTime := time.Now().Unix()
 
 	for !a.doStop.WaitFor(5 * time.Second) {
+		isItemsProcessed := false
+
 		// Do a non-paged fetch based on time.
 		entries, nextPage, err := a.makeOneContentRequest(lastTime, "")
 		if err != nil {
 			return
 		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries", len(entries)))
 
 		// If we got data, feed it.
-		lastTime, err = a.shipEntries(entries)
-		if err != nil {
-			return
+		if len(entries) != 0 {
+			isItemsProcessed = true
+			lastTime, err = a.shipEntries(entries)
+			if err != nil {
+				return
+			}
 		}
 
 		// If a page was given back, exhaust the cursor.
@@ -128,22 +134,25 @@ func (a *SlackAdapter) fetchEvents() {
 			if err != nil {
 				return
 			}
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries from page", len(entries)))
 
 			// If we got data, feed it.
 			if len(entries) != 0 {
+				isItemsProcessed = true
 				lastTime, err = a.shipEntries(entries)
 				if err != nil {
 					return
 				}
 			}
 		}
+
+		if isItemsProcessed {
+			lastTime++
+		}
 	}
 }
 
 func (a *SlackAdapter) shipEntries(entries []utils.Dict) (int64, error) {
-	if len(entries) == 0 {
-		return 0, nil
-	}
 	latestTs := uint64(0)
 	now := uint64(time.Now().UnixNano() / int64(time.Millisecond))
 	for _, event := range entries {
@@ -182,12 +191,13 @@ func (a *SlackAdapter) makeOneContentRequest(lastTime int64, page string) ([]uti
 
 	q := req.URL.Query()
 	if lastTime != 0 {
-		q.Add("latest", fmt.Sprintf("%d", lastTime))
+		q.Add("oldest", fmt.Sprintf("%d", lastTime))
 	}
 	if page != "" {
 		q.Add("cursor", page)
 	}
 	req.URL.RawQuery = q.Encode()
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("query: %s", req.URL.RawQuery))
 
 	// Issue the request.
 	resp, err := a.httpClient.Do(req)
