@@ -30,9 +30,6 @@ type SlackAdapter struct {
 	wgSenders sync.WaitGroup
 	doStop    *utils.Event
 
-	nextPage string
-	lastTime int64
-
 	ctx context.Context
 }
 
@@ -82,9 +79,6 @@ func NewSlackAdapter(conf SlackConfig) (*SlackAdapter, chan struct{}, error) {
 
 	a.chStopped = make(chan struct{})
 
-	// Initianlize the search parameters
-	a.lastTime = time.Now().Unix()
-
 	a.wgSenders.Add(1)
 	go func() {
 		defer a.wgSenders.Done()
@@ -112,28 +106,33 @@ func (a *SlackAdapter) Close() error {
 }
 
 func (a *SlackAdapter) fetchEvents() {
+	// Initianlize the search parameters
+	lastTime := time.Now().Unix()
+
 	for !a.doStop.WaitFor(5 * time.Second) {
 		// Do a non-paged fetch based on time.
-		entries, nextPage, err := a.makeOneContentRequest(a.lastTime, "")
+		entries, nextPage, err := a.makeOneContentRequest(lastTime, "")
 		if err != nil {
 			return
 		}
 
 		// If we got data, feed it.
-		if err := a.shipEntries(entries); err != nil {
+		lastTime, err = a.shipEntries(entries)
+		if err != nil {
 			return
 		}
 
 		// If a page was given back, exhaust the cursor.
 		for nextPage != "" {
-			entries, nextPage, err = a.makeOneContentRequest(a.lastTime, nextPage)
+			entries, nextPage, err = a.makeOneContentRequest(lastTime, nextPage)
 			if err != nil {
 				return
 			}
 
 			// If we got data, feed it.
 			if len(entries) != 0 {
-				if err := a.shipEntries(entries); err != nil {
+				lastTime, err = a.shipEntries(entries)
+				if err != nil {
 					return
 				}
 			}
@@ -141,12 +140,17 @@ func (a *SlackAdapter) fetchEvents() {
 	}
 }
 
-func (a *SlackAdapter) shipEntries(entries []utils.Dict) error {
+func (a *SlackAdapter) shipEntries(entries []utils.Dict) (int64, error) {
 	if len(entries) == 0 {
-		return nil
+		return 0, nil
 	}
+	latestTs := uint64(0)
 	now := uint64(time.Now().UnixNano() / int64(time.Millisecond))
 	for _, event := range entries {
+		ts, _ := event.GetInt("date_create")
+		if ts > latestTs {
+			latestTs = ts
+		}
 		msg := &protocol.DataMessage{
 			JsonPayload: event,
 			TimestampMs: now,
@@ -158,11 +162,11 @@ func (a *SlackAdapter) shipEntries(entries []utils.Dict) error {
 			}
 			if err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				return err
+				return int64(latestTs), err
 			}
 		}
 	}
-	return nil
+	return int64(latestTs), nil
 }
 
 func (a *SlackAdapter) makeOneContentRequest(lastTime int64, page string) ([]utils.Dict, string, error) {
