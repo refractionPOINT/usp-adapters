@@ -75,3 +75,17 @@ journalctl -f -q | netcat 127.0.0.1 4444
 ```
 ./adapter stdin client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=text "client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" client_options.sensor_seed_key=testclient3 client_options.mapping.event_type_path=exe
 ```
+
+## Adding a new Adapter
+
+1. Add the code in `usp-adapters`.
+1. Add the definition for the new Platform in `go-essentials`.
+  1. Update `legion_endpoint-go`.
+  1. Update `legion_cloud_sensor_host` if new Platform can be cloud-to-cloud.
+  1. Update `legion_usp_proxy`.
+1. Add the new definition in `legion_sensor_directory` and add new Platform to the Actor.
+1. Deploy:
+  1. `legion_sensor_directory`
+  1. `legion_endoint-go`
+  1. `legion_usp_proxy`
+  1. `legion_cloud_sensor_host`
