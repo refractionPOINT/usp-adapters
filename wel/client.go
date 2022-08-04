@@ -40,14 +40,14 @@ func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
 	}
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
+	if a.conf.EvtSources == "" {
+		return nil, nil, errors.New("missing evt_sources, a csv of SOURCE-NAME:FILTER")
+	}
+
 	var err error
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
-	}
-
-	if a.conf.EvtSources == "" {
-		return nil, nil, errors.New("missing evt_sources, a csv of SOURCE-NAME:FILTER")
 	}
 
 	for _, src := range strings.Split(a.conf.EvtSources, ",") {

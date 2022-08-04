@@ -143,8 +143,9 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 		url := fmt.Sprintf("%s%s/activity/feed/subscriptions/start?contentType=%s&PublisherIdentifier=%s", a.endpoint, a.conf.TenantID, ct, a.conf.PublisherID)
 		sub, err := a.makeOneRegistrationRequest(url)
 		if err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to register subscription to %s: %v", url, err))
-			continue
+			a.conf.ClientOptions.OnError(fmt.Errorf("failed to register subscription to %s: %v", url, err))
+			a.Close()
+			return nil, nil, fmt.Errorf("failed to register subscription to %s: %v", url, err)
 		}
 		if len(sub) != 0 {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("subscription created: %+v", sub))
@@ -158,6 +159,7 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 	}
 
 	if nCollecting == 0 {
+		a.Close()
 		return nil, nil, errors.New("no content types specified")
 	}
 
