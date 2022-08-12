@@ -21,6 +21,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/slack"
+	"github.com/refractionPOINT/usp-adapters/sqs"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
@@ -51,6 +52,7 @@ type GeneralConfigs struct {
 	Duo           usp_duo.DuoConfig                  `json:"duo" yaml:"duo"`
 	Gcs           usp_gcs.GCSConfig                  `json:"gcs" yaml:"gcs"`
 	Slack         usp_slack.SlackConfig              `json:"slack" yaml:"slack"`
+	Sqs           usp_sqs.SQSConfig                  `json:"sqs" yaml:"sqs"`
 }
 
 type AdapterStats struct {
@@ -233,6 +235,11 @@ func main() {
 		configs.Slack.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Slack)
 		client, chRunning, err = usp_slack.NewSlackAdapter(configs.Slack)
+	} else if adapterType == "sqs" {
+		configs.Sqs.ClientOptions = applyLogging(configs.Sqs.ClientOptions)
+		configs.Sqs.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.Sqs)
+		client, chRunning, err = usp_sqs.NewSQSAdapter(configs.Sqs)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)

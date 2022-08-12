@@ -1,4 +1,4 @@
-package usp_pubsub
+package usp_sqs
 
 import (
 	"context"
