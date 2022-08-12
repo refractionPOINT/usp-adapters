@@ -36,6 +36,7 @@ type SQSConfig struct {
 	AccessKey     string                  `json:"access_key" yaml:"access_key"`
 	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
 	QueueURL      string                  `json:"queue_url" yaml:"queue_url"`
+	Region        string                  `json:"region" yaml:"region"`
 }
 
 func (c *SQSConfig) Validate() error {
@@ -48,6 +49,12 @@ func (c *SQSConfig) Validate() error {
 	if c.SecretKey == "" {
 		return errors.New("missing secret_key")
 	}
+	if c.Region == "" {
+		return errors.New("missing region")
+	}
+	if c.QueueURL == "" {
+		return errors.New("missing queue_url")
+	}
 	return nil
 }
 
@@ -59,6 +66,7 @@ func NewSQSAdapter(conf SQSConfig) (*SQSAdapter, chan struct{}, error) {
 
 	var err error
 	a.awsConfig = &aws.Config{
+		Region:      aws.String(conf.Region),
 		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
 	}
 
