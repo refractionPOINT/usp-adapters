@@ -20,6 +20,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
+	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/sqs"
 	"github.com/refractionPOINT/usp-adapters/stdin"
@@ -53,6 +54,7 @@ type GeneralConfigs struct {
 	Gcs           usp_gcs.GCSConfig                  `json:"gcs" yaml:"gcs"`
 	Slack         usp_slack.SlackConfig              `json:"slack" yaml:"slack"`
 	Sqs           usp_sqs.SQSConfig                  `json:"sqs" yaml:"sqs"`
+	Simulator     usp_simulator.SimulatorConfig      `json:"simulator" yaml:"simulator"`
 }
 
 type AdapterStats struct {
@@ -240,6 +242,11 @@ func main() {
 		configs.Sqs.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Sqs)
 		client, chRunning, err = usp_sqs.NewSQSAdapter(configs.Sqs)
+	} else if adapterType == "simulator" {
+		configs.Simulator.ClientOptions = applyLogging(configs.Simulator.ClientOptions)
+		configs.Simulator.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.Simulator)
+		client, chRunning, err = usp_simulator.NewSimulatorAdapter(configs.Simulator)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
