@@ -231,7 +231,7 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
 
 	readBuffer := make([]byte, readBufferSize)
 	for atomic.LoadUint32(&a.isRunning) == 1 {
-		sizeRead, err := conn.Read(readBuffer[:])
+		sizeRead, err := conn.Read(readBuffer)
 		if err != nil {
 			if err != io.EOF {
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("conn.Read(): %v", err))
