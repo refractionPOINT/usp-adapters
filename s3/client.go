@@ -81,7 +81,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	var region string
 
 	if region, err = a.getRegion(); err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
 	}
 
 	a.awsConfig = &aws.Config{
@@ -90,7 +90,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	}
 
 	if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("s3.NewSession(): %v", err)
 	}
 
 	a.awsS3 = s3.New(a.awsSession)
@@ -288,7 +288,7 @@ func (a *S3Adapter) processEvent(data []byte, isCompressed bool) bool {
 	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 		if err == uspclient.ErrorBufferFull {
 			a.conf.ClientOptions.OnWarning("stream falling behind")
-			err = a.uspClient.Ship(msg, 0)
+			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
