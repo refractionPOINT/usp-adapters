@@ -140,7 +140,7 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 		message.Nack()
 		if err == uspclient.ErrorBufferFull {
 			a.conf.ClientOptions.DebugLog("stream falling behind")
-			err = a.uspClient.Ship(msg, 0)
+			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))

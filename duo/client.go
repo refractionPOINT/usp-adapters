@@ -135,7 +135,7 @@ func (a *DuoAdapter) fetchAuthLogs() {
 			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 				if err == uspclient.ErrorBufferFull {
 					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 0)
+					err = a.uspClient.Ship(msg, 1*time.Hour)
 				}
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
@@ -190,7 +190,7 @@ func (a *DuoAdapter) fetchAdminLogs() {
 			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 				if err == uspclient.ErrorBufferFull {
 					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 0)
+					err = a.uspClient.Ship(msg, 1*time.Hour)
 				}
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
