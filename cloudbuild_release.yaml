@@ -41,7 +41,7 @@ steps:
   waitFor: ['get-github-keys']
 - name: 'golang'
   id: build-linuxarm
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm', './containers/general']
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=linux'
     - 'GOARCH=arm'
@@ -49,7 +49,7 @@ steps:
   waitFor: ['get-github-keys']
 - name: 'golang'
   id: build-linuxarm64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64', './containers/general']
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=linux'
     - 'GOARCH=arm64'
