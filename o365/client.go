@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -329,9 +330,13 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 
 	// Parse the response.
 	respData := utils.Dict{}
-	jsonDecoder := json.NewDecoder(resp.Body)
-	if err := jsonDecoder.Decode(&respData); err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api invalid json: %v", err))
+	rawResp, err := io.ReadAll(resp.Body)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api response error: %v", err))
+		return nil, err
+	}
+	if err := json.Unmarshal(rawResp, &respData); err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api invalid json: %v (%s)", err, string(rawResp)))
 		return nil, err
 	}
 
