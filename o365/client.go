@@ -197,7 +197,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 
 	nextPage := ""
 	isFirstRun := true
-	for isFirstRun || nextPage != "" || !a.doStop.WaitFor(5*time.Minute) {
+	for isFirstRun || (nextPage != "" && !a.doStop.IsSet()) || !a.doStop.WaitFor(5*time.Minute) {
 		if nextPage == "" {
 			now := time.Now().UTC()
 			start := a.conf.StartTime
