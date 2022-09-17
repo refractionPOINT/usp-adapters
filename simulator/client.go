@@ -64,6 +64,8 @@ func NewSimulatorAdapter(conf SimulatorConfig) (*SimulatorAdapter, chan struct{}
 			return nil, nil, err
 		}
 		a.dataReader = f
+	} else {
+		a.dataReader = conf.Reader
 	}
 
 	var err error
@@ -109,7 +111,7 @@ func (a *SimulatorAdapter) handleInput() {
 		sizeRead, err := a.dataReader.Read(readBuffer[:])
 		if err != nil {
 			if err != io.EOF {
-				a.conf.ClientOptions.OnError(fmt.Errorf("os.File.Read(): %v", err))
+				a.conf.ClientOptions.OnError(fmt.Errorf("io.Read(): %v", err))
 			}
 			return
 		}
