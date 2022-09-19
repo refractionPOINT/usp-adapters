@@ -136,19 +136,7 @@ func (a *SimulatorAdapter) handleLine(line []byte) {
 	// If Replay Timing is enabled, parse the line
 	// and look at replaying it based on the routing.
 	if a.conf.IsReplayTiming {
-		evt := basicLCEvent{}
-		if err := json.Unmarshal(line, &evt); err == nil {
-			if a.lastEventTime <= evt.Routing.EventTime {
-				evtDelta := evt.Routing.EventTime - a.lastEventTime
-				now := time.Now().UnixMilli()
-				clockDelta := now - a.lastSentTime
-				if clockDelta < evtDelta {
-					time.Sleep(time.Duration(evtDelta-clockDelta) * time.Millisecond)
-				}
-				a.lastEventTime = evt.Routing.EventTime
-				a.lastSentTime = now
-			}
-		}
+		a.replayTimedEvent(line)
 	}
 
 	msg := &protocol.DataMessage{
@@ -163,4 +151,24 @@ func (a *SimulatorAdapter) handleLine(line []byte) {
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 	}
+}
+
+func (a *SimulatorAdapter) replayTimedEvent(line []byte) bool {
+	evt := basicLCEvent{}
+	err := json.Unmarshal(line, &evt)
+	if err != nil {
+		return false
+	}
+	if a.lastEventTime > evt.Routing.EventTime {
+		return false
+	}
+	evtDelta := evt.Routing.EventTime - a.lastEventTime
+	now := time.Now().UnixMilli()
+	clockDelta := now - a.lastSentTime
+	if clockDelta < evtDelta {
+		time.Sleep(time.Duration(evtDelta-clockDelta) * time.Millisecond)
+	}
+	a.lastEventTime = evt.Routing.EventTime
+	a.lastSentTime = now
+	return true
 }
