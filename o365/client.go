@@ -199,10 +199,10 @@ func (a *Office365Adapter) fetchEvents(url string) {
 	isFirstRun := true
 	for isFirstRun || (nextPage != "" && !a.doStop.IsSet()) || !a.doStop.WaitFor(5*time.Minute) {
 		if nextPage == "" {
-			now := time.Now().Add(-1 * time.Hour).UTC()
+			now := time.Now().UTC()
 			start := a.conf.StartTime
 			if !isFirstRun || start == "" {
-				start = now.Format("2006-01-02T15:04:05")
+				start = now.Add(-3 * time.Hour).Format("2006-01-02T15:04:05")
 			}
 			end := now.Format("2006-01-02T15:04:05")
 			nextPage = fmt.Sprintf("%s&startTime=%s&endTime=%s", url, start, end)
