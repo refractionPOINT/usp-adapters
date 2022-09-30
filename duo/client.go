@@ -110,13 +110,13 @@ func (a *DuoAdapter) fetchAuthLogs() {
 	minTime := time.Now()
 	window := inTenYears
 	results, err := a.adminClient.GetAuthLogs(minTime, window)
-	fmt.Printf("1: %#v %v\n", results, err)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("GetAuthLogs: %v", err))
 		return
 	}
 	next := results.Response.Metadata.GetNextOffset()
 	for !a.doStop.WaitFor(1 * time.Minute) {
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from api: %#v %#v", minTime, next))
 		if next == nil {
 			results, err = a.adminClient.GetAuthLogs(minTime, window)
 		} else {
@@ -151,6 +151,8 @@ func (a *DuoAdapter) fetchAuthLogs() {
 					nt, err := time.Parse(time.RFC3339, its)
 					if err == nil {
 						minTime = nt.Add(1 * time.Millisecond)
+					} else {
+						a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
 					}
 				} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
 					// Otherwise we use the timestamp in seconds.
