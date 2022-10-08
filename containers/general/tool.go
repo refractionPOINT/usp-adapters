@@ -16,6 +16,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	"github.com/refractionPOINT/usp-adapters/duo"
+	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
@@ -55,6 +56,7 @@ type GeneralConfigs struct {
 	Slack         usp_slack.SlackConfig              `json:"slack" yaml:"slack"`
 	Sqs           usp_sqs.SQSConfig                  `json:"sqs" yaml:"sqs"`
 	Simulator     usp_simulator.SimulatorConfig      `json:"simulator" yaml:"simulator"`
+	File          usp_file.FileConfig                `json:"file" yaml:"file"`
 }
 
 type AdapterStats struct {
@@ -247,6 +249,11 @@ func main() {
 		configs.Simulator.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Simulator)
 		client, chRunning, err = usp_simulator.NewSimulatorAdapter(configs.Simulator)
+	} else if adapterType == "file" {
+		configs.File.ClientOptions = applyLogging(configs.File.ClientOptions)
+		configs.File.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.File)
+		client, chRunning, err = usp_file.NewFileAdapter(configs.File)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
