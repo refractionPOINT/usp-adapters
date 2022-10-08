@@ -8,6 +8,7 @@ require (
 	github.com/Azure/azure-event-hubs-go/v3 v3.3.18
 	github.com/aws/aws-sdk-go v1.44.99
 	github.com/duosecurity/duo_api_golang v0.0.0-20220902131320-61f4e624f85c
+	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/go-uspclient v0.0.0-20220915233536-8019b99d874d
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.0.0-20220909003341-f21342109be1
@@ -50,7 +51,6 @@ require (
 	github.com/mattn/go-isatty v0.0.16 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e // indirect
-	github.com/nxadm/tail v1.4.8 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20220914162801-599a6b3814d1 // indirect
 	github.com/rs/zerolog v1.28.0 // indirect
