@@ -116,7 +116,7 @@ func (a *DuoAdapter) fetchAuthLogs() {
 	}
 	next := results.Response.Metadata.GetNextOffset()
 	for !a.doStop.WaitFor(1 * time.Minute) {
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from api: %#v %#v", minTime, next))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from api: %v %p", minTime, next))
 		if next == nil {
 			results, err = a.adminClient.GetAuthLogs(minTime, window)
 		} else {
