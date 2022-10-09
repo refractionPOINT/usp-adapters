@@ -24,6 +24,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/sqs"
+	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
@@ -55,6 +56,7 @@ type GeneralConfigs struct {
 	Gcs           usp_gcs.GCSConfig                  `json:"gcs" yaml:"gcs"`
 	Slack         usp_slack.SlackConfig              `json:"slack" yaml:"slack"`
 	Sqs           usp_sqs.SQSConfig                  `json:"sqs" yaml:"sqs"`
+	SqsFiles      usp_sqs_files.SQSFilesConfig       `json:"sqs-files" yaml:"sqs-files"`
 	Simulator     usp_simulator.SimulatorConfig      `json:"simulator" yaml:"simulator"`
 	File          usp_file.FileConfig                `json:"file" yaml:"file"`
 }
