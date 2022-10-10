@@ -246,6 +246,11 @@ func main() {
 		configs.Sqs.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.Sqs)
 		client, chRunning, err = usp_sqs.NewSQSAdapter(configs.Sqs)
+	} else if adapterType == "sqs-files" {
+		configs.SqsFiles.ClientOptions = applyLogging(configs.SqsFiles.ClientOptions)
+		configs.SqsFiles.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.SqsFiles)
+		client, chRunning, err = usp_sqs_files.NewSQSFilesAdapter(configs.SqsFiles)
 	} else if adapterType == "simulator" {
 		configs.Simulator.ClientOptions = applyLogging(configs.Simulator.ClientOptions)
 		configs.Simulator.ClientOptions.Architecture = "usp_adapter"
