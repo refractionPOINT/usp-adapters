@@ -72,11 +72,17 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 		defer a.wg.Done()
 		defer close(chStopped)
 		a.handleInput()
+		if a.conf.NoFollow {
+			a.conf.ClientOptions.DebugLog("finished tailing, waiting to drain")
+			time.Sleep(2 * time.Second)
+			a.uspClient.Drain(10 * time.Minute)
+		}
 	}()
 	if a.conf.NoFollow {
 		a.wg.Add(1)
 		go func() {
 			defer a.wg.Done()
+			time.Sleep(2 * time.Second)
 			a.tailFile.StopAtEOF()
 		}()
 	}

@@ -68,7 +68,9 @@ func ParseCLI(prefix string, args []string, out interface{}) error {
 				continue
 			}
 			if i == len(pathElems)-1 {
-				if num, err := strconv.ParseInt(val, 10, 64); err == nil {
+				if b, err := strconv.ParseBool(val); val != "0" && val != "1" && err == nil {
+					tmp[v] = b
+				} else if num, err := strconv.ParseInt(val, 10, 64); err == nil {
 					tmp[v] = num
 				} else {
 					tmp[v] = val
