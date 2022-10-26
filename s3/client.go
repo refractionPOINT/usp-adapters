@@ -219,6 +219,14 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 	defer close()
 
 	isDataFound := false
+
+	// We will delete the files as
+	// we go asynchronously so that
+	// we can get higher throughput.
+	errMutex := sync.Mutex{}
+	var delErr error
+	delWg := sync.WaitGroup{}
+
 	for {
 		var newFile interface{}
 		newFile, err = genNewFile()
@@ -251,19 +259,45 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			continue
 		}
 
-		if _, err = a.awsS3.DeleteObject(&s3.DeleteObjectInput{
-			Bucket: aws.String(a.conf.BucketName),
-			Key:    aws.String(*localFile.Obj.Key),
-		}); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("s3.DeleteObject(): %v", err))
-			// Since we rely on object deletion to prevent re-ingesting
-			// the same files over and over again, we need to abort
-			// if we cannot delete a file.
-			a.conf.ClientOptions.OnWarning("aborting because files cannot be deleted")
+		delWg.Add(1)
+		go func() {
+			defer delWg.Done()
+			if _, err = a.awsS3.DeleteObject(&s3.DeleteObjectInput{
+				Bucket: aws.String(a.conf.BucketName),
+				Key:    aws.String(*localFile.Obj.Key),
+			}); err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("s3.DeleteObject(): %v", err))
+				// Since we rely on object deletion to prevent re-ingesting
+				// the same files over and over again, we need to abort
+				// if we cannot delete a file.
+				a.conf.ClientOptions.OnWarning("aborting because files cannot be deleted")
+				errMutex.Lock()
+				delErr = err
+				errMutex.Unlock()
+			}
+		}()
+
+		// Take the opportunity to check if a delete failed.
+		errMutex.Lock()
+		if delErr != nil {
+			err = delErr
+		}
+		errMutex.Unlock()
+
+		if err != nil {
 			break
 		}
+
 		isDataFound = true
 	}
+
+	// Wait for all file deletes and confirm they did not error.
+	delWg.Wait()
+	errMutex.Lock()
+	if delErr != nil {
+		err = delErr
+	}
+	errMutex.Unlock()
 
 	return isDataFound, err
 }
