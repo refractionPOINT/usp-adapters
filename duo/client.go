@@ -143,7 +143,7 @@ func (a *DuoAdapter) fetchAuthLogs() {
 					return
 				}
 			}
-			if next == nil {
+			if utils.IsInterfaceNil(next) {
 				// Then we must use the time in the last response.
 				// This logic is based on https://github.com/duosecurity/duo_log_sync/blob/master/duologsync/producer/producer.py#L159
 				// Ideally we use iso timestamp that could have ms.
