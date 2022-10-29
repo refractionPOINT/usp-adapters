@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -94,4 +95,8 @@ func removeWaiter(s []chan struct{}, i int) []chan struct{} {
 
 func (e *Event) IsSet() bool {
 	return atomic.LoadUint32(&e.v) != 0
+}
+
+func IsInterfaceNil(v interface{}) bool {
+	return v == nil || reflect.ValueOf(v).Kind() == reflect.Ptr && reflect.ValueOf(v).IsNil()
 }
