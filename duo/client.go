@@ -108,6 +108,7 @@ func (a *DuoAdapter) Close() error {
 
 func (a *DuoAdapter) fetchAuthLogs() {
 	minTime := time.Now()
+	var latestTime time.Time
 	window := inTenYears
 	results, err := a.adminClient.GetAuthLogs(minTime, window)
 	if err != nil {
@@ -116,12 +117,15 @@ func (a *DuoAdapter) fetchAuthLogs() {
 	}
 	next := results.Response.Metadata.GetNextOffset()
 	for !a.doStop.WaitFor(1 * time.Minute) {
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from api: %v %p", minTime, next))
+		if utils.IsInterfaceNil(next) {
+			minTime = latestTime
+		}
 		if next == nil {
 			results, err = a.adminClient.GetAuthLogs(minTime, window)
 		} else {
 			results, err = a.adminClient.GetAuthLogs(minTime, window, next)
 		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from auth api: %v %p => %d: %v", minTime, next, len(results.Response.Logs), err))
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAuthLogs: %v", err))
 			continue
@@ -143,23 +147,21 @@ func (a *DuoAdapter) fetchAuthLogs() {
 					return
 				}
 			}
-			if utils.IsInterfaceNil(next) {
-				// Then we must use the time in the last response.
-				// This logic is based on https://github.com/duosecurity/duo_log_sync/blob/master/duologsync/producer/producer.py#L159
-				// Ideally we use iso timestamp that could have ms.
-				if its, ok := utils.Dict(al).GetString("isotimestamp"); ok {
-					nt, err := time.Parse(time.RFC3339, its)
-					if err == nil {
-						minTime = nt.Add(1 * time.Millisecond)
-					} else {
-						a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
-					}
-				} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
-					// Otherwise we use the timestamp in seconds.
-					minTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
+			// Then we must use the time in the last response.
+			// This logic is based on https://github.com/duosecurity/duo_log_sync/blob/master/duologsync/producer/producer.py#L159
+			// Ideally we use iso timestamp that could have ms.
+			if its, ok := utils.Dict(al).GetString("isotimestamp"); ok {
+				nt, err := time.Parse(time.RFC3339, its)
+				if err == nil {
+					latestTime = nt.Add(1 * time.Millisecond)
 				} else {
-					a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time: %#v", al))
+					a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
 				}
+			} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
+				// Otherwise we use the timestamp in seconds.
+				latestTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
+			} else {
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time: %#v", al))
 			}
 		}
 	}
@@ -167,6 +169,7 @@ func (a *DuoAdapter) fetchAuthLogs() {
 
 func (a *DuoAdapter) fetchAdminLogs() {
 	minTime := time.Now()
+	var latestTime time.Time
 	results, err := a.adminClient.GetAdminLogs(minTime)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("GetAdminLogs: %v", err))
@@ -174,11 +177,15 @@ func (a *DuoAdapter) fetchAdminLogs() {
 	}
 	next := results.Logs.GetNextOffset(time.Now().Add(inTenYears))
 	for !a.doStop.WaitFor(1 * time.Minute) {
+		if utils.IsInterfaceNil(next) {
+			minTime = latestTime
+		}
 		if next == nil {
 			results, err = a.adminClient.GetAdminLogs(minTime)
 		} else {
 			results, err = a.adminClient.GetAdminLogs(minTime, next)
 		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from admin api: %v %p => %d: %v", minTime, next, len(results.Logs), err))
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAdminLogs: %v", err))
 			continue
@@ -207,11 +214,13 @@ func (a *DuoAdapter) fetchAdminLogs() {
 				if its, ok := utils.Dict(al).GetString("isotimestamp"); ok {
 					nt, err := time.Parse(time.RFC3339, its)
 					if err == nil {
-						minTime = nt.Add(1 * time.Second)
+						latestTime = nt.Add(1 * time.Second)
+					} else {
+						a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
 					}
 				} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
 					// Otherwise we use the timestamp in seconds.
-					minTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
+					latestTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
 				} else {
 					a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time: %#v", al))
 				}
