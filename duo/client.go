@@ -116,7 +116,7 @@ func (a *DuoAdapter) fetchAuthLogs() {
 	}
 	next := results.Response.Metadata.GetNextOffset()
 	for !a.doStop.WaitFor(1 * time.Minute) {
-		if utils.IsInterfaceNil(next) {
+		if next == nil {
 			results, err = a.adminClient.GetAuthLogs(minTime, window)
 		} else {
 			results, err = a.adminClient.GetAuthLogs(minTime, window, next)
@@ -172,7 +172,7 @@ func (a *DuoAdapter) fetchAdminLogs() {
 	}
 	next := results.Logs.GetNextOffset(time.Now().Add(inTenYears))
 	for !a.doStop.WaitFor(1 * time.Minute) {
-		if utils.IsInterfaceNil(next) {
+		if next == nil {
 			results, err = a.adminClient.GetAdminLogs(minTime)
 		} else {
 			results, err = a.adminClient.GetAdminLogs(minTime, next)
