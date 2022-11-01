@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go v1.44.128
 	github.com/duosecurity/duo_api_golang v0.0.0-20220927171823-f4576e85b96c
 	github.com/nxadm/tail v1.4.8
-	github.com/refractionPOINT/go-uspclient v0.0.0-20221101190251-16c98057b027
+	github.com/refractionPOINT/go-uspclient v0.0.0-20221101232103-d0e5c2520e0f
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.1.0
 	golang.org/x/sync v0.1.0
