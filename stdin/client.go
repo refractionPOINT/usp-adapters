@@ -87,7 +87,7 @@ func (a *StdinAdapter) handleInput() {
 
 	readBuffer := make([]byte, readBufferSize)
 	for atomic.LoadUint32(&a.isRunning) == 1 {
-		sizeRead, err := os.Stdin.Read(readBuffer[:])
+		sizeRead, err := os.Stdin.Read(readBuffer)
 		if err != nil {
 			if err != io.EOF {
 				a.conf.ClientOptions.OnError(fmt.Errorf("os.Stdin.Read(): %v", err))
