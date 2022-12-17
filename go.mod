@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go v1.44.137
 	github.com/duosecurity/duo_api_golang v0.0.0-20220927171823-f4576e85b96c
 	github.com/nxadm/tail v1.4.8
+	github.com/refractionPOINT/evtx v0.0.0-20221217000111-9bafcc00e7ad
 	github.com/refractionPOINT/go-uspclient v0.0.0-20221115010525-894ac485edd1
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.2.0
@@ -34,6 +35,9 @@ require (
 	github.com/Azure/go-autorest/autorest/validation v0.3.1 // indirect
 	github.com/Azure/go-autorest/logger v0.2.1 // indirect
 	github.com/Azure/go-autorest/tracing v0.6.0 // indirect
+	github.com/Velocidex/ordereddict v0.0.0-20220107075049-3dbe58412844 // indirect
+	github.com/Velocidex/pkcs7 v0.0.0-20210524015001-8d1eee94a157 // indirect
+	github.com/Velocidex/yaml/v2 v2.2.8 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/devigned/tab v0.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
@@ -45,12 +49,14 @@ require (
 	github.com/googleapis/enterprise-certificate-proxy v0.2.0 // indirect
 	github.com/googleapis/gax-go/v2 v2.7.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
+	github.com/hashicorp/golang-lru v0.5.4 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.16 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20221013200528-96d1e5299dd7 // indirect
 	github.com/rs/zerolog v1.28.0 // indirect
@@ -67,4 +73,6 @@ require (
 	google.golang.org/protobuf v1.28.1 // indirect
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
+	www.velocidex.com/golang/binparsergen v0.1.1-0.20220107080050-ae6122c5ed14 // indirect
+	www.velocidex.com/golang/go-pe v0.1.1-0.20220107093716-e91743c801de // indirect
 )

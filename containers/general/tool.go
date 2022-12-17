@@ -16,6 +16,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	"github.com/refractionPOINT/usp-adapters/duo"
+	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/o365"
@@ -59,6 +60,7 @@ type GeneralConfigs struct {
 	SqsFiles      usp_sqs_files.SQSFilesConfig       `json:"sqs-files" yaml:"sqs-files"`
 	Simulator     usp_simulator.SimulatorConfig      `json:"simulator" yaml:"simulator"`
 	File          usp_file.FileConfig                `json:"file" yaml:"file"`
+	Evtx          usp_evtx.EVTXConfig                `json:"evtx" yaml:"evtx"`
 }
 
 type AdapterStats struct {
@@ -261,6 +263,11 @@ func main() {
 		configs.File.ClientOptions.Architecture = "usp_adapter"
 		printConfig(adapterType, configs.File)
 		client, chRunning, err = usp_file.NewFileAdapter(configs.File)
+	} else if adapterType == "evtx" {
+		configs.Evtx.ClientOptions = applyLogging(configs.Evtx.ClientOptions)
+		configs.Evtx.ClientOptions.Architecture = "usp_adapter"
+		printConfig(adapterType, configs.Evtx)
+		client, chRunning, err = usp_evtx.NewEVTXAdapter(configs.Evtx)
 	} else {
 		logError("unknown adapter_type: %s", adapterType)
 		os.Exit(1)
