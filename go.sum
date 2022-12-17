@@ -164,8 +164,8 @@ github.com/pkg/errors v0.9.1/go.mod h1:bwawxfHBFNV+L2hUp1rHADufV3IMtnDRdf1r5NINE
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
-github.com/refractionPOINT/evtx v0.0.0-20221217004445-f42f69b98711 h1:cDXkhcYbHpsuMQ6ZQlKuligqErG2ABS3AtTGZZNXGxs=
-github.com/refractionPOINT/evtx v0.0.0-20221217004445-f42f69b98711/go.mod h1:1IV89223MNLbPjzzrRRtSsCGQYiwuts8tBSqnAvPy74=
+github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e h1:QvAB9TiNx4ADirPuKsDKqV0N0uRfQ+yBNdMs7XSDIOc=
+github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e/go.mod h1:1IV89223MNLbPjzzrRRtSsCGQYiwuts8tBSqnAvPy74=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20221013200528-96d1e5299dd7/go.mod h1:tfWrJ/apsZfu/7Gonxi+JcarYWsWKt1skeycWfgverw=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20221210014829-5635355bc317 h1:9Bf4XOuB4TXhxg6sRtDF3AwCHS7IeBeDIPkVY6qFrqE=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20221210014829-5635355bc317/go.mod h1:P1wVdCR3k8PFgRpsnF3EUwAJKkQdt+FydQ/nsEidoG4=
