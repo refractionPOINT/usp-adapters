@@ -108,7 +108,7 @@ func (a *SimulatorAdapter) handleInput() {
 
 	readBuffer := make([]byte, readBufferSize)
 	for atomic.LoadUint32(&a.isRunning) == 1 {
-		sizeRead, err := a.dataReader.Read(readBuffer[:])
+		sizeRead, err := a.dataReader.Read(readBuffer)
 		if err != nil {
 			if err != io.EOF {
 				a.conf.ClientOptions.OnError(fmt.Errorf("io.Read(): %v", err))
