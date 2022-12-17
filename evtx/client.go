@@ -1,6 +1,7 @@
 package usp_evtx
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -109,11 +110,21 @@ func (a *EVTXAdapter) handleEvent(event map[string]interface{}) {
 	if event == nil {
 		return
 	}
+	// The underlying map contains some custom datastructure so we
+	// need to do a JSON roundtrip to normalize it.
+	b, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	m := map[string]interface{}{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return
+	}
 	msg := &protocol.DataMessage{
-		JsonPayload: event,
+		JsonPayload: m,
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
-	err := a.uspClient.Ship(msg, a.writeTimeout)
+	err = a.uspClient.Ship(msg, a.writeTimeout)
 	if err == uspclient.ErrorBufferFull {
 		a.conf.ClientOptions.OnWarning("stream falling behind")
 		err = a.uspClient.Ship(msg, 1*time.Hour)

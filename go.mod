@@ -3,30 +3,30 @@ module github.com/refractionPOINT/usp-adapters
 go 1.18
 
 require (
-	cloud.google.com/go/pubsub v1.26.0
-	cloud.google.com/go/storage v1.28.0
-	github.com/Azure/azure-event-hubs-go/v3 v3.3.20
-	github.com/aws/aws-sdk-go v1.44.137
-	github.com/duosecurity/duo_api_golang v0.0.0-20220927171823-f4576e85b96c
+	cloud.google.com/go/pubsub v1.28.0
+	cloud.google.com/go/storage v1.28.1
+	github.com/Azure/azure-event-hubs-go/v3 v3.4.0
+	github.com/aws/aws-sdk-go v1.44.162
+	github.com/duosecurity/duo_api_golang v0.0.0-20221117185402-091daa09e19d
 	github.com/nxadm/tail v1.4.8
-	github.com/refractionPOINT/evtx v0.0.0-20221217000111-9bafcc00e7ad
+	github.com/refractionPOINT/evtx v0.0.0-20221217004445-f42f69b98711
 	github.com/refractionPOINT/go-uspclient v0.0.0-20221115010525-894ac485edd1
 	github.com/vmihailenco/msgpack/v5 v5.3.5
-	golang.org/x/oauth2 v0.2.0
+	golang.org/x/oauth2 v0.3.0
 	golang.org/x/sync v0.1.0
-	golang.org/x/text v0.4.0
-	google.golang.org/api v0.103.0
+	golang.org/x/text v0.5.0
+	google.golang.org/api v0.105.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
 require (
-	cloud.google.com/go v0.106.0 // indirect
-	cloud.google.com/go/compute v1.12.1 // indirect
-	cloud.google.com/go/compute/metadata v0.2.1 // indirect
-	cloud.google.com/go/iam v0.7.0 // indirect
-	github.com/Azure/azure-amqp-common-go/v3 v3.2.3 // indirect
-	github.com/Azure/azure-sdk-for-go v67.0.0+incompatible // indirect
-	github.com/Azure/go-amqp v0.17.5 // indirect
+	cloud.google.com/go v0.107.0 // indirect
+	cloud.google.com/go/compute v1.14.0 // indirect
+	cloud.google.com/go/compute/metadata v0.2.3 // indirect
+	cloud.google.com/go/iam v0.9.0 // indirect
+	github.com/Azure/azure-amqp-common-go/v4 v4.0.0 // indirect
+	github.com/Azure/azure-sdk-for-go v67.2.0+incompatible // indirect
+	github.com/Azure/go-amqp v0.18.0 // indirect
 	github.com/Azure/go-autorest v14.2.0+incompatible // indirect
 	github.com/Azure/go-autorest/autorest v0.11.28 // indirect
 	github.com/Azure/go-autorest/autorest/adal v0.9.21 // indirect
@@ -35,18 +35,19 @@ require (
 	github.com/Azure/go-autorest/autorest/validation v0.3.1 // indirect
 	github.com/Azure/go-autorest/logger v0.2.1 // indirect
 	github.com/Azure/go-autorest/tracing v0.6.0 // indirect
-	github.com/Velocidex/ordereddict v0.0.0-20220107075049-3dbe58412844 // indirect
+	github.com/Velocidex/json v0.0.0-20220224052537-92f3c0326e5a // indirect
+	github.com/Velocidex/ordereddict v0.0.0-20221110130714-6a7cb85851cd // indirect
 	github.com/Velocidex/pkcs7 v0.0.0-20210524015001-8d1eee94a157 // indirect
 	github.com/Velocidex/yaml/v2 v2.2.8 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/devigned/tab v0.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
-	github.com/golang-jwt/jwt/v4 v4.4.2 // indirect
+	github.com/golang-jwt/jwt/v4 v4.4.3 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/protobuf v1.5.2 // indirect
 	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/google/uuid v1.3.0 // indirect
-	github.com/googleapis/enterprise-certificate-proxy v0.2.0 // indirect
+	github.com/googleapis/enterprise-certificate-proxy v0.2.1 // indirect
 	github.com/googleapis/gax-go/v2 v2.7.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
@@ -58,18 +59,18 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20221013200528-96d1e5299dd7 // indirect
+	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20221210014829-5635355bc317 // indirect
 	github.com/rs/zerolog v1.28.0 // indirect
 	github.com/stretchr/testify v1.8.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
-	golang.org/x/crypto v0.2.0 // indirect
-	golang.org/x/net v0.2.0 // indirect
-	golang.org/x/sys v0.2.0 // indirect
+	golang.org/x/crypto v0.4.0 // indirect
+	golang.org/x/net v0.4.0 // indirect
+	golang.org/x/sys v0.3.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 	google.golang.org/appengine v1.6.7 // indirect
-	google.golang.org/genproto v0.0.0-20221114212237-e4508ebdbee1 // indirect
-	google.golang.org/grpc v1.50.1 // indirect
+	google.golang.org/genproto v0.0.0-20221207170731-23e4bf6bdc37 // indirect
+	google.golang.org/grpc v1.51.0 // indirect
 	google.golang.org/protobuf v1.28.1 // indirect
 	gopkg.in/tomb.v1 v1.0.0-20141024135613-dd632973f1e7 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
