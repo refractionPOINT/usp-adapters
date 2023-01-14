@@ -121,7 +121,11 @@ func (a *DuoAdapter) fetchAuthLogs() {
 		} else {
 			results, err = a.adminClient.GetAuthLogs(minTime, window, next)
 		}
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from auth api: %v %p => %d: %v", minTime, next, len(results.Response.Logs), err))
+		resLen := 0
+		if err == nil {
+			resLen = len(results.Response.Logs)
+		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from auth api: %v %p => %d: %v", minTime, next, resLen, err))
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAuthLogs: %v", err))
 			continue
