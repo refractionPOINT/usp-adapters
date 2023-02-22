@@ -54,10 +54,24 @@ steps:
     - 'GOOS=linux'
     - 'GOARCH=arm64'
   waitFor: ['get-github-keys']
+- name: 'golang'
+  id: build-solarisamd64
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_solaris_amd64_$TAG_NAME', './containers/general']
+  env:
+    - 'GOOS=solaris'
+    - 'GOARCH=amd64'
+  waitFor: ['get-github-keys']
+- name: 'golang'
+  id: build-aixppc64
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_aix_ppc64_$TAG_NAME', './containers/general']
+  env:
+    - 'GOOS=aix'
+    - 'GOARCH=ppc64'
+  waitFor: ['get-github-keys']
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-adapters
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64', 'build-linuxarm', 'build-linuxarm64']
+  waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter
   entrypoint: 'bash'

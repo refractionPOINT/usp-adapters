@@ -1,3 +1,6 @@
+//go:build windows || darwin || linux || solaris
+// +build windows darwin linux solaris
+
 package usp_file
 
 import (
@@ -22,13 +25,6 @@ type FileAdapter struct {
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 	tailFile     *tail.Tail
-}
-
-type FileConfig struct {
-	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-	FilePath        string                  `json:"file_path" yaml:"file_path"`
-	NoFollow        bool                    `json:"no_follow" yaml:"no_follow"`
 }
 
 func (c *FileConfig) Validate() error {

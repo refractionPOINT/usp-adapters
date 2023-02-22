@@ -36,6 +36,18 @@ steps:
       - 'GOOS=linux'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_solaris_amd64', './containers/general']
+    env:
+      - 'GOOS=solaris'
+      - 'GOARCH=amd64'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_aix_ppc64', './containers/general']
+    env:
+      - 'GOOS=aix'
+      - 'GOARCH=ppc64'
+    waitFor: ['run-tests']
 options:
   machineType: 'N1_HIGHCPU_8'
 timeout: 15m
