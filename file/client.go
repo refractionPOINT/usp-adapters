@@ -49,9 +49,10 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 
 	var err error
 	a.tailFile, err = tail.TailFile(a.conf.FilePath, tail.Config{
-		ReOpen:    !a.conf.NoFollow,
-		MustExist: true,
-		Follow:    !a.conf.NoFollow,
+		ReOpen:        !a.conf.NoFollow,
+		MustExist:     true,
+		Follow:        !a.conf.NoFollow,
+		CompleteLines: true,
 	})
 	if err != nil {
 		return nil, nil, err
