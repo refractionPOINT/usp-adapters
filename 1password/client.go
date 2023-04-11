@@ -19,6 +19,7 @@ import (
 )
 
 const (
+	auditURL = "/api/v1/auditevents"
 	itemsURL = "/api/v1/itemusages"
 	usersURL = "/api/v1/signinattempts"
 )
@@ -106,7 +107,8 @@ func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan s
 
 	a.chStopped = make(chan struct{})
 
-	a.wgSenders.Add(2)
+	a.wgSenders.Add(3)
+	go a.fetchEvents(auditURL)
 	go a.fetchEvents(itemsURL)
 	go a.fetchEvents(usersURL)
 
