@@ -121,32 +121,19 @@ func printConfig(method string, c interface{}) {
 
 func main() {
 	log("starting")
-	runtimeConfigs := &RuntimeConfig{}
-	configs := &GeneralConfigs{}
-	var err error
 
-	if err := serviceMode(); err != nil {
-		os.Exit(1)
+	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-") {
+		if err := serviceMode(os.Args[0], os.Args[1], os.Args[2:]); err != nil {
+			os.Exit(1)
+		}
+		return
 	}
 
-	if len(os.Args) < 2 {
+	method, runtimeConfigs, configs, err := parseConfigs(os.Args[1:])
+	if err != nil {
+		logError("error: %s", err)
 		printUsage()
 		os.Exit(1)
-	}
-	method := os.Args[1]
-	if len(os.Args) == 3 {
-		if runtimeConfigs, configs, err = parseConfigsFromFile(os.Args[2]); err != nil {
-			os.Exit(1)
-		}
-	} else {
-		// Read the config from the CLI.
-		if err = parseConfigsFromParams(os.Args[1], os.Args[2:], runtimeConfigs, configs); err != nil {
-			os.Exit(1)
-		}
-		// Read the config from the Env.
-		if err = parseConfigsFromParams(os.Args[1], os.Environ(), runtimeConfigs, configs); err != nil {
-			os.Exit(1)
-		}
 	}
 
 	client, chRunning, err := runAdapter(method, *runtimeConfigs, *configs)
@@ -276,6 +263,32 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	}
 
 	return client, chRunning, nil
+}
+
+func parseConfigs(args []string) (string, *RuntimeConfig, *GeneralConfigs, error) {
+	runtimeConfigs := &RuntimeConfig{}
+	configs := &GeneralConfigs{}
+	var err error
+	if len(os.Args) < 2 {
+		return "", nil, nil, errors.New("not enough arguments")
+	}
+
+	method := args[0]
+	if len(os.Args) == 3 {
+		if runtimeConfigs, configs, err = parseConfigsFromFile(os.Args[2]); err != nil {
+			return "", nil, nil, err
+		}
+	} else {
+		// Read the config from the CLI.
+		if err = parseConfigsFromParams(os.Args[1], os.Args[2:], runtimeConfigs, configs); err != nil {
+			return "", nil, nil, err
+		}
+		// Read the config from the Env.
+		if err = parseConfigsFromParams(os.Args[1], os.Environ(), runtimeConfigs, configs); err != nil {
+			return "", nil, nil, err
+		}
+	}
+	return method, runtimeConfigs, configs, nil
 }
 
 func parseConfigsFromFile(filePath string) (*RuntimeConfig, *GeneralConfigs, error) {
