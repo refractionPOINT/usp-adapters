@@ -1,4 +1,8 @@
 //go:build windows
 // +build windows
 
-package general
+package main
+
+func serviceMode() error {
+
+}

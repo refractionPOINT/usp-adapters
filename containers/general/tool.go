@@ -121,73 +121,35 @@ func printConfig(method string, c interface{}) {
 
 func main() {
 	log("starting")
-	runtimeConfigs := RuntimeConfig{}
-	configs := GeneralConfigs{}
+	runtimeConfigs := &RuntimeConfig{}
+	configs := &GeneralConfigs{}
+	var err error
+
+	if err := serviceMode(); err != nil {
+		os.Exit(1)
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)
 	}
 	method := os.Args[1]
 	if len(os.Args) == 3 {
-		// Read the config from disk.
-		f, err := os.Open(os.Args[2])
-		if err != nil {
-			logError("os.Open(): %v", err)
-			printUsage()
+		if runtimeConfigs, configs, err = parseConfigsFromFile(os.Args[2]); err != nil {
 			os.Exit(1)
-		}
-		b, err := io.ReadAll(f)
-		if err != nil {
-			logError("io.ReadAll(): %v", err)
-			printUsage()
-			os.Exit(1)
-		}
-		if err := json.Unmarshal(b, &configs); err != nil {
-			err2 := yaml.Unmarshal(b, &configs)
-			if err2 != nil {
-				logError("json.Unmarshal(): %v", err)
-				logError("yaml.Unmarshal(): %v", err2)
-				printUsage()
-				os.Exit(1)
-			}
-		}
-		if err := json.Unmarshal(b, &runtimeConfigs); err != nil {
-			err2 := yaml.Unmarshal(b, &runtimeConfigs)
-			if err2 != nil {
-				logError("json.Unmarshal(): %v", err)
-				logError("yaml.Unmarshal(): %v", err2)
-				printUsage()
-				os.Exit(1)
-			}
 		}
 	} else {
 		// Read the config from the CLI.
-		if err := utils.ParseCLI(os.Args[1], os.Args[2:], &configs); err != nil {
-			logError("ParseCLI(): %v", err)
-			printUsage()
-			os.Exit(1)
-		}
-		// Get the runtime configs.
-		if err := utils.ParseCLI("", os.Args[2:], &runtimeConfigs); err != nil {
-			logError("ParseCLI(): %v", err)
-			printUsage()
+		if err = parseConfigsFromParams(os.Args[1], os.Args[2:], runtimeConfigs, configs); err != nil {
 			os.Exit(1)
 		}
 		// Read the config from the Env.
-		if err := utils.ParseCLI(os.Args[1], os.Environ(), &configs); err != nil {
-			logError("ParseEnv(): %v", err)
-			printUsage()
-			os.Exit(1)
-		}
-		// Get the runtime configs.
-		if err := utils.ParseCLI("", os.Environ(), &runtimeConfigs); err != nil {
-			logError("ParseEnv(): %v", err)
-			printUsage()
+		if err = parseConfigsFromParams(os.Args[1], os.Environ(), runtimeConfigs, configs); err != nil {
 			os.Exit(1)
 		}
 	}
 
-	client, chRunning, err := runAdapter(method, runtimeConfigs, configs)
+	client, chRunning, err := runAdapter(method, *runtimeConfigs, *configs)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -301,17 +263,69 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	}
 
 	if err != nil {
+		client.Close()
 		return nil, nil, errors.New(logError("error instantiating client: %v", err))
 	}
 
 	// If healthchecks were requested, start it.
 	if runtimeConfigs.Healthcheck != 0 {
 		if err := startHealthChecks(runtimeConfigs.Healthcheck); err != nil {
+			client.Close()
 			return nil, nil, errors.New(logError("error starting healthchecks: %v", err))
 		}
 	}
 
 	return client, chRunning, nil
+}
+
+func parseConfigsFromFile(filePath string) (*RuntimeConfig, *GeneralConfigs, error) {
+	runtimeConfigs := &RuntimeConfig{}
+	configs := &GeneralConfigs{}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		printUsage()
+		return nil, nil, errors.New(logError("os.Open(): %v", err))
+	}
+	b, err := io.ReadAll(f)
+	if err != nil {
+		printUsage()
+		return nil, nil, errors.New(logError("io.ReadAll(): %v", err))
+	}
+	if err := json.Unmarshal(b, &configs); err != nil {
+		err2 := yaml.Unmarshal(b, &configs)
+		if err2 != nil {
+			printUsage()
+			err = errors.New(logError("json.Unmarshal(): %v", err))
+			err2 = errors.New(logError("yaml.Unmarshal(): %v", err2))
+			return nil, nil, fmt.Errorf("%v\n%v", err, err2)
+		}
+	}
+	if err := json.Unmarshal(b, &runtimeConfigs); err != nil {
+		err2 := yaml.Unmarshal(b, &runtimeConfigs)
+		if err2 != nil {
+			printUsage()
+			err = errors.New(logError("json.Unmarshal(): %v", err))
+			err2 = errors.New(logError("yaml.Unmarshal(): %v", err2))
+			return nil, nil, fmt.Errorf("%v\n%v", err, err2)
+		}
+	}
+	return runtimeConfigs, configs, nil
+}
+
+func parseConfigsFromParams(prefix string, params []string, runtimeConfigs *RuntimeConfig, configs *GeneralConfigs) error {
+	// Read the config from the CLI.
+	if err := utils.ParseCLI(prefix, params, configs); err != nil {
+		printUsage()
+		return errors.New(logError("ParseCLI(): %v", err))
+	}
+	// Get the runtime configs.
+	if err := utils.ParseCLI("", params, runtimeConfigs); err != nil {
+		printUsage()
+		return errors.New(logError("ParseCLI(): %v", err))
+	}
+
+	return nil
 }
 
 func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
