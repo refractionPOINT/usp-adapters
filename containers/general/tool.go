@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -69,8 +70,10 @@ type AdapterStats struct {
 	lastBackPressure time.Time
 }
 
-func logError(format string, elems ...interface{}) {
-	os.Stderr.Write([]byte(fmt.Sprintf(format+"\n", elems...)))
+func logError(format string, elems ...interface{}) string {
+	s := fmt.Sprintf(format+"\n", elems...)
+	os.Stderr.Write([]byte(s))
+	return s
 }
 
 func log(format string, elems ...interface{}) {
@@ -111,9 +114,9 @@ func printUsage() {
 	printStruct("", RuntimeConfig{}, false)
 }
 
-func printConfig(adapterType string, c interface{}) {
+func printConfig(method string, c interface{}) {
 	b, _ := yaml.Marshal(c)
-	log("Configs in use (%s):\n----------------------------------\n%s----------------------------------\n", adapterType, string(b))
+	log("Configs in use (%s):\n----------------------------------\n%s----------------------------------\n", method, string(b))
 }
 
 func main() {
@@ -124,7 +127,7 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
-	adapterType := os.Args[1]
+	method := os.Args[1]
 	if len(os.Args) == 3 {
 		// Read the config from disk.
 		f, err := os.Open(os.Args[2])
@@ -184,106 +187,9 @@ func main() {
 		}
 	}
 
-	var client USPClient
-	var chRunning chan struct{}
-	var err error
-
-	if adapterType == "syslog" {
-		configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
-		configs.Syslog.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Syslog)
-		client, chRunning, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
-	} else if adapterType == "pubsub" {
-		configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
-		configs.PubSub.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.PubSub)
-		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
-	} else if adapterType == "gcs" {
-		configs.Gcs.ClientOptions = applyLogging(configs.Gcs.ClientOptions)
-		configs.Gcs.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Gcs)
-		client, chRunning, err = usp_gcs.NewGCSAdapter(configs.Gcs)
-	} else if adapterType == "s3" {
-		configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
-		configs.S3.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.S3)
-		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
-	} else if adapterType == "stdin" {
-		configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
-		configs.Stdin.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Stdin)
-		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
-	} else if adapterType == "1password" {
-		configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
-		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.OnePassword)
-		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
-	} else if adapterType == "office365" {
-		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
-		configs.Office365.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Office365)
-		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
-	} else if adapterType == "wel" {
-		configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
-		configs.Wel.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Wel)
-		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
-	} else if adapterType == "azure_event_hub" {
-		configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
-		configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.AzureEventHub)
-		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
-	} else if adapterType == "duo" {
-		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
-		configs.Duo.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Duo)
-		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
-	} else if adapterType == "slack" {
-		configs.Slack.ClientOptions = applyLogging(configs.Slack.ClientOptions)
-		configs.Slack.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Slack)
-		client, chRunning, err = usp_slack.NewSlackAdapter(configs.Slack)
-	} else if adapterType == "sqs" {
-		configs.Sqs.ClientOptions = applyLogging(configs.Sqs.ClientOptions)
-		configs.Sqs.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Sqs)
-		client, chRunning, err = usp_sqs.NewSQSAdapter(configs.Sqs)
-	} else if adapterType == "sqs-files" {
-		configs.SqsFiles.ClientOptions = applyLogging(configs.SqsFiles.ClientOptions)
-		configs.SqsFiles.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.SqsFiles)
-		client, chRunning, err = usp_sqs_files.NewSQSFilesAdapter(configs.SqsFiles)
-	} else if adapterType == "simulator" {
-		configs.Simulator.ClientOptions = applyLogging(configs.Simulator.ClientOptions)
-		configs.Simulator.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Simulator)
-		client, chRunning, err = usp_simulator.NewSimulatorAdapter(configs.Simulator)
-	} else if adapterType == "file" {
-		configs.File.ClientOptions = applyLogging(configs.File.ClientOptions)
-		configs.File.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.File)
-		client, chRunning, err = usp_file.NewFileAdapter(configs.File)
-	} else if adapterType == "evtx" {
-		configs.Evtx.ClientOptions = applyLogging(configs.Evtx.ClientOptions)
-		configs.Evtx.ClientOptions.Architecture = "usp_adapter"
-		printConfig(adapterType, configs.Evtx)
-		client, chRunning, err = usp_evtx.NewEVTXAdapter(configs.Evtx)
-	} else {
-		logError("unknown adapter_type: %s", adapterType)
-		os.Exit(1)
-	}
-
+	client, chRunning, err := runAdapter(method, runtimeConfigs, configs)
 	if err != nil {
-		logError("error instantiating client: %v", err)
 		os.Exit(1)
-	}
-
-	// If healthchecks were requested, start it.
-	if runtimeConfigs.Healthcheck != 0 {
-		if err := startHealthChecks(runtimeConfigs.Healthcheck); err != nil {
-			logError("error starting healthchecks: %v", err)
-			os.Exit(1)
-		}
 	}
 
 	osSignals := make(chan os.Signal, 1)
@@ -303,6 +209,109 @@ func main() {
 		os.Exit(1)
 	}
 	log("exited")
+}
+
+func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConfigs) (USPClient, chan struct{}, error) {
+	var client USPClient
+	var chRunning chan struct{}
+	var err error
+
+	if method == "syslog" {
+		configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
+		configs.Syslog.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Syslog)
+		client, chRunning, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
+	} else if method == "pubsub" {
+		configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
+		configs.PubSub.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.PubSub)
+		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
+	} else if method == "gcs" {
+		configs.Gcs.ClientOptions = applyLogging(configs.Gcs.ClientOptions)
+		configs.Gcs.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Gcs)
+		client, chRunning, err = usp_gcs.NewGCSAdapter(configs.Gcs)
+	} else if method == "s3" {
+		configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
+		configs.S3.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.S3)
+		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
+	} else if method == "stdin" {
+		configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
+		configs.Stdin.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Stdin)
+		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
+	} else if method == "1password" {
+		configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
+		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.OnePassword)
+		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
+	} else if method == "office365" {
+		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
+		configs.Office365.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Office365)
+		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
+	} else if method == "wel" {
+		configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
+		configs.Wel.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Wel)
+		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
+	} else if method == "azure_event_hub" {
+		configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
+		configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.AzureEventHub)
+		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
+	} else if method == "duo" {
+		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
+		configs.Duo.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Duo)
+		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
+	} else if method == "slack" {
+		configs.Slack.ClientOptions = applyLogging(configs.Slack.ClientOptions)
+		configs.Slack.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Slack)
+		client, chRunning, err = usp_slack.NewSlackAdapter(configs.Slack)
+	} else if method == "sqs" {
+		configs.Sqs.ClientOptions = applyLogging(configs.Sqs.ClientOptions)
+		configs.Sqs.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Sqs)
+		client, chRunning, err = usp_sqs.NewSQSAdapter(configs.Sqs)
+	} else if method == "sqs-files" {
+		configs.SqsFiles.ClientOptions = applyLogging(configs.SqsFiles.ClientOptions)
+		configs.SqsFiles.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.SqsFiles)
+		client, chRunning, err = usp_sqs_files.NewSQSFilesAdapter(configs.SqsFiles)
+	} else if method == "simulator" {
+		configs.Simulator.ClientOptions = applyLogging(configs.Simulator.ClientOptions)
+		configs.Simulator.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Simulator)
+		client, chRunning, err = usp_simulator.NewSimulatorAdapter(configs.Simulator)
+	} else if method == "file" {
+		configs.File.ClientOptions = applyLogging(configs.File.ClientOptions)
+		configs.File.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.File)
+		client, chRunning, err = usp_file.NewFileAdapter(configs.File)
+	} else if method == "evtx" {
+		configs.Evtx.ClientOptions = applyLogging(configs.Evtx.ClientOptions)
+		configs.Evtx.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Evtx)
+		client, chRunning, err = usp_evtx.NewEVTXAdapter(configs.Evtx)
+	} else {
+		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
+	}
+
+	if err != nil {
+		return nil, nil, errors.New(logError("error instantiating client: %v", err))
+	}
+
+	// If healthchecks were requested, start it.
+	if runtimeConfigs.Healthcheck != 0 {
+		if err := startHealthChecks(runtimeConfigs.Healthcheck); err != nil {
+			return nil, nil, errors.New(logError("error starting healthchecks: %v", err))
+		}
+	}
+
+	return client, chRunning, nil
 }
 
 func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
