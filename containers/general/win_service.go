@@ -8,9 +8,12 @@ import (
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/mgr"
+	"net"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 type serviceInstance struct {
@@ -125,12 +128,24 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	args = m.args
 	method, runtimeConfigs, configs, err := parseConfigs(args)
 	if err != nil {
-		logError("parseConfigs(): %v", err)
+		saveErrorOnDisk(logError("parseConfigs(): %v", err))
 		return false, 1
 	}
+
+	// Running as a Service we are not guaranteed that the network
+	// stack will be up and running yet, give it a few moments.
+	retries := 0
+	for retries < 5 {
+		if _, err := net.LookupIP("api.limacharlie.io"); err == nil {
+			break
+		}
+		time.Sleep(2 * time.Second)
+		retries++
+	}
+
 	client, chRunning, err := runAdapter(method, *runtimeConfigs, *configs)
 	if err != nil {
-		logError("runAdapter(): %v", err)
+		saveErrorOnDisk(logError("runAdapter(): %v", err))
 		return false, 1
 	}
 	defer client.Close()
@@ -161,4 +176,10 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 
 	wg.Wait()
 	return false, 0
+}
+
+func saveErrorOnDisk(err string) {
+	f, _ := os.Create("lc_adapter.log")
+	f.Write([]byte(err))
+	f.Close()
 }
