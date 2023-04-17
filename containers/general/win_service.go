@@ -6,6 +6,9 @@ package main
 import (
 	"fmt"
 	"golang.org/x/sys/windows/svc"
+	"golang.org/x/sys/windows/svc/mgr"
+	"strings"
+	"sync"
 )
 
 type serviceInstance struct {
@@ -27,7 +30,6 @@ func serviceMode(thisExe string, action string, args []string) error {
 	if isInService {
 		return runService(svcName, args)
 	}
-
 	if action == "-install" {
 		return installService(thisExe, svcName, args)
 	} else if action == "-remove" {
@@ -58,12 +60,13 @@ func installService(thisExe string, svcName string, args []string) error {
 		s.Close()
 		return fmt.Errorf("service %s already exists", svcName)
 	}
+	args = append([]string{fmt.Sprintf("-run:%s", svcName)}, args...)
 	s, err = m.CreateService(svcName, thisExe, mgr.Config{
-		StartTime:    mgr.StartAutomatic,
+		StartType:    mgr.StartAutomatic,
 		ErrorControl: mgr.ErrorNormal,
 		Description:  "LimaCharlie Adapter",
-		DisplayName:  fmt.Sprintf("LimaCharlie Adapter - %s", desc),
-	}, fmt.Sprintf("-run:%s", svcName), args...)
+		DisplayName:  fmt.Sprintf("LimaCharlie Adapter - %s", svcName),
+	}, args...)
 	if err != nil {
 		return err
 	}
@@ -92,11 +95,13 @@ func removeService(svcName string) error {
 func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, changes chan<- svc.Status) (ssec bool, errno uint32) {
 	method, runtimeConfigs, configs, err := parseConfigs(args)
 	if err != nil {
-		return err
+		logError("parseConfigs(): %v", err)
+		return false, 1
 	}
 	client, chRunning, err := runAdapter(method, *runtimeConfigs, *configs)
 	if err != nil {
-		return err
+		logError("runAdapter(): %v", err)
+		return false, 1
 	}
 	defer client.Close()
 
@@ -108,7 +113,7 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 				changes <- svc.Status{State: svc.StopPending}
 				client.Close()
 			} else if c.Cmd == svc.Interrogate {
-				changes <= c.CurrentStatus
+				changes <- c.CurrentStatus
 			} else {
 				logError("unexpected control request: #%d", c)
 			}
@@ -123,5 +128,5 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	}()
 
 	wg.Wait()
-	return 0, 0
+	return false, 0
 }
