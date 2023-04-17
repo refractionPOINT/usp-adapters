@@ -124,6 +124,7 @@ func main() {
 
 	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-") {
 		if err := serviceMode(os.Args[0], os.Args[1], os.Args[2:]); err != nil {
+			logError("service: %v", err)
 			os.Exit(1)
 		}
 		return
@@ -250,7 +251,6 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	}
 
 	if err != nil {
-		client.Close()
 		return nil, nil, errors.New(logError("error instantiating client: %v", err))
 	}
 
@@ -269,22 +269,23 @@ func parseConfigs(args []string) (string, *RuntimeConfig, *GeneralConfigs, error
 	runtimeConfigs := &RuntimeConfig{}
 	configs := &GeneralConfigs{}
 	var err error
-	if len(os.Args) < 2 {
+	if len(args) < 2 {
 		return "", nil, nil, errors.New("not enough arguments")
 	}
 
 	method := args[0]
-	if len(os.Args) == 3 {
-		if runtimeConfigs, configs, err = parseConfigsFromFile(os.Args[2]); err != nil {
+	args = args[1:]
+	if len(args) == 2 {
+		if runtimeConfigs, configs, err = parseConfigsFromFile(args[0]); err != nil {
 			return "", nil, nil, err
 		}
 	} else {
 		// Read the config from the CLI.
-		if err = parseConfigsFromParams(os.Args[1], os.Args[2:], runtimeConfigs, configs); err != nil {
+		if err = parseConfigsFromParams(method, args, runtimeConfigs, configs); err != nil {
 			return "", nil, nil, err
 		}
 		// Read the config from the Env.
-		if err = parseConfigsFromParams(os.Args[1], os.Environ(), runtimeConfigs, configs); err != nil {
+		if err = parseConfigsFromParams(method, os.Environ(), runtimeConfigs, configs); err != nil {
 			return "", nil, nil, err
 		}
 	}
