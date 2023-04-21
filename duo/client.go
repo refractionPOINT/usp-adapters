@@ -181,7 +181,11 @@ func (a *DuoAdapter) fetchAdminLogs() {
 		} else {
 			results, err = a.adminClient.GetAdminLogs(minTime, next)
 		}
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from admin api: %v %p => %d: %v", minTime, next, len(results.Logs), err))
+		logLen := 0
+		if results != nil {
+			logLen = len(results.Logs)
+		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from admin api: %v %p => %d: %v", minTime, next, logLen, err))
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAdminLogs: %v", err))
 			continue
