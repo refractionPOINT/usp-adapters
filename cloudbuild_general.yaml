@@ -1,0 +1,53 @@
+steps:
+  - name: 'golang'
+    id: run-tests
+    args: ['go', 'test', '-race', './...', '-v']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64', './containers/general']
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64.exe', './containers/general']
+    env:
+      - 'GOOS=windows'
+      - 'GOARCH=amd64'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64', './containers/general']
+    env:
+      - 'GOOS=darwin'
+      - 'GOARCH=amd64'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64', './containers/general']
+    env:
+      - 'GOOS=darwin'
+      - 'GOARCH=arm64'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm', './containers/general']
+    env:
+      - 'GOOS=linux'
+      - 'GOARCH=arm'
+      - 'GOARM=5'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64', './containers/general']
+    env:
+      - 'GOOS=linux'
+      - 'GOARCH=arm64'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_solaris_amd64', './containers/general']
+    env:
+      - 'GOOS=solaris'
+      - 'GOARCH=amd64'
+    waitFor: ['run-tests']
+  - name: 'golang'
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_aix_ppc64', './containers/general']
+    env:
+      - 'GOOS=aix'
+      - 'GOARCH=ppc64'
+    waitFor: ['run-tests']
+options:
+  machineType: 'N1_HIGHCPU_8'
+timeout: 15m
