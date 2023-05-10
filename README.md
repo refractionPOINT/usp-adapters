@@ -1,5 +1,5 @@
-# usp-adapters
-USP Adapters for various sources.
+# LimaCharlie Universal Sensor Protocol Adapter
+USP Adapters to allow ingest from various sources into [LimaCharlie](https://limacharlie.io).
 
 ## Usage
 
