@@ -2,7 +2,7 @@ steps:
 - name: 'gcr.io/cloud-builders/gcloud'
   entrypoint: 'bash'
   id: get-github-keys
-  args: ['-c', 'echo $$SSH_KEY', '>', '/workspace/id_rsa']
+  args: ['-c', 'echo $$SSH_KEY > /workspace/id_rsa']
   secretEnv: ['SSH_KEY']
 - name: 'gcr.io/cloud-builders/docker'
   id: build-docker
