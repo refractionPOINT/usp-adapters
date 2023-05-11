@@ -275,7 +275,7 @@ func parseConfigs(args []string) (string, *RuntimeConfig, *GeneralConfigs, error
 
 	method := args[0]
 	args = args[1:]
-	if len(args) == 2 {
+	if len(args) == 1 {
 		log("loading config from file: %s", args[0])
 		if runtimeConfigs, configs, err = parseConfigsFromFile(args[0]); err != nil {
 			return "", nil, nil, err
