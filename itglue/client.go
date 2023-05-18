@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,6 +18,7 @@ import (
 
 const (
 	logsURL = "/logs"
+	URL     = "https://api.itglue.com"
 )
 
 type opRequest struct {
@@ -27,16 +27,10 @@ type opRequest struct {
 	Sort      string `json:"sort,omitempty"`
 }
 
-var URL = map[string]string{
-	"enterprise": "https://api.itglue.com",
-}
-
 type ITGlueAdapter struct {
 	conf       ITGlueConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
-
-	endpoint string
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -48,7 +42,6 @@ type ITGlueAdapter struct {
 type ITGlueConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
-	Endpoint      string                  `json:"endpoint" yaml:"endpoint"`
 }
 
 func (c *ITGlueConfig) Validate() error {
@@ -57,13 +50,6 @@ func (c *ITGlueConfig) Validate() error {
 	}
 	if c.Token == "" {
 		return errors.New("missing token")
-	}
-	if c.Endpoint == "" {
-		return errors.New("missing endpoint")
-	}
-	_, ok := URL[c.Endpoint]
-	if !strings.HasPrefix(c.Endpoint, "https://") && !ok {
-		return fmt.Errorf("invalid endpoint, not https or in %v", URL)
 	}
 	return nil
 }
@@ -74,14 +60,6 @@ func NewITGlueAdapter(conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) 
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
-	}
-
-	if strings.HasPrefix(conf.Endpoint, "https://") {
-		a.endpoint = conf.Endpoint
-	} else if v, ok := URL[conf.Endpoint]; ok {
-		a.endpoint = v
-	} else {
-		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
 
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
@@ -178,7 +156,7 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 	formattedTime := thirtySecondsAgo.Format(timeFormat)
 
 	// Prepare the request.
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", a.endpoint, url, formattedTime), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", URL, url, formattedTime), nil)
 	//debugTimestamp := formattedTime
 	if lastCursor != "" {
 		req, err = http.NewRequest("GET", fmt.Sprintf("%s", lastCursor), nil)
@@ -192,7 +170,7 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 	req.Header.Set("x-api-key", a.conf.Token)
 
 	//
-	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s", a.endpoint, url, debugTimestamp))
+	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s", URL, url, debugTimestamp))
 
 	// Issue the request.
 	resp, err := a.httpClient.Do(req)
