@@ -14,23 +14,24 @@ import (
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
-	"github.com/refractionPOINT/usp-adapters/1password"
-	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
-	"github.com/refractionPOINT/usp-adapters/duo"
-	"github.com/refractionPOINT/usp-adapters/evtx"
-	"github.com/refractionPOINT/usp-adapters/file"
-	"github.com/refractionPOINT/usp-adapters/gcs"
-	"github.com/refractionPOINT/usp-adapters/o365"
-	"github.com/refractionPOINT/usp-adapters/pubsub"
-	"github.com/refractionPOINT/usp-adapters/s3"
-	"github.com/refractionPOINT/usp-adapters/simulator"
-	"github.com/refractionPOINT/usp-adapters/slack"
-	"github.com/refractionPOINT/usp-adapters/sqs"
-	"github.com/refractionPOINT/usp-adapters/sqs-files"
-	"github.com/refractionPOINT/usp-adapters/stdin"
-	"github.com/refractionPOINT/usp-adapters/syslog"
+	usp_1password "github.com/refractionPOINT/usp-adapters/1password"
+	usp_azure_event_hub "github.com/refractionPOINT/usp-adapters/azure_event_hub"
+	usp_duo "github.com/refractionPOINT/usp-adapters/duo"
+	usp_evtx "github.com/refractionPOINT/usp-adapters/evtx"
+	usp_file "github.com/refractionPOINT/usp-adapters/file"
+	usp_gcs "github.com/refractionPOINT/usp-adapters/gcs"
+	usp_itglue "github.com/refractionPOINT/usp-adapters/itglue"
+	usp_o365 "github.com/refractionPOINT/usp-adapters/o365"
+	usp_pubsub "github.com/refractionPOINT/usp-adapters/pubsub"
+	usp_s3 "github.com/refractionPOINT/usp-adapters/s3"
+	usp_simulator "github.com/refractionPOINT/usp-adapters/simulator"
+	usp_slack "github.com/refractionPOINT/usp-adapters/slack"
+	usp_sqs "github.com/refractionPOINT/usp-adapters/sqs"
+	usp_sqs_files "github.com/refractionPOINT/usp-adapters/sqs-files"
+	usp_stdin "github.com/refractionPOINT/usp-adapters/stdin"
+	usp_syslog "github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
-	"github.com/refractionPOINT/usp-adapters/wel"
+	usp_wel "github.com/refractionPOINT/usp-adapters/wel"
 
 	"gopkg.in/yaml.v2"
 )
@@ -51,6 +52,7 @@ type GeneralConfigs struct {
 	S3            usp_s3.S3Config                    `json:"s3" yaml:"s3"`
 	Stdin         usp_stdin.StdinConfig              `json:"stdin" yaml:"stdin"`
 	OnePassword   usp_1password.OnePasswordConfig    `json:"1password" yaml:"1password"`
+	ITGlue        usp_itglue.ITGlueConfig            `json:"itglue" yaml:"itglue"`
 	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
@@ -196,6 +198,11 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.OnePassword)
 		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
+	} else if method == "itglue" {
+		configs.ITGlue.ClientOptions = applyLogging(configs.ITGlue.ClientOptions)
+		configs.ITGlue.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.ITGlue)
+		client, chRunning, err = usp_itglue.NewITGlueAdapter(configs.ITGlue)
 	} else if method == "office365" {
 		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
 		configs.Office365.ClientOptions.Architecture = "usp_adapter"
