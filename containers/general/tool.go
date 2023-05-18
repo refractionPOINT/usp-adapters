@@ -31,7 +31,7 @@ import (
 	usp_stdin "github.com/refractionPOINT/usp-adapters/stdin"
 	usp_syslog "github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
-	usp_wel "github.com/refractionPOINT/usp-adapters/wel"
+	"github.com/refractionPOINT/usp-adapters/wel"
 
 	"gopkg.in/yaml.v2"
 )
