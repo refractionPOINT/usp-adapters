@@ -1,19 +1,19 @@
 //go:build aix
 // +build aix
 
-package usp_file
+package usp_k8s_pods
 
 import "errors"
 
 // Dummy noop file to build when the platform
 // is _not_ supported.
 
-type FileAdapter struct{}
+type K8sPodsConfig struct{}
 
-func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
-	return nil, nil, errors.New("file collection not supported on this platform")
+func NewK8sPodsAdapter(conf K8sConfig) (*FileAdapter, chan struct{}, error) {
+	return nil, nil, errors.New("k8s_pods collection not supported on this platform")
 }
 
-func (a *FileAdapter) Close() error {
+func (a *K8sPodsAdapter) Close() error {
 	return nil
 }

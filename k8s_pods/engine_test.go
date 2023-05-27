@@ -1,4 +1,4 @@
-package usp_k8s
+package usp_k8s_pods
 
 import (
 	"fmt"
