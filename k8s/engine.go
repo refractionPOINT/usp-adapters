@@ -2,9 +2,12 @@ package usp_k8s
 
 import (
 	"fmt"
+	"os"
+	"path"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
 
@@ -12,7 +15,7 @@ import (
 	"github.com/nxadm/tail"
 )
 
-var k8sPodPattern = regexp.MustCompile("(.+)_(.+)_(.+)")
+var k8sPodPattern = regexp.MustCompile(".+/(.+)_(.+)_(.+)")
 
 type K8sLogProcessor struct {
 	options uspclient.ClientOptions
@@ -52,15 +55,17 @@ func NewK8sLogProcessor(root string, cOpt uspclient.ClientOptions) (*K8sLogProce
 		root:       root,
 		chStop:     make(chan struct{}),
 		chNewFiles: make(chan k8sFileMtd),
+		chLines:    make(chan K8sLogLine),
 	}
 
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fsnotify.NewWatcher(): %v", err)
 	}
 	klp.rootWatcher = w
+	klp.options.DebugLog("k8s root watcher created: " + root)
 	if err := klp.rootWatcher.Add(root); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("rootWatcher.Add(): %v", err)
 	}
 	klp.wg.Add(1)
 	go klp.watchForPods()
@@ -93,13 +98,13 @@ func (klp *K8sLogProcessor) watchForPods() {
 			if event.Op != fsnotify.Create {
 				continue
 			}
-			components := k8sPodPattern.FindStringSubmatch(strings.TrimPrefix(event.Name, "/"))
+			components := k8sPodPattern.FindStringSubmatch(event.Name)
 			if len(components) != 4 {
 				klp.options.DebugLog("k8s pod name does not match pattern: " + event.Name)
 				continue
 			}
 			mtd := k8sFileMtd{
-				FileName: fmt.Sprintf("%s/%s", klp.root, event.Name),
+				FileName: event.Name,
 				Entity: K8sEntity{
 					Namespace: components[1],
 					PodName:   components[2],
@@ -113,11 +118,13 @@ func (klp *K8sLogProcessor) watchForPods() {
 			klp.wg.Add(1)
 			go klp.watchPod(mtd)
 		case err, ok := <-klp.rootWatcher.Errors:
+			klp.options.DebugLog("k8s root watcher error: " + err.Error())
 			if !ok {
 				return
 			}
-			klp.options.OnError(err)
+			klp.options.OnError(fmt.Errorf("error watching root %s: %v", klp.root, err))
 		case <-klp.chStop:
+			klp.options.DebugLog("k8s root watcher stopping")
 			return
 		}
 	}
@@ -131,16 +138,43 @@ func (klp *K8sLogProcessor) watchPod(mtd k8sFileMtd) {
 
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		klp.options.OnError(err)
+		klp.options.OnError(fmt.Errorf("error watching pod %s: %v", mtd.FileName, err))
 		return
 	}
 	defer w.Close()
 	if err := w.Add(mtd.FileName); err != nil {
-		klp.options.OnError(err)
+		klp.options.OnError(fmt.Errorf("error adding pod watch %s: %v", mtd.FileName, err))
 		return
 	}
 
 	running := map[string]chan struct{}{}
+	defer func() {
+		klp.options.DebugLog("signaling containers to stop: " + mtd.FileName)
+		for _, ch := range running {
+			close(ch)
+		}
+	}()
+
+	// Initialize all containers already present.
+	if files, err := os.ReadDir(mtd.FileName); err == nil {
+		for _, file := range files {
+			if !file.IsDir() {
+				continue
+			}
+			containerPath := path.Join(mtd.FileName, file.Name())
+			if _, ok := running[containerPath]; ok {
+				continue
+			}
+			nameComponents := strings.Split(file.Name(), "/")
+			newMtd := mtd
+			newMtd.FileName = containerPath
+			newMtd.Entity.ContainerName = nameComponents[len(nameComponents)-1]
+
+			running[containerPath] = make(chan struct{})
+			klp.wg.Add(1)
+			go klp.watchContainer(newMtd, running[containerPath])
+		}
+	}
 
 	for {
 		select {
@@ -148,9 +182,13 @@ func (klp *K8sLogProcessor) watchPod(mtd k8sFileMtd) {
 			if !ok {
 				return
 			}
-			containerPath := fmt.Sprintf("%s/%s", mtd.FileName, event.Name)
+			containerPath := event.Name
 
 			if event.Op == fsnotify.Remove {
+				if event.Name == mtd.FileName {
+					klp.options.DebugLog("k8s pod watcher stopping")
+					return
+				}
 				klp.options.DebugLog("k8s container removed: " + containerPath)
 				close(running[containerPath])
 				delete(running, containerPath)
@@ -160,22 +198,27 @@ func (klp *K8sLogProcessor) watchPod(mtd k8sFileMtd) {
 				continue
 			}
 
+			// There could be a race condition with init, ignore.
+			if _, ok := running[containerPath]; ok {
+				continue
+			}
+
+			nameComponents := strings.Split(event.Name, "/")
 			newMtd := mtd
 			newMtd.FileName = containerPath
-			newMtd.Entity.ContainerName = event.Name
+			newMtd.Entity.ContainerName = nameComponents[len(nameComponents)-1]
 
 			running[containerPath] = make(chan struct{})
 			klp.wg.Add(1)
 			go klp.watchContainer(newMtd, running[containerPath])
 		case err, ok := <-w.Errors:
 			if !ok {
+				klp.options.DebugLog("k8s pod watcher stopping")
 				return
 			}
-			klp.options.OnError(err)
+			klp.options.OnError(fmt.Errorf("error from pod watch %s: %v", mtd.FileName, err))
 		case <-klp.chStop:
-			for _, ch := range running {
-				close(ch)
-			}
+			klp.options.DebugLog("k8s pod watcher stopping")
 			return
 		}
 	}
@@ -189,32 +232,89 @@ func (klp *K8sLogProcessor) watchContainer(mtd k8sFileMtd, chStop chan struct{})
 
 	w, err := fsnotify.NewWatcher()
 	if err != nil {
-		klp.options.OnError(err)
+		klp.options.OnError(fmt.Errorf("error watching container %s: %v", mtd.FileName, err))
 		return
 	}
 	defer w.Close()
 	if err := w.Add(mtd.FileName); err != nil {
-		klp.options.OnError(err)
+		klp.options.OnError(fmt.Errorf("error adding container watch %s: %v", mtd.FileName, err))
 		return
 	}
 
 	var curFile *tail.Tail
+	currentLog := ""
+
+	// If logs are already present, start tailing the latest.
+	if files, err := os.ReadDir(mtd.FileName); err == nil {
+		latestLog := ""
+		latestMod := time.Time{}
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			info, err := file.Info()
+			if err != nil {
+				continue
+			}
+			mod := info.ModTime()
+			if mod.After(latestMod) {
+				latestLog = file.Name()
+				latestMod = mod
+			}
+		}
+		if latestLog != "" {
+			klp.options.DebugLog("k8s container log priming: " + path.Join(mtd.FileName, latestLog))
+			newMtd := mtd
+			logPath := path.Join(mtd.FileName, latestLog)
+			newMtd.FileName = logPath
+
+			curFile, err = tail.TailFile(logPath, tail.Config{
+				Follow:        true,
+				ReOpen:        true,
+				MustExist:     true,
+				CompleteLines: true,
+			})
+			if err != nil {
+				klp.options.OnError(fmt.Errorf("error tailing %s: %v", logPath, err))
+			} else {
+				klp.wg.Add(1)
+				go klp.processFile(newMtd, curFile)
+				currentLog = logPath
+			}
+		}
+	}
 
 	for {
 		select {
 		case event, ok := <-w.Events:
 			if !ok {
+				klp.options.DebugLog("k8s container watcher stopping: " + mtd.FileName)
 				return
 			}
-			logPath := fmt.Sprintf("%s/%s", mtd.FileName, event.Name)
+			logPath := event.Name
 
 			if event.Op == fsnotify.Remove {
 				klp.options.DebugLog("k8s log removed: " + logPath)
 				curFile.StopAtEOF()
+				curFile.Cleanup()
 				continue
 			}
 			if event.Op != fsnotify.Create {
 				continue
+			}
+
+			// If this is already the log we're tracking, it's likely
+			// a race condition with init.
+			if logPath == currentLog {
+				continue
+			}
+
+			// If a tail is currently running, it likely means that
+			// the log is cycling.
+			if curFile != nil {
+				klp.options.DebugLog("k8s log cycled: " + logPath)
+				curFile.StopAtEOF()
+				curFile.Cleanup()
 			}
 
 			newMtd := mtd
@@ -227,7 +327,7 @@ func (klp *K8sLogProcessor) watchContainer(mtd k8sFileMtd, chStop chan struct{})
 				CompleteLines: true,
 			})
 			if err != nil {
-				klp.options.OnError(err)
+				klp.options.OnError(fmt.Errorf("error tailing log %s: %v", logPath, err))
 				continue
 			}
 
@@ -235,11 +335,14 @@ func (klp *K8sLogProcessor) watchContainer(mtd k8sFileMtd, chStop chan struct{})
 			go klp.processFile(newMtd, curFile)
 		case err, ok := <-w.Errors:
 			if !ok {
+				klp.options.DebugLog("k8s container watcher stopping: " + mtd.FileName)
 				return
 			}
-			klp.options.OnError(err)
+			klp.options.OnError(fmt.Errorf("error from container watch %s: %v", mtd.FileName, err))
 		case <-chStop:
+			klp.options.DebugLog("k8s container watcher stopping: " + mtd.FileName)
 			curFile.StopAtEOF()
+			curFile.Cleanup()
 			return
 		}
 	}
