@@ -1,5 +1,5 @@
-//go:build darwin || linux || solaris || aix
-// +build darwin linux solaris aix
+//go:build !windows
+// +build !windows
 
 package usp_wel
 
