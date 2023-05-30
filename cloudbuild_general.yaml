@@ -49,19 +49,19 @@ steps:
       - 'GOARCH=ppc64'
     waitFor: ['run-tests']
   - name: 'golang'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_amd64', './containers/general']
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64', './containers/general']
     env:
       - 'GOOS=freebsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_amd64', './containers/general']
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_64', './containers/general']
     env:
       - 'GOOS=netbsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_amd64', './containers/general']
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_64', './containers/general']
     env:
       - 'GOOS=openbsd'
       - 'GOARCH=amd64'
