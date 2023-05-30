@@ -1,5 +1,5 @@
-//go:build windows || darwin || linux || solaris
-// +build windows darwin linux solaris
+//go:build windows || darwin || linux || solaris || netbsd || openbsd || freebsd
+// +build windows darwin linux solaris netbsd openbsd freebsd
 
 package usp_file
 

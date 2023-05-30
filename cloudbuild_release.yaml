@@ -63,10 +63,31 @@ steps:
     - 'GOOS=aix'
     - 'GOARCH=ppc64'
   waitFor: ['get-github-keys']
+- name: 'golang'
+  id: 'build-freebsdamd64'
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_amd64_$TAG_NAME', './containers/general']
+  env:
+    - 'GOOS=freebsd'
+    - 'GOARCH=amd64'
+  waitFor: ['get-github-keys']
+- name: 'golang'
+  id: 'build-netbsdamd64'
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_amd64_$TAG_NAME', './containers/general']
+  env:
+    - 'GOOS=netbsd'
+    - 'GOARCH=amd64'
+  waitFor: ['get-github-keys']
+- name: 'golang'
+  id: 'build-openbsdamd64'
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_amd64_$TAG_NAME', './containers/general']
+  env:
+    - 'GOOS=openbsd'
+    - 'GOARCH=amd64'
+  waitFor: ['get-github-keys']
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-adapters
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64']
+  waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter
   entrypoint: 'bash'
