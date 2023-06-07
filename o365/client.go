@@ -234,15 +234,15 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			nFetched++
 			newBundles[item.ContentID] = map[string]struct{}{}
 
-			for _, event := range events {
-				eventID := gjson.ParseBytes(event).Get("Id").String()
+			gjson.ParseBytes(events).ForEach(func(_, event gjson.Result) bool {
+				eventID := event.Get("Id").String()
 				contentIDsThisPass[eventID] = struct{}{}
 				if _, ok := contentSeen[eventID]; ok {
-					continue
+					return true
 				}
 
 				msg := &protocol.DataMessage{
-					TextPayload: string(event),
+					TextPayload: string(event.Raw),
 					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 				}
 				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
@@ -253,13 +253,14 @@ func (a *Office365Adapter) fetchEvents(url string) {
 					if err != nil {
 						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 						a.doStop.Set()
-						return
+						return true
 					}
 				}
 				newBundles[item.ContentID][eventID] = struct{}{}
 				contentSeen[eventID] = struct{}{}
 				nShipped++
-			}
+				return true
+			})
 		}
 
 		for bundleID := range lastBundles {
@@ -384,7 +385,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 	return respData, nextPage
 }
 
-func (a *Office365Adapter) makeOneContentRequest(url string) [][]byte {
+func (a *Office365Adapter) makeOneContentRequest(url string) []byte {
 	// Prepare the request.
 	req, err := http.NewRequest("GET", url, &bytes.Buffer{})
 	if err != nil {
@@ -415,5 +416,5 @@ func (a *Office365Adapter) makeOneContentRequest(url string) [][]byte {
 		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api invalid json: %v", err))
 		return nil
 	}
-	return bytes.Split(data, []byte("\n"))
+	return data
 }
