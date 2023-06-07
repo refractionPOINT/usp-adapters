@@ -10,6 +10,7 @@ require (
 	github.com/duosecurity/duo_api_golang v0.0.0-20230418202038-096d3306c029
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e
+	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
 	github.com/refractionPOINT/go-uspclient v0.0.0-20230227011818-1c8752a42005
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.8.0
@@ -65,6 +66,8 @@ require (
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20230525201548-49c323b8a529 // indirect
 	github.com/rs/zerolog v1.29.1 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
+	github.com/tidwall/pretty v1.2.0 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/crypto v0.9.0 // indirect
