@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/refractionPOINT/gjson"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
@@ -234,14 +235,14 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			newBundles[item.ContentID] = map[string]struct{}{}
 
 			for _, event := range events {
-				eventID, _ := event.GetString("Id")
+				eventID := gjson.ParseBytes(event).Get("Id").String()
 				contentIDsThisPass[eventID] = struct{}{}
 				if _, ok := contentSeen[eventID]; ok {
 					continue
 				}
 
 				msg := &protocol.DataMessage{
-					JsonPayload: event,
+					TextPayload: string(event),
 					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 				}
 				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
@@ -383,7 +384,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 	return respData, nextPage
 }
 
-func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
+func (a *Office365Adapter) makeOneContentRequest(url string) [][]byte {
 	// Prepare the request.
 	req, err := http.NewRequest("GET", url, &bytes.Buffer{})
 	if err != nil {
@@ -409,12 +410,10 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []utils.Dict {
 	}
 
 	// Parse the response.
-	respData := []utils.Dict{}
-	jsonDecoder := json.NewDecoder(resp.Body)
-	if err := jsonDecoder.Decode(&respData); err != nil {
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api invalid json: %v", err))
 		return nil
 	}
-
-	return respData
+	return bytes.Split(data, []byte("\n"))
 }

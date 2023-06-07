@@ -183,6 +183,8 @@ github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZN
 github.com/prometheus/client_model v0.0.0-20190812154241-14fe0d1b01d4/go.mod h1:xMI15A0UPsDsEKsMN9yxemIoYk6Tm2C1GtYGdfGttqA=
 github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e h1:QvAB9TiNx4ADirPuKsDKqV0N0uRfQ+yBNdMs7XSDIOc=
 github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e/go.mod h1:1IV89223MNLbPjzzrRRtSsCGQYiwuts8tBSqnAvPy74=
+github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d h1:5OLPrBvVR0V/eGezlkJ4fyTaaJS/7pbYNTzMqu0Qur0=
+github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d/go.mod h1:7S4MA6zBzHBCOlHUFK+X+lgQq+pHiR0OZtW0v3VJOkY=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20230215163839-251d0a4a5966/go.mod h1:P1wVdCR3k8PFgRpsnF3EUwAJKkQdt+FydQ/nsEidoG4=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20230525201548-49c323b8a529 h1:QL7jOmXBjQjk7jevE/M0HdQD+oCtKyDu1J9ESlZMBlI=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20230525201548-49c323b8a529/go.mod h1:3fL8cZvIp0K//jp9GvkoTlmHaZafjwiEUcsZLZpZp7A=
@@ -219,6 +221,10 @@ github.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o
 github.com/stretchr/testify v1.8.2/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o6fzry7u4=
 github.com/stretchr/testify v1.8.4 h1:CcVxjf3Q8PM0mHUKJCdn+eZZtm5yQwehR5yeSVQQcUk=
 github.com/stretchr/testify v1.8.4/go.mod h1:sz/lmYIOXD/1dqDmKjjqLyZ2RngseejIcXlSw2iwfAo=
+github.com/tidwall/match v1.1.1 h1:+Ho715JplO36QYgwN9PGYNhgZvoUSc9X2c80KVTi+GA=
+github.com/tidwall/match v1.1.1/go.mod h1:eRSPERbgtNPcGhD8UCthc6PmLEQXEWd3PRB5JTxsfmM=
+github.com/tidwall/pretty v1.2.0 h1:RWIZEg2iJ8/g6fDDYzMpobmaoGh5OLl4AXtGUGPcqCs=
+github.com/tidwall/pretty v1.2.0/go.mod h1:ITEVvHYasfjBbM0u2Pg8T2nJnzm8xPwvNhhsoaGGjNU=
 github.com/vmihailenco/msgpack/v5 v5.3.5 h1:5gO0H1iULLWGhs2H5tbAHIZTV8/cYafcFOr9znI5mJU=
 github.com/vmihailenco/msgpack/v5 v5.3.5/go.mod h1:7xyJ9e+0+9SaZT0Wt1RGleJXzli6Q/V5KbhBonMG9jc=
 github.com/vmihailenco/tagparser/v2 v2.0.0 h1:y09buUbR+b5aycVFQs/g70pqKVZNBmxwAhO7/IwNM9g=
