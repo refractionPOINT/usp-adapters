@@ -64,6 +64,7 @@ func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, erro
 		return nil, nil, err
 	}
 
+	a.wg.Add(1)
 	go a.consumeLogs()
 
 	chStopped := make(chan struct{})
