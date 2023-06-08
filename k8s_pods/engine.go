@@ -89,6 +89,39 @@ func (klp *K8sLogProcessor) watchForPods() {
 	defer klp.wg.Done()
 	defer klp.options.DebugLog("k8s root watcher stopped")
 
+	// Initialize all containers already present.
+	running := map[string]chan struct{}{}
+	if files, err := os.ReadDir(klp.root); err == nil {
+		for _, file := range files {
+			if !file.IsDir() {
+				continue
+			}
+			podPath := path.Join(klp.root, file.Name())
+			if _, ok := running[podPath]; ok {
+				continue
+			}
+			components := k8sPodPattern.FindStringSubmatch(podPath)
+			if len(components) != 4 {
+				klp.options.DebugLog("k8s existing pod name does not match pattern: " + podPath)
+				continue
+			}
+			mtd := k8sFileMtd{
+				FileName: podPath,
+				Entity: K8sEntity{
+					Namespace: components[1],
+					PodName:   components[2],
+					PodID:     components[3],
+				},
+			}
+			if mtd.Entity.Namespace == "" || mtd.Entity.PodName == "" || mtd.Entity.PodID == "" {
+				klp.options.DebugLog("k8s existing pod name does not match pattern: " + podPath)
+				continue
+			}
+			klp.wg.Add(1)
+			go klp.watchPod(mtd)
+		}
+	}
+
 	for {
 		select {
 		case event, ok := <-klp.rootWatcher.Events:
@@ -96,6 +129,9 @@ func (klp *K8sLogProcessor) watchForPods() {
 				return
 			}
 			if event.Op != fsnotify.Create {
+				continue
+			}
+			if _, ok := running[event.Name]; ok {
 				continue
 			}
 			components := k8sPodPattern.FindStringSubmatch(event.Name)

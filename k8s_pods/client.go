@@ -69,9 +69,8 @@ func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, erro
 
 	chStopped := make(chan struct{})
 
-	a.wg.Add(1)
 	go func() {
-		a.wg.Done()
+		a.wg.Wait()
 		close(chStopped)
 	}()
 
