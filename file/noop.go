@@ -10,7 +10,7 @@ import "errors"
 
 type FileAdapter struct{}
 
-func NewFileAdapter(conf K8sConfig) (*FileAdapter, chan struct{}, error) {
+func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	return nil, nil, errors.New("file collection not supported on this platform")
 }
 
