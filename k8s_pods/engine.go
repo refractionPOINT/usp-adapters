@@ -32,21 +32,21 @@ type K8sLogProcessor struct {
 }
 
 type k8sFileMtd struct {
-	FileName            string    `json:"file_name"`
-	IsProcessEntireFile bool      `json:"-"`
-	Entity              K8sEntity `json:"entity"`
+	FileName            string    `json:"file_name" msgpack:"file_name"`
+	IsProcessEntireFile bool      `json:"-" msgpack:"-"`
+	Entity              K8sEntity `json:"entity" msgpack:"entity"`
 }
 
 type K8sEntity struct {
-	Namespace     string `json:"namespace"`
-	PodName       string `json:"pod_name"`
-	PodID         string `json:"pod_id"`
-	ContainerName string `json:"container_name"`
+	Namespace     string `json:"namespace" msgpack:"namespace"`
+	PodName       string `json:"pod_name" msgpack:"pod_name"`
+	PodID         string `json:"pod_id" msgpack:"pod_id"`
+	ContainerName string `json:"container_name" msgpack:"container_name"`
 }
 
 type K8sLogLine struct {
-	Entity K8sEntity `json:"entity"`
-	Line   string    `json:"line"`
+	Entity K8sEntity `json:"entity" msgpack:"entity"`
+	Line   string    `json:"line" msgpack:"line"`
 }
 
 func NewK8sLogProcessor(root string, cOpt uspclient.ClientOptions) (*K8sLogProcessor, error) {
