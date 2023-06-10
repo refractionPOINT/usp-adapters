@@ -10,7 +10,7 @@ import "errors"
 
 type K8sPodsAdapter struct{}
 
-func NewK8sPodsAdapter(conf FileConfig) (*K8sPodsAdapter, chan struct{}, error) {
+func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, error) {
 	return nil, nil, errors.New("k8s_pods collection not supported on this platform")
 }
 

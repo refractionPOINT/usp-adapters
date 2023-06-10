@@ -27,12 +27,6 @@ type K8sPodsAdapter struct {
 	engine *K8sLogProcessor
 }
 
-type K8sPodsConfig struct {
-	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-	Root            string                  `json:"root" yaml:"root"`
-}
-
 func (c *K8sPodsConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
