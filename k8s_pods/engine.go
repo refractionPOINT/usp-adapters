@@ -79,9 +79,9 @@ func (klp *K8sLogProcessor) Lines() chan K8sLogLine {
 
 func (klp *K8sLogProcessor) Close() error {
 	close(klp.chStop)
+	klp.wg.Wait()
 	klp.rootWatcher.Close()
 	close(klp.chLines)
-	klp.wg.Wait()
 	return nil
 }
 
