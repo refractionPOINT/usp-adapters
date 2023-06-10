@@ -21,6 +21,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/itglue"
+	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -64,6 +65,7 @@ type GeneralConfigs struct {
 	Simulator     usp_simulator.SimulatorConfig      `json:"simulator" yaml:"simulator"`
 	File          usp_file.FileConfig                `json:"file" yaml:"file"`
 	Evtx          usp_evtx.EVTXConfig                `json:"evtx" yaml:"evtx"`
+	K8sPods       usp_k8s_pods.K8sPodsConfig         `json:"k8s_pods" yaml:"k8s_pods"`
 }
 
 type AdapterStats struct {
@@ -253,6 +255,11 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.Evtx.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Evtx)
 		client, chRunning, err = usp_evtx.NewEVTXAdapter(configs.Evtx)
+	} else if method == "k8s_pods" {
+		configs.K8sPods.ClientOptions = applyLogging(configs.K8sPods.ClientOptions)
+		configs.K8sPods.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.K8sPods)
+		client, chRunning, err = usp_k8s_pods.NewK8sPodsAdapter(configs.K8sPods)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}

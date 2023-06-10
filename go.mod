@@ -6,18 +6,19 @@ require (
 	cloud.google.com/go/pubsub v1.31.0
 	cloud.google.com/go/storage v1.30.1
 	github.com/Azure/azure-event-hubs-go/v3 v3.6.0
-	github.com/aws/aws-sdk-go v1.44.272
+	github.com/aws/aws-sdk-go v1.44.280
 	github.com/duosecurity/duo_api_golang v0.0.0-20230418202038-096d3306c029
+	github.com/fsnotify/fsnotify v1.6.0
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
-	github.com/refractionPOINT/go-uspclient v0.0.0-20230227011818-1c8752a42005
+	github.com/refractionPOINT/go-uspclient v1.0.0
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.8.0
 	golang.org/x/sync v0.2.0
 	golang.org/x/sys v0.8.0
 	golang.org/x/text v0.9.0
-	google.golang.org/api v0.125.0
+	google.golang.org/api v0.126.0
 	gopkg.in/yaml.v2 v2.4.0
 )
 
@@ -28,7 +29,7 @@ require (
 	cloud.google.com/go/iam v1.1.0 // indirect
 	github.com/Azure/azure-amqp-common-go/v4 v4.2.0 // indirect
 	github.com/Azure/azure-sdk-for-go v68.0.0+incompatible // indirect
-	github.com/Azure/go-amqp v1.0.0 // indirect
+	github.com/Azure/go-amqp v1.0.1 // indirect
 	github.com/Azure/go-autorest v14.2.0+incompatible // indirect
 	github.com/Azure/go-autorest/autorest v0.11.29 // indirect
 	github.com/Azure/go-autorest/autorest/adal v0.9.23 // indirect
@@ -43,14 +44,13 @@ require (
 	github.com/Velocidex/yaml/v2 v2.2.8 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/devigned/tab v0.1.1 // indirect
-	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/golang-jwt/jwt/v4 v4.5.0 // indirect
 	github.com/golang/groupcache v0.0.0-20210331224755-41bb18bfe9da // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
 	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/google/s2a-go v0.1.4 // indirect
 	github.com/google/uuid v1.3.0 // indirect
-	github.com/googleapis/enterprise-certificate-proxy v0.2.3 // indirect
+	github.com/googleapis/enterprise-certificate-proxy v0.2.4 // indirect
 	github.com/googleapis/gax-go/v2 v2.10.0 // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/hashicorp/golang-lru v0.5.4 // indirect
@@ -67,7 +67,7 @@ require (
 	github.com/rs/zerolog v1.29.1 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
-	github.com/tidwall/pretty v1.2.0 // indirect
+	github.com/tidwall/pretty v1.2.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/crypto v0.9.0 // indirect
