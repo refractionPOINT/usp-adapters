@@ -12,7 +12,7 @@ require (
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
-	github.com/refractionPOINT/go-uspclient v1.0.0
+	github.com/refractionPOINT/go-uspclient v1.1.0
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.8.0
 	golang.org/x/sync v0.2.0
