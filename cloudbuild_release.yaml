@@ -94,13 +94,13 @@ steps:
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
   waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64']
 - name: 'gcr.io/cloud-builders/docker'
-  id: copy-docker-adapter
+  id: copy-docker-adapter-general
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter:$TAG_NAME && docker push refractionpoint/lc-adapter:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
   waitFor: ['build-docker-general']
 - name: 'gcr.io/cloud-builders/docker'
-  id: copy-docker-adapter
+  id: copy-docker-adapter-zeek
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
