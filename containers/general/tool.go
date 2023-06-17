@@ -283,7 +283,7 @@ func parseConfigs(args []string) (string, *RuntimeConfig, *GeneralConfigs, error
 	runtimeConfigs := &RuntimeConfig{}
 	configs := &GeneralConfigs{}
 	var err error
-	if len(args) < 2 {
+	if len(args) == 0 {
 		return "", nil, nil, errors.New("not enough arguments")
 	}
 
