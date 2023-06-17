@@ -12,7 +12,7 @@ steps:
 - name: 'gcr.io/cloud-builders/docker'
   id: build-docker-zeek
   entrypoint: 'bash'
-  args: ['-c', 'docker build -f ./containers/zeek/Dockerfile -t refractionpoint/lc-adapter-zeek:$TAG_NAME -t gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter-zeek:$TAG_NAME -t refractionpoint/lc-adapter-zeek:latest .']
+  args: ['-c', 'cd ./containers/zeek/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek:$TAG_NAME -t refractionpoint/lc-adapter-zeek:latest .']
   waitFor: ['get-github-keys']
 - name: 'golang'
   id: build-linux64
