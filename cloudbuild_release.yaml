@@ -5,12 +5,12 @@ steps:
   args: ['-c', 'echo $$SSH_KEY > /workspace/id_rsa']
   secretEnv: ['SSH_KEY']
 - name: 'gcr.io/cloud-builders/docker'
-  id: build-docker
+  id: build-docker-general
   entrypoint: 'bash'
   args: ['-c', 'docker build -f ./containers/general/Dockerfile -t refractionpoint/lc-adapter:$TAG_NAME -t gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME -t refractionpoint/lc-adapter:latest .']
   waitFor: ['get-github-keys']
 - name: 'gcr.io/cloud-builders/docker'
-  id: build-docker
+  id: build-docker-zeek
   entrypoint: 'bash'
   args: ['-c', 'docker build -f ./containers/zeek/Dockerfile -t refractionpoint/lc-adapter-zeek:$TAG_NAME -t gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter-zeek:$TAG_NAME -t refractionpoint/lc-adapter-zeek:latest .']
   waitFor: ['get-github-keys']
@@ -98,13 +98,13 @@ steps:
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter:$TAG_NAME && docker push refractionpoint/lc-adapter:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker']
+  waitFor: ['build-docker-general']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker']
+  waitFor: ['build-docker-zeek']
 images:
   - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME
 availableSecrets:
