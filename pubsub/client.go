@@ -34,6 +34,7 @@ type PubSubConfig struct {
 	SubscriptionName    string                  `json:"sub_name" yaml:"sub_name"`
 	ProjectName         string                  `json:"project_name" yaml:"project_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
+	MaxPSBuffer         int                     `json:"max_ps_buffer,omitempty" yaml:"max_ps_buffer,omitempty"`
 }
 
 func (c *PubSubConfig) Validate() error {
@@ -84,6 +85,9 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 	}
 
 	a.buildSub = a.psClient.Subscription(a.conf.SubscriptionName)
+	if conf.MaxPSBuffer != 0 {
+		a.buildSub.ReceiveSettings.MaxOutstandingBytes = conf.MaxPSBuffer
+	}
 	pubsubCtx, pubsubCancel := context.WithCancel(a.ctx)
 	a.stopSub = pubsubCancel
 	chStopped := make(chan struct{})
