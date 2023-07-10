@@ -14,6 +14,11 @@ steps:
   entrypoint: 'bash'
   args: ['-c', 'cd ./containers/zeek/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek:$TAG_NAME -t refractionpoint/lc-adapter-zeek:latest .']
   waitFor: ['get-github-keys']
+- name: 'gcr.io/cloud-builders/docker'
+  id: build-docker-k8s-pods
+  entrypoint: 'bash'
+  args: ['-c', 'cd ./containers/k8s_pods/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-k8s-pods:$TAG_NAME -t refractionpoint/lc-adapter-k8s-pods:latest .']
+  waitFor: ['get-github-keys']
 - name: 'golang'
   id: build-linux64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64_$TAG_NAME', './containers/general']
@@ -105,6 +110,12 @@ steps:
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
   waitFor: ['build-docker-zeek']
+- name: 'gcr.io/cloud-builders/docker'
+  id: copy-docker-adapter-k8s-pods
+  entrypoint: 'bash'
+  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-k8s-pods:$TAG_NAME && docker push refractionpoint/lc-adapter-k8s-pods:latest']
+  secretEnv: ['USERNAME', 'PASSWORD']
+  waitFor: ['build-docker-k8s-pods']
 images:
   - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME
 availableSecrets:
