@@ -15,5 +15,47 @@ User needs to define the following environment variables:
 
 Example command line with Docker:
 ```bash
-docker run -it -e OID=aaaaaaaa-bfa1-bbbb-cccc-138cd51389cd -e IKEY=aaaaaaaa-9ae6-bbbb-cccc-5e42b854adf5 -e NAME=zeek -e K8S_POD_LOGS=/k8s-pod-logs --mount type=bind,source=/var/log/pods,target=/k8s-pod-logs,readonly refractionpoint/lc-adapter-k8s-pods
+docker run -it -e OID=aaaaaaaa-bfa1-bbbb-cccc-138cd51389cd -e IKEY=aaaaaaaa-9ae6-bbbb-cccc-5e42b854adf5 -e NAME=k8s-pods -e K8S_POD_LOGS=/k8s-pod-logs --mount type=bind,source=/var/log/pods,target=/k8s-pod-logs,readonly refractionpoint/lc-adapter-k8s-pods
+```
+
+Example kubernetes daemon set:
+```yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: lc-adapter-k8s-pods
+  namespace: default
+spec:
+  minReadySeconds: 30
+  selector:
+    matchLabels:
+      name: lc-adapter-k8s-pods
+  template:
+    metadata:
+      labels:
+        name: lc-adapter-k8s-pods
+    spec:
+      containers:
+      - image: refractionpoint/lc-adapter-k8s-pods
+        name: lc-adapter-k8s-pods
+        volumeMounts:
+        - mountPath: /k8s-pod-logs
+          name: pod-logs
+        env:
+        - name: K8S_POD_LOGS
+          value: /k8s-pod-logs
+        - name: OID
+          value: aaaaaaaa-bfa1-bbbb-cccc-138cd51389cd
+        - name: IKEY
+          value: aaaaaaaa-9ae6-bbbb-cccc-5e42b854adf5
+        - name: NAME
+          value: k8s-pods
+      volumes:
+      - hostPath:
+          path: /var/log/pods
+        name: pod-logs
+  updateStrategy:
+    rollingUpdate:
+      maxUnavailable: 1
+    type: RollingUpdate
 ```
