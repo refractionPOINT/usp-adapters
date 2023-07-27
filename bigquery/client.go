@@ -3,7 +3,9 @@ package usp_file
 import (
 	"context"
 	"errors"
-	"log"
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +23,7 @@ type BigQueryAdapter struct {
 	isStop    chan bool
 	wg        sync.WaitGroup
 	chStopped chan struct{}
+	uspClient *uspclient.Client
 }
 
 type BigQueryConfig struct {
@@ -75,6 +78,9 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 	a.dataset = a.client.Dataset(a.conf.DatasetName)
 	a.table = a.dataset.Table(a.conf.TableName)
 
+	a.dataset = a.client.Dataset(a.conf.DatasetName)
+	a.table = a.dataset.Table(a.conf.TableName)
+
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
@@ -85,12 +91,11 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 			case <-a.isStop:
 				return
 			default:
-				_, err := a.Lookup()
+				err := a.lookupAndSend()
 				if err != nil || a.conf.IsOneTimeLoad {
 					a.isStop <- true
 					return
 				}
-				// figure out what to do with results
 
 				time.Sleep(5 * time.Second)
 			}
@@ -98,18 +103,17 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 	}()
 
 	return a, a.chStopped, nil
+
 }
 
-func (a *BigQueryAdapter) Lookup() ([]bigquery.Value, error) {
+func (a *BigQueryAdapter) lookupAndSend() error {
 	ctx := context.Background()
 	q := a.client.Query(a.conf.SqlQuery)
 	it, err := q.Read(ctx)
 	if err != nil {
-		log.Printf("Error during Lookup(): %v", err)
-		return nil, err
+		return err
 	}
 
-	var results []bigquery.Value
 	for {
 		var row []bigquery.Value
 		err := it.Next(&row)
@@ -117,12 +121,29 @@ func (a *BigQueryAdapter) Lookup() ([]bigquery.Value, error) {
 			break
 		}
 		if err != nil {
-			log.Printf("Error during Lookup(): %v", err)
-			return nil, err
+			return err
 		}
 
-		results = append(results, row...)
+		// Convert []bigquery.Value to map[string]interface{} for USP payload
+		rowMap := make(map[string]interface{})
+		for i, col := range row {
+			rowMap["col"+strconv.Itoa(i)] = col
+		}
+
+		msg := &protocol.DataMessage{
+			JsonPayload: rowMap,
+			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+		}
+
+		if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+			if errors.Is(err, uspclient.ErrorBufferFull) {
+				err = a.uspClient.Ship(msg, 1*time.Hour)
+			}
+			if err != nil {
+				return err
+			}
+		}
 	}
 
-	return results, nil
+	return nil
 }
