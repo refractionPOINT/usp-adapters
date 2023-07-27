@@ -6,7 +6,6 @@ import (
 	"log"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -19,7 +18,7 @@ type BigQueryAdapter struct {
 	client    *bigquery.Client
 	dataset   *bigquery.Dataset
 	table     *bigquery.Table
-	isStop    uint32
+	isStop    chan bool
 	wg        sync.WaitGroup
 	chStopped chan struct{}
 }
@@ -50,6 +49,7 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 	a := &BigQueryAdapter{
 		conf:      conf,
 		chStopped: make(chan struct{}),
+		isStop:    make(chan bool),
 	}
 
 	var err error
@@ -81,20 +81,19 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 		defer close(a.chStopped)
 
 		for {
-			if atomic.LoadUint32(&a.isStop) == 1 {
-				break
+			select {
+			case <-a.isStop:
+				return
+			default:
+				_, err := a.Lookup()
+				if err != nil || a.conf.IsOneTimeLoad {
+					a.isStop <- true
+					return
+				}
+				// figure out what to do with results
+
+				time.Sleep(5 * time.Second)
 			}
-
-			_, err := a.Lookup()
-			if err != nil || a.conf.IsOneTimeLoad {
-				break
-			}
-
-			time.Sleep(5 * time.Second)
-		}
-
-		if err != nil {
-			log.Printf("BigQuery stopped with error: %v", err)
 		}
 	}()
 
