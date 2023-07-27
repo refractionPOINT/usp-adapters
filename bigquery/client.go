@@ -1,11 +1,8 @@
 package usp_file
 
-package main
-
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -18,13 +15,13 @@ import (
 )
 
 type BigQueryAdapter struct {
-	conf       BigQueryConfig
-	client     *bigquery.Client
-	dataset    *bigquery.DatasetHandle
-	table      *bigquery.TableHandle
-	isStop     uint32
-	wg         sync.WaitGroup
-	chStopped  chan struct{}
+	conf      BigQueryConfig
+	client    *bigquery.Client
+	dataset   *bigquery.Dataset
+	table     *bigquery.Table
+	isStop    uint32
+	wg        sync.WaitGroup
+	chStopped chan struct{}
 }
 
 type BigQueryConfig struct {
@@ -51,7 +48,7 @@ func (c *BigQueryConfig) Validate() error {
 
 func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
 	a := &BigQueryAdapter{
-		conf: conf,
+		conf:      conf,
 		chStopped: make(chan struct{}),
 	}
 
@@ -117,7 +114,7 @@ func (a *BigQueryAdapter) Lookup() ([]bigquery.Value, error) {
 	for {
 		var row []bigquery.Value
 		err := it.Next(&row)
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		}
 		if err != nil {
@@ -130,4 +127,3 @@ func (a *BigQueryAdapter) Lookup() ([]bigquery.Value, error) {
 
 	return results, nil
 }
-
