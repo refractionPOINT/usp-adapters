@@ -34,6 +34,8 @@ type BigQueryConfig struct {
 	TableName           string                  `json:"table_name" yaml:"table_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 	SqlQuery            string                  `json:"sql_query" yaml:"sql_query"`
+	TimestampColumnName string                  `json:"timestamp_column_name" yaml:"timestamp_column_name"` // Name of the timestamp column
+	LastQueryTime       time.Time               `json:"last_query_time" yaml:"last_query_time"`
 	QueryInterval       time.Duration           `json:"query_interval" yaml:"query_interval"` // Time to sleep between queries
 	IsOneTimeLoad       bool                    `json:"is_one_time_load" yaml:"is_one_time_load"`
 }
@@ -110,13 +112,40 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 	return a, chStopped, nil
 }
 
-func (a *BigQueryAdapter) lookupAndSend() error {
-	q := a.client.Query(a.conf.SqlQuery)
-	it, err := q.Read(a.ctx)
+func (bq *BigQueryAdapter) lookupAndSend() error {
+	query := bq.conf.SqlQuery
+	if bq.conf.TimestampColumnName != "" && !bq.conf.LastQueryTime.IsZero() {
+		// Create the WHERE clause
+		whereClause := fmt.Sprintf(" WHERE %s > TIMESTAMP \"%s\"",
+			bq.conf.TimestampColumnName,
+			bq.conf.LastQueryTime.Format(time.RFC3339))
+
+		// Check if the query contains an ORDER BY clause
+		if strings.Contains(strings.ToUpper(query), "ORDER BY") {
+			// Split the query into two parts: the SELECT part and the ORDER BY part
+			queryParts := strings.SplitN(query, " ORDER BY ", 2)
+
+			// Insert the WHERE clause between the two parts
+			query = fmt.Sprintf("%s%s ORDER BY %s", queryParts[0], whereClause, queryParts[1])
+		} else {
+			// If there's no ORDER BY clause, simply append the WHERE clause at the end
+			query += whereClause
+		}
+	}
+
+	q := bq.client.Query(query)
+	it, err := q.Read(bq.ctx)
 	if err != nil {
 		return err
 	}
-	schema := it.Schema // used to get column name
+
+	tableRef := bq.client.DatasetInProject(bq.conf.ProjectId, bq.conf.DatasetName).Table(bq.conf.TableName)
+	meta, err := tableRef.Metadata(bq.ctx)
+
+	if err != nil {
+		return err
+	}
+	schema := meta.Schema
 
 	for {
 		var row []bigquery.Value
@@ -139,28 +168,31 @@ func (a *BigQueryAdapter) lookupAndSend() error {
 			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 		}
 
-		if err = a.uspClient.Ship(msg, 10*time.Second); err != nil {
+		if err = bq.uspClient.Ship(msg, 10*time.Second); err != nil {
 			if errors.Is(err, uspclient.ErrorBufferFull) {
-				a.conf.ClientOptions.OnWarning("stream falling behind")
-				err = a.uspClient.Ship(msg, 1*time.Hour)
+				bq.conf.ClientOptions.OnWarning("stream falling behind")
+				err = bq.uspClient.Ship(msg, 1*time.Hour)
 			}
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
+				bq.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
 				return err
 			}
 		}
 	}
 
+	// Update the time of the last query
+	bq.conf.LastQueryTime = time.Now()
+
 	return nil
 }
 
-func (a *BigQueryAdapter) Close() error {
-	a.conf.ClientOptions.DebugLog("closing")
-	atomic.StoreUint32(&a.isStop, 1)
-	a.wg.Wait()
-	a.client.Close()
-	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+func (bq *BigQueryAdapter) Close() error {
+	bq.conf.ClientOptions.DebugLog("closing")
+	atomic.StoreUint32(&bq.isStop, 1)
+	bq.wg.Wait()
+	bq.client.Close()
+	err1 := bq.uspClient.Drain(1 * time.Minute)
+	_, err2 := bq.uspClient.Close()
 
 	if err1 != nil {
 		return err1
