@@ -34,9 +34,9 @@ type BigQueryConfig struct {
 	TableName           string                  `json:"table_name" yaml:"table_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 	SqlQuery            string                  `json:"sql_query" yaml:"sql_query"`
-	TimestampColumnName string                  `json:"timestamp_column_name" yaml:"timestamp_column_name"` // Name of the timestamp column
+	TimestampColumnName string                  `json:"timestamp_column_name" yaml:"timestamp_column_name"`
 	LastQueryTime       time.Time               `json:"last_query_time" yaml:"last_query_time"`
-	QueryInterval       time.Duration           `json:"query_interval" yaml:"query_interval"` // Time to sleep between queries
+	QueryInterval       time.Duration           `json:"query_interval" yaml:"query_interval"`
 	IsOneTimeLoad       bool                    `json:"is_one_time_load" yaml:"is_one_time_load"`
 }
 
@@ -157,7 +157,7 @@ func (bq *BigQueryAdapter) lookupAndSend() error {
 			return err
 		}
 
-		// Convert []bigquery.Value to map[string]interface{} for USP payload
+		// convert response to json format
 		rowMap := make(map[string]interface{})
 		for i, col := range row {
 			rowMap[schema[i].Name] = col // use column name to form json object
