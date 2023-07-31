@@ -3,6 +3,7 @@ package usp_bigquery
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"strconv"
@@ -35,6 +36,7 @@ type BigQueryConfig struct {
 	TableName           string                  `json:"table_name" yaml:"table_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 	SqlQuery            string                  `json:"sql_query" yaml:"sql_query"`
+	QueryInterval       time.Duration           `json:"query_interval" yaml:"query_interval"` // Time to sleep between queries
 	IsOneTimeLoad       bool                    `json:"is_one_time_load" yaml:"is_one_time_load"`
 }
 
@@ -47,6 +49,9 @@ func (bq *BigQueryConfig) Validate() error {
 	}
 	if bq.TableName == "" {
 		return errors.New("missing table_name")
+	}
+	if bq.SqlQuery == "" {
+		return errors.New("missing sql query")
 	}
 	return nil
 }
@@ -100,7 +105,7 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 				return
 			}
 
-			time.Sleep(5 * time.Second)
+			time.Sleep(a.conf.QueryInterval)
 		}
 	}()
 
@@ -141,6 +146,7 @@ func (a *BigQueryAdapter) lookupAndSend() error {
 				err = a.uspClient.Ship(msg, 1*time.Hour)
 			}
 			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
 				return err
 			}
 		}
