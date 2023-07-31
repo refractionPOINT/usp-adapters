@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,7 +23,6 @@ type BigQueryAdapter struct {
 	table     *bigquery.Table
 	isStop    uint32
 	wg        sync.WaitGroup
-	chStopped chan struct{}
 	uspClient *uspclient.Client
 	ctx       context.Context
 }
@@ -58,9 +56,8 @@ func (bq *BigQueryConfig) Validate() error {
 
 func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
 	a := &BigQueryAdapter{
-		conf:      conf,
-		chStopped: make(chan struct{}),
-		ctx:       context.Background(),
+		conf: conf,
+		ctx:  context.Background(),
 	}
 
 	var err error
@@ -90,10 +87,11 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 		return nil, nil, err
 	}
 
+	chStopped := make(chan struct{})
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
-		defer close(a.chStopped)
+		defer close(chStopped)
 
 		for {
 			if atomic.LoadUint32(&a.isStop) == 1 {
@@ -109,7 +107,7 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 		}
 	}()
 
-	return a, a.chStopped, nil
+	return a, chStopped, nil
 }
 
 func (a *BigQueryAdapter) lookupAndSend() error {
@@ -118,6 +116,7 @@ func (a *BigQueryAdapter) lookupAndSend() error {
 	if err != nil {
 		return err
 	}
+	schema := it.Schema // used to get column name
 
 	for {
 		var row []bigquery.Value
@@ -132,7 +131,7 @@ func (a *BigQueryAdapter) lookupAndSend() error {
 		// Convert []bigquery.Value to map[string]interface{} for USP payload
 		rowMap := make(map[string]interface{})
 		for i, col := range row {
-			rowMap["col"+strconv.Itoa(i)] = col
+			rowMap[schema[i].Name] = col // use column name to form json object
 		}
 
 		msg := &protocol.DataMessage{
