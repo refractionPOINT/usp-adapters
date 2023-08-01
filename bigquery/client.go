@@ -8,7 +8,6 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/bigquery"
@@ -25,6 +24,7 @@ type BigQueryAdapter struct {
 	wg        sync.WaitGroup
 	uspClient *uspclient.Client
 	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 type BigQueryConfig struct {
@@ -34,9 +34,7 @@ type BigQueryConfig struct {
 	TableName           string                  `json:"table_name" yaml:"table_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 	SqlQuery            string                  `json:"sql_query" yaml:"sql_query"`
-	TimestampColumnName string                  `json:"timestamp_column_name" yaml:"timestamp_column_name"`
-	LastQueryTime       time.Time               `json:"last_query_time" yaml:"last_query_time"`
-	QueryInterval       time.Duration           `json:"query_interval" yaml:"query_interval"`
+	QueryInterval       string                  `json:"query_interval" yaml:"query_interval"`
 	IsOneTimeLoad       bool                    `json:"is_one_time_load" yaml:"is_one_time_load"`
 }
 
@@ -57,91 +55,83 @@ func (bq *BigQueryConfig) Validate() error {
 }
 
 func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
-	a := &BigQueryAdapter{
-		conf: conf,
-		ctx:  context.Background(),
+	// Create bq cancellable context
+	ctx, cancel := context.WithCancel(context.Background())
+	bq := &BigQueryAdapter{
+		conf:   conf,
+		ctx:    ctx,
+		cancel: cancel,
 	}
 
 	var err error
-	if a.conf.ServiceAccountCreds == "" {
-		if a.client, err = bigquery.NewClient(context.Background(), a.conf.ProjectId); err != nil {
+	if bq.conf.ServiceAccountCreds == "" {
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId); err != nil {
 			return nil, nil, err
 		}
-	} else if a.conf.ServiceAccountCreds == "-" {
-		if a.client, err = bigquery.NewClient(context.Background(), a.conf.ProjectId, option.WithoutAuthentication()); err != nil {
+	} else if bq.conf.ServiceAccountCreds == "-" {
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
-	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
-		if a.client, err = bigquery.NewClient(context.Background(), a.conf.ProjectId, option.WithCredentialsFile(a.conf.ServiceAccountCreds)); err != nil {
+	} else if !strings.HasPrefix(bq.conf.ServiceAccountCreds, "{") {
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithCredentialsFile(bq.conf.ServiceAccountCreds)); err != nil {
 			return nil, nil, err
 		}
 	} else {
-		if a.client, err = bigquery.NewClient(context.Background(), a.conf.ProjectId, option.WithCredentialsJSON([]byte(a.conf.ServiceAccountCreds))); err != nil {
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithCredentialsJSON([]byte(bq.conf.ServiceAccountCreds))); err != nil {
 			return nil, nil, err
 		}
 	}
 
-	a.dataset = a.client.Dataset(a.conf.DatasetName)
-	a.table = a.dataset.Table(a.conf.TableName)
+	bq.dataset = bq.client.Dataset(bq.conf.DatasetName)
+	bq.table = bq.dataset.Table(bq.conf.TableName)
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	bq.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
 
+	// Parse the query interval
+	queryInterval, err := time.ParseDuration(conf.QueryInterval)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid query interval: %w", err)
+	}
+
 	chStopped := make(chan struct{})
-	a.wg.Add(1)
+	bq.wg.Add(1)
 	go func() {
-		defer a.wg.Done()
+		defer bq.wg.Done()
 		defer close(chStopped)
 
 		for {
-			if atomic.LoadUint32(&a.isStop) == 1 {
-				return
-			}
-			err = a.lookupAndSend()
-			if err != nil || a.conf.IsOneTimeLoad {
-				atomic.StoreUint32(&a.isStop, 1)
+			err = bq.lookupAndSend(bq.ctx)
+			if err != nil || bq.conf.IsOneTimeLoad {
 				return
 			}
 
-			time.Sleep(a.conf.QueryInterval)
+			select {
+			case <-time.After(queryInterval):
+			case <-bq.ctx.Done():
+				return
+			}
 		}
 	}()
 
-	return a, chStopped, nil
+	return bq, chStopped, nil
 }
 
-func (bq *BigQueryAdapter) lookupAndSend() error {
-	query := bq.conf.SqlQuery
-	if bq.conf.TimestampColumnName != "" && !bq.conf.LastQueryTime.IsZero() {
-		// Create the WHERE clause
-		whereClause := fmt.Sprintf(" WHERE %s > TIMESTAMP \"%s\"",
-			bq.conf.TimestampColumnName,
-			bq.conf.LastQueryTime.Format(time.RFC3339))
+func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
+	q := bq.client.Query(bq.conf.SqlQuery)
 
-		// Check if the query contains an ORDER BY clause
-		if strings.Contains(strings.ToUpper(query), "ORDER BY") {
-			// Split the query into two parts: the SELECT part and the ORDER BY part
-			queryParts := strings.SplitN(query, " ORDER BY ", 2)
-
-			// Insert the WHERE clause between the two parts
-			query = fmt.Sprintf("%s%s ORDER BY %s", queryParts[0], whereClause, queryParts[1])
-		} else {
-			// If there's no ORDER BY clause, simply append the WHERE clause at the end
-			query += whereClause
-		}
-	}
-
-	q := bq.client.Query(query)
-	it, err := q.Read(bq.ctx)
+	// Pass the context to the Read method
+	it, err := q.Read(ctx)
 	if err != nil {
 		return err
 	}
 
 	tableRef := bq.client.DatasetInProject(bq.conf.ProjectId, bq.conf.DatasetName).Table(bq.conf.TableName)
-	meta, err := tableRef.Metadata(bq.ctx)
 
+	// Pass the context to the Metadata method
+	meta, err := tableRef.Metadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -149,6 +139,14 @@ func (bq *BigQueryAdapter) lookupAndSend() error {
 
 	for {
 		var row []bigquery.Value
+
+		// Check the context's Done channel before calling Next
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		err = it.Next(&row)
 		if errors.Is(err, iterator.Done) {
 			break
@@ -157,7 +155,7 @@ func (bq *BigQueryAdapter) lookupAndSend() error {
 			return err
 		}
 
-		// convert response to json format
+		// Convert response to json format
 		rowMap := make(map[string]interface{})
 		for i, col := range row {
 			rowMap[schema[i].Name] = col // use column name to form json object
@@ -166,6 +164,13 @@ func (bq *BigQueryAdapter) lookupAndSend() error {
 		msg := &protocol.DataMessage{
 			JsonPayload: rowMap,
 			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+		}
+
+		// Check the context's Done channel before calling Ship
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default: // continue
 		}
 
 		if err = bq.uspClient.Ship(msg, 10*time.Second); err != nil {
@@ -180,15 +185,12 @@ func (bq *BigQueryAdapter) lookupAndSend() error {
 		}
 	}
 
-	// Update the time of the last query
-	bq.conf.LastQueryTime = time.Now()
-
 	return nil
 }
 
 func (bq *BigQueryAdapter) Close() error {
 	bq.conf.ClientOptions.DebugLog("closing")
-	atomic.StoreUint32(&bq.isStop, 1)
+	bq.cancel() // cancel the context
 	bq.wg.Wait()
 	bq.client.Close()
 	err1 := bq.uspClient.Drain(1 * time.Minute)
