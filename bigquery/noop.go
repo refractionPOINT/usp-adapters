@@ -11,6 +11,14 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 	return nil, nil, errors.New("BigQuery is not supported on AIX")
 }
 
-func (a *BigQueryAdapter) Close() error {
+func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
+	return nil
+}
+
+func (bq *BigQueryAdapter) Close() error {
+	return nil
+}
+
+func (bq *BigQueryConfig) Validate() error {
 	return nil
 }
