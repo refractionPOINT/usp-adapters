@@ -5,37 +5,15 @@ package usp_bigquery
 
 import "errors"
 
+// Dummy noop file to build when the platform
+// is _not_ supported.
+
 type BigQueryAdapter struct{}
 
 func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
-	return nil, nil, errors.New("BigQuery is not supported on AIX")
+	return nil, nil, errors.New("bigquery collection not supported on this platform")
 }
 
-func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
+func (a *BigQueryAdapter) Close() error {
 	return nil
-}
-
-func (bq *BigQueryAdapter) Close() error {
-	return nil
-}
-
-func (bq *BigQueryConfig) Validate() error {
-	return nil
-}
-
-// everything past this point pulled from socket_conn
-
-var zeroTime time.Time
-
-type socketConn struct {
-	Conn   net.Conn
-	buffer [1024]byte
-}
-
-func (sc *socketConn) read0() error {
-	return errors.New("function read0 is not available on AIX")
-}
-
-func (sc *socketConn) checkConn() error {
-	return errors.New("function checkConn is not available on AIX")
 }

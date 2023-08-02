@@ -1,3 +1,6 @@
+//go:build windows || darwin || linux || solaris || netbsd || openbsd || freebsd
+// +build windows darwin linux solaris netbsd openbsd freebsd
+
 package usp_bigquery
 
 import (
@@ -25,17 +28,6 @@ type BigQueryAdapter struct {
 	uspClient *uspclient.Client
 	ctx       context.Context
 	cancel    context.CancelFunc
-}
-
-type BigQueryConfig struct {
-	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ProjectId           string                  `json:"project_id" yaml:"project_id"`
-	DatasetName         string                  `json:"dataset_name" yaml:"dataset_name"`
-	TableName           string                  `json:"table_name" yaml:"table_name"`
-	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
-	SqlQuery            string                  `json:"sql_query" yaml:"sql_query"`
-	QueryInterval       string                  `json:"query_interval" yaml:"query_interval"`
-	IsOneTimeLoad       bool                    `json:"is_one_time_load" yaml:"is_one_time_load"`
 }
 
 func (bq *BigQueryConfig) Validate() error {
