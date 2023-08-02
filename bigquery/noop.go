@@ -22,3 +22,18 @@ func (bq *BigQueryAdapter) Close() error {
 func (bq *BigQueryConfig) Validate() error {
 	return nil
 }
+
+var zeroTime time.Time
+
+type socketConn struct {
+	Conn   net.Conn
+	buffer [1024]byte
+}
+
+func (sc *socketConn) read0() error {
+	return errors.New("function read0 is not available on AIX")
+}
+
+func (sc *socketConn) checkConn() error {
+	return errors.New("function checkConn is not available on AIX")
+}
