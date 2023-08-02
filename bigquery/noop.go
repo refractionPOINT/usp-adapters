@@ -23,6 +23,8 @@ func (bq *BigQueryConfig) Validate() error {
 	return nil
 }
 
+// everything past this point pulled from socket_conn
+
 var zeroTime time.Time
 
 type socketConn struct {
