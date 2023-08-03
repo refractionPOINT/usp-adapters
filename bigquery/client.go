@@ -117,8 +117,6 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 
 func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 	q := bq.client.Query(bq.conf.SqlQuery)
-
-	// Pass the context to the Read method
 	it, err := q.Read(ctx)
 	if err != nil {
 		return err
@@ -132,9 +130,7 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 	}
 	schema := meta.Schema
 
-	rowsChan := make(chan []bigquery.Value, 5000)
-	errChan := make(chan error)
-
+	errChan, rowsChan := make(chan error), make(chan []bigquery.Value, 5000)
 	go func() {
 		defer close(rowsChan)
 		for {
