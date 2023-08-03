@@ -172,6 +172,8 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	var chRunning chan struct{}
 	var err error
 
+	fmt.Println("this is method name ", method)
+
 	if method == "syslog" {
 		configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
 		configs.Syslog.ClientOptions.Architecture = "usp_adapter"
@@ -263,8 +265,8 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		printConfig(method, configs.K8sPods)
 		client, chRunning, err = usp_k8s_pods.NewK8sPodsAdapter(configs.K8sPods)
 	} else if method == "bigquery" {
-		configs.K8sPods.ClientOptions = applyLogging(configs.BigQuery.ClientOptions)
-		configs.K8sPods.ClientOptions.Architecture = "usp_adapter"
+		configs.BigQuery.ClientOptions = applyLogging(configs.BigQuery.ClientOptions)
+		configs.BigQuery.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.BigQuery)
 		client, chRunning, err = usp_bigquery.NewBigQueryAdapter(configs.BigQuery)
 

@@ -34,6 +34,10 @@ func (bq *BigQueryConfig) Validate() error {
 	if bq.ProjectId == "" {
 		return errors.New("missing project_id")
 	}
+	// this will usually be th same as projectID but could be different if using outside project dataset such as a public data set
+	if bq.BigQueryProject == "" {
+		return errors.New("missing bigquery project name")
+	}
 	if bq.DatasetName == "" {
 		return errors.New("missing dataset_name")
 	}
@@ -120,7 +124,7 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 		return err
 	}
 
-	tableRef := bq.client.DatasetInProject(bq.conf.ProjectId, bq.conf.DatasetName).Table(bq.conf.TableName)
+	tableRef := bq.client.DatasetInProject(bq.conf.BigQueryProject, bq.conf.DatasetName).Table(bq.conf.TableName)
 
 	// Pass the context to the Metadata method
 	meta, err := tableRef.Metadata(ctx)

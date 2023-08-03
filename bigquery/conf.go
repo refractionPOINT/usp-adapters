@@ -7,6 +7,7 @@ import (
 type BigQueryConfig struct {
 	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ProjectId           string                  `json:"project_id" yaml:"project_id"`
+	BigQueryProject     string                  `json:"bigquery_project" yaml:"bigquery_project"`
 	DatasetName         string                  `json:"dataset_name" yaml:"dataset_name"`
 	TableName           string                  `json:"table_name" yaml:"table_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
