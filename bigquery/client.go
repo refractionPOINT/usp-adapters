@@ -124,64 +124,84 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 		return err
 	}
 
+	// used for accessing column names
 	tableRef := bq.client.DatasetInProject(bq.conf.BigQueryProject, bq.conf.DatasetName).Table(bq.conf.TableName)
-
-	// Pass the context to the Metadata method
 	meta, err := tableRef.Metadata(ctx)
 	if err != nil {
 		return err
 	}
 	schema := meta.Schema
 
-	for {
-		var row []bigquery.Value
+	rowsChan := make(chan []bigquery.Value, 5000)
+	errChan := make(chan error)
 
-		// Check the context's Done channel before calling Next
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
+	go func() {
+		defer close(rowsChan)
+		for {
+			var row []bigquery.Value
 
-		err = it.Next(&row)
-		if errors.Is(err, iterator.Done) {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		// Convert response to json format
-		rowMap := make(map[string]interface{})
-		for i, col := range row {
-			rowMap[schema[i].Name] = col // use column name to form json object
-		}
-
-		msg := &protocol.DataMessage{
-			JsonPayload: rowMap,
-			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-		}
-
-		// Check the context's Done channel before calling Ship
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default: // continue
-		}
-
-		if err = bq.uspClient.Ship(msg, 10*time.Second); err != nil {
-			if errors.Is(err, uspclient.ErrorBufferFull) {
-				bq.conf.ClientOptions.OnWarning("stream falling behind")
-				err = bq.uspClient.Ship(msg, 1*time.Hour)
+			err = it.Next(&row)
+			if errors.Is(err, iterator.Done) {
+				break
 			}
 			if err != nil {
-				bq.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
-				return err
+				errChan <- err
+				return
+			}
+
+			select {
+			case rowsChan <- row:
+			case <-ctx.Done():
+				return
 			}
 		}
+	}()
+
+	doneChan := make(chan struct{})
+	go func() {
+		defer close(doneChan)
+		for row := range rowsChan {
+			// Check the context's Done channel before calling Next
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			// Convert response to json format
+			rowMap := make(map[string]interface{})
+			for i, col := range row {
+				rowMap[schema[i].Name] = col // use column name to form json object
+			}
+
+			msg := &protocol.DataMessage{
+				JsonPayload: rowMap,
+				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+			}
+
+			if err = bq.uspClient.Ship(msg, 10*time.Second); err != nil {
+				if errors.Is(err, uspclient.ErrorBufferFull) {
+					bq.conf.ClientOptions.OnWarning("stream falling behind")
+					err = bq.uspClient.Ship(msg, 1*time.Hour)
+				}
+				if err != nil {
+					bq.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
+					errChan <- err
+					return
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-doneChan:
+		return nil
+	case err = <-errChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 
-	return nil
 }
 
 func (bq *BigQueryAdapter) Close() error {
