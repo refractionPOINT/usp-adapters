@@ -172,8 +172,6 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	var chRunning chan struct{}
 	var err error
 
-	fmt.Println("this is method name ", method)
-
 	if method == "syslog" {
 		configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
 		configs.Syslog.ClientOptions.Architecture = "usp_adapter"
