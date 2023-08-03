@@ -101,9 +101,3 @@ require (
 )
 
 replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6
-
-replace github.com/refractionPOINT/go-limacharlie => /home/joshua/lima_code/go-limacharlie
-
-replace github.com/refractionPOINT/go-limacharlie/limacharlie => /home/joshua/lima_code/go-limacharlie/limacharlie
-
-replace github.com/refractionPOINT/go-uspclient => /home/joshua/lima_code/go-uspclient
