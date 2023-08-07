@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"io"
 	"os"
 	"os/signal"
@@ -66,6 +67,7 @@ type GeneralConfigs struct {
 	File          usp_file.FileConfig                `json:"file" yaml:"file"`
 	Evtx          usp_evtx.EVTXConfig                `json:"evtx" yaml:"evtx"`
 	K8sPods       usp_k8s_pods.K8sPodsConfig         `json:"k8s_pods" yaml:"k8s_pods"`
+	BigQuery      usp_bigquery.BigQueryConfig        `json:"bigquery" yaml:"bigquery"`
 }
 
 type AdapterStats struct {
@@ -260,6 +262,12 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.K8sPods.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.K8sPods)
 		client, chRunning, err = usp_k8s_pods.NewK8sPodsAdapter(configs.K8sPods)
+	} else if method == "bigquery" {
+		configs.BigQuery.ClientOptions = applyLogging(configs.BigQuery.ClientOptions)
+		configs.BigQuery.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.BigQuery)
+		client, chRunning, err = usp_bigquery.NewBigQueryAdapter(configs.BigQuery)
+
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
