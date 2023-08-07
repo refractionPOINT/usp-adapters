@@ -172,7 +172,7 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 
 			msg := &protocol.DataMessage{
 				JsonPayload: rowMap,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+				TimestampMs: uint64(time.Now().UnixMilli()),
 			}
 
 			if err = bq.uspClient.Ship(msg, 10*time.Second); err != nil {
