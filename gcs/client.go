@@ -19,6 +19,8 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
+const maxObjectSize = 1024 * 1024 * 100 // 100 MB
+
 type GCSAdapter struct {
 	conf      GCSConfig
 	uspClient *uspclient.Client
@@ -168,11 +170,20 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 		return attrs, nil
 	}, a.conf.ParallelFetch, func(e utils.Element) utils.Element {
 		attrs := e.(*storage.ObjectAttrs)
+		obj := a.bucket.Object(attrs.Name).ReadCompressed(true)
+
+		if attrs.Size > maxObjectSize {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s too large (%d)", attrs.Name, attrs.Size))
+			return &gcsLocalFile{
+				Obj:  obj,
+				Data: nil,
+				Err:  fmt.Errorf("file too large"),
+			}
+		}
 
 		startTime := time.Now().UTC()
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s (%d)", attrs.Name, attrs.Size))
 
-		obj := a.bucket.Object(attrs.Name).ReadCompressed(true)
 		r, err := obj.NewReader(a.ctx)
 		if err != nil {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("gcs.NewReader(): %v", err))

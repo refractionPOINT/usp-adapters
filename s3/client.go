@@ -20,6 +20,8 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
+const maxObjectSize = 1024 * 1024 * 100 // 100 MB
+
 type S3Adapter struct {
 	conf      S3Config
 	uspClient *uspclient.Client
@@ -180,6 +182,15 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		return e, nil
 	}, a.conf.ParallelFetch, func(e utils.Element) utils.Element {
 		item := e.(*s3.Object)
+
+		if *item.Size > maxObjectSize {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s too large (%d)", *item.Key, *item.Size))
+			return &s3LocalFile{
+				Obj:  item,
+				Data: nil,
+				Err:  fmt.Errorf("file too large"),
+			}
+		}
 
 		startTime := time.Now().UTC()
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s (%d)", *item.Key, *item.Size))
