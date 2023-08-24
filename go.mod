@@ -7,7 +7,7 @@ require (
 	cloud.google.com/go/pubsub v1.33.0
 	cloud.google.com/go/storage v1.32.0
 	github.com/Azure/azure-event-hubs-go/v3 v3.6.1
-	github.com/aws/aws-sdk-go v1.44.330
+	github.com/aws/aws-sdk-go v1.44.331
 	github.com/duosecurity/duo_api_golang v0.0.0-20230418202038-096d3306c029
 	github.com/fsnotify/fsnotify v1.6.0
 	github.com/nxadm/tail v1.4.8

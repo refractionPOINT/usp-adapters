@@ -64,10 +64,15 @@ func (c *S3Config) Validate() error {
 }
 
 type s3LocalFile struct {
-	Obj          *s3.Object
+	Obj          *s3Record
 	Data         []byte
 	IsCompressed bool
 	Err          error
+}
+
+type s3Record struct {
+	Key  string
+	Size int64
 }
 
 func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
@@ -179,12 +184,12 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		}
 		e := resp.Contents[nextFileIndex]
 		nextFileIndex++
-		return e, nil
+		return &s3Record{Key: *e.Key, Size: *e.Size}, nil
 	}, a.conf.ParallelFetch, func(e utils.Element) utils.Element {
-		item := e.(*s3.Object)
+		item := e.(*s3Record)
 
-		if *item.Size > maxObjectSize {
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s too large (%d)", *item.Key, *item.Size))
+		if item.Size > maxObjectSize {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s too large (%d)", item.Key, item.Size))
 			return &s3LocalFile{
 				Obj:  item,
 				Data: nil,
@@ -193,13 +198,13 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		}
 
 		startTime := time.Now().UTC()
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s (%d)", *item.Key, *item.Size))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s (%d)", item.Key, item.Size))
 
 		writerAt := aws.NewWriteAtBuffer([]byte{})
 
 		if _, err := a.awsDownloader.Download(writerAt, &s3.GetObjectInput{
 			Bucket: aws.String(a.conf.BucketName),
-			Key:    aws.String(*item.Key),
+			Key:    aws.String(item.Key),
 		}); err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
 			return &s3LocalFile{
@@ -211,11 +216,11 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 
 		isCompressed := false
 
-		if strings.HasSuffix(*item.Key, ".gz") {
+		if strings.HasSuffix(item.Key, ".gz") {
 			isCompressed = true
 		}
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", *item.Key, time.Since(startTime), *item.Size))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", item.Key, time.Since(startTime), item.Size))
 
 		return &s3LocalFile{
 			Obj:          item,
@@ -259,11 +264,11 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		startTime := time.Now().UTC()
 
 		if !a.processEvent(localFile.Data, localFile.IsCompressed) {
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s NOT processed in %v (%d)", *localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s NOT processed in %v (%d)", localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
 			continue
 		}
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s processed in %v (%d)", *localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s processed in %v (%d)", localFile.Obj.Key, time.Since(startTime), localFile.Obj.Size))
 
 		if a.conf.IsOneTimeLoad {
 			// In one time loads we don't delete the contents.
@@ -275,7 +280,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			defer delWg.Done()
 			if _, err = a.awsS3.DeleteObject(&s3.DeleteObjectInput{
 				Bucket: aws.String(a.conf.BucketName),
-				Key:    aws.String(*localFile.Obj.Key),
+				Key:    aws.String(localFile.Obj.Key),
 			}); err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("s3.DeleteObject(): %v", err))
 				// Since we rely on object deletion to prevent re-ingesting
