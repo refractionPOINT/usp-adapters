@@ -30,12 +30,12 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	urls, err := o.GetURLs()
+	connInfo, err := o.GetSiteConnectivityInfo()
 	if err != nil {
 		panic(err)
 	}
 
-	for urlName, url := range urls {
+	for urlName, url := range connInfo.URLs {
 		// Resolve the relevant DNS.
 		recs, err := net.LookupIP(url)
 		if err != nil {
@@ -76,8 +76,17 @@ func main() {
 			fingerprint := md5.Sum(cert.Raw)
 			fmt.Printf("OK    SSL certificate for %q: %s\n", url, hex.EncodeToString(fingerprint[:]))
 			if _, ok := nonRootCA[urlName]; ok {
-				// We don't expect this to be verifiable.
-				fmt.Printf("??    SSL certificate for %q is not verifiable (non-root CA), check manually\n", url)
+				expectedFP, ok := connInfo.Certs[url]
+				if !ok {
+					// We don't expect this to be verifiable.
+					fmt.Printf("??    SSL certificate for %q is not verifiable (non-root CA), check manually\n", url)
+				} else {
+					if expectedFP != hex.EncodeToString(fingerprint[:]) {
+						fmt.Printf("!!    SSL certificate for %q does not match expected fingerprint %s\n", url, fingerprint)
+					} else {
+						fmt.Printf("OK    SSL certificate for %q matches expected fingerprint %s\n", url, fingerprint)
+					}
+				}
 			} else {
 				// Verify the certificate.
 				if _, err := testSSLConnect(url, true); err != nil {

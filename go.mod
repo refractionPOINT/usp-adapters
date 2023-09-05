@@ -13,11 +13,12 @@ require (
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
+	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20230905214132-2e66e8bba492
 	github.com/refractionPOINT/go-uspclient v1.1.0
 	github.com/vmihailenco/msgpack/v5 v5.3.5
 	golang.org/x/oauth2 v0.11.0
 	golang.org/x/sync v0.3.0
-	golang.org/x/sys v0.11.0
+	golang.org/x/sys v0.12.0
 	golang.org/x/text v0.12.0
 	google.golang.org/api v0.138.0
 	gopkg.in/yaml.v2 v2.4.0
@@ -75,7 +76,6 @@ require (
 	github.com/pierrec/lz4/v4 v4.1.18 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
-	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20230824003416-620166461920 // indirect
 	github.com/rs/zerolog v1.30.0 // indirect
 	github.com/stretchr/testify v1.8.4 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
