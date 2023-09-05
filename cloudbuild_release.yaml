@@ -146,7 +146,7 @@ steps:
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
 - name: 'golang:1.20-bullseye'
-  id: build-aixppc64
+  id: build-aixppc64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_aix_ppc64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=aix'
