@@ -74,17 +74,18 @@ func main() {
 		}
 		for _, cert := range certs {
 			fingerprint := md5.Sum(cert.Raw)
-			fmt.Printf("OK    SSL certificate for %q: %s\n", url, hex.EncodeToString(fingerprint[:]))
+			fingerprintStr := hex.EncodeToString(fingerprint[:])
+			fmt.Printf("OK    SSL certificate for %q: %s\n", url, fingerprintStr)
 			if _, ok := nonRootCA[urlName]; ok {
 				expectedFP, ok := connInfo.Certs[url]
 				if !ok {
 					// We don't expect this to be verifiable.
 					fmt.Printf("??    SSL certificate for %q is not verifiable (non-root CA), check manually\n", url)
 				} else {
-					if expectedFP != hex.EncodeToString(fingerprint[:]) {
-						fmt.Printf("!!    SSL certificate for %q does not match expected fingerprint %s\n", url, fingerprint)
+					if expectedFP != fingerprintStr {
+						fmt.Printf("!!    SSL certificate for %q does not match expected fingerprint %s\n", url, fingerprintStr)
 					} else {
-						fmt.Printf("OK    SSL certificate for %q matches expected fingerprint %s\n", url, fingerprint)
+						fmt.Printf("OK    SSL certificate for %q matches expected fingerprint %s\n", url, fingerprintStr)
 					}
 				}
 			} else {
