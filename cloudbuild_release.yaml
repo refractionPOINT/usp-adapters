@@ -104,7 +104,7 @@ steps:
   waitFor: ['get-github-keys']
 - name: 'golang:1.20-bullseye'
   id: build-win64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivityr_windows_64_$TAG_NAME.exe', './containers/connectivity']
+  args: ['go', 'build', '-v', '-o', 'lc_connectivity_windows_64_$TAG_NAME.exe', './containers/connectivity']
   env:
     - 'GOOS=windows'
     - 'GOARCH=amd64'
