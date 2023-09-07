@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"regexp"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ const (
 	pod1container2 = "config-reloader"
 	pod2           = "limacharlie_endpoint-0_hdaadf1d-bbbb-435d-b497-cccc76db1614"
 	pod2container1 = "endpoint"
+	podNot         = "limacharlie_notagoodpod-0_hdaadf1d-bbbb-435d-b497-cccc76db1614"
 )
 
 func TestEngine(t *testing.T) {
@@ -37,6 +39,8 @@ func TestEngine(t *testing.T) {
 		OnError: func(err error) {
 			fmt.Println("ERROR", err)
 		},
+	}, runtimeOptions{
+		excludePods: regexp.MustCompile(`.*notagoodpod.*`),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +69,12 @@ func TestEngine(t *testing.T) {
 			t.Error(err)
 		}
 		time.Sleep(1 * time.Second)
+		if err := os.MkdirAll(path.Join(testDir, podNot, pod2container1), 0755); err != nil {
+			t.Error(err)
+		}
+		if err := os.WriteFile(path.Join(testDir, podNot, pod2container1, "0.log"), []byte("test1\ntest2\ntest3\n"), 0644); err != nil {
+			t.Error(err)
+		}
 		if err := os.WriteFile(path.Join(testDir, pod1, pod1container2, "1.log"), []byte("test4\ntest5\ntest6\n"), 0644); err != nil {
 			t.Error(err)
 		}
