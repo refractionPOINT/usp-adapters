@@ -21,8 +21,9 @@ import (
 var k8sPodPattern = regexp.MustCompile(".+/(.+)_(.+)_(.+)")
 
 type K8sLogProcessor struct {
-	options uspclient.ClientOptions
-	root    string
+	options   uspclient.ClientOptions
+	root      string
+	rtOptions runtimeOptions
 
 	wg     sync.WaitGroup
 	chStop chan struct{}
@@ -52,7 +53,7 @@ type K8sLogLine struct {
 	Line   string    `json:"line" msgpack:"line"`
 }
 
-func NewK8sLogProcessor(root string, cOpt uspclient.ClientOptions) (*K8sLogProcessor, error) {
+func NewK8sLogProcessor(root string, cOpt uspclient.ClientOptions, rtOptions runtimeOptions) (*K8sLogProcessor, error) {
 	klp := &K8sLogProcessor{
 		options:    cOpt,
 		root:       root,
@@ -120,6 +121,15 @@ func (klp *K8sLogProcessor) watchForPods() {
 				klp.options.DebugLog("k8s existing pod name does not match pattern: " + podPath)
 				continue
 			}
+
+			// If user-supplied filters were supplied, apply them here.
+			if klp.rtOptions.includePods != nil && !klp.rtOptions.includePods.MatchString(mtd.Entity.PodName) {
+				continue
+			}
+			if klp.rtOptions.excludePods != nil && klp.rtOptions.excludePods.MatchString(mtd.Entity.PodName) {
+				continue
+			}
+
 			klp.wg.Add(1)
 			go klp.watchPod(mtd)
 		}
@@ -154,6 +164,15 @@ func (klp *K8sLogProcessor) watchForPods() {
 				klp.options.DebugLog("k8s pod name does not match pattern: " + event.Name)
 				continue
 			}
+
+			// If user-supplied filters were supplied, apply them here.
+			if klp.rtOptions.includePods != nil && !klp.rtOptions.includePods.MatchString(mtd.Entity.PodName) {
+				continue
+			}
+			if klp.rtOptions.excludePods != nil && klp.rtOptions.excludePods.MatchString(mtd.Entity.PodName) {
+				continue
+			}
+
 			klp.wg.Add(1)
 			go klp.watchPod(mtd)
 		case err, ok := <-klp.rootWatcher.Errors:

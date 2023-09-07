@@ -6,6 +6,7 @@ package usp_k8s_pods
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"sync"
 	"time"
 
@@ -24,7 +25,14 @@ type K8sPodsAdapter struct {
 	writeTimeout time.Duration
 	wg           sync.WaitGroup
 
+	rtOptions runtimeOptions
+
 	engine *K8sLogProcessor
+}
+
+type runtimeOptions struct {
+	includePods *regexp.Regexp
+	excludePods *regexp.Regexp
 }
 
 func (c *K8sPodsConfig) Validate() error {
@@ -48,12 +56,23 @@ func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, erro
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
+	if a.conf.IncludePodsRE != "" {
+		if a.rtOptions.includePods, err = regexp.Compile(a.conf.IncludePodsRE); err != nil {
+			return nil, nil, fmt.Errorf("include_pods_re: %v", err)
+		}
+	}
+	if a.conf.ExcludePodsRE != "" {
+		if a.rtOptions.excludePods, err = regexp.Compile(a.conf.ExcludePodsRE); err != nil {
+			return nil, nil, fmt.Errorf("exclude_pods_re: %v", err)
+		}
+	}
+
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	a.engine, err = NewK8sLogProcessor(a.conf.Root, a.conf.ClientOptions)
+	a.engine, err = NewK8sLogProcessor(a.conf.Root, a.conf.ClientOptions, a.rtOptions)
 	if err != nil {
 		return nil, nil, err
 	}
