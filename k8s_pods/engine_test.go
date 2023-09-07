@@ -37,7 +37,7 @@ func TestEngine(t *testing.T) {
 		OnError: func(err error) {
 			fmt.Println("ERROR", err)
 		},
-	})
+	}, runtimeOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
