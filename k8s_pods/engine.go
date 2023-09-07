@@ -60,6 +60,7 @@ func NewK8sLogProcessor(root string, cOpt uspclient.ClientOptions, rtOptions run
 		chStop:     make(chan struct{}),
 		chNewFiles: make(chan k8sFileMtd),
 		chLines:    make(chan K8sLogLine),
+		rtOptions:  rtOptions,
 	}
 
 	w, err := fsnotify.NewWatcher()
