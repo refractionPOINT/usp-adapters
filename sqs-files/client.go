@@ -231,7 +231,7 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 
 			bucket := a.conf.Bucket
 			if bucket == "" {
-				bucket, _ = d.GetString(a.conf.BucketPath)
+				bucket = d.FindOneString(a.conf.BucketPath)
 			}
 			filePaths := d.FindString(a.conf.FilePath)
 
