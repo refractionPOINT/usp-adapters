@@ -61,6 +61,8 @@ type SQSFilesConfig struct {
 	ParallelFetch int    `json:"parallel_fetch" yaml:"parallel_fetch"`
 	BucketPath    string `json:"bucket_path,omitempty" yaml:"bucket_path,omitempty"`
 	FilePath      string `json:"file_path,omitempty" yaml:"file_path,omitempty"`
+	// Optional: alternative to BucketPath
+	Bucket string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
 }
 
 type fileInfo struct {
@@ -209,20 +211,28 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 			return err
 		}
 		delRequest := &sqs.DeleteMessageBatchInput{
-			Entries:  make([]*sqs.DeleteMessageBatchRequestEntry, len(result.Messages)),
+			Entries:  make([]*sqs.DeleteMessageBatchRequestEntry, 0, len(result.Messages)),
 			QueueUrl: &a.conf.QueueURL,
 		}
 		if len(result.Messages) == 0 {
 			continue
 		}
-		for i, msg := range result.Messages {
+		for _, msg := range result.Messages {
+			delRequest.Entries = append(delRequest.Entries, &sqs.DeleteMessageBatchRequestEntry{
+				Id:            msg.MessageId,
+				ReceiptHandle: msg.ReceiptHandle,
+			})
+
 			d := utils.Dict{}
 			if err := json.Unmarshal([]byte(*msg.Body), &d); err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.Message.Json: %v", err))
-				return err
+				continue
 			}
 
-			bucket, _ := d.GetString(a.conf.BucketPath)
+			bucket := a.conf.Bucket
+			if bucket == "" {
+				bucket, _ = d.GetString(a.conf.BucketPath)
+			}
 			filePaths := d.FindString(a.conf.FilePath)
 
 			if bucket == "" {
@@ -234,7 +244,7 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 			}
 			if err := a.initS3SDKs(bucket); err != nil {
 				a.conf.ClientOptions.OnError(err)
-				continue
+				return err
 			}
 
 			for _, p := range filePaths {
@@ -243,10 +253,7 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 					path:   p,
 				}
 			}
-			delRequest.Entries[i] = &sqs.DeleteMessageBatchRequestEntry{
-				Id:            msg.MessageId,
-				ReceiptHandle: msg.ReceiptHandle,
-			}
+
 		}
 		delRes, err := a.sqsClient.DeleteMessageBatch(delRequest)
 		if err != nil {
