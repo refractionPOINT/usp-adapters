@@ -89,6 +89,7 @@ func (a *SimulatorAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	a.dataReader.Close()
+	a.wg.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := a.uspClient.Close()
 
