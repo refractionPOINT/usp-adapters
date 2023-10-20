@@ -16,6 +16,7 @@ import (
 
 const (
 	defaultWriteTimeout = 60 * 10
+	sleepDelta          = 1 * time.Second
 )
 
 type SimulatorAdapter struct {
@@ -167,7 +168,16 @@ func (a *SimulatorAdapter) replayTimedEvent(line []byte) bool {
 	now := time.Now().UnixMilli()
 	clockDelta := now - a.lastSentTime
 	if clockDelta < evtDelta {
-		time.Sleep(time.Duration(evtDelta-clockDelta) * time.Millisecond)
+		totalSleep := time.Duration(evtDelta-clockDelta) * time.Millisecond
+		for atomic.LoadUint32(&a.isRunning) == 1 && totalSleep != 0 {
+			if totalSleep > sleepDelta {
+				time.Sleep(sleepDelta)
+				totalSleep -= sleepDelta
+			} else {
+				time.Sleep(totalSleep)
+				totalSleep = 0
+			}
+		}
 	}
 	a.lastEventTime = evt.Routing.EventTime
 	a.lastSentTime = now
