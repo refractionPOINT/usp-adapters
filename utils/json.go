@@ -278,6 +278,11 @@ func (d Dict) FindString(path string) []string {
 	return e(d)
 }
 
+func (d Dict) ExapandableFindString(path string) []string {
+	e := MakeExpandableExtractorForString(path, true)
+	return e(d)
+}
+
 func (d Dict) FindInt(path string) []uint64 {
 	e := MakeExtractorForInt(path)
 	return e(d)
@@ -369,6 +374,17 @@ func (d *Dict) UnmarshalJSON(data []byte) error {
 
 func findElem(o interface{}, tokens []string, isWildcardDepth bool, isAutoExpand bool) []interface{} {
 	var results []interface{}
+
+	// If we're not done the path tokens, and we're dealing with a string
+	// and isAutoExpand is True, then attempt to parse the JSON string.
+	if len(tokens) != 0 && isAutoExpand {
+		if s, ok := o.(string); ok {
+			if err := json.Unmarshal([]byte(s), &o); err != nil {
+				return []interface{}{}
+			}
+		}
+	}
+
 	if len(tokens) == 0 {
 		if isWildcardDepth {
 			if dict := effectiveDict(o); dict != nil {
@@ -501,7 +517,7 @@ func MakeExpandableExtractorForString(path string, isAutoExpand bool) StringExtr
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []string {
 		var values []string
-		for _, v := range findElem(evt, tokenizedPath, false, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, isAutoExpand) {
 			if i, ok := v.(string); ok {
 				values = append(values, i)
 			}
@@ -522,7 +538,7 @@ func MakeExpandableExtractorForInt(path string, isAutoExpand bool) IntExtractor 
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []uint64 {
 		var values []uint64
-		for _, v := range findElem(evt, tokenizedPath, false, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, isAutoExpand) {
 			if i, ok := StandardInt(v); ok {
 				values = append(values, i)
 			}
@@ -543,7 +559,7 @@ func MakeExpandableExtractorForBool(path string, isAutoExpand bool) BoolExtracto
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []bool {
 		var values []bool
-		for _, v := range findElem(evt, tokenizedPath, false, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, isAutoExpand) {
 			if i, ok := v.(bool); ok {
 				values = append(values, i)
 			}
@@ -564,7 +580,7 @@ func MakeExpandableExtractorForOpaque(path string, isAutoExpand bool) OpaqueExtr
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []interface{} {
 		var values []interface{}
-		for _, v := range findElem(evt, tokenizedPath, false, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, isAutoExpand) {
 			values = append(values, v)
 		}
 		return values
@@ -583,7 +599,7 @@ func MakeExpandableExtractorForDict(path string, isAutoExpand bool) DictExtracto
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []Dict {
 		var values []Dict
-		for _, v := range findElem(evt, tokenizedPath, false, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, isAutoExpand) {
 			d, ok := v.(Dict)
 			if !ok {
 				d, ok = v.(map[string]interface{})
@@ -609,7 +625,7 @@ func MakeExpandableExtractorForList(path string, isAutoExpand bool) ListExtracto
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []List {
 		var values []List
-		for _, v := range findElem(evt, tokenizedPath, false, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, isAutoExpand) {
 			d, ok := v.(List)
 			if !ok {
 				d, ok = v.([]interface{})
