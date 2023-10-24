@@ -220,15 +220,15 @@ func (d Dict) GetListOfString(k string) ([]string, bool) {
 		}
 		return nil, false
 	}
-	s := make([]string, len(l), len(l))
+	s := make([]string, 0, len(l))
 	isWrongType := false
-	for i, v := range l {
+	for _, v := range l {
 		t, ok := v.(string)
 		if !ok {
 			isWrongType = true
 			break
 		}
-		s[i] = t
+		s = append(s, t)
 	}
 	return s, !isWrongType
 }
@@ -278,7 +278,7 @@ func (d Dict) FindString(path string) []string {
 	return e(d)
 }
 
-func (d Dict) ExapandableFindString(path string) []string {
+func (d Dict) ExpandableFindString(path string) []string {
 	e := MakeExpandableExtractorForString(path, true)
 	return e(d)
 }
@@ -310,6 +310,15 @@ func (d Dict) FindList(path string) []List {
 
 func (d Dict) FindOneString(path string) string {
 	e := MakeExtractorForString(path)
+	v := e(d)
+	if len(v) == 0 {
+		return ""
+	}
+	return v[0]
+}
+
+func (d Dict) ExpandableFindOneString(path string) string {
+	e := MakeExpandableExtractorForString(path, true)
 	v := e(d)
 	if len(v) == 0 {
 		return ""
