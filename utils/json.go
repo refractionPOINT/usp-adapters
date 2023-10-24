@@ -27,6 +27,17 @@ func effectiveDict(d interface{}) Dict {
 	if ok {
 		return r
 	}
+	if t, ok := d.(map[interface{}]interface{}); ok {
+		r := make(map[string]interface{}, len(t))
+		for k, v := range t {
+			s, ok := k.(string)
+			if !ok {
+				return nil
+			}
+			r[s] = v
+		}
+		return r
+	}
 	return nil
 }
 
@@ -179,18 +190,17 @@ func (d Dict) GetListOfDict(k string) ([]Dict, bool) {
 		}
 		return nil, false
 	}
-	s := make([]Dict, len(l), len(l))
+	s := make([]Dict, 0, len(l))
 	isWrongType := false
-	for i, v := range l {
+	for _, v := range l {
 		t, ok := v.(Dict)
 		if !ok {
-			t, ok = v.(map[string]interface{})
-			if !ok {
+			if t = effectiveDict(v); t == nil {
 				isWrongType = true
 				break
 			}
 		}
-		s[i] = t
+		s = append(s, t)
 	}
 	return s, !isWrongType
 }
@@ -404,6 +414,9 @@ func findElem(o interface{}, tokens []string, isWildcardDepth bool, isAutoExpand
 				}
 			}
 		} else {
+			if curToken == "*" || curToken == "?" {
+				tokens = tokens[1:]
+			}
 			for _, elem := range list {
 				results = append(results, findElem(elem, tokens, isWildcardDepth, isAutoExpand)...)
 			}
