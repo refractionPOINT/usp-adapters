@@ -357,17 +357,17 @@ func (d *Dict) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func findElem(o interface{}, tokens []string, isWildcardDepth bool) []interface{} {
+func findElem(o interface{}, tokens []string, isWildcardDepth bool, isAutoExpand bool) []interface{} {
 	var results []interface{}
 	if len(tokens) == 0 {
 		if isWildcardDepth {
 			if dict := effectiveDict(o); dict != nil {
 				for _, v := range dict {
-					results = append(results, findElem(v, tokens[:], isWildcardDepth)...)
+					results = append(results, findElem(v, tokens[:], isWildcardDepth, isAutoExpand)...)
 				}
 			} else if list := effectiveList(o); list != nil {
 				for _, elem := range list {
-					results = append(results, findElem(elem, tokens[:], isWildcardDepth)...)
+					results = append(results, findElem(elem, tokens[:], isWildcardDepth, isAutoExpand)...)
 				}
 			} else {
 				return []interface{}{o}
@@ -380,32 +380,32 @@ func findElem(o interface{}, tokens []string, isWildcardDepth bool) []interface{
 	curToken := tokens[0]
 	if dict := effectiveDict(o); dict != nil {
 		if curToken == "*" {
-			results = findElem(o, tokens[1:], true)
+			results = findElem(o, tokens[1:], true, isAutoExpand)
 		} else if curToken == "?" {
 			for _, v := range dict {
-				results = append(results, findElem(v, tokens[1:], false)...)
+				results = append(results, findElem(v, tokens[1:], false, isAutoExpand)...)
 			}
 		} else if v, ok := dict[curToken]; ok {
-			results = append(results, findElem(v, tokens[1:], false)...)
+			results = append(results, findElem(v, tokens[1:], false, isAutoExpand)...)
 		}
 
 		if isWildcardDepth {
 			tmpTokens := make([]string, len(tokens))
 			copy(tmpTokens, tokens)
 			for _, v := range dict {
-				results = append(results, findElem(v, tmpTokens, true)...)
+				results = append(results, findElem(v, tmpTokens, true, isAutoExpand)...)
 			}
 		}
 	} else if list := effectiveList(o); list != nil {
 		if strings.HasPrefix(curToken, "[") && strings.HasSuffix(curToken, "]") {
 			if listIndex, err := strconv.Atoi(curToken[1 : len(curToken)-1]); err == nil {
 				if listIndex < len(list) && listIndex >= 0 {
-					results = append(results, findElem(list[listIndex], tokens[1:], isWildcardDepth)...)
+					results = append(results, findElem(list[listIndex], tokens[1:], isWildcardDepth, isAutoExpand)...)
 				}
 			}
 		} else {
 			for _, elem := range list {
-				results = append(results, findElem(elem, tokens, isWildcardDepth)...)
+				results = append(results, findElem(elem, tokens, isWildcardDepth, isAutoExpand)...)
 			}
 		}
 	}
@@ -481,10 +481,14 @@ func tokenizePath(path string) []string {
 type StringExtractor func(evt Dict) []string
 
 func MakeExtractorForString(path string) StringExtractor {
+	return MakeExpandableExtractorForString(path, false)
+}
+
+func MakeExpandableExtractorForString(path string, isAutoExpand bool) StringExtractor {
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []string {
 		var values []string
-		for _, v := range findElem(evt, tokenizedPath, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, false) {
 			if i, ok := v.(string); ok {
 				values = append(values, i)
 			}
@@ -498,10 +502,14 @@ func MakeExtractorForString(path string) StringExtractor {
 type IntExtractor func(evt Dict) []uint64
 
 func MakeExtractorForInt(path string) IntExtractor {
+	return MakeExpandableExtractorForInt(path, false)
+}
+
+func MakeExpandableExtractorForInt(path string, isAutoExpand bool) IntExtractor {
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []uint64 {
 		var values []uint64
-		for _, v := range findElem(evt, tokenizedPath, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, false) {
 			if i, ok := StandardInt(v); ok {
 				values = append(values, i)
 			}
@@ -515,10 +523,14 @@ func MakeExtractorForInt(path string) IntExtractor {
 type BoolExtractor func(evt Dict) []bool
 
 func MakeExtractorForBool(path string) BoolExtractor {
+	return MakeExpandableExtractorForBool(path, false)
+}
+
+func MakeExpandableExtractorForBool(path string, isAutoExpand bool) BoolExtractor {
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []bool {
 		var values []bool
-		for _, v := range findElem(evt, tokenizedPath, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, false) {
 			if i, ok := v.(bool); ok {
 				values = append(values, i)
 			}
@@ -532,10 +544,14 @@ func MakeExtractorForBool(path string) BoolExtractor {
 type OpaqueExtractor func(evt Dict) []interface{}
 
 func MakeExtractorForOpaque(path string) OpaqueExtractor {
+	return MakeExpandableExtractorForOpaque(path, false)
+}
+
+func MakeExpandableExtractorForOpaque(path string, isAutoExpand bool) OpaqueExtractor {
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []interface{} {
 		var values []interface{}
-		for _, v := range findElem(evt, tokenizedPath, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, false) {
 			values = append(values, v)
 		}
 		return values
@@ -547,10 +563,14 @@ func MakeExtractorForOpaque(path string) OpaqueExtractor {
 type DictExtractor func(evt Dict) []Dict
 
 func MakeExtractorForDict(path string) DictExtractor {
+	return MakeExpandableExtractorForDict(path, false)
+}
+
+func MakeExpandableExtractorForDict(path string, isAutoExpand bool) DictExtractor {
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []Dict {
 		var values []Dict
-		for _, v := range findElem(evt, tokenizedPath, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, false) {
 			d, ok := v.(Dict)
 			if !ok {
 				d, ok = v.(map[string]interface{})
@@ -569,10 +589,14 @@ func MakeExtractorForDict(path string) DictExtractor {
 type ListExtractor func(evt Dict) []List
 
 func MakeExtractorForList(path string) ListExtractor {
+	return MakeExpandableExtractorForList(path, false)
+}
+
+func MakeExpandableExtractorForList(path string, isAutoExpand bool) ListExtractor {
 	tokenizedPath := tokenizePath(path)
 	return func(evt Dict) []List {
 		var values []List
-		for _, v := range findElem(evt, tokenizedPath, false) {
+		for _, v := range findElem(evt, tokenizedPath, false, false) {
 			d, ok := v.(List)
 			if !ok {
 				d, ok = v.([]interface{})
