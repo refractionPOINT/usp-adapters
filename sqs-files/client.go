@@ -231,9 +231,9 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 
 			bucket := a.conf.Bucket
 			if bucket == "" {
-				bucket = d.FindOneString(a.conf.BucketPath)
+				bucket = d.ExpandableFindOneString(a.conf.BucketPath)
 			}
-			filePaths := d.FindString(a.conf.FilePath)
+			filePaths := d.ExpandableFindString(a.conf.FilePath)
 
 			if bucket == "" {
 				a.conf.ClientOptions.OnError(errors.New("sqsClient.Message: missing bucket"))
