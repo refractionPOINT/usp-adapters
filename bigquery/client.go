@@ -100,7 +100,11 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 
 		for {
 			err = bq.lookupAndSend(bq.ctx)
-			if err != nil || bq.conf.IsOneTimeLoad {
+			if err != nil {
+				bq.conf.ClientOptions.OnError(fmt.Errorf("bigquery error: %v", err))
+				return
+			}
+			if bq.conf.IsOneTimeLoad {
 				return
 			}
 
