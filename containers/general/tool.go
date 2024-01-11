@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"io"
 	"os"
 	"os/signal"
@@ -13,6 +12,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
@@ -28,6 +29,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
+	"github.com/refractionPOINT/usp-adapters/sophos"
 	"github.com/refractionPOINT/usp-adapters/sqs"
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
@@ -55,6 +57,7 @@ type GeneralConfigs struct {
 	Stdin         usp_stdin.StdinConfig              `json:"stdin" yaml:"stdin"`
 	OnePassword   usp_1password.OnePasswordConfig    `json:"1password" yaml:"1password"`
 	ITGlue        usp_itglue.ITGlueConfig            `json:"itglue" yaml:"itglue"`
+	Sophos        usp_sophos.SophosConfig            `json:"sophos" yaml:"sophos"`
 	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
@@ -207,6 +210,11 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.ITGlue.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.ITGlue)
 		client, chRunning, err = usp_itglue.NewITGlueAdapter(configs.ITGlue)
+	} else if method == "sophos" {
+		configs.Sophos.ClientOptions = applyLogging(configs.Sophos.ClientOptions)
+		configs.Sophos.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Sophos)
+		client, chRunning, err = usp_sophos.NewSophosAdapter(configs.Sophos)
 	} else if method == "office365" {
 		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
 		configs.Office365.ClientOptions.Architecture = "usp_adapter"
@@ -402,3 +410,4 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
+
