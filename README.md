@@ -50,6 +50,30 @@ Data sent via USP can be formatted in many different ways. Data is processed in 
 1. The various "extractors" defined, like `EventTypePath`, `EventTimePath`, `SensorHostnamePath` and `SensorKeyPath`.
 1. Custom `Mappings` directives provided by the client.
 
+## Building a New Adapter Type
+
+Is there an API or data source we don't officially support yet that you'd like to see? You can build one! 
+
+1. Modify `containers/general/tool.go` with the new adapter type you wish to add.
+2. Add your adapter files (ex: `itglue/client.go`)
+3. Format
+   ```
+   go fmt mynewsensor/client.go
+   ```
+4. Build
+   ```
+   go build ./containers/general
+   ```
+5. Test  
+
+   `param1` and `param2` represent any additional variables you need in your adapter (such as API keys, etc).
+   ```
+   chmod +x mynewsensor
+   ./general mynewsensor client_options.identity.installation_key=$INSTALLATION_KEY client_options.identity.oid=$OID client_options.platform=json client_options.sensor_seed_key=mynewsensor param1=$param1 param2=$param2 
+   ```
+6. You should see a new sensor in your LimaCharlie org if successful
+7. Submit a PR
+
 
 ## Examples
 
