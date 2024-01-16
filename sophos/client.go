@@ -183,7 +183,7 @@ func (a *SophosAdapter) getJwt() string {
 		//	a.conf.ClientOptions.DebugLog(fmt.Sprintf("response: %s", body))
 		//	a.conf.ClientOptions.DebugLog(fmt.Sprintf("error code: %s", resp.StatusCode))
 
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf("sophos api non-200: %s\nRESPONSE: %s", resp.Status, string(body)))
+		a.conf.ClientOptions.OnError(fmt.Errorf("sophos api non-200: %s\nRESPONSE: %s", resp.Status, string(body)))
 		return ""
 	}
 
@@ -253,7 +253,7 @@ func (a *SophosAdapter) makeOneRequest(url string, lastCursor string, has_more s
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response: %s", body))
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("error code: %s", resp.StatusCode))
 
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf("sophos api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
+		a.conf.ClientOptions.OnError(fmt.Errorf("sophos api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
 		return nil, lastCursor, has_more
 	}
 
