@@ -25,6 +25,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/o365"
+        "github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/simulator"
@@ -58,6 +59,7 @@ type GeneralConfigs struct {
 	OnePassword   usp_1password.OnePasswordConfig    `json:"1password" yaml:"1password"`
 	ITGlue        usp_itglue.ITGlueConfig            `json:"itglue" yaml:"itglue"`
 	Sophos        usp_sophos.SophosConfig            `json:"sophos" yaml:"sophos"`
+        Okta          usp_okta.OktaConfig                `json:"okta" yaml:"okta"`
 	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
@@ -215,6 +217,11 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.Sophos.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Sophos)
 		client, chRunning, err = usp_sophos.NewSophosAdapter(configs.Sophos)
+        } else if method == "okta" {
+                configs.Okta.ClientOptions = applyLogging(configs.Okta.ClientOptions)
+                configs.Okta.ClientOptions.Architecture = "usp_adapter"
+                printConfig(method, configs.Okta)      
+                client, chRunning, err = usp_okta.NewOktaAdapter(configs.Okta)
 	} else if method == "office365" {
 		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
 		configs.Office365.ClientOptions.Architecture = "usp_adapter"
