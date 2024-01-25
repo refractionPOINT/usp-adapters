@@ -111,10 +111,12 @@ func (a *OktaAdapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
+	lastTimestamp := ""
 	for !a.doStop.WaitFor(30 * time.Second) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
-		items := a.makeOneRequest(url)
+		items, timestamp := a.makeOneRequest(url, lastTimestamp)
+		lastTimestamp = timestamp
 		if items == nil {
 			continue
 		}
@@ -140,14 +142,14 @@ func (a *OktaAdapter) fetchEvents(url string) {
 	}
 }
 
-func (a *OktaAdapter) makeOneRequest(url string) []utils.Dict {
+func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string) ([]utils.Dict, string) {
 
 	// Prepare the request body.
 	reqData := opRequest{}
 	b, err := json.Marshal(reqData)
 	if err != nil {
 		a.doStop.Set()
-		return nil
+		return nil, ""
 	}
 
 	// Get request timestamp
@@ -158,9 +160,13 @@ func (a *OktaAdapter) makeOneRequest(url string) []utils.Dict {
 	// Prepare the request.
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?since=%s&until=%s", a.conf.URL, url, thirtySecondsAgo, until), nil)
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s until %s", a.conf.URL, url, thirtySecondsAgo, until))
+	if lastTimestamp != "" {
+		req, err = http.NewRequest("GET", fmt.Sprintf("%s%s?since=%s&until=%s", a.conf.URL, url, lastTimestamp, until), nil)
+		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s until %s", a.conf.URL, url, lastTimestamp, until))
+	}
 	if err != nil {
 		a.doStop.Set()
-		return nil
+		return nil, ""
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("SSWS %s", a.conf.ApiKey))
@@ -171,7 +177,7 @@ func (a *OktaAdapter) makeOneRequest(url string) []utils.Dict {
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-		return nil
+		return nil, ""
 	}
 	defer resp.Body.Close()
 
@@ -182,7 +188,7 @@ func (a *OktaAdapter) makeOneRequest(url string) []utils.Dict {
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("error code: %s", resp.StatusCode))
 
 		a.conf.ClientOptions.OnError(fmt.Errorf("okta api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
-		return nil
+		return nil, ""
 	}
 
 	body, _ := ioutil.ReadAll(resp.Body)
@@ -198,7 +204,13 @@ func (a *OktaAdapter) makeOneRequest(url string) []utils.Dict {
 	// Report if a cursor was returned
 	// as well as the items.
 	items := data
-	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", data))
 
-	return items
+	timestamp := ""
+	for _, item := range items {
+		timestamp = item["published"].(string)
+	}
+	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", data))
+	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", timestamp))
+
+	return items, timestamp
 }
