@@ -135,5 +135,5 @@ steps:
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
 options:
-  machineType: 'N1_HIGHCPU_8'
-timeout: 15m
+  machineType: 'N1_HIGHCPU_32'
+timeout: 30m
