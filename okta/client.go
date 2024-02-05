@@ -112,11 +112,13 @@ func (a *OktaAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastTimestamp := ""
+	lastEventid := ""
 	for !a.doStop.WaitFor(30 * time.Second) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
-		items, timestamp := a.makeOneRequest(url, lastTimestamp)
+		items, timestamp, eventid := a.makeOneRequest(url, lastTimestamp, lastEventid)
 		lastTimestamp = timestamp
+		lastEventid = eventid
 		if items == nil {
 			continue
 		}
@@ -142,14 +144,14 @@ func (a *OktaAdapter) fetchEvents(url string) {
 	}
 }
 
-func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string) ([]utils.Dict, string) {
+func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string, lastEventid string) ([]utils.Dict, string, string) {
 
 	// Prepare the request body.
 	reqData := opRequest{}
 	b, err := json.Marshal(reqData)
 	if err != nil {
 		a.doStop.Set()
-		return nil, ""
+		return nil, "", ""
 	}
 
 	// Get request timestamp
@@ -166,7 +168,7 @@ func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string) ([]utils.
 	}
 	if err != nil {
 		a.doStop.Set()
-		return nil, ""
+		return nil, "", ""
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("SSWS %s", a.conf.ApiKey))
@@ -177,7 +179,7 @@ func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string) ([]utils.
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-		return nil, ""
+		return nil, "", ""
 	}
 	defer resp.Body.Close()
 
@@ -188,7 +190,7 @@ func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string) ([]utils.
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("error code: %s", resp.StatusCode))
 
 		a.conf.ClientOptions.OnError(fmt.Errorf("okta api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
-		return nil, ""
+		return nil, "", ""
 	}
 
 	body, _ := ioutil.ReadAll(resp.Body)
@@ -206,11 +208,18 @@ func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string) ([]utils.
 	items := data
 
 	timestamp := ""
+	eventid := ""
+	var newItems []utils.Dict
+
 	for _, item := range items {
 		timestamp = item["published"].(string)
+		eventid = item["uuid"].(string)
+		if eventid != lastEventid {
+			newItems = append(newItems, item)
+		}
 	}
-	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", data))
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", newItems))
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", timestamp))
 
-	return items, timestamp
+	return newItems, timestamp, eventid
 }
