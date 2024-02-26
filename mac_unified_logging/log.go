@@ -1,6 +1,6 @@
 // adapted from https://github.com/MaxSchaefer/macos-log-stream/blob/main/pkg/mls/logs.go
 
-package usp_mac
+package usp_mac_unified_logging
 
 import (
 	"bufio"

@@ -1,7 +1,7 @@
 //go:build darwin
 // +build darwin
 
-package usp_mac
+package usp_mac_unified_logging
 
 import (
 	"context"
@@ -21,8 +21,8 @@ const (
 	defaultWriteTimeout = 60 * 10
 )
 
-type MacAdapter struct {
-	conf         MacConfig
+type MacUnifiedLoggingAdapter struct {
+	conf         MacUnifiedLoggingConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
@@ -35,8 +35,8 @@ type MacAdapter struct {
 	ctx context.Context
 }
 
-func NewMacAdapter(conf MacConfig) (*MacAdapter, chan struct{}, error) {
-	a := &MacAdapter{
+func NewMacUnifiedLoggingAdapter(conf MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
+	a := &MacUnifiedLoggingAdapter{
 		conf:      conf,
 		isRunning: 1,
 	}
@@ -65,7 +65,7 @@ func NewMacAdapter(conf MacConfig) (*MacAdapter, chan struct{}, error) {
 	return a, a.chStopped, nil
 }
 
-func (a *MacAdapter) Close() error {
+func (a *MacUnifiedLoggingAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 
 	a.mRunning.Lock()
@@ -82,7 +82,7 @@ func (a *MacAdapter) Close() error {
 	return nil
 }
 
-func (a *MacAdapter) convertStructToMap(obj interface{}) map[string]interface{} {
+func (a *MacUnifiedLoggingAdapter) convertStructToMap(obj interface{}) map[string]interface{} {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return nil
@@ -97,7 +97,7 @@ func (a *MacAdapter) convertStructToMap(obj interface{}) map[string]interface{} 
 	return mapRepresentation
 }
 
-func (a *MacAdapter) handleEvent() uintptr {
+func (a *MacUnifiedLoggingAdapter) handleEvent() uintptr {
 
 	logs := NewLogs()
 
