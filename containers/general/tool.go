@@ -37,6 +37,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/usp-adapters/wel"
+	"github.com/refractionPOINT/usp-adapters/mac"
 
 	"gopkg.in/yaml.v2"
 )
@@ -62,6 +63,7 @@ type GeneralConfigs struct {
 	Okta          usp_okta.OktaConfig                `json:"okta" yaml:"okta"`
 	Office365     usp_o365.Office365Config           `json:"office365" yaml:"office365"`
 	Wel           usp_wel.WELConfig                  `json:"wel" yaml:"wel"`
+	Mac	      usp_mac.MacConfig			 `json:"mac" yaml:"mac"`
 	AzureEventHub usp_azure_event_hub.EventHubConfig `json:"azure_event_hub" yaml:"azure_event_hub"`
 	Duo           usp_duo.DuoConfig                  `json:"duo" yaml:"duo"`
 	Gcs           usp_gcs.GCSConfig                  `json:"gcs" yaml:"gcs"`
@@ -232,6 +234,11 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.Wel.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Wel)
 		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
+        } else if method == "mac" {
+                configs.Mac.ClientOptions = applyLogging(configs.Mac.ClientOptions)
+                configs.Mac.ClientOptions.Architecture = "usp_adapter"
+                printConfig(method, configs.Mac)
+                client, chRunning, err = usp_mac.NewMacAdapter(configs.Mac)
 	} else if method == "azure_event_hub" {
 		configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
 		configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
