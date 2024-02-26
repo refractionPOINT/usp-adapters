@@ -1,12 +1,12 @@
-// adapted from https://github.com/MaxSchaefer/macos-log-stream/blob/main/pkg/mls/logs.go 
+// adapted from https://github.com/MaxSchaefer/macos-log-stream/blob/main/pkg/mls/logs.go
 
 package usp_mac
 
 import (
 	"bufio"
 	"encoding/json"
-	"os/exec"
 	"fmt"
+	"os/exec"
 	"sync"
 )
 
@@ -41,9 +41,9 @@ type Log struct {
 }
 
 type Logs struct {
-	m         sync.Mutex
-	Channel   chan Log
-	exit      chan bool
+	m       sync.Mutex
+	Channel chan Log
+	exit    chan bool
 }
 
 func NewLogs() *Logs {

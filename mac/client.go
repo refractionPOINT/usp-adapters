@@ -5,11 +5,11 @@ package usp_mac
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
 	"sync"
-	"encoding/json"
 	"syscall"
 	"time"
 
@@ -82,7 +82,7 @@ func (a *MacAdapter) Close() error {
 	return nil
 }
 
-func (a *MacAdapter) convertStructToMap(obj interface{}) (map[string]interface{}) {
+func (a *MacAdapter) convertStructToMap(obj interface{}) map[string]interface{} {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return nil
