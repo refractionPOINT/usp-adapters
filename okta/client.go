@@ -218,7 +218,7 @@ func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string, lastEvent
 			newItems = append(newItems, item)
 		}
 	}
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", newItems))
+
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", timestamp))
 
 	return newItems, timestamp, eventid
