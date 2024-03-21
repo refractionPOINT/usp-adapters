@@ -55,7 +55,7 @@ func NewMacUnifiedLoggingAdapter(conf MacUnifiedLoggingConfig) (*MacUnifiedLoggi
 	a.chStopped = make(chan struct{})
 
 	a.wgSenders.Add(1)
-	go a.handleEvent()
+	go a.handleEvent(a.conf.Predicate)
 
 	go func() {
 		a.wgSenders.Wait()
@@ -97,7 +97,7 @@ func (a *MacUnifiedLoggingAdapter) convertStructToMap(obj interface{}) map[strin
 	return mapRepresentation
 }
 
-func (a *MacUnifiedLoggingAdapter) handleEvent() uintptr {
+func (a *MacUnifiedLoggingAdapter) handleEvent(predicate string) uintptr {
 
 	logs := NewLogs()
 
@@ -109,7 +109,7 @@ func (a *MacUnifiedLoggingAdapter) handleEvent() uintptr {
 		os.Exit(0)
 	}()
 
-	if err := logs.StartGathering(); err != nil {
+	if err := logs.StartGathering(predicate); err != nil {
 		panic(err)
 	}
 

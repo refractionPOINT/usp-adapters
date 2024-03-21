@@ -7,4 +7,5 @@ import (
 type MacUnifiedLoggingConfig struct {
 	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
+	Predicate		string					`json:"predicate,omitempty" yaml:"predicate,omitempty"`
 }
