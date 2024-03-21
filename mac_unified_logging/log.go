@@ -58,7 +58,7 @@ func (logs *Logs) StartGathering(predicate string) error {
 	cmd := exec.Command("log", "stream", "--color=none", "--style=ndjson")
 	if predicate != "" {
 		cmd = exec.Command("log", "stream", "--color=none", "--style=ndjson", "--predicate", predicate)
-	} 
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
