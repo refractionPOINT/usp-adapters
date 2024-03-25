@@ -15,6 +15,11 @@ steps:
   args: ['-c', 'cd ./containers/zeek/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek:$TAG_NAME -t refractionpoint/lc-adapter-zeek:latest .']
   waitFor: ['get-github-keys']
 - name: 'gcr.io/cloud-builders/docker'
+  id: build-docker-zeek-extract
+  entrypoint: 'bash'
+  args: ['-c', 'cd ./containers/zeek_extract/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek-extract:$TAG_NAME -t refractionpoint/lc-adapter-zeek-extract:latest .']
+  waitFor: ['get-github-keys']
+- name: 'gcr.io/cloud-builders/docker'
   id: build-docker-k8s-pods
   entrypoint: 'bash'
   args: ['-c', 'cd ./containers/k8s_pods/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-k8s-pods:$TAG_NAME -t refractionpoint/lc-adapter-k8s-pods:latest .']
@@ -195,6 +200,12 @@ steps:
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
   waitFor: ['build-docker-zeek']
+- name: 'gcr.io/cloud-builders/docker'
+  id: copy-docker-adapter-zeek-extract
+  entrypoint: 'bash'
+  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek-extract:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek-extract:latest']
+  secretEnv: ['USERNAME', 'PASSWORD']
+  waitFor: ['build-docker-zeek-extract']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter-k8s-pods
   entrypoint: 'bash'
