@@ -2,10 +2,12 @@ package usp_syslog
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -32,13 +34,14 @@ type SyslogAdapter struct {
 }
 
 type SyslogConfig struct {
-	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Port            uint16                  `json:"port" yaml:"port"`
-	Interface       string                  `json:"iface" yaml:"iface"`
-	IsUDP           bool                    `json:"is_udp,omitempty" yaml:"is_udp,omitempty"`
-	SslCertPath     string                  `json:"ssl_cert" yaml:"ssl_cert"`
-	SslKeyPath      string                  `json:"ssl_key" yaml:"ssl_key"`
-	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
+	ClientOptions     uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	Port              uint16                  `json:"port" yaml:"port"`
+	Interface         string                  `json:"iface" yaml:"iface"`
+	IsUDP             bool                    `json:"is_udp,omitempty" yaml:"is_udp,omitempty"`
+	SslCertPath       string                  `json:"ssl_cert" yaml:"ssl_cert"`
+	SslKeyPath        string                  `json:"ssl_key" yaml:"ssl_key"`
+	MutualTlsCertPath string                  `json:"mutual_tls_cert,omitempty" yaml:"mutual_tls_cert,omitempty"`
+	WriteTimeoutSec   uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 }
 
 func (c *SyslogConfig) Validate() error {
@@ -79,6 +82,19 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 		tlsConfig := tls.Config{
 			Certificates: []tls.Certificate{cert},
 		}
+
+		// If mutual TLS is enabled, load the client certificate.
+		if conf.MutualTlsCertPath != "" {
+			caCert, err := os.ReadFile(conf.MutualTlsCertPath)
+			if err != nil {
+				return nil, nil, fmt.Errorf("error loading mutual TLS certificate with path '%s': %s", conf.MutualTlsCertPath, err)
+			}
+			caCertPool := x509.NewCertPool()
+			caCertPool.AppendCertsFromPEM(caCert)
+			tlsConfig.ClientCAs = caCertPool
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+
 		l, err = tls.Listen("tcp", addr, &tlsConfig)
 	} else if conf.IsUDP {
 		var udpAddr *net.UDPAddr
