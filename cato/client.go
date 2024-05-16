@@ -142,7 +142,7 @@ func (a *CatoAdapter) convertStructToMap(obj interface{}) map[string]interface{}
 	return mapRepresentation
 }
 
-func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key string) uintptr {
+func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key string) {
 
 	start = time.Now()
 
