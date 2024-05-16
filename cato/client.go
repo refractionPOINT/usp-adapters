@@ -92,13 +92,13 @@ func NewCatoAdapter(conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
 		if _, err := os.Stat(configFile); err == nil {
 			content, err := ioutil.ReadFile(configFile)
 			if err != nil {
-				fmt.Println(fmt.Sprintf("Error reading config file: %v", err))
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("Error reading config file: %v", err))
 			} else {
 				marker = strings.TrimSpace(string(content))
 			}
 		}
 	}
-	
+
 	go a.handleEvent(marker, strconv.Itoa(a.conf.AccountId), a.conf.ApiKey)
 
 	go func() {
@@ -135,7 +135,7 @@ func (a *CatoAdapter) convertStructToMap(obj interface{}) map[string]interface{}
 	var mapRepresentation map[string]interface{}
 	err = json.Unmarshal(data, &mapRepresentation)
 	if err != nil {
-		fmt.Println(err)
+		a.conf.ClientOptions.DebugLog(err.Error())
 		return nil
 	}
 
@@ -172,7 +172,7 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
 
 		success, resp := a.send(query, account_id, api_key)
 		if !success {
-			fmt.Println(resp)
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s", resp))
 			os.Exit(1)
 		}
 
@@ -224,17 +224,12 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
 		}
 
 		if err := ioutil.WriteFile(configFile, []byte(marker), 0644); err != nil {
-			fmt.Println(fmt.Sprintf("Error writing config file: %v", err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("Error writing config file: %v", err))
 		}
 
 		iteration++
-		elapsed := time.Since(start)
-		if elapsed.Hours() > 24 {
-			break
-		}
 	}
 
-	return 0
 }
 
 func (a *CatoAdapter) send(query string, account_id string, api_key string) (bool, map[string]interface{}) {
@@ -253,7 +248,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 
 		jsonData, err := json.Marshal(data)
 		if err != nil {
-			fmt.Println(fmt.Sprintf("ERROR %d: %v", retryCount, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)
 			retryCount++
 			continue
@@ -261,7 +256,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 
 		req, err := http.NewRequest("POST", "https://api.catonetworks.com/api/v1/graphql2", bytes.NewBuffer(jsonData))
 		if err != nil {
-			fmt.Println(fmt.Sprintf("ERROR %d: %v", retryCount, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)
 			retryCount++
 			continue
@@ -275,7 +270,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 		defer cancel()
 		resp, err := ctxhttp.Do(ctx, http.DefaultClient, req)
 		if err != nil {
-			fmt.Println(fmt.Sprintf("ERROR %d: %v, sleeping 2 seconds then retrying", retryCount, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v, sleeping 2 seconds then retrying", retryCount, err))
 			time.Sleep(2 * time.Second)
 			retryCount++
 			continue
@@ -286,7 +281,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 
 		zippedData, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			fmt.Println(fmt.Sprintf("ERROR %d: %v", retryCount, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)
 			retryCount++
 			continue
@@ -296,7 +291,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 
 		reader, err := gzip.NewReader(bytes.NewReader(zippedData))
 		if err != nil {
-			fmt.Println(fmt.Sprintf("ERROR %d: %v", retryCount, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)
 			retryCount++
 			continue
@@ -305,7 +300,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 
 		resultData, err := ioutil.ReadAll(reader)
 		if err != nil {
-			fmt.Println(fmt.Sprintf("ERROR %d: %v", retryCount, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)
 			retryCount++
 			continue
@@ -314,21 +309,21 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 		totalBytesUncompressed += len(resultData)
 
 		if strings.HasPrefix(string(resultData), `{"errors":[{"message":"rate limit for operation:`) {
-			fmt.Println("RATE LIMIT sleeping 5 seconds then retrying")
+			a.conf.ClientOptions.DebugLog("RATE LIMIT sleeping 5 seconds then retrying")
 			time.Sleep(5 * time.Second)
 			continue
 		}
 
 		var result map[string]interface{}
 		if err := json.Unmarshal(resultData, &result); err != nil {
-			fmt.Println(fmt.Sprintf("ERROR %d: %v", retryCount, err))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)
 			retryCount++
 			continue
 		}
 
 		if _, ok := result["errors"]; ok {
-			fmt.Println(fmt.Sprintf("API error: %s", resultData))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("API error: %s", resultData))
 			return false, result
 		}
 
