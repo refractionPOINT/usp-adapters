@@ -173,7 +173,7 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
 		success, resp := a.send(query, account_id, api_key)
 		if !success {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s", resp))
-			os.Exit(1)
+			break
 		}
 
 		marker = resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["marker"].(string)
