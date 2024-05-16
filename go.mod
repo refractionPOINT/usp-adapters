@@ -16,6 +16,7 @@ require (
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20240304235735-ed7c2ba48a10
 	github.com/refractionPOINT/go-uspclient v1.4.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
+	golang.org/x/net v0.22.0
 	golang.org/x/oauth2 v0.18.0
 	golang.org/x/sync v0.6.0
 	golang.org/x/sys v0.18.0
@@ -86,7 +87,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.24.0 // indirect
 	golang.org/x/crypto v0.21.0 // indirect
 	golang.org/x/mod v0.16.0 // indirect
-	golang.org/x/net v0.22.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.19.0 // indirect
 	golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028 // indirect

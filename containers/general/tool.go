@@ -18,6 +18,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
+	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/file"
@@ -60,6 +61,7 @@ type GeneralConfigs struct {
 	OnePassword       usp_1password.OnePasswordConfig                 `json:"1password" yaml:"1password"`
 	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
 	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
+	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
 	Okta              usp_okta.OktaConfig                             `json:"okta" yaml:"okta"`
 	Office365         usp_o365.Office365Config                        `json:"office365" yaml:"office365"`
 	Wel               usp_wel.WELConfig                               `json:"wel" yaml:"wel"`
@@ -249,6 +251,16 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.Duo.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Duo)
 		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
+	} else if method == "cato" {
+		configs.Cato.ClientOptions = applyLogging(configs.Cato.ClientOptions)
+		configs.Cato.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Cato)
+		client, chRunning, err = usp_cato.NewCatoAdapter(configs.Cato)
+	} else if method == "duo" {
+		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
+		configs.Duo.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Duo)
+		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
 	} else if method == "slack" {
 		configs.Slack.ClientOptions = applyLogging(configs.Slack.ClientOptions)
 		configs.Slack.ClientOptions.Architecture = "usp_adapter"
@@ -340,7 +352,7 @@ func parseConfigs(args []string) (string, *RuntimeConfig, *GeneralConfigs, error
 func parseConfigsFromFile(filePath string) (*RuntimeConfig, *GeneralConfigs, error) {
 	runtimeConfigs := &RuntimeConfig{}
 	configs := &GeneralConfigs{}
-
+	
 	f, err := os.Open(filePath)
 	if err != nil {
 		printUsage()
