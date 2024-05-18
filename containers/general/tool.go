@@ -352,7 +352,7 @@ func parseConfigs(args []string) (string, *RuntimeConfig, *GeneralConfigs, error
 func parseConfigsFromFile(filePath string) (*RuntimeConfig, *GeneralConfigs, error) {
 	runtimeConfigs := &RuntimeConfig{}
 	configs := &GeneralConfigs{}
-	
+
 	f, err := os.Open(filePath)
 	if err != nil {
 		printUsage()
