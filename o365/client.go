@@ -205,14 +205,14 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			}
 			end := now.Format("2006-01-02T15:04:05")
 			nextPage = fmt.Sprintf("%s&startTime=%s&endTime=%s", url, start, end)
+
+			// Reset the content seen since we're starting a new time window.
+			contentSeen = map[string]struct{}{}
 		}
 		isFirstRun = false
 		var items []listItem
 		items, nextPage = a.makeOneListRequest(nextPage)
 		if len(items) == 0 {
-			// No bundles at all, we can just reset the
-			// content seen before.
-			contentSeen = map[string]struct{}{}
 			continue
 		}
 
@@ -220,9 +220,8 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		nShipped := 0
 		nSkipped := 0
 		nEmpty := 0
-		contentIDsThisPass := map[string]struct{}{}
 		for _, item := range items {
-			contentIDsThisPass[item.ContentID] = struct{}{}
+			contentSeen[item.ContentID] = struct{}{}
 			if _, ok := contentSeen[item.ContentID]; ok {
 				nSkipped++
 				continue
@@ -255,8 +254,6 @@ func (a *Office365Adapter) fetchEvents(url string) {
 				return true
 			})
 		}
-
-		contentSeen = contentIDsThisPass
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d empty: %d, history: %d", nFetched, nShipped, nSkipped, nEmpty, len(contentSeen)))
 	}
