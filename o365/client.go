@@ -221,11 +221,11 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		nSkipped := 0
 		nEmpty := 0
 		for _, item := range items {
-			contentSeen[item.ContentID] = struct{}{}
 			if _, ok := contentSeen[item.ContentID]; ok {
 				nSkipped++
 				continue
 			}
+			contentSeen[item.ContentID] = struct{}{}
 			events := a.makeOneContentRequest(item.ContentURI)
 			if len(events) == 0 {
 				nEmpty++
