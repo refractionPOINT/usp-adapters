@@ -193,6 +193,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog("fetching of events exiting")
 
 	contentSeen := map[string]struct{}{}
+	newContentSeen := map[string]struct{}{}
 
 	nextPage := ""
 	isFirstRun := true
@@ -207,7 +208,8 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			nextPage = fmt.Sprintf("%s&startTime=%s&endTime=%s", url, start, end)
 
 			// Reset the content seen since we're starting a new time window.
-			contentSeen = map[string]struct{}{}
+			contentSeen = newContentSeen
+			newContentSeen = map[string]struct{}{}
 		}
 		isFirstRun = false
 		var items []listItem
@@ -225,7 +227,11 @@ func (a *Office365Adapter) fetchEvents(url string) {
 				nSkipped++
 				continue
 			}
-			contentSeen[item.ContentID] = struct{}{}
+			if _, ok := newContentSeen[item.ContentID]; ok {
+				nSkipped++
+				continue
+			}
+			newContentSeen[item.ContentID] = struct{}{}
 			events := a.makeOneContentRequest(item.ContentURI)
 			if len(events) == 0 {
 				nEmpty++

@@ -26,32 +26,32 @@ steps:
   waitFor: ['get-github-keys']
 
 # Adapters
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-linux64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64_$TAG_NAME', './containers/general']
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-win64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64_$TAG_NAME.exe', './containers/general']
   env:
     - 'GOOS=windows'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-macos64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=darwin'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-macosarm64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=darwin'
     - 'GOARCH=arm64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-linuxarm
   args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm_$TAG_NAME', './containers/general']
   env:
@@ -59,42 +59,42 @@ steps:
     - 'GOARCH=arm'
     - 'GOARM=5'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-linuxarm64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=linux'
     - 'GOARCH=arm64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-solarisamd64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_solaris_amd64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=solaris'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-aixppc64
   args: ['go', 'build', '-v', '-o', 'lc_adapter_aix_ppc64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=aix'
     - 'GOARCH=ppc64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: 'build-freebsdamd64'
   args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=freebsd'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: 'build-netbsdamd64'
   args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_64_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=netbsd'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: 'build-openbsdamd64'
   args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_64_$TAG_NAME', './containers/general']
   env:
@@ -103,32 +103,32 @@ steps:
   waitFor: ['get-github-keys']
 
 # Connectivity Tester
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-linux64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_64_$TAG_NAME', './containers/connectivity']
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-win64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_windows_64_$TAG_NAME.exe', './containers/connectivity']
   env:
     - 'GOOS=windows'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-macos64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=darwin'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-macosarm64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_arm64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=darwin'
     - 'GOARCH=arm64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-linuxarm-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm_$TAG_NAME', './containers/connectivity']
   env:
@@ -136,42 +136,42 @@ steps:
     - 'GOARCH=arm'
     - 'GOARM=5'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-linuxarm64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=linux'
     - 'GOARCH=arm64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-solarisamd64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_solaris_amd64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=solaris'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-aixppc64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_aix_ppc64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=aix'
     - 'GOARCH=ppc64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-freebsdamd64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_freebsd_64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=freebsd'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-netbsdamd64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_netbsd_64_$TAG_NAME', './containers/connectivity']
   env:
     - 'GOOS=netbsd'
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
-- name: 'golang:1.20-bullseye'
+- name: 'golang:1.22-bullseye'
   id: build-openbsdamd64-connectivity
   args: ['go', 'build', '-v', '-o', 'lc_connectivity_openbsd_64_$TAG_NAME', './containers/connectivity']
   env:
