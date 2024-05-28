@@ -23,6 +23,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/entraid"
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
@@ -61,6 +62,7 @@ type GeneralConfigs struct {
 	OnePassword       usp_1password.OnePasswordConfig                 `json:"1password" yaml:"1password"`
 	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
 	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
+	EntraID              usp_entraid.EntraIDConfig                             `json:"entraid" yaml:"entraid"`
 	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
 	Okta              usp_okta.OktaConfig                             `json:"okta" yaml:"okta"`
 	Office365         usp_o365.Office365Config                        `json:"office365" yaml:"office365"`
@@ -256,6 +258,11 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.Cato.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Cato)
 		client, chRunning, err = usp_cato.NewCatoAdapter(configs.Cato)
+	} else if method == "entraid" {
+		configs.EntraID.ClientOptions = applyLogging(configs.EntraID.ClientOptions)
+		configs.EntraID.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.EntraID)
+		client, chRunning, err = usp_entraid.NewEntraIDAdapter(configs.EntraID)
 	} else if method == "duo" {
 		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
 		configs.Duo.ClientOptions.Architecture = "usp_adapter"
