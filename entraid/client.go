@@ -237,11 +237,25 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, last
 	lastDetectionTime := since
 	var alerts []map[string]interface{}
 	for _, detection := range items {
+		detectMap, ok := detection.(map[string]interface{})
+		if !ok {
+			a.conf.ClientOptions.DebugLog("Error parsing detectMap JSON")
+		}
 
-		if detection.(map[string]interface{})["id"].(string) != lastEventId {
-			lastDetectionTime = detection.(map[string]interface{})["activityDateTime"].(string)
-			eventId = detection.(map[string]interface{})["id"].(string)
-			alerts = append(alerts, detection.(map[string]interface{}))
+		id, ok := detectMap["id"].(string)
+		if !ok {
+			a.conf.ClientOptions.DebugLog("Error parsing ID from detectMap JSON")
+		}
+
+		if id != lastEventId {
+			createdDateTime, ok := detectMap["createdDateTime"].(string)
+			if !ok {
+				a.conf.ClientOptions.DebugLog("Error parsing createdDateTime from detectMap JSON")
+			}
+
+			lastDetectionTime = createdDateTime
+			eventId = id
+			alerts = append(alerts, detectMap)
 		}
 	}
 
