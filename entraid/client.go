@@ -20,7 +20,7 @@ import (
 
 var scope = "https://graph.microsoft.com/.default"
 var URL = map[string]string{
-	"get_alerts": "https://graph.microsoft.com/beta/riskDetections",
+	"get_alerts": "https://graph.microsoft.com/v1.0/identityProtection/riskDetections",
 }
 
 type EntraIDAdapter struct {
