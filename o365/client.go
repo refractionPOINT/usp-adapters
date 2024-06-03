@@ -250,7 +250,11 @@ func (a *Office365Adapter) fetchEvents(url string) {
 						nSkipped++
 						return true
 					}
-					contentSeen[ID] = struct{}{}
+					if _, ok := newContentSeen[ID]; ok {
+						nSkipped++
+						return true
+					}
+					newContentSeen[ID] = struct{}{}
 				}
 				msg := &protocol.DataMessage{
 					TextPayload: event.Raw,
