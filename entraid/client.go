@@ -246,6 +246,7 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, last
 		if !ok {
 			a.conf.ClientOptions.DebugLog("Error parsing ID from detectMap JSON")
 		}
+		eventId = id
 
 		if id != lastEventId {
 			createdDateTime, ok := detectMap["createdDateTime"].(string)
@@ -254,7 +255,6 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, last
 			}
 
 			lastDetectionTime = createdDateTime
-			eventId = id
 			alerts = append(alerts, detectMap)
 		}
 	}
