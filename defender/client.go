@@ -74,7 +74,7 @@ func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, e
 	}
 
 	a.httpClient = &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
 				Timeout: 10 * time.Second,
@@ -154,6 +154,7 @@ func (a *DefenderAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastEventId := ""
+	// since := time.Date(2022, time.June, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000000Z")
 	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
 
 	for !a.doStop.WaitFor(30 * time.Second) {
@@ -246,6 +247,7 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 		if !ok {
 			a.conf.ClientOptions.DebugLog("Error parsing ID from detectMap JSON")
 		}
+		eventId = id
 
 		if id != lastEventId {
 			createdDateTime, ok := detectMap["createdDateTime"].(string)
@@ -254,7 +256,6 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 			}
 
 			lastDetectionTime = createdDateTime
-			eventId = id
 			alerts = append(alerts, detectMap)
 		}
 	}
