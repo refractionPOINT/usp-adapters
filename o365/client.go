@@ -225,6 +225,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		for _, item := range items {
 			if _, ok := contentSeen[item.ContentID]; ok {
 				nSkipped++
+				newContentSeen[item.ContentID] = struct{}{}
 				continue
 			}
 			if _, ok := newContentSeen[item.ContentID]; ok {
@@ -248,6 +249,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 				if ID != "" {
 					if _, ok := contentSeen[ID]; ok {
 						nSkipped++
+						newContentSeen[ID] = struct{}{}
 						return true
 					}
 					if _, ok := newContentSeen[ID]; ok {
