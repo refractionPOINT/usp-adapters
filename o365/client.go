@@ -225,6 +225,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		for _, item := range items {
 			if _, ok := contentSeen[item.ContentID]; ok {
 				nSkipped++
+				newContentSeen[item.ContentID] = struct{}{}
 				continue
 			}
 			if _, ok := newContentSeen[item.ContentID]; ok {
@@ -241,8 +242,24 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			nFetched++
 
 			gjson.ParseBytes(events).ForEach(func(_, event gjson.Result) bool {
+				// There is apparently no standard deduplication key in these logs
+				// and MS makes no guarantees of uniqueness, so we have to dedup
+				// ourselves. We will take a best stab by using the ID per event.
+				ID := gjson.Parse(event.Raw).Get("Id").String()
+				if ID != "" {
+					if _, ok := contentSeen[ID]; ok {
+						nSkipped++
+						newContentSeen[ID] = struct{}{}
+						return true
+					}
+					if _, ok := newContentSeen[ID]; ok {
+						nSkipped++
+						return true
+					}
+					newContentSeen[ID] = struct{}{}
+				}
 				msg := &protocol.DataMessage{
-					TextPayload: string(event.Raw),
+					TextPayload: event.Raw,
 					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 				}
 				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
