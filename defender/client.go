@@ -1,4 +1,4 @@
-package usp_entraid
+package usp_defender
 
 import (
 	"bytes"
@@ -20,11 +20,11 @@ import (
 
 var scope = "https://graph.microsoft.com/.default"
 var URL = map[string]string{
-	"get_alerts": "https://graph.microsoft.com/v1.0/identityProtection/riskDetections",
+	"get_alerts": "https://graph.microsoft.com/v1.0/security/alerts_v2",
 }
 
-type EntraIDAdapter struct {
-	conf       EntraIDConfig
+type DefenderAdapter struct {
+	conf       DefenderConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -37,14 +37,14 @@ type EntraIDAdapter struct {
 	ctx context.Context
 }
 
-type EntraIDConfig struct {
+type DefenderConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
 }
 
-func (c *EntraIDConfig) Validate() error {
+func (c *DefenderConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
@@ -60,9 +60,9 @@ func (c *EntraIDConfig) Validate() error {
 	return nil
 }
 
-func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, error) {
+func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, error) {
 	var err error
-	a := &EntraIDAdapter{
+	a := &DefenderAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
@@ -74,7 +74,7 @@ func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, erro
 	}
 
 	a.httpClient = &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
 				Timeout: 10 * time.Second,
@@ -97,7 +97,7 @@ func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, erro
 	return a, a.chStopped, nil
 }
 
-func (a *EntraIDAdapter) Close() error {
+func (a *DefenderAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
@@ -112,7 +112,7 @@ func (a *EntraIDAdapter) Close() error {
 	return err2
 }
 
-func (a *EntraIDAdapter) fetchToken() (token string) {
+func (a *DefenderAdapter) fetchToken() (token string) {
 
 	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.conf.TenantID)
 	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
@@ -149,11 +149,12 @@ func (a *EntraIDAdapter) fetchToken() (token string) {
 
 }
 
-func (a *EntraIDAdapter) fetchEvents(url string) {
+func (a *DefenderAdapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastEventId := ""
+	// since := time.Date(2022, time.June, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000000Z")
 	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
 
 	for !a.doStop.WaitFor(30 * time.Second) {
@@ -187,12 +188,12 @@ func (a *EntraIDAdapter) fetchEvents(url string) {
 	}
 }
 
-func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, lastEventId string) ([]map[string]interface{}, string, string, error) {
+func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, lastEventId string) ([]map[string]interface{}, string, string, error) {
 
 	// Create query parameters
 	filter := "%24"
 	query := "%20ge%20"
-	date_filter := fmt.Sprintf("?%sfilter=activityDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
+	date_filter := fmt.Sprintf("?%sfilter=createdDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
 
 	// Append query parameters to the URL
 	eventsUrl += date_filter
