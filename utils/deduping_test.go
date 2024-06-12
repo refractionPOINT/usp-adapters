@@ -26,7 +26,7 @@ func TestLocalDeduper_CheckAndAdd(t *testing.T) {
 	if !d.CheckAndAdd("key2") {
 		t.Error("key1 should exist")
 	}
-	time.Sleep(ttl+time.Second)
+	time.Sleep(ttl + time.Second)
 	if d.CheckAndAdd("key1") {
 		t.Error("key1 should not exist after ttl")
 	}

@@ -62,6 +62,8 @@ type Office365Config struct {
 	Endpoint      string                  `json:"endpoint" yaml:"endpoint"`
 	ContentTypes  string                  `json:"content_types" yaml:"content_types"`
 	StartTime     string                  `json:"start_time" yaml:"start_time"`
+
+	Deduper utils.Deduper `json:"-" yaml:"-"`
 }
 
 func (c *Office365Config) Validate() error {
@@ -95,6 +97,15 @@ func (c *Office365Config) Validate() error {
 
 func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}, error) {
 	var err error
+
+	// If no deduper is provided, use a local one.
+	if conf.Deduper == nil {
+		conf.Deduper, err = utils.NewLocalDeduper(1*time.Hour, 24*time.Hour)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
 	a := &Office365Adapter{
 		conf:   conf,
 		ctx:    context.Background(),
@@ -181,6 +192,8 @@ func (a *Office365Adapter) Close() error {
 	_, err2 := a.uspClient.Close()
 	a.httpClient.CloseIdleConnections()
 
+	a.conf.Deduper.Close()
+
 	if err1 != nil {
 		return err1
 	}
@@ -191,9 +204,6 @@ func (a *Office365Adapter) Close() error {
 func (a *Office365Adapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog("fetching of events exiting")
-
-	contentSeen := map[string]struct{}{}
-	newContentSeen := map[string]struct{}{}
 
 	nextPage := ""
 	isFirstRun := true
@@ -206,10 +216,6 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			}
 			end := now.Format("2006-01-02T15:04:05")
 			nextPage = fmt.Sprintf("%s&startTime=%s&endTime=%s", url, start, end)
-
-			// Reset the content seen since we're starting a new time window.
-			contentSeen = newContentSeen
-			newContentSeen = map[string]struct{}{}
 		}
 		isFirstRun = false
 		var items []listItem
@@ -223,16 +229,11 @@ func (a *Office365Adapter) fetchEvents(url string) {
 		nSkipped := 0
 		nEmpty := 0
 		for _, item := range items {
-			if _, ok := contentSeen[item.ContentID]; ok {
-				nSkipped++
-				newContentSeen[item.ContentID] = struct{}{}
-				continue
-			}
-			if _, ok := newContentSeen[item.ContentID]; ok {
+			if a.conf.Deduper.CheckAndAdd(item.ContentID) {
 				nSkipped++
 				continue
 			}
-			newContentSeen[item.ContentID] = struct{}{}
+
 			events := a.makeOneContentRequest(item.ContentURI)
 			if len(events) == 0 {
 				nEmpty++
@@ -242,22 +243,6 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			nFetched++
 
 			gjson.ParseBytes(events).ForEach(func(_, event gjson.Result) bool {
-				// There is apparently no standard deduplication key in these logs
-				// and MS makes no guarantees of uniqueness, so we have to dedup
-				// ourselves. We will take a best stab by using the ID per event.
-				ID := gjson.Parse(event.Raw).Get("Id").String()
-				if ID != "" {
-					if _, ok := contentSeen[ID]; ok {
-						nSkipped++
-						newContentSeen[ID] = struct{}{}
-						return true
-					}
-					if _, ok := newContentSeen[ID]; ok {
-						nSkipped++
-						return true
-					}
-					newContentSeen[ID] = struct{}{}
-				}
 				msg := &protocol.DataMessage{
 					TextPayload: event.Raw,
 					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
@@ -278,7 +263,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			})
 		}
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d empty: %d, history: %d", nFetched, nShipped, nSkipped, nEmpty, len(contentSeen)))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d empty: %d", nFetched, nShipped, nSkipped, nEmpty))
 	}
 }
 

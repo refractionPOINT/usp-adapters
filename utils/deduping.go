@@ -12,13 +12,13 @@ type Deduper interface {
 }
 
 type localDeduper struct {
-	window time.Duration
-	ttl time.Duration
+	window   time.Duration
+	ttl      time.Duration
 	nBuckets int
 	nCurrent int
 
 	stopEvt *Event
-	m sync.Mutex
+	m       sync.Mutex
 	windows []map[string]struct{}
 }
 
@@ -35,12 +35,12 @@ func NewLocalDeduper(window time.Duration, ttl time.Duration) (Deduper, error) {
 	windows[nCurrent] = make(map[string]struct{})
 
 	d := &localDeduper{
-		window: window,
-		ttl: ttl,
+		window:   window,
+		ttl:      ttl,
 		nBuckets: nBuckets,
 		nCurrent: nCurrent,
-		stopEvt: NewEvent(),
-		windows: windows,
+		stopEvt:  NewEvent(),
+		windows:  windows,
 	}
 
 	go func() {
