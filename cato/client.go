@@ -228,6 +228,9 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
 		}
 
 		iteration++
+
+		// Add sleep to ensure the request is made every 1 minute
+		time.Sleep(1 * time.Minute)
 	}
 
 }
