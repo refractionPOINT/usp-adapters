@@ -243,6 +243,17 @@ func (a *Office365Adapter) fetchEvents(url string) {
 			nFetched++
 
 			gjson.ParseBytes(events).ForEach(func(_, event gjson.Result) bool {
+				// There is apparently no standard deduplication key in these logs
+				// and MS makes no guarantees of uniqueness, so we have to dedup
+				// ourselves. We will take a best stab by using the ID per event.
+				ID := gjson.Parse(event.Raw).Get("Id").String()
+				if ID != "" {
+					if a.conf.Deduper.CheckAndAdd(item.ContentID) {
+						nSkipped++
+						return true
+					}
+
+				}
 				msg := &protocol.DataMessage{
 					TextPayload: event.Raw,
 					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
