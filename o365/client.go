@@ -248,7 +248,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 				// ourselves. We will take a best stab by using the ID per event.
 				ID := gjson.Parse(event.Raw).Get("Id").String()
 				if ID != "" {
-					if a.conf.Deduper.CheckAndAdd(item.ContentID) {
+					if a.conf.Deduper.CheckAndAdd(ID) {
 						nSkipped++
 						return true
 					}
