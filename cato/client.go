@@ -170,10 +170,19 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
   }
 }`, account_id, marker, eventFilterString, eventSubfilterString)
 
-		success, resp := a.send(query, account_id, api_key)
-		if !success {
+		var success bool
+		var resp map[string]interface{}
+
+		attempts := 0
+		for attempts < 3 {
+			success, resp = a.send(query, account_id, api_key)
+			if success {
+				break
+			}
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s", resp))
-			break
+			time.Sleep(15 * time.Second)
+
+			attempts++
 		}
 
 		marker = resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["marker"].(string)
