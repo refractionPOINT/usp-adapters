@@ -173,13 +173,16 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
 		var success bool
 		var resp map[string]interface{}
 
-		for {
+		attempts := 0
+		for attempts < 3 {
 			success, resp = a.send(query, account_id, api_key)
 			if success {
 				break
 			}
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s", resp))
-			time.Sleep(1 * time.Minute)
+			time.Sleep(15 * time.Second)
+
+			attempts++
 		}
 
 		marker = resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["marker"].(string)
