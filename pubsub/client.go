@@ -88,6 +88,7 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 	if conf.MaxPSBuffer != 0 {
 		a.buildSub.ReceiveSettings.MaxOutstandingBytes = conf.MaxPSBuffer
 	}
+	a.buildSub.ReceiveSettings.MaxExtension = 61 * time.Minute
 	pubsubCtx, pubsubCancel := context.WithCancel(a.ctx)
 	a.stopSub = pubsubCancel
 	chStopped := make(chan struct{})
@@ -141,13 +142,13 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
 	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-		message.Nack()
 		if err == uspclient.ErrorBufferFull {
 			a.conf.ClientOptions.DebugLog("stream falling behind")
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			message.Nack()
 			return
 		}
 	}
