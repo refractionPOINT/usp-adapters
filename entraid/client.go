@@ -269,6 +269,7 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, last
 
 				lastDetectionTime = createdDateTime
 				alerts = append(alerts, detectMap)
+
 			}
 		}
 
