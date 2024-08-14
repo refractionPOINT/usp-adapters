@@ -188,75 +188,93 @@ func (a *EntraIDAdapter) fetchEvents(url string) {
 }
 
 func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, lastEventId string) ([]map[string]interface{}, string, string, error) {
-
-	// Create query parameters
-	filter := "%24"
-	query := "%20ge%20"
-	date_filter := fmt.Sprintf("?%sfilter=activityDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
-
-	// Append query parameters to the URL
-	eventsUrl += date_filter
-
-	req, err := http.NewRequest("GET", eventsUrl, nil)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Error creating request: %s\n", err))
-		return nil, since, "", err
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.fetchToken()))
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Error making request: %s\n", err))
-		return nil, since, "", err
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Error reading response: %s\n", err))
-		return nil, since, "", err
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Error response: %s\n", body))
-		return nil, since, "", err
-	}
-
-	var data map[string]interface{}
-	err = json.Unmarshal(body, &data)
-	detections, _ := data["value"].([]interface{})
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Error parsing JSON: %v", err))
-	}
-	items := detections
-
-	eventId := ""
-	lastDetectionTime := since
 	var alerts []map[string]interface{}
-	for _, detection := range items {
-		detectMap, ok := detection.(map[string]interface{})
-		if !ok {
-			a.conf.ClientOptions.DebugLog("Error parsing detectMap JSON")
+	var lastDetectionTime, eventId string
+
+	// Retry up to 3 times
+	for attempt := 1; attempt <= 3; attempt++ {
+		// Create query parameters
+		filter := "%24"
+		query := "%20ge%20"
+		date_filter := fmt.Sprintf("?%sfilter=activityDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
+
+		// Append query parameters to the URL
+		eventsUrl += date_filter
+
+		req, err := http.NewRequest("GET", eventsUrl, nil)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Error creating request: %s\n", err))
+			return nil, since, "", err
 		}
 
-		id, ok := detectMap["id"].(string)
-		if !ok {
-			a.conf.ClientOptions.DebugLog("Error parsing ID from detectMap JSON")
-		}
-		eventId = id
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.fetchToken()))
+		req.Header.Set("Content-Type", "application/json")
 
-		if id != lastEventId {
-			createdDateTime, ok := detectMap["createdDateTime"].(string)
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Error making request: %s\n", err))
+			return nil, since, "", err
+		}
+		defer resp.Body.Close()
+
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Error reading response: %s\n", err))
+			return nil, since, "", err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt %d): %s\n", attempt, body))
+			// Retry if the status code is not OK, but continue to the next iteration
+			if attempt < 3 {
+				continue
+			}
+			// Return after 3 failed attempts
+			return nil, since, "", fmt.Errorf("Error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt 3): %s\n", body)
+		}
+
+		// If the response is OK, parse the body and process detections
+		var data map[string]interface{}
+		err = json.Unmarshal(body, &data)
+		detections, _ := data["value"].([]interface{})
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Error parsing JSON: %v", err))
+			return nil, since, "", err
+		}
+
+		items := detections
+
+		lastDetectionTime = since
+		for _, detection := range items {
+			detectMap, ok := detection.(map[string]interface{})
 			if !ok {
-				a.conf.ClientOptions.DebugLog("Error parsing createdDateTime from detectMap JSON")
+				a.conf.ClientOptions.DebugLog("Error parsing detectMap JSON")
+				continue
 			}
 
-			lastDetectionTime = createdDateTime
-			alerts = append(alerts, detectMap)
+			id, ok := detectMap["id"].(string)
+			if !ok {
+				a.conf.ClientOptions.DebugLog("Error parsing ID from detectMap JSON")
+				continue
+			}
+			eventId = id
+
+			if id != lastEventId {
+				createdDateTime, ok := detectMap["createdDateTime"].(string)
+				if !ok {
+					a.conf.ClientOptions.DebugLog("Error parsing createdDateTime from detectMap JSON")
+					continue
+				}
+
+				lastDetectionTime = createdDateTime
+				alerts = append(alerts, detectMap)
+
+			}
 		}
+
+		// Break out of the loop if successful
+		break
 	}
 
 	return alerts, lastDetectionTime, eventId, nil
