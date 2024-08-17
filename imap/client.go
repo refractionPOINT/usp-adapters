@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/emersion/go-imap"
@@ -140,20 +141,26 @@ func (a *IMAPAdapter) handleConnection() {
 	seqSet.Add("$")
 	messages := make(chan *imap.Message, 1)
 
+	wg := sync.WaitGroup{}
 	done := make(chan error, 1)
+	wg.Add(2)
 	go func() {
+		defer wg.Done()
 		done <- a.imapClient.Fetch(seqSet, []imap.FetchItem{imap.FetchUid}, messages)
+	}()
+	go func() {
+		defer wg.Done()
+		// Try to consume the last UID
+		for msg := range messages {
+			lastUID = msg.Uid
+			break
+		}
 	}()
 	if err := waitForErrorFromChanForDuration(done, 10*time.Second); err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("initial.Fetch(): %v", err))
 		return
 	}
-
-	// Try to consume the last UID
-	for msg := range messages {
-		lastUID = msg.Uid
-		break
-	}
+	wg.Wait()
 
 	// Then start polling every X seconds for new messages by searching for messages with UID > last UID
 	// Bail if the chStop channel is closed
@@ -171,34 +178,40 @@ func (a *IMAPAdapter) handleConnection() {
 		}
 		messages := make(chan *imap.Message, 10)
 		done := make(chan error, 1)
+		wg := sync.WaitGroup{}
+		wg.Add(2)
 		go func() {
+			defer wg.Done()
 			done <- a.imapClient.Fetch(seqSet, []imap.FetchItem{imap.FetchAll}, messages)
+		}()
+		go func() {
+			defer wg.Done()
+			for {
+				isDone := false
+				select {
+				case <-a.chStop:
+					return
+				case msg := <-messages:
+					if err := a.processEvent(a.ctx, msg); err != nil {
+						a.conf.ClientOptions.OnError(fmt.Errorf("processEvent(): %v", err))
+						return
+					}
+					// Update the last UID
+					lastUID = msg.Uid
+				default:
+					isDone = true
+				}
+				if isDone {
+					time.Sleep(10 * time.Second)
+					break
+				}
+			}
 		}()
 		if err := waitForErrorFromChanForDuration(done, 10*time.Second); err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("next.Fetch(): %v", err))
 			return
 		}
-
-		for {
-			isDone := false
-			select {
-			case <-a.chStop:
-				return
-			case msg := <-messages:
-				if err := a.processEvent(a.ctx, msg); err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("processEvent(): %v", err))
-					return
-				}
-				// Update the last UID
-				lastUID = msg.Uid
-			default:
-				isDone = true
-			}
-			if isDone {
-				time.Sleep(10 * time.Second)
-				break
-			}
-		}
+		wg.Wait()
 	}
 }
 
