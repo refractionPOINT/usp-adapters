@@ -4,12 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
-	"github.com/emersion/go-imap/idle"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
@@ -19,24 +17,27 @@ const (
 	defaultWriteTimeout = 60 * 10
 )
 
+var (
+	ErrTimeout = errors.New("timeout")
+)
+
 type IMAPAdapter struct {
 	conf      PubSubConfig
 	uspClient *uspclient.Client
 
 	imapClient *client.Client
-	chUpdates  chan client.Update
-	chStop chan struct{}
+	chStop     chan struct{}
+	chStopped  chan struct{}
 
-	ctx      context.Context
+	ctx context.Context
 }
 
 type PubSubConfig struct {
-	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Server string `json:"server" yaml:"server"`
-	UserName string `json:"username" yaml:"username"`
-	Password string `json:"password" yaml:"password"`
-	InboxName string `json:"inbox_name" yaml:"inbox_name"`
-	UseStartTLS bool `json:"use_starttls" yaml:"use_starttls"`
+	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	Server        string                  `json:"server" yaml:"server"`
+	UserName      string                  `json:"username" yaml:"username"`
+	Password      string                  `json:"password" yaml:"password"`
+	InboxName     string                  `json:"inbox_name" yaml:"inbox_name"`
 }
 
 func (c *PubSubConfig) Validate() error {
@@ -67,11 +68,7 @@ func NewIMAPAdapter(conf PubSubConfig) (*IMAPAdapter, chan struct{}, error) {
 
 	// Connect to the server.
 	var err error
-	if a.conf.UseStartTLS{
-		a.imapClient, err = client.DialStartTLS(a.conf.Server, nil)
-	} else {
-		a.imapClient, err = client.DialTLS(a.conf.Server, nil)
-	}
+	a.imapClient, err = client.DialTLS(a.conf.Server, nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -99,41 +96,14 @@ func NewIMAPAdapter(conf PubSubConfig) (*IMAPAdapter, chan struct{}, error) {
 		return nil, nil, err
 	}
 
-	// Create an IDLE client
-	idleClient := idle.NewClient(a.imapClient)
-
-	// Create a channel to receive mailbox updates
-	updates := make(chan client.Update)
-	a.imapClient.Updates = updates
-	a.chUpdates = updates
-
-	// Create channels for the life cycle of the IDLE client
+	// Create channels for the life cycle
 	stop := make(chan struct{})
 	chStopped := make(chan struct{})
-	go func() {
-		chStopped <- idleClient.IdleWithFallback(stop, 0)
-	}()
 	a.chStop = stop
+	a.chStopped = chStopped
 
-	go func() {
-		for {
-			select {
-			case update := <-updates:
-				switch update.(type) {
-				case *client.MailboxUpdate:
-					log.Println("New message received")
-					// Here you can fetch the new email or perform other actions
-				}
-			case <-time.After(29 * time.Minute):
-				// Stop IDLE after 29 minutes as many servers close the connection after 30 minutes
-				close(stop)
-				if err := <-done; err != nil {
-					log.Fatal(err)
-				}
-				return
-			}
-		}
-	}()
+	// Start the connection handler
+	go a.handleConnection()
 
 	return a, chStopped, nil
 }
@@ -161,9 +131,93 @@ func (a *IMAPAdapter) Close() error {
 	return err4
 }
 
-func (a *IMAPAdapter) processEvent(ctx context.Context, message *client.MailboxUpdate) {
+func (a *IMAPAdapter) handleConnection() {
+	defer close(a.chStopped)
+
+	// Start by FETCHing the last UID
+	lastUID := uint32(0)
+	seqSet := &imap.SeqSet{}
+	seqSet.Add("$")
+	messages := make(chan *imap.Message, 1)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- a.imapClient.Fetch(seqSet, []imap.FetchItem{imap.FetchUid}, messages)
+	}()
+	if err := waitForErrorFromChanForDuration(done, 10*time.Second); err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("initial.Fetch(): %v", err))
+		return
+	}
+
+	// Try to consume the last UID
+	for msg := range messages {
+		lastUID = msg.Uid
+		break
+	}
+
+	// Then start polling every X seconds for new messages by searching for messages with UID > last UID
+	// Bail if the chStop channel is closed
+	for {
+		select {
+		case <-a.chStop:
+			return
+		default:
+		}
+
+		seqSet, err := imap.ParseSeqSet(fmt.Sprintf("%d:*", lastUID+1))
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("ParseSeqSet(): %v", err))
+			return
+		}
+		messages := make(chan *imap.Message, 10)
+		done := make(chan error, 1)
+		go func() {
+			done <- a.imapClient.Fetch(seqSet, []imap.FetchItem{imap.FetchAll}, messages)
+		}()
+		if err := waitForErrorFromChanForDuration(done, 10*time.Second); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("next.Fetch(): %v", err))
+			return
+		}
+
+		for {
+			isDone := false
+			select {
+			case <-a.chStop:
+				return
+			case msg := <-messages:
+				if err := a.processEvent(a.ctx, msg); err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("processEvent(): %v", err))
+					return
+				}
+				// Update the last UID
+				lastUID = msg.Uid
+			default:
+				isDone = true
+			}
+			if isDone {
+				time.Sleep(10 * time.Second)
+				break
+			}
+		}
+	}
+}
+
+func waitForErrorFromChanForDuration(ch chan error, duration time.Duration) error {
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(duration):
+		return ErrTimeout
+	}
+}
+
+func (a *IMAPAdapter) processEvent(ctx context.Context, message *imap.Message) error {
+	j, err := a.messageToJSON(message)
+	if err != nil {
+		return fmt.Errorf("messageToJSON(): %v", err)
+	}
 	msg := &protocol.DataMessage{
-		TextPayload: string(message.Data),
+		TextPayload: j,
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
 	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
@@ -172,10 +226,12 @@ func (a *IMAPAdapter) processEvent(ctx context.Context, message *client.MailboxU
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-			message.Nack()
-			return
+			return fmt.Errorf("Ship(): %v", err)
 		}
 	}
-	message.Ack()
+	return nil
+}
+
+func (a *IMAPAdapter) messageToJSON(message *imap.Message) (string, error) {
+	return "", nil
 }
