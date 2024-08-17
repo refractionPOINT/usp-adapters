@@ -1,7 +1,8 @@
-package usp_pubsub
+package usp_imap
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -23,7 +24,7 @@ var (
 )
 
 type IMAPAdapter struct {
-	conf      PubSubConfig
+	conf      ImapConfig
 	uspClient *uspclient.Client
 
 	imapClient *client.Client
@@ -33,7 +34,7 @@ type IMAPAdapter struct {
 	ctx context.Context
 }
 
-type PubSubConfig struct {
+type ImapConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Server        string                  `json:"server" yaml:"server"`
 	UserName      string                  `json:"username" yaml:"username"`
@@ -41,7 +42,7 @@ type PubSubConfig struct {
 	InboxName     string                  `json:"inbox_name" yaml:"inbox_name"`
 }
 
-func (c *PubSubConfig) Validate() error {
+func (c *ImapConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
@@ -61,7 +62,7 @@ func (c *PubSubConfig) Validate() error {
 	return nil
 }
 
-func NewIMAPAdapter(conf PubSubConfig) (*IMAPAdapter, chan struct{}, error) {
+func NewImapAdapter(conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
 	a := &IMAPAdapter{
 		conf: conf,
 		ctx:  context.Background(),
@@ -246,5 +247,9 @@ func (a *IMAPAdapter) processEvent(ctx context.Context, message *imap.Message) e
 }
 
 func (a *IMAPAdapter) messageToJSON(message *imap.Message) (string, error) {
-	return "", nil
+	j, err := json.Marshal(message)
+	if err != nil {
+		return "", err
+	}
+	return string(j), nil
 }
