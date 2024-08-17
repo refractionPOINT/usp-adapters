@@ -185,7 +185,7 @@ func (a *IMAPAdapter) handleConnection() {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			done <- a.imapClient.Fetch(seqSet, []imap.FetchItem{imap.FetchAll, imap.FetchUid, imap.FetchFull}, messages)
+			done <- a.imapClient.Fetch(seqSet, append([]imap.FetchItem{imap.FetchBodyStructure, imap.FetchUid}, imap.FetchFull.Expand()...), messages)
 		}()
 		go func() {
 			defer wg.Done()
