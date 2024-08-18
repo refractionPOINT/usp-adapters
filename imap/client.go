@@ -37,6 +37,7 @@ type ImapConfig struct {
 	UserName           string                  `json:"username" yaml:"username"`
 	Password           string                  `json:"password" yaml:"password"`
 	InboxName          string                  `json:"inbox_name" yaml:"inbox_name"`
+	IsInsecure         bool                    `json:"is_insecure" yaml:"is_insecure"`
 	FromZero           bool                    `json:"from_zero" yaml:"from_zero"`
 	IncludeAttachments bool                    `json:"include_attachments" yaml:"include_attachments"`
 	MaxBodySize        int                     `json:"max_body_size" yaml:"max_body_size"`
@@ -68,8 +69,11 @@ func NewImapAdapter(conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
 
 	// Connect to the server.
 	var err error
-	// a.imapClient, err = client.DialTLS(a.conf.Server, nil)
-	a.imapClient, err = client.Dial(a.conf.Server)
+	if a.conf.IsInsecure {
+		a.imapClient, err = client.Dial(a.conf.Server)
+	} else {
+		a.imapClient, err = client.DialTLS(a.conf.Server, nil)
+	}
 	if err != nil {
 		a.conf.ClientOptions.DebugLog("failed to connect")
 		return nil, nil, err
@@ -288,7 +292,6 @@ func (a *IMAPAdapter) processEvent(ctx context.Context, message *imap.Message) e
 	if err != nil {
 		return fmt.Errorf("messageToJSON(): %v", err)
 	}
-
 	if err := a.uspClient.Ship(d, 10*time.Second); err != nil {
 		if err == uspclient.ErrorBufferFull {
 			a.conf.ClientOptions.DebugLog("stream falling behind")
@@ -339,7 +342,6 @@ func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessag
 	msg := &protocol.DataMessage{
 		TextPayload: body,
 		TimestampMs: uint64(time.Now().UnixMilli()),
-		EventType:   "email",
 	}
 	return msg, nil
 }
