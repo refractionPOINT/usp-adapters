@@ -195,13 +195,19 @@ func (a *IMAPAdapter) handleConnection() {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			bsn := &imap.BodySectionName{}
-			done <- a.imapClient.Fetch(seqSet, append([]imap.FetchItem{
+			toFetch := append([]imap.FetchItem{
 				imap.FetchBodyStructure,
 				imap.FetchUid,
 				imap.FetchFlags,
-				bsn.FetchItem(),
-			}, imap.FetchFull.Expand()...), messages)
+				imap.FetchRFC822Header,
+				imap.FetchRFC822Size,
+			})
+			if a.conf.IncludeBody {
+				bsn := &imap.BodySectionName{}
+				toFetch = append(toFetch, imap.FetchFull.Expand()...)
+				toFetch = append(toFetch, bsn.FetchItem())
+			}
+			done <- a.imapClient.Fetch(seqSet, toFetch, messages)
 		}()
 		go func() {
 			defer wg.Done()
