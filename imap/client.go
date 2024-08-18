@@ -2,9 +2,11 @@ package usp_imap
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -37,7 +39,9 @@ type ImapConfig struct {
 	UserName      string                  `json:"username" yaml:"username"`
 	Password      string                  `json:"password" yaml:"password"`
 	InboxName     string                  `json:"inbox_name" yaml:"inbox_name"`
-	FromZero	  bool                    `json:"from_zero" yaml:"from_zero"`
+	FromZero      bool                    `json:"from_zero" yaml:"from_zero"`
+	IncludeBody   bool                    `json:"include_body" yaml:"include_body"`
+	MaxBodySize   int                     `json:"max_body_size" yaml:"max_body_size"`
 }
 
 func (c *ImapConfig) Validate() error {
@@ -166,11 +170,17 @@ func (a *IMAPAdapter) handleConnection() {
 
 	// Then start polling every X seconds for new messages by searching for messages with UID > last UID
 	// Bail if the chStop channel is closed
+	isFirstRun := true
 	for {
 		select {
 		case <-a.chStop:
 			return
 		default:
+			if isFirstRun {
+				isFirstRun = false
+			} else {
+				time.Sleep(10 * time.Second)
+			}
 		}
 
 		seqSet, err := imap.ParseSeqSet(fmt.Sprintf("%d:*", lastUID+1))
@@ -185,7 +195,13 @@ func (a *IMAPAdapter) handleConnection() {
 		wg.Add(2)
 		go func() {
 			defer wg.Done()
-			done <- a.imapClient.Fetch(seqSet, append([]imap.FetchItem{imap.FetchBodyStructure, imap.FetchUid}, imap.FetchFull.Expand()...), messages)
+			bsn := &imap.BodySectionName{}
+			done <- a.imapClient.Fetch(seqSet, append([]imap.FetchItem{
+				imap.FetchBodyStructure,
+				imap.FetchUid,
+				imap.FetchFlags,
+				bsn.FetchItem(),
+			}, imap.FetchFull.Expand()...), messages)
 		}()
 		go func() {
 			defer wg.Done()
@@ -196,7 +212,7 @@ func (a *IMAPAdapter) handleConnection() {
 					continue
 				}
 				select {
-				case <- a.chStop:
+				case <-a.chStop:
 					continue
 				default:
 				}
@@ -252,7 +268,7 @@ func (a *IMAPAdapter) getLastUID() (uint32, error) {
 	return lastUID, nil
 }
 
-func (a *IMAPAdapter)waitForErrorFromChanForDuration(chStopped chan struct{}, ch chan error, duration time.Duration) error {
+func (a *IMAPAdapter) waitForErrorFromChanForDuration(chStopped chan struct{}, ch chan error, duration time.Duration) error {
 	select {
 	case <-chStopped:
 		return nil
@@ -268,7 +284,7 @@ func (a *IMAPAdapter) processEvent(ctx context.Context, message *imap.Message) e
 	if err != nil {
 		return fmt.Errorf("messageToJSON(): %v", err)
 	}
-	
+
 	if err := a.uspClient.Ship(d, 10*time.Second); err != nil {
 		if err == uspclient.ErrorBufferFull {
 			a.conf.ClientOptions.DebugLog("stream falling behind")
@@ -284,10 +300,10 @@ func (a *IMAPAdapter) processEvent(ctx context.Context, message *imap.Message) e
 func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessage, error) {
 	j := utils.Dict{
 		"imap": utils.Dict{
-			"uid": message.Uid,
+			"uid":           message.Uid,
 			"internal_date": message.InternalDate.UnixMilli(),
-			"flags": message.Flags,
-			"size": message.Size,
+			"flags":         message.Flags,
+			"size":          message.Size,
 		},
 	}
 	if message.Envelope != nil {
@@ -296,6 +312,20 @@ func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessag
 	if message.BodyStructure != nil {
 		j["body_structure"] = convertBodyStructure(message.BodyStructure)
 	}
+	if a.conf.IncludeBody && message.Body != nil {
+		if a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize {
+			for _, bp := range message.Body {
+				// We only ever expect a single body part since we did not
+				// query for specific parts.
+				data, err := io.ReadAll(bp)
+				if err != nil {
+					return nil, err
+				}
+				j["body"] = base64.StdEncoding.EncodeToString(data)
+				break
+			}
+		}
+	}
 	d, err := json.Marshal(j)
 	if err != nil {
 		return nil, err
@@ -303,7 +333,7 @@ func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessag
 	msg := &protocol.DataMessage{
 		TextPayload: string(d),
 		TimestampMs: uint64(time.Now().UnixMilli()),
-		EventType: "email",
+		EventType:   "email",
 	}
 	return msg, nil
 }
@@ -312,9 +342,9 @@ func imapAddressesToJSON(addrs []*imap.Address) []utils.Dict {
 	to := make([]utils.Dict, len(addrs))
 	for i, f := range addrs {
 		to[i] = utils.Dict{
-			"personal_name": f.PersonalName,
-			"mailbox_name": f.MailboxName,
-			"host_name": f.HostName,
+			"personal_name":  f.PersonalName,
+			"mailbox_name":   f.MailboxName,
+			"host_name":      f.HostName,
 			"at_domain_list": f.AtDomainList,
 		}
 	}
@@ -323,34 +353,34 @@ func imapAddressesToJSON(addrs []*imap.Address) []utils.Dict {
 
 func convertEnvelope(e *imap.Envelope) utils.Dict {
 	return utils.Dict{
-		"date": e.Date.UnixMilli(),
-		"subject": e.Subject,
-		"from": imapAddressesToJSON(e.From),
-		"reply_to": imapAddressesToJSON(e.ReplyTo),
-		"sender": imapAddressesToJSON(e.Sender),
-		"to": imapAddressesToJSON(e.To),
-		"cc": imapAddressesToJSON(e.Cc),
-		"bcc": imapAddressesToJSON(e.Bcc),
+		"date":        e.Date.UnixMilli(),
+		"subject":     e.Subject,
+		"from":        imapAddressesToJSON(e.From),
+		"reply_to":    imapAddressesToJSON(e.ReplyTo),
+		"sender":      imapAddressesToJSON(e.Sender),
+		"to":          imapAddressesToJSON(e.To),
+		"cc":          imapAddressesToJSON(e.Cc),
+		"bcc":         imapAddressesToJSON(e.Bcc),
 		"in_reply_to": e.InReplyTo,
-		"message_id": e.MessageId,
+		"message_id":  e.MessageId,
 	}
 }
 
 func convertBodyStructure(bs *imap.BodyStructure) utils.Dict {
 	d := utils.Dict{
-		"mime_type": bs.MIMEType,
-		"mime_subtype": bs.MIMESubType,
-		"params": bs.Params,
-		"id": bs.Id,
-		"description": bs.Description,
-		"encoding": bs.Encoding,
-		"size": bs.Size,
-		"extended": bs.Extended,
-		"disposition": bs.Disposition,
+		"mime_type":          bs.MIMEType,
+		"mime_subtype":       bs.MIMESubType,
+		"params":             bs.Params,
+		"id":                 bs.Id,
+		"description":        bs.Description,
+		"encoding":           bs.Encoding,
+		"size":               bs.Size,
+		"extended":           bs.Extended,
+		"disposition":        bs.Disposition,
 		"disposition_params": bs.DispositionParams,
-		"language": bs.Language,
-		"location": bs.Location,
-		"md5": bs.MD5,
+		"language":           bs.Language,
+		"location":           bs.Location,
+		"md5":                bs.MD5,
 	}
 	parts := make([]utils.Dict, len(bs.Parts))
 	for i, p := range bs.Parts {
