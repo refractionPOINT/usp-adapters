@@ -2,8 +2,6 @@ package usp_imap
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -34,14 +32,14 @@ type IMAPAdapter struct {
 }
 
 type ImapConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Server        string                  `json:"server" yaml:"server"`
-	UserName      string                  `json:"username" yaml:"username"`
-	Password      string                  `json:"password" yaml:"password"`
-	InboxName     string                  `json:"inbox_name" yaml:"inbox_name"`
-	FromZero      bool                    `json:"from_zero" yaml:"from_zero"`
-	IncludeBody   bool                    `json:"include_body" yaml:"include_body"`
-	MaxBodySize   int                     `json:"max_body_size" yaml:"max_body_size"`
+	ClientOptions      uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	Server             string                  `json:"server" yaml:"server"`
+	UserName           string                  `json:"username" yaml:"username"`
+	Password           string                  `json:"password" yaml:"password"`
+	InboxName          string                  `json:"inbox_name" yaml:"inbox_name"`
+	FromZero           bool                    `json:"from_zero" yaml:"from_zero"`
+	IncludeAttachments bool                    `json:"include_attachments" yaml:"include_attachments"`
+	MaxBodySize        int                     `json:"max_body_size" yaml:"max_body_size"`
 }
 
 func (c *ImapConfig) Validate() error {
@@ -199,10 +197,10 @@ func (a *IMAPAdapter) handleConnection() {
 				imap.FetchBodyStructure,
 				imap.FetchUid,
 				imap.FetchFlags,
-				imap.FetchRFC822Header,
 				imap.FetchRFC822Size,
+				imap.FetchRFC822Text,
 			})
-			if a.conf.IncludeBody {
+			if a.conf.IncludeAttachments {
 				bsn := &imap.BodySectionName{}
 				toFetch = append(toFetch, imap.FetchFull.Expand()...)
 				toFetch = append(toFetch, bsn.FetchItem())
@@ -304,40 +302,42 @@ func (a *IMAPAdapter) processEvent(ctx context.Context, message *imap.Message) e
 }
 
 func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessage, error) {
-	j := utils.Dict{
-		"imap": utils.Dict{
-			"uid":           message.Uid,
-			"internal_date": message.InternalDate.UnixMilli(),
-			"flags":         message.Flags,
-			"size":          message.Size,
-		},
-	}
-	if message.Envelope != nil {
-		j["envelope"] = convertEnvelope(message.Envelope)
-	}
-	if message.BodyStructure != nil {
-		j["body_structure"] = convertBodyStructure(message.BodyStructure)
-	}
-	if a.conf.IncludeBody && message.Body != nil {
+	// For INCLUDE ATTACHMENT, use the "" body part.
+	// For WITHOUT, use the "TEXT" body part.
+	body := ""
+	if a.conf.IncludeAttachments {
 		if a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize {
-			for _, bp := range message.Body {
-				// We only ever expect a single body part since we did not
-				// query for specific parts.
+			for bpn, bp := range message.Body {
+				// We only want the "" body part.
+				if bpn.Specifier != "" {
+					continue
+				}
 				data, err := io.ReadAll(bp)
 				if err != nil {
 					return nil, err
 				}
-				j["body"] = base64.StdEncoding.EncodeToString(data)
+				body = string(data)
+				break
+			}
+		}
+	} else {
+		if a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize {
+			for bpn, bp := range message.Body {
+				// We only want the "TEXT" body part.
+				if bpn.Specifier != "TEXT" {
+					continue
+				}
+				data, err := io.ReadAll(bp)
+				if err != nil {
+					return nil, err
+				}
+				body = string(data)
 				break
 			}
 		}
 	}
-	d, err := json.Marshal(j)
-	if err != nil {
-		return nil, err
-	}
 	msg := &protocol.DataMessage{
-		TextPayload: string(d),
+		TextPayload: body,
 		TimestampMs: uint64(time.Now().UnixMilli()),
 		EventType:   "email",
 	}
