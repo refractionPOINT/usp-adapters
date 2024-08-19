@@ -25,6 +25,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
@@ -81,6 +82,7 @@ type GeneralConfigs struct {
 	Evtx              usp_evtx.EVTXConfig                             `json:"evtx" yaml:"evtx"`
 	K8sPods           usp_k8s_pods.K8sPodsConfig                      `json:"k8s_pods" yaml:"k8s_pods"`
 	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
+	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
 }
 
 type AdapterStats struct {
@@ -270,11 +272,6 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.Defender.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Defender)
 		client, chRunning, err = usp_defender.NewDefenderAdapter(configs.Defender)
-	} else if method == "duo" {
-		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
-		configs.Duo.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Duo)
-		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
 	} else if method == "slack" {
 		configs.Slack.ClientOptions = applyLogging(configs.Slack.ClientOptions)
 		configs.Slack.ClientOptions.Architecture = "usp_adapter"
@@ -315,7 +312,11 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 		configs.BigQuery.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.BigQuery)
 		client, chRunning, err = usp_bigquery.NewBigQueryAdapter(configs.BigQuery)
-
+	} else if method == "imap" {
+		configs.Imap.ClientOptions = applyLogging(configs.Imap.ClientOptions)
+		configs.Imap.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Imap)
+		client, chRunning, err = usp_imap.NewImapAdapter(configs.Imap)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
