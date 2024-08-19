@@ -13,7 +13,6 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
-	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 var (
@@ -344,62 +343,4 @@ func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessag
 		TimestampMs: uint64(time.Now().UnixMilli()),
 	}
 	return msg, nil
-}
-
-func imapAddressesToJSON(addrs []*imap.Address) []utils.Dict {
-	to := make([]utils.Dict, len(addrs))
-	for i, f := range addrs {
-		to[i] = utils.Dict{
-			"personal_name":  f.PersonalName,
-			"mailbox_name":   f.MailboxName,
-			"host_name":      f.HostName,
-			"at_domain_list": f.AtDomainList,
-		}
-	}
-	return to
-}
-
-func convertEnvelope(e *imap.Envelope) utils.Dict {
-	return utils.Dict{
-		"date":        e.Date.UnixMilli(),
-		"subject":     e.Subject,
-		"from":        imapAddressesToJSON(e.From),
-		"reply_to":    imapAddressesToJSON(e.ReplyTo),
-		"sender":      imapAddressesToJSON(e.Sender),
-		"to":          imapAddressesToJSON(e.To),
-		"cc":          imapAddressesToJSON(e.Cc),
-		"bcc":         imapAddressesToJSON(e.Bcc),
-		"in_reply_to": e.InReplyTo,
-		"message_id":  e.MessageId,
-	}
-}
-
-func convertBodyStructure(bs *imap.BodyStructure) utils.Dict {
-	d := utils.Dict{
-		"mime_type":          bs.MIMEType,
-		"mime_subtype":       bs.MIMESubType,
-		"params":             bs.Params,
-		"id":                 bs.Id,
-		"description":        bs.Description,
-		"encoding":           bs.Encoding,
-		"size":               bs.Size,
-		"extended":           bs.Extended,
-		"disposition":        bs.Disposition,
-		"disposition_params": bs.DispositionParams,
-		"language":           bs.Language,
-		"location":           bs.Location,
-		"md5":                bs.MD5,
-	}
-	parts := make([]utils.Dict, len(bs.Parts))
-	for i, p := range bs.Parts {
-		parts[i] = convertBodyStructure(p)
-	}
-	d["parts"] = parts
-	if bs.BodyStructure != nil {
-		d["body_structure"] = convertBodyStructure(bs.BodyStructure)
-	}
-	if bs.Envelope != nil {
-		d["envelope"] = convertEnvelope(bs.Envelope)
-	}
-	return d
 }
