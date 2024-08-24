@@ -184,6 +184,11 @@ func (a *IMAPAdapter) handleConnection() {
 			}
 		}
 
+		if _, err = a.imapClient.Select(a.conf.InboxName, false); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Select(): %v", err))
+			return
+		}
+
 		seqSet, err := imap.ParseSeqSet(fmt.Sprintf("%d:*", lastUID+1))
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("ParseSeqSet(): %v", err))
