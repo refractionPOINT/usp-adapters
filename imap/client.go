@@ -1,16 +1,22 @@
 package usp_imap
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/emersion/go-imap"
 	"github.com/emersion/go-imap/client"
+	"github.com/emersion/go-message/mail"
 
+	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 )
@@ -27,19 +33,24 @@ type IMAPAdapter struct {
 	chStop     chan struct{}
 	chStopped  chan struct{}
 
+	artifactUploader *limacharlie.Organization
+	wgArtifacts      sync.WaitGroup
+
 	ctx context.Context
 }
 
 type ImapConfig struct {
-	ClientOptions      uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Server             string                  `json:"server" yaml:"server"`
-	UserName           string                  `json:"username" yaml:"username"`
-	Password           string                  `json:"password" yaml:"password"`
-	InboxName          string                  `json:"inbox_name" yaml:"inbox_name"`
-	IsInsecure         bool                    `json:"is_insecure" yaml:"is_insecure"`
-	FromZero           bool                    `json:"from_zero" yaml:"from_zero"`
-	IncludeAttachments bool                    `json:"include_attachments" yaml:"include_attachments"`
-	MaxBodySize        int                     `json:"max_body_size" yaml:"max_body_size"`
+	ClientOptions           uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	Server                  string                  `json:"server" yaml:"server"`
+	UserName                string                  `json:"username" yaml:"username"`
+	Password                string                  `json:"password" yaml:"password"`
+	InboxName               string                  `json:"inbox_name" yaml:"inbox_name"`
+	IsInsecure              bool                    `json:"is_insecure" yaml:"is_insecure"`
+	FromZero                bool                    `json:"from_zero" yaml:"from_zero"`
+	IncludeAttachments      bool                    `json:"include_attachments" yaml:"include_attachments"`
+	MaxBodySize             int                     `json:"max_body_size" yaml:"max_body_size"`
+	AttachmentIngestKey     string                  `json:"attachment_ingest_key" yaml:"attachment_ingest_key"`
+	AttachmentRetentionDays int                     `json:"attachment_retention_days" yaml:"attachment_retention_days"`
 }
 
 func (c *ImapConfig) Validate() error {
@@ -103,6 +114,17 @@ func NewImapAdapter(conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
 
 	a.conf.ClientOptions.DebugLog("selected inbox")
 
+	if a.conf.IncludeAttachments && a.conf.AttachmentIngestKey != "" {
+		a.artifactUploader, err = limacharlie.NewOrganizationFromClientOptions(limacharlie.ClientOptions{
+			OID: a.conf.ClientOptions.Identity.Oid,
+		}, &limacharlie.LCLoggerGCP{})
+		if err != nil {
+			a.imapClient.Logout()
+			a.imapClient.Close()
+			return nil, nil, fmt.Errorf("artifactUploader: %v", err)
+		}
+	}
+
 	// Create the USP client to ship to LC
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
@@ -135,6 +157,7 @@ func (a *IMAPAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("drained")
 	_, err4 := a.uspClient.Close()
 	a.conf.ClientOptions.DebugLog("closed USP client")
+	a.wgArtifacts.Wait()
 
 	if err1 != nil {
 		return err1
@@ -319,12 +342,98 @@ func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessag
 				if bpn.Specifier != "" {
 					continue
 				}
-				data, err := io.ReadAll(bp)
+				fullBody, err := io.ReadAll(bp)
 				if err != nil {
-					return nil, err
+					return nil, fmt.Errorf("ReadAll(): %v", err)
 				}
-				body = string(data)
-				break
+				if a.conf.AttachmentIngestKey != "" {
+					mr, err := mail.CreateReader(bytes.NewReader(fullBody))
+					if err != nil {
+						return nil, fmt.Errorf("CreateReader(): %v", err)
+					}
+					for {
+						part, err := mr.NextPart()
+						if err == io.EOF {
+							break
+						} else if err != nil {
+							mr.Close()
+							return nil, fmt.Errorf("NextPart(): %v", err)
+						}
+						isAttachment := false
+						attachmentName := ""
+						if ah, ok := part.Header.(*mail.InlineHeader); ok {
+							for k, v := range ah.Map() {
+								if strings.ToLower(k) == "content-type" {
+									for _, vv := range v {
+										if !strings.Contains(strings.ToLower(vv), "text/html") && !strings.Contains(strings.ToLower(vv), "text/plain") {
+											isAttachment = true
+											break
+										}
+									}
+								} else if strings.ToLower(k) == "content-disposition" {
+									// Try to get the attachment name from the content-disposition header.
+									for _, vv := range v {
+										vv = strings.ToLower(vv)
+										// Get the index of filename= to extract the attachment name.
+										if strings.Contains(vv, "filename=") {
+											attachmentName = strings.Trim(vv[strings.Index(vv, "filename=")+9:], "\"")
+											break
+										}
+									}
+								}
+							}
+						} else if ah, ok := part.Header.(*mail.AttachmentHeader); ok {
+							for k, v := range ah.Map() {
+								if strings.ToLower(k) == "content-type" {
+									for _, vv := range v {
+										if !strings.Contains(strings.ToLower(vv), "text/html") && !strings.Contains(strings.ToLower(vv), "text/plain") {
+											isAttachment = true
+											break
+										}
+									}
+								} else if strings.ToLower(k) == "content-disposition" {
+									// Try to get the attachment name from the content-disposition header.
+									for _, vv := range v {
+										vv = strings.ToLower(vv)
+										// Get the index of filename= to extract the attachment name.
+										if strings.Contains(vv, "filename=") {
+											attachmentName = strings.Trim(vv[strings.Index(vv, "filename=")+9:], "\"")
+											break
+										}
+									}
+								}
+							}
+						}
+						if !isAttachment {
+							continue
+						}
+						body, err := io.ReadAll(part.Body)
+						if err != nil {
+							mr.Close()
+							return nil, fmt.Errorf("ReadAll(): %v", err)
+						}
+						// Upload the attachment as an artifact to LC.
+						a.wgArtifacts.Add(1)
+						go func() {
+							defer a.wgArtifacts.Done()
+
+							a.conf.ClientOptions.DebugLog(fmt.Sprintf("Uploading attachment: %s", attachmentName))
+							defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("Uploaded attachment: %s", attachmentName))
+
+							// Hash the attachment with sha256 and use it as the artifact id.
+							hash := sha256.Sum256(body)
+							artifactID := hex.EncodeToString(hash[:])
+							// Upload the attachment.
+							if err := a.artifactUploader.UploadArtifact(bytes.NewBuffer(body), int64(len(body)), "attachment", a.conf.ClientOptions.Hostname, artifactID, attachmentName, a.conf.AttachmentRetentionDays, a.conf.AttachmentIngestKey); err != nil {
+								mr.Close()
+								a.conf.ClientOptions.OnError(fmt.Errorf("CreateArtifactFromBytes(): %v", err))
+							}
+						}()
+					}
+					mr.Close()
+				}
+
+				body = string(fullBody)
 			}
 		}
 	} else {
