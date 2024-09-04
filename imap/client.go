@@ -274,10 +274,18 @@ func (a *IMAPAdapter) getLastUID() (uint32, error) {
 		return 0, nil
 	}
 	sc := imap.NewSearchCriteria()
-	sc.Since = time.Now().Add(-24 * time.Hour)
-	seqs, err := a.imapClient.Search(sc)
-	if err != nil {
-		return 0, fmt.Errorf("initial.Search(): %v", err)
+	var seqs []uint32
+	var err error
+	for i := 1; i <= 365; i++ {
+		sc.Since = time.Now().Add(-24 * time.Hour * time.Duration(i))
+		seqs, err = a.imapClient.Search(sc)
+		if err != nil {
+			return 0, fmt.Errorf("initial.Search(): %v", err)
+		}
+		if len(seqs) > 0 {
+			break
+		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("no messages found for %d days ago", i))
 	}
 	seqSet := &imap.SeqSet{}
 	seqSet.AddNum(seqs...)
