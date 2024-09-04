@@ -236,7 +236,7 @@ func (a *IMAPAdapter) handleConnection() {
 				toFetch = append(toFetch, imap.FetchFull.Expand()...)
 				toFetch = append(toFetch, bsn.FetchItem())
 			}
-			done <- a.imapClient.Fetch(seqSet, toFetch, messages)
+			done <- a.imapClient.UidFetch(seqSet, toFetch, messages)
 		}()
 		go func() {
 			defer wg.Done()
@@ -261,7 +261,7 @@ func (a *IMAPAdapter) handleConnection() {
 			}
 		}()
 		if err := a.waitForErrorFromChanForDuration(a.chStopped, done, 10*time.Minute); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("next.Fetch(): %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("next.UidFetch(): %v", err))
 			return
 		}
 		wg.Wait()
@@ -287,7 +287,7 @@ func (a *IMAPAdapter) getLastUID() (uint32, error) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		done <- a.imapClient.Fetch(seqSet, []imap.FetchItem{imap.FetchUid}, messages)
+		done <- a.imapClient.UidFetch(seqSet, []imap.FetchItem{imap.FetchUid}, messages)
 	}()
 	lastUID := uint32(0)
 	go func() {
@@ -297,7 +297,7 @@ func (a *IMAPAdapter) getLastUID() (uint32, error) {
 		}
 	}()
 	if err := a.waitForErrorFromChanForDuration(a.chStopped, done, 10*time.Second); err != nil {
-		return 0, fmt.Errorf("initial.Fetch(): %v", err)
+		return 0, fmt.Errorf("initial.UidFetch(): %v", err)
 	}
 	wg.Wait()
 	return lastUID, nil
