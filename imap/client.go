@@ -253,7 +253,7 @@ func (a *IMAPAdapter) handleConnection() {
 				}
 				// Sometimes the server returns an old out of bounds UID for some reason, so
 				// just ignore those cases.
-				if msg.Uid < lastUID {
+				if msg.Uid <= lastUID {
 
 					continue
 				}
