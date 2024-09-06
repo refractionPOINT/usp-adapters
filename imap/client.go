@@ -251,6 +251,12 @@ func (a *IMAPAdapter) handleConnection() {
 					continue
 				default:
 				}
+				// Sometimes the server returns an old out of bounds UID for some reason, so
+				// just ignore those cases.
+				if msg.Uid <= lastUID {
+
+					continue
+				}
 				if err := a.processEvent(a.ctx, msg); err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("processEvent(): %v", err))
 					hadError = true
