@@ -51,13 +51,9 @@ type USPClient interface {
 	Close() error
 }
 
-// These configs are top level and cannot
-// be used by underlying adapters.
-type RuntimeConfig struct {
-	Healthcheck int `json:"healthcheck" yaml:"healthcheck"`
-}
-
 type GeneralConfigs struct {
+	Healthcheck int `json:"healthcheck" yaml:"healthcheck"`
+
 	Syslog            usp_syslog.SyslogConfig                         `json:"syslog" yaml:"syslog"`
 	PubSub            usp_pubsub.PubSubConfig                         `json:"pubsub" yaml:"pubsub"`
 	S3                usp_s3.S3Config                                 `json:"s3" yaml:"s3"`
@@ -90,11 +86,6 @@ type AdapterStats struct {
 	m                sync.Mutex
 	lastAck          time.Time
 	lastBackPressure time.Time
-}
-
-type configToRun struct {
-	rc *RuntimeConfig
-	gc *GeneralConfigs
 }
 
 func logError(format string, elems ...interface{}) string {
@@ -137,8 +128,6 @@ func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 	logError("Available configs:\n")
 	printStruct("", GeneralConfigs{}, true)
-	logError("\nGlobal Runtime Options\n----------------------------------")
-	printStruct("", RuntimeConfig{}, false)
 }
 
 func printConfig(method string, c interface{}) {
@@ -163,10 +152,16 @@ func main() {
 		printUsage()
 		os.Exit(1)
 	}
+	if len(configsToRun) == 0 {
+		logError("no configs to run")
+		os.Exit(1)
+		return
+	}
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
 	for _, config := range configsToRun {
-		client, chRunning, err := runAdapter(method, *config.rc, *config.gc)
+		log("starting adapter: %s", method)
+		client, chRunning, err := runAdapter(method, *config)
 		if err != nil {
 			os.Exit(1)
 		}
@@ -197,7 +192,7 @@ func main() {
 	log("exited")
 }
 
-func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConfigs) (USPClient, chan struct{}, error) {
+func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}, error) {
 	var client USPClient
 	var chRunning chan struct{}
 	var err error
@@ -341,8 +336,8 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	}
 
 	// If healthchecks were requested, start it.
-	if runtimeConfigs.Healthcheck != 0 {
-		if err := startHealthChecks(runtimeConfigs.Healthcheck); err != nil {
+	if configs.Healthcheck != 0 {
+		if err := startHealthChecks(configs.Healthcheck); err != nil {
 			client.Close()
 			return nil, nil, errors.New(logError("error starting healthchecks: %v", err))
 		}
@@ -351,8 +346,8 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	return client, chRunning, nil
 }
 
-func parseConfigs(args []string) (string, []configToRun, error) {
-	configsToRun := []configToRun{}
+func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
+	configsToRun := []*GeneralConfigs{}
 	var err error
 	if len(args) < 2 {
 		return "", nil, errors.New("not enough arguments")
@@ -365,23 +360,23 @@ func parseConfigs(args []string) (string, []configToRun, error) {
 		if configsToRun, err = parseConfigsFromFile(args[0]); err != nil {
 			return "", nil, err
 		}
+		log("found %d configs to run", len(configsToRun))
 	} else {
-		var runtimeConfigs *RuntimeConfig
 		var configs *GeneralConfigs
 		// Read the config from the CLI.
-		if err = parseConfigsFromParams(method, args, runtimeConfigs, configs); err != nil {
+		if err = parseConfigsFromParams(method, args, configs); err != nil {
 			return "", nil, err
 		}
 		// Read the config from the Env.
-		if err = parseConfigsFromParams(method, os.Environ(), runtimeConfigs, configs); err != nil {
+		if err = parseConfigsFromParams(method, os.Environ(), configs); err != nil {
 			return "", nil, err
 		}
-		configsToRun = append(configsToRun, configToRun{runtimeConfigs, configs})
+		configsToRun = append(configsToRun, configs)
 	}
 	return method, configsToRun, nil
 }
 
-func parseConfigsFromFile(filePath string) ([]configToRun, error) {
+func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		printUsage()
@@ -392,14 +387,13 @@ func parseConfigsFromFile(filePath string) ([]configToRun, error) {
 		printUsage()
 		return nil, errors.New(logError("io.ReadAll(): %v", err))
 	}
-	jsonDecoder := json.NewDecoder(bytes.NewBuffer(b))
 	yamlDecoder := yaml.NewDecoder(bytes.NewBuffer(b))
+	jsonDecoder := json.NewDecoder(bytes.NewBuffer(b))
 	var jsonErr error
 	var yamlErr error
 
-	configsToRun := []configToRun{}
+	configsToRun := []*GeneralConfigs{}
 	for {
-		runtimeConfigs := &RuntimeConfig{}
 		configs := &GeneralConfigs{}
 
 		if jsonErr = jsonDecoder.Decode(configs); jsonErr != nil {
@@ -408,18 +402,10 @@ func parseConfigsFromFile(filePath string) ([]configToRun, error) {
 			}
 			break
 		}
-
-		if jsonErr = jsonDecoder.Decode(runtimeConfigs); jsonErr != nil {
-			if jsonErr == io.EOF {
-				jsonErr = nil
-			}
-			break
-		}
-		configsToRun = append(configsToRun, configToRun{runtimeConfigs, configs})
+		configsToRun = append(configsToRun, configs)
 	}
 
 	for {
-		runtimeConfigs := &RuntimeConfig{}
 		configs := &GeneralConfigs{}
 
 		if yamlErr = yamlDecoder.Decode(configs); yamlErr != nil {
@@ -429,13 +415,7 @@ func parseConfigsFromFile(filePath string) ([]configToRun, error) {
 			break
 		}
 
-		if yamlErr = yamlDecoder.Decode(runtimeConfigs); yamlErr != nil {
-			if yamlErr == io.EOF {
-				yamlErr = nil
-			}
-			break
-		}
-		configsToRun = append(configsToRun, configToRun{runtimeConfigs, configs})
+		configsToRun = append(configsToRun, configs)
 	}
 
 	if jsonErr != nil && yamlErr != nil {
@@ -446,14 +426,9 @@ func parseConfigsFromFile(filePath string) ([]configToRun, error) {
 	return configsToRun, nil
 }
 
-func parseConfigsFromParams(prefix string, params []string, runtimeConfigs *RuntimeConfig, configs *GeneralConfigs) error {
+func parseConfigsFromParams(prefix string, params []string, configs *GeneralConfigs) error {
 	// Read the config from the CLI.
 	if err := utils.ParseCLI(prefix, params, configs); err != nil {
-		printUsage()
-		return errors.New(logError("ParseCLI(): %v", err))
-	}
-	// Get the runtime configs.
-	if err := utils.ParseCLI("", params, runtimeConfigs); err != nil {
 		printUsage()
 		return errors.New(logError("ParseCLI(): %v", err))
 	}
