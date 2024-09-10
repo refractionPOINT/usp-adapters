@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -91,6 +92,11 @@ type AdapterStats struct {
 	lastBackPressure time.Time
 }
 
+type configToRun struct {
+	rc *RuntimeConfig
+	gc *GeneralConfigs
+}
+
 func logError(format string, elems ...interface{}) string {
 	s := fmt.Sprintf(format+"\n", elems...)
 	os.Stderr.Write([]byte(s))
@@ -151,16 +157,24 @@ func main() {
 		return
 	}
 
-	method, runtimeConfigs, configs, err := parseConfigs(os.Args[1:])
+	method, configsToRun, err := parseConfigs(os.Args[1:])
 	if err != nil {
 		logError("error: %s", err)
 		printUsage()
 		os.Exit(1)
 	}
-
-	client, chRunning, err := runAdapter(method, *runtimeConfigs, *configs)
-	if err != nil {
-		os.Exit(1)
+	clients := []USPClient{}
+	chRunnings := make(chan struct{})
+	for _, config := range configsToRun {
+		client, chRunning, err := runAdapter(method, *config.rc, *config.gc)
+		if err != nil {
+			os.Exit(1)
+		}
+		clients = append(clients, client)
+		go func() {
+			<-chRunning
+			chRunnings <- struct{}{}
+		}()
 	}
 
 	osSignals := make(chan os.Signal, 1)
@@ -170,14 +184,15 @@ func main() {
 	case <-osSignals:
 		log("received signal to exit")
 		break
-	case <-chRunning:
+	case <-chRunnings:
 		log("client stopped")
 		break
 	}
-
-	if err := client.Close(); err != nil {
-		logError("error closing client: %v", err)
-		os.Exit(1)
+	for _, client := range clients {
+		if err := client.Close(); err != nil {
+			logError("error closing client: %v", err)
+			os.Exit(1)
+		}
 	}
 	log("exited")
 }
@@ -336,67 +351,99 @@ func runAdapter(method string, runtimeConfigs RuntimeConfig, configs GeneralConf
 	return client, chRunning, nil
 }
 
-func parseConfigs(args []string) (string, *RuntimeConfig, *GeneralConfigs, error) {
-	runtimeConfigs := &RuntimeConfig{}
-	configs := &GeneralConfigs{}
+func parseConfigs(args []string) (string, []configToRun, error) {
+	configsToRun := []configToRun{}
 	var err error
 	if len(args) < 2 {
-		return "", nil, nil, errors.New("not enough arguments")
+		return "", nil, errors.New("not enough arguments")
 	}
 
 	method := args[0]
 	args = args[1:]
 	if len(args) == 1 {
 		log("loading config from file: %s", args[0])
-		if runtimeConfigs, configs, err = parseConfigsFromFile(args[0]); err != nil {
-			return "", nil, nil, err
+		if configsToRun, err = parseConfigsFromFile(args[0]); err != nil {
+			return "", nil, err
 		}
 	} else {
+		var runtimeConfigs *RuntimeConfig
+		var configs *GeneralConfigs
 		// Read the config from the CLI.
 		if err = parseConfigsFromParams(method, args, runtimeConfigs, configs); err != nil {
-			return "", nil, nil, err
+			return "", nil, err
 		}
 		// Read the config from the Env.
 		if err = parseConfigsFromParams(method, os.Environ(), runtimeConfigs, configs); err != nil {
-			return "", nil, nil, err
+			return "", nil, err
 		}
+		configsToRun = append(configsToRun, configToRun{runtimeConfigs, configs})
 	}
-	return method, runtimeConfigs, configs, nil
+	return method, configsToRun, nil
 }
 
-func parseConfigsFromFile(filePath string) (*RuntimeConfig, *GeneralConfigs, error) {
-	runtimeConfigs := &RuntimeConfig{}
-	configs := &GeneralConfigs{}
-
+func parseConfigsFromFile(filePath string) ([]configToRun, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		printUsage()
-		return nil, nil, errors.New(logError("os.Open(): %v", err))
+		return nil, errors.New(logError("os.Open(): %v", err))
 	}
 	b, err := io.ReadAll(f)
 	if err != nil {
 		printUsage()
-		return nil, nil, errors.New(logError("io.ReadAll(): %v", err))
+		return nil, errors.New(logError("io.ReadAll(): %v", err))
 	}
-	if err := json.Unmarshal(b, &configs); err != nil {
-		err2 := yaml.Unmarshal(b, &configs)
-		if err2 != nil {
-			printUsage()
-			err = errors.New(logError("json.Unmarshal(): %v", err))
-			err2 = errors.New(logError("yaml.Unmarshal(): %v", err2))
-			return nil, nil, fmt.Errorf("%v\n%v", err, err2)
+	jsonDecoder := json.NewDecoder(bytes.NewBuffer(b))
+	yamlDecoder := yaml.NewDecoder(bytes.NewBuffer(b))
+	var jsonErr error
+	var yamlErr error
+
+	configsToRun := []configToRun{}
+	for {
+		runtimeConfigs := &RuntimeConfig{}
+		configs := &GeneralConfigs{}
+
+		if jsonErr = jsonDecoder.Decode(configs); jsonErr != nil {
+			if jsonErr == io.EOF {
+				jsonErr = nil
+			}
+			break
 		}
-	}
-	if err := json.Unmarshal(b, &runtimeConfigs); err != nil {
-		err2 := yaml.Unmarshal(b, &runtimeConfigs)
-		if err2 != nil {
-			printUsage()
-			err = errors.New(logError("json.Unmarshal(): %v", err))
-			err2 = errors.New(logError("yaml.Unmarshal(): %v", err2))
-			return nil, nil, fmt.Errorf("%v\n%v", err, err2)
+
+		if jsonErr = jsonDecoder.Decode(runtimeConfigs); jsonErr != nil {
+			if jsonErr == io.EOF {
+				jsonErr = nil
+			}
+			break
 		}
+		configsToRun = append(configsToRun, configToRun{runtimeConfigs, configs})
 	}
-	return runtimeConfigs, configs, nil
+
+	for {
+		runtimeConfigs := &RuntimeConfig{}
+		configs := &GeneralConfigs{}
+
+		if yamlErr = yamlDecoder.Decode(configs); yamlErr != nil {
+			if yamlErr == io.EOF {
+				yamlErr = nil
+			}
+			break
+		}
+
+		if yamlErr = yamlDecoder.Decode(runtimeConfigs); yamlErr != nil {
+			if yamlErr == io.EOF {
+				yamlErr = nil
+			}
+			break
+		}
+		configsToRun = append(configsToRun, configToRun{runtimeConfigs, configs})
+	}
+
+	if jsonErr != nil && yamlErr != nil {
+		printUsage()
+		return nil, errors.New(logError("decoding error: json=%v yaml=%v", jsonErr, yamlErr))
+	}
+
+	return configsToRun, nil
 }
 
 func parseConfigsFromParams(prefix string, params []string, runtimeConfigs *RuntimeConfig, configs *GeneralConfigs) error {
