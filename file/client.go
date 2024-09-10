@@ -6,6 +6,7 @@ package usp_file
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -16,7 +17,8 @@ import (
 )
 
 const (
-	defaultWriteTimeout = 60 * 10
+	defaultWriteTimeout    = 60 * 10
+	defaultPollingInterval = 10 * time.Second
 )
 
 type FileAdapter struct {
@@ -24,7 +26,8 @@ type FileAdapter struct {
 	wg           sync.WaitGroup
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
-	tailFile     *tail.Tail
+	tailFiles    map[string]*tail.Tail
+	mu           sync.Mutex
 }
 
 func (c *FileConfig) Validate() error {
@@ -39,7 +42,8 @@ func (c *FileConfig) Validate() error {
 
 func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	a := &FileAdapter{
-		conf: conf,
+		conf:      conf,
+		tailFiles: make(map[string]*tail.Tail),
 	}
 
 	if a.conf.WriteTimeoutSec == 0 {
@@ -48,16 +52,6 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.tailFile, err = tail.TailFile(a.conf.FilePath, tail.Config{
-		ReOpen:        !a.conf.NoFollow,
-		MustExist:     true,
-		Follow:        !a.conf.NoFollow,
-		CompleteLines: true,
-	})
-	if err != nil {
-		return nil, nil, err
-	}
-
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
@@ -68,40 +62,49 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	go func() {
 		defer a.wg.Done()
 		defer close(chStopped)
-		a.handleInput()
-		if a.conf.NoFollow {
-			a.conf.ClientOptions.DebugLog("finished tailing, waiting to drain")
-			time.Sleep(2 * time.Second)
-			a.uspClient.Drain(10 * time.Minute)
-		}
+		a.pollFiles()
 	}()
-	if a.conf.NoFollow {
-		a.wg.Add(1)
-		go func() {
-			defer a.wg.Done()
-			time.Sleep(2 * time.Second)
-			a.tailFile.StopAtEOF()
-		}()
-	}
 
 	return a, chStopped, nil
 }
 
-func (a *FileAdapter) Close() error {
-	a.conf.ClientOptions.DebugLog("closing")
-	a.tailFile.Stop()
-	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+func (a *FileAdapter) pollFiles() {
+	for {
+		matches, err := filepath.Glob(a.conf.FilePath)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("glob error: %v", err))
+			return
+		}
 
-	if err1 != nil {
-		return err1
+		a.mu.Lock()
+		for _, match := range matches {
+			if _, ok := a.tailFiles[match]; !ok {
+				t, err := tail.TailFile(match, tail.Config{
+					ReOpen:        !a.conf.NoFollow,
+					MustExist:     true,
+					Follow:        !a.conf.NoFollow,
+					CompleteLines: true,
+				})
+				if err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("tail error: %v", err))
+					continue
+				}
+				a.tailFiles[match] = t
+				a.wg.Add(1)
+				go func(t *tail.Tail) {
+					defer a.wg.Done()
+					a.handleInput(t)
+				}(t)
+			}
+		}
+		a.mu.Unlock()
+
+		time.Sleep(defaultPollingInterval)
 	}
-
-	return err2
 }
 
-func (a *FileAdapter) handleInput() {
-	for line := range a.tailFile.Lines {
+func (a *FileAdapter) handleInput(t *tail.Tail) {
+	for line := range t.Lines {
 		if line.Err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("tail.Line(): %v", line.Err))
 			break
@@ -126,4 +129,21 @@ func (a *FileAdapter) handleLine(line string) {
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 	}
+}
+
+func (a *FileAdapter) Close() error {
+	a.conf.ClientOptions.DebugLog("closing")
+	a.mu.Lock()
+	for _, t := range a.tailFiles {
+		t.Stop()
+	}
+	a.mu.Unlock()
+	err1 := a.uspClient.Drain(1 * time.Minute)
+	_, err2 := a.uspClient.Close()
+
+	if err1 != nil {
+		return err1
+	}
+
+	return err2
 }
