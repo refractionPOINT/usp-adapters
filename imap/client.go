@@ -231,11 +231,9 @@ func (a *IMAPAdapter) handleConnection() {
 				imap.FetchRFC822Size,
 				imap.FetchRFC822Text,
 			})
-			if a.conf.IncludeAttachments {
-				bsn := &imap.BodySectionName{}
-				toFetch = append(toFetch, imap.FetchFull.Expand()...)
-				toFetch = append(toFetch, bsn.FetchItem())
-			}
+			bsn := &imap.BodySectionName{}
+			toFetch = append(toFetch, imap.FetchFull.Expand()...)
+			toFetch = append(toFetch, bsn.FetchItem())
 			done <- a.imapClient.UidFetch(seqSet, toFetch, messages)
 		}()
 		go func() {
@@ -349,121 +347,104 @@ func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessag
 	// For INCLUDE ATTACHMENT, use the "" body part.
 	// For WITHOUT, use the "TEXT" body part.
 	body := ""
-	if a.conf.IncludeAttachments {
-		if a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize {
-			for bpn, bp := range message.Body {
-				// We only want the "" body part.
-				if bpn.Specifier != "" {
-					continue
-				}
-				fullBody, err := io.ReadAll(bp)
+	if a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize {
+		for bpn, bp := range message.Body {
+			// We only want the "" body part.
+			if bpn.Specifier != "" {
+				continue
+			}
+			fullBody, err := io.ReadAll(bp)
+			if err != nil {
+				return nil, fmt.Errorf("ReadAll(): %v", err)
+			}
+			if a.conf.AttachmentIngestKey != "" && (a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize) {
+				mr, err := mail.CreateReader(bytes.NewReader(fullBody))
 				if err != nil {
-					return nil, fmt.Errorf("ReadAll(): %v", err)
+					return nil, fmt.Errorf("CreateReader(): %v", err)
 				}
-				if a.conf.AttachmentIngestKey != "" {
-					mr, err := mail.CreateReader(bytes.NewReader(fullBody))
+				for {
+					part, err := mr.NextPart()
+					if err == io.EOF {
+						break
+					} else if err != nil {
+						mr.Close()
+						return nil, fmt.Errorf("NextPart(): %v", err)
+					}
+					isAttachment := false
+					attachmentName := ""
+					if ah, ok := part.Header.(*mail.InlineHeader); ok {
+						for k, v := range ah.Map() {
+							if strings.ToLower(k) == "content-type" {
+								for _, vv := range v {
+									if !strings.Contains(strings.ToLower(vv), "text/html") && !strings.Contains(strings.ToLower(vv), "text/plain") {
+										isAttachment = true
+										break
+									}
+								}
+							} else if strings.ToLower(k) == "content-disposition" {
+								// Try to get the attachment name from the content-disposition header.
+								for _, vv := range v {
+									vv = strings.ToLower(vv)
+									// Get the index of filename= to extract the attachment name.
+									if strings.Contains(vv, "filename=") {
+										attachmentName = strings.Trim(vv[strings.Index(vv, "filename=")+9:], "\"")
+										break
+									}
+								}
+							}
+						}
+					} else if ah, ok := part.Header.(*mail.AttachmentHeader); ok {
+						for k, v := range ah.Map() {
+							if strings.ToLower(k) == "content-type" {
+								for _, vv := range v {
+									if !strings.Contains(strings.ToLower(vv), "text/html") && !strings.Contains(strings.ToLower(vv), "text/plain") {
+										isAttachment = true
+										break
+									}
+								}
+							} else if strings.ToLower(k) == "content-disposition" {
+								// Try to get the attachment name from the content-disposition header.
+								for _, vv := range v {
+									vv = strings.ToLower(vv)
+									// Get the index of filename= to extract the attachment name.
+									if strings.Contains(vv, "filename=") {
+										attachmentName = strings.Trim(vv[strings.Index(vv, "filename=")+9:], "\"")
+										break
+									}
+								}
+							}
+						}
+					}
+					if !isAttachment {
+						continue
+					}
+					body, err := io.ReadAll(part.Body)
 					if err != nil {
-						return nil, fmt.Errorf("CreateReader(): %v", err)
+						mr.Close()
+						return nil, fmt.Errorf("ReadAll(): %v", err)
 					}
-					for {
-						part, err := mr.NextPart()
-						if err == io.EOF {
-							break
-						} else if err != nil {
+					// Upload the attachment as an artifact to LC.
+					a.wgArtifacts.Add(1)
+					go func() {
+						defer a.wgArtifacts.Done()
+
+						a.conf.ClientOptions.DebugLog(fmt.Sprintf("Uploading attachment: %s", attachmentName))
+						defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("Uploaded attachment: %s", attachmentName))
+
+						// Hash the attachment with sha256 and use it as the artifact id.
+						hash := sha256.Sum256(body)
+						artifactID := hex.EncodeToString(hash[:])
+						// Upload the attachment.
+						if err := a.artifactUploader.UploadArtifact(bytes.NewBuffer(body), int64(len(body)), "attachment", a.conf.ClientOptions.Hostname, artifactID, attachmentName, a.conf.AttachmentRetentionDays, a.conf.AttachmentIngestKey); err != nil {
 							mr.Close()
-							return nil, fmt.Errorf("NextPart(): %v", err)
+							a.conf.ClientOptions.OnError(fmt.Errorf("CreateArtifactFromBytes(): %v", err))
 						}
-						isAttachment := false
-						attachmentName := ""
-						if ah, ok := part.Header.(*mail.InlineHeader); ok {
-							for k, v := range ah.Map() {
-								if strings.ToLower(k) == "content-type" {
-									for _, vv := range v {
-										if !strings.Contains(strings.ToLower(vv), "text/html") && !strings.Contains(strings.ToLower(vv), "text/plain") {
-											isAttachment = true
-											break
-										}
-									}
-								} else if strings.ToLower(k) == "content-disposition" {
-									// Try to get the attachment name from the content-disposition header.
-									for _, vv := range v {
-										vv = strings.ToLower(vv)
-										// Get the index of filename= to extract the attachment name.
-										if strings.Contains(vv, "filename=") {
-											attachmentName = strings.Trim(vv[strings.Index(vv, "filename=")+9:], "\"")
-											break
-										}
-									}
-								}
-							}
-						} else if ah, ok := part.Header.(*mail.AttachmentHeader); ok {
-							for k, v := range ah.Map() {
-								if strings.ToLower(k) == "content-type" {
-									for _, vv := range v {
-										if !strings.Contains(strings.ToLower(vv), "text/html") && !strings.Contains(strings.ToLower(vv), "text/plain") {
-											isAttachment = true
-											break
-										}
-									}
-								} else if strings.ToLower(k) == "content-disposition" {
-									// Try to get the attachment name from the content-disposition header.
-									for _, vv := range v {
-										vv = strings.ToLower(vv)
-										// Get the index of filename= to extract the attachment name.
-										if strings.Contains(vv, "filename=") {
-											attachmentName = strings.Trim(vv[strings.Index(vv, "filename=")+9:], "\"")
-											break
-										}
-									}
-								}
-							}
-						}
-						if !isAttachment {
-							continue
-						}
-						body, err := io.ReadAll(part.Body)
-						if err != nil {
-							mr.Close()
-							return nil, fmt.Errorf("ReadAll(): %v", err)
-						}
-						// Upload the attachment as an artifact to LC.
-						a.wgArtifacts.Add(1)
-						go func() {
-							defer a.wgArtifacts.Done()
-
-							a.conf.ClientOptions.DebugLog(fmt.Sprintf("Uploading attachment: %s", attachmentName))
-							defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("Uploaded attachment: %s", attachmentName))
-
-							// Hash the attachment with sha256 and use it as the artifact id.
-							hash := sha256.Sum256(body)
-							artifactID := hex.EncodeToString(hash[:])
-							// Upload the attachment.
-							if err := a.artifactUploader.UploadArtifact(bytes.NewBuffer(body), int64(len(body)), "attachment", a.conf.ClientOptions.Hostname, artifactID, attachmentName, a.conf.AttachmentRetentionDays, a.conf.AttachmentIngestKey); err != nil {
-								mr.Close()
-								a.conf.ClientOptions.OnError(fmt.Errorf("CreateArtifactFromBytes(): %v", err))
-							}
-						}()
-					}
-					mr.Close()
+					}()
 				}
-
-				body = string(fullBody)
+				mr.Close()
 			}
-		}
-	} else {
-		if a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize {
-			for bpn, bp := range message.Body {
-				// We only want the "TEXT" body part.
-				if bpn.Specifier != "TEXT" {
-					continue
-				}
-				data, err := io.ReadAll(bp)
-				if err != nil {
-					return nil, err
-				}
-				body = string(data)
-				break
-			}
+
+			body = string(fullBody)
 		}
 	}
 	msg := &protocol.DataMessage{
