@@ -126,7 +126,7 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	acceptedControls := svc.AcceptStop | svc.AcceptShutdown
 	changes <- svc.Status{State: svc.StartPending, Accepts: acceptedControls}
 	args = m.args
-	method, runtimeConfigs, configs, err := parseConfigs(args)
+	method, configsToRun, err := parseConfigs(args)
 	if err != nil {
 		saveErrorOnDisk(logError("parseConfigs(): %v", err))
 		return false, 1
@@ -143,12 +143,26 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 		retries++
 	}
 
-	client, chRunning, err := runAdapter(method, *runtimeConfigs, *configs)
-	if err != nil {
-		saveErrorOnDisk(logError("runAdapter(): %v", err))
-		return false, 1
+	if len(configsToRun) == 0 {
+		logError("no configs to run")
+		os.Exit(1)
+		return
 	}
-	defer client.Close()
+	clients := []USPClient{}
+	chRunnings := make(chan struct{})
+	for _, config := range configsToRun {
+		log("starting adapter: %s", method)
+		client, chRunning, err := runAdapter(method, *config)
+		if err != nil {
+			saveErrorOnDisk(logError("runAdapter(): %v", err))
+			return false, 1
+		}
+		clients = append(clients, client)
+		go func() {
+			<-chRunning
+			chRunnings <- struct{}{}
+		}()
+	}
 
 	wg := sync.WaitGroup{}
 
@@ -156,7 +170,9 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 		for c := range r {
 			if c.Cmd == svc.Stop || c.Cmd == svc.Shutdown {
 				changes <- svc.Status{State: svc.StopPending, Accepts: acceptedControls}
-				client.Close()
+				for _, client := range clients {
+					client.Close()
+				}
 			} else if c.Cmd == svc.Interrogate {
 				changes <- c.CurrentStatus
 			} else {
@@ -168,7 +184,7 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-chRunning
+		<-chRunnings
 		changes <- svc.Status{State: svc.Stopped, Accepts: acceptedControls}
 	}()
 
