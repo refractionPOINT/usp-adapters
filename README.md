@@ -38,6 +38,27 @@ Other common configurations that are not required include:
 
 All other configurations in `client_options` should only be set for advanced ingestion schemes.
 
+### Multi-Adapter
+If running using a configuration file, it is possible to run multiple instances of the same adapter type within a single instance of the adapter
+process. To do this, simply make the config file multiple "documents" (in JSON or YAML format) within the same file, like:
+```yaml
+file:
+   client_options.identity.oid: XXXXX
+   file_path: ./file_1
+   ...
+
+---
+
+file:
+   client_options.identity.oid: XXXXX
+   file_path: ./file_2
+   ...
+
+---
+
+...
+```
+
 ## Sensor IDs
 USP Clients generate LimaCharlie Sensors at runtime. The ID of those sensors (SID) is generated based on the Organization ID (OID) and the Sensor Seed Key.
 
