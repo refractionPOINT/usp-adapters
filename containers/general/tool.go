@@ -362,7 +362,7 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 		}
 		log("found %d configs to run", len(configsToRun))
 	} else {
-		var configs *GeneralConfigs
+		configs := &GeneralConfigs{}
 		// Read the config from the CLI.
 		if err = parseConfigsFromParams(method, args, configs); err != nil {
 			return "", nil, err
