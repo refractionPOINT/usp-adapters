@@ -112,14 +112,14 @@ func (a *EntraIDAdapter) Close() error {
 	return err2
 }
 
-func (a *EntraIDAdapter) fetchToken() (token string) {
+func (a *EntraIDAdapter) fetchToken() (string, error) {
 
 	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.conf.TenantID)
 	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
 	if err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -127,25 +127,26 @@ func (a *EntraIDAdapter) fetchToken() (token string) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
-	if accessToken, ok := result["access_token"].(string); ok {
-		return accessToken
+	accessToken, ok := result["access_token"].(string)
+	if !ok {
+		return "", fmt.Errorf("no bearer token returned: %#v", result)
 	}
 
-	return ""
+	return accessToken, nil
 
 }
 
@@ -203,35 +204,41 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, last
 
 		req, err := http.NewRequest("GET", eventsUrl, nil)
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error creating request: %s\n", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("error creating request: %s", err))
 			return nil, since, "", err
 		}
 
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.fetchToken()))
+		authToken, err := a.fetchToken()
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("error fetching token: %s", err))
+			return nil, since, "", err
+		}
+
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
 		req.Header.Set("Content-Type", "application/json")
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error making request: %s\n", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("error making request: %s", err))
 			return nil, since, "", err
 		}
 		defer resp.Body.Close()
 
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error reading response: %s\n", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("error reading response: %s", err))
 			return nil, since, "", err
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt %d): %s\n", attempt, body))
+			a.conf.ClientOptions.OnError(fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt %d): %s", attempt, body))
 			// Retry if the status code is not OK, but continue to the next iteration
 			if attempt < 3 {
 				continue
 			}
 			// Return after 3 failed attempts
-			return nil, since, "", fmt.Errorf("Error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt 3): %s\n", body)
+			return nil, since, "", fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt 3): %s", body)
 		}
 
 		// If the response is OK, parse the body and process detections
@@ -239,7 +246,7 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, last
 		err = json.Unmarshal(body, &data)
 		detections, _ := data["value"].([]interface{})
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error parsing JSON: %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("error parsing JSON: %v", err))
 			return nil, since, "", err
 		}
 
