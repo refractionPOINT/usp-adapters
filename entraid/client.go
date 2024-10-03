@@ -268,13 +268,13 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, since string, last
 			eventId = id
 
 			if id != lastEventId {
-				createdDateTime, ok := detectMap["createdDateTime"].(string)
+				activityDateTime, ok := detectMap["activityDateTime"].(string)
 				if !ok {
-					a.conf.ClientOptions.DebugLog("Error parsing createdDateTime from detectMap JSON")
+					a.conf.ClientOptions.DebugLog("Error parsing activityDateTime from detectMap JSON")
 					continue
 				}
 
-				lastDetectionTime = createdDateTime
+				lastDetectionTime = activityDateTime
 				alerts = append(alerts, detectMap)
 
 			}
