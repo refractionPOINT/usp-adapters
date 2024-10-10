@@ -6,6 +6,7 @@ package usp_file
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -20,9 +21,11 @@ import (
 const (
 	defaultWriteTimeout    = 60 * 10
 	defaultPollingInterval = 10 * time.Second
+)
 
-	inactivityThreshold   = 15 * time.Second
-	reactivationThreshold = 1 * time.Minute
+var (
+	inactivityThreshold   = 30 * time.Second
+	reactivationThreshold = 60 * time.Second
 )
 
 // contain a tail with a fields that help to now if a file is actively modified/in use
@@ -30,6 +33,7 @@ type tailInfo struct {
 	tail       *tail.Tail
 	lastActive time.Time
 	isInactive bool
+	lastOffset int64
 }
 
 type FileAdapter struct {
@@ -80,6 +84,13 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 }
 
 func (a *FileAdapter) pollFiles() {
+	if a.conf.InactivityThreshold != 0 {
+		inactivityThreshold = time.Duration(a.conf.InactivityThreshold) * time.Second
+	}
+	if a.conf.ReactivationThreshold != 0 {
+		reactivationThreshold = time.Duration(a.conf.ReactivationThreshold) * time.Second
+	}
+
 	for {
 		matches, err := filepath.Glob(a.conf.FilePath)
 		if err != nil {
@@ -103,6 +114,7 @@ func (a *FileAdapter) pollFiles() {
 							MustExist:     true,
 							Follow:        !a.conf.NoFollow,
 							CompleteLines: true,
+							Location:      &tail.SeekInfo{Offset: info.lastOffset, Whence: io.SeekStart}, // start to ingest from last known position
 						})
 						if err != nil {
 							a.conf.ClientOptions.OnError(fmt.Errorf("tail error on reactivation: %v", err))
@@ -122,6 +134,7 @@ func (a *FileAdapter) pollFiles() {
 					// validate if an active file has become inactive and we need to stop tailing it
 					if now.Sub(modTime) > inactivityThreshold {
 						a.conf.ClientOptions.OnError(fmt.Errorf("file inactive: %s", path))
+						info.lastOffset, err = info.tail.Tell() // store current position before stopping the tail in case we need to resume
 						err := info.tail.Stop()
 						if err != nil {
 							a.conf.ClientOptions.OnError(fmt.Errorf("error stopping tail: %v", err))
@@ -145,11 +158,23 @@ func (a *FileAdapter) pollFiles() {
 
 		for _, match := range matches {
 			if _, ok := a.tailFiles[match]; !ok {
+				stat, err := os.Stat(match)
+				if err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("error getting file stats: %v", err))
+					continue
+				}
+
+				if now.Sub(stat.ModTime()) > inactivityThreshold {
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf("file too old to open: %s", match))
+					continue
+				}
+
 				t, err := tail.TailFile(match, tail.Config{
 					ReOpen:        !a.conf.NoFollow,
 					MustExist:     true,
 					Follow:        !a.conf.NoFollow,
 					CompleteLines: true,
+					Location:      &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd}, // start to ingest at the end for new files
 				})
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("tail error: %v", err))
