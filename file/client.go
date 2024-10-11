@@ -24,7 +24,7 @@ const (
 )
 
 var (
-	inactivityThreshold   = 30 * time.Second
+	inactivityThreshold   = 24 * time.Hour
 	reactivationThreshold = 60 * time.Second
 )
 
