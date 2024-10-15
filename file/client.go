@@ -6,6 +6,8 @@ package usp_file
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"time"
@@ -21,12 +23,25 @@ const (
 	defaultPollingInterval = 10 * time.Second
 )
 
+var (
+	inactivityThreshold   = 24 * time.Hour
+	reactivationThreshold = 60 * time.Second
+)
+
+// contain a tail with a fields that help to now if a file is actively modified/in use
+type tailInfo struct {
+	tail       *tail.Tail
+	lastActive time.Time
+	isInactive bool
+	lastOffset int64
+}
+
 type FileAdapter struct {
 	conf         FileConfig
 	wg           sync.WaitGroup
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
-	tailFiles    map[string]*tail.Tail
+	tailFiles    map[string]*tailInfo
 	mu           sync.Mutex
 }
 
@@ -43,7 +58,7 @@ func (c *FileConfig) Validate() error {
 func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	a := &FileAdapter{
 		conf:      conf,
-		tailFiles: make(map[string]*tail.Tail),
+		tailFiles: make(map[string]*tailInfo),
 	}
 
 	if a.conf.WriteTimeoutSec == 0 {
@@ -69,6 +84,13 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 }
 
 func (a *FileAdapter) pollFiles() {
+	if a.conf.InactivityThreshold != 0 {
+		inactivityThreshold = time.Duration(a.conf.InactivityThreshold) * time.Second
+	}
+	if a.conf.ReactivationThreshold != 0 {
+		reactivationThreshold = time.Duration(a.conf.ReactivationThreshold) * time.Second
+	}
+
 	for {
 		matches, err := filepath.Glob(a.conf.FilePath)
 		if err != nil {
@@ -77,19 +99,92 @@ func (a *FileAdapter) pollFiles() {
 		}
 
 		a.mu.Lock()
+		now := time.Now()
+
+		// check all files against what we have in the tailfiles map
+		for path, info := range a.tailFiles {
+			if stat, err := os.Stat(path); err == nil {
+				modTime := stat.ModTime()
+				if info.isInactive {
+					// validate if an inactive file has been modified recently and we need to tail it
+					if now.Sub(modTime) <= reactivationThreshold {
+						a.conf.ClientOptions.OnError(fmt.Errorf("file reactivated: %s", path))
+						t, err := tail.TailFile(path, tail.Config{
+							ReOpen:        !a.conf.NoFollow,
+							MustExist:     true,
+							Follow:        !a.conf.NoFollow,
+							CompleteLines: true,
+							Location:      &tail.SeekInfo{Offset: info.lastOffset, Whence: io.SeekStart}, // start to ingest from last known position
+						})
+						if err != nil {
+							a.conf.ClientOptions.OnError(fmt.Errorf("tail error on reactivation: %v", err))
+							continue
+						}
+						info.tail = t
+						info.isInactive = false
+						info.lastActive = modTime
+						a.wg.Add(1)
+
+						go func(t *tail.Tail) {
+							defer a.wg.Done()
+							a.handleInput(t)
+						}(t)
+					}
+				} else {
+					// validate if an active file has become inactive and we need to stop tailing it
+					if now.Sub(modTime) > inactivityThreshold {
+						a.conf.ClientOptions.OnError(fmt.Errorf("file inactive: %s", path))
+						info.lastOffset, err = info.tail.Tell() // store current position before stopping the tail in case we need to resume
+						err := info.tail.Stop()
+						if err != nil {
+							a.conf.ClientOptions.OnError(fmt.Errorf("error stopping tail: %v", err))
+						}
+						info.isInactive = true
+					} else if modTime.After(info.lastActive) {
+						info.lastActive = modTime
+					}
+				}
+			} else {
+				// fle no longer exists on disk, close and remove all the tail resources
+				a.conf.ClientOptions.OnError(fmt.Errorf("file removed: %s", path))
+				err := info.tail.Stop()
+				if err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("error stopping tail: %v", err))
+				}
+				info.tail.Cleanup()
+				delete(a.tailFiles, path)
+			}
+		}
+
 		for _, match := range matches {
 			if _, ok := a.tailFiles[match]; !ok {
+				stat, err := os.Stat(match)
+				if err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("error getting file stats: %v", err))
+					continue
+				}
+
+				if now.Sub(stat.ModTime()) > inactivityThreshold {
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf("file too old to open: %s", match))
+					continue
+				}
+
 				t, err := tail.TailFile(match, tail.Config{
 					ReOpen:        !a.conf.NoFollow,
 					MustExist:     true,
 					Follow:        !a.conf.NoFollow,
 					CompleteLines: true,
+					Location:      &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd}, // start to ingest at the end for new files
 				})
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("tail error: %v", err))
 					continue
 				}
-				a.tailFiles[match] = t
+				a.tailFiles[match] = &tailInfo{
+					tail:       t,
+					lastActive: time.Now(),
+					isInactive: false,
+				}
 				a.wg.Add(1)
 				go func(t *tail.Tail) {
 					defer a.wg.Done()
@@ -134,8 +229,8 @@ func (a *FileAdapter) handleLine(line string) {
 func (a *FileAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	a.mu.Lock()
-	for _, t := range a.tailFiles {
-		t.Stop()
+	for _, info := range a.tailFiles {
+		info.tail.Stop()
 	}
 	a.mu.Unlock()
 	err1 := a.uspClient.Drain(1 * time.Minute)
