@@ -11,4 +11,5 @@ type FileConfig struct {
 	NoFollow              bool                    `json:"no_follow" yaml:"no_follow"`
 	InactivityThreshold   int                     `json:"inactivity_threshold" yaml:"inactivity_threshold"`
 	ReactivationThreshold int                     `json:"reactivation_threshold" yaml:"reactivation_threshold"`
+	Backfill              bool                    `json:"backfill" yaml:"backfill"`
 }
