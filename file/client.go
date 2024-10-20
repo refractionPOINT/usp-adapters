@@ -169,12 +169,17 @@ func (a *FileAdapter) pollFiles() {
 					continue
 				}
 
+				location := &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd} // start to ingest at the end for new files
+				if a.conf.Backfill {
+					location = &tail.SeekInfo{Offset: 0, Whence: io.SeekStart} // start to ingest at the beginning of files
+				}
+
 				t, err := tail.TailFile(match, tail.Config{
 					ReOpen:        !a.conf.NoFollow,
 					MustExist:     true,
 					Follow:        !a.conf.NoFollow,
 					CompleteLines: true,
-					Location:      &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd}, // start to ingest at the end for new files
+					Location:      location,
 				})
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("tail error: %v", err))
