@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	logsURL = "/api/v1/logs"
+	logsURL       = "/api/v1/logs"
 	overlapPeriod = 30 * time.Minute
 )
 
