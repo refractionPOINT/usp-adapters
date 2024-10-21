@@ -4,11 +4,13 @@
 package usp_file
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 
@@ -16,6 +18,8 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 
 	"github.com/nxadm/tail"
+
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -37,12 +41,14 @@ type tailInfo struct {
 }
 
 type FileAdapter struct {
+	ctx          context.Context
 	conf         FileConfig
 	wg           sync.WaitGroup
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 	tailFiles    map[string]*tailInfo
 	mu           sync.Mutex
+	serialFeed   *semaphore.Weighted
 }
 
 func (c *FileConfig) Validate() error {
@@ -57,8 +63,9 @@ func (c *FileConfig) Validate() error {
 
 func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	a := &FileAdapter{
-		conf:      conf,
-		tailFiles: make(map[string]*tailInfo),
+		conf:       conf,
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
 	}
 
 	if a.conf.WriteTimeoutSec == 0 {
@@ -84,6 +91,10 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 }
 
 func (a *FileAdapter) pollFiles() {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.ctx = ctx
+	defer cancel()
+
 	if a.conf.InactivityThreshold != 0 {
 		inactivityThreshold = time.Duration(a.conf.InactivityThreshold) * time.Second
 	}
@@ -97,6 +108,7 @@ func (a *FileAdapter) pollFiles() {
 			a.conf.ClientOptions.OnError(fmt.Errorf("glob error: %v", err))
 			return
 		}
+		sort.Strings(matches)
 
 		a.mu.Lock()
 		now := time.Now()
@@ -134,7 +146,7 @@ func (a *FileAdapter) pollFiles() {
 					// validate if an active file has become inactive and we need to stop tailing it
 					if now.Sub(modTime) > inactivityThreshold {
 						a.conf.ClientOptions.OnError(fmt.Errorf("file inactive: %s", path))
-						info.lastOffset, err = info.tail.Tell() // store current position before stopping the tail in case we need to resume
+						info.lastOffset, _ = info.tail.Tell() // store current position before stopping the tail in case we need to resume
 						err := info.tail.Stop()
 						if err != nil {
 							a.conf.ClientOptions.OnError(fmt.Errorf("error stopping tail: %v", err))
@@ -204,12 +216,23 @@ func (a *FileAdapter) pollFiles() {
 }
 
 func (a *FileAdapter) handleInput(t *tail.Tail) {
+	if a.conf.SerializeFiles {
+		// If we are serializing files, we need to acquire a semaphore to ensure we only tail one file at a time.
+		if err := a.serialFeed.Acquire(a.ctx, 1); err != nil {
+			return
+		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting file %s in serial mode", t.Filename))
+		defer a.serialFeed.Release(1)
+	}
 	for line := range t.Lines {
 		if line.Err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("tail.Line(): %v", line.Err))
 			break
 		}
 		a.handleLine(line.Text)
+	}
+	if a.conf.SerializeFiles {
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("finished file %s in serial mode", t.Filename))
 	}
 }
 
