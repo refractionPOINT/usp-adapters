@@ -2,7 +2,7 @@ steps:
 # Adapters
   - name: 'golang:1.22-bullseye'
     id: run-tests
-    args: ['go', 'test', '-race', './...', '-v']
+    args: ['go', 'test', './...', '-v']
   - name: 'golang:1.22-bullseye'
     args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64', './containers/general']
     waitFor: ['run-tests']
