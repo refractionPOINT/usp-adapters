@@ -18,6 +18,7 @@ import (
 
 const (
 	logsURL = "/api/v1/logs"
+	overlapPeriod = 30 * time.Minute
 )
 
 type opRequest struct {
@@ -36,6 +37,8 @@ type OktaAdapter struct {
 	doStop    *utils.Event
 
 	ctx context.Context
+
+	dedupe map[string]int64
 }
 
 type OktaConfig struct {
@@ -63,6 +66,7 @@ func NewOktaAdapter(conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
+		dedupe: make(map[string]int64),
 	}
 
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
@@ -111,14 +115,11 @@ func (a *OktaAdapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
-	lastTimestamp := ""
-	lastEventid := ""
+	adapterStart := time.Now()
 	for !a.doStop.WaitFor(30 * time.Second) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
-		items, timestamp, eventid := a.makeOneRequest(url, lastTimestamp, lastEventid)
-		lastTimestamp = timestamp
-		lastEventid = eventid
+		items := a.makeOneRequest(url, adapterStart)
 		if items == nil {
 			continue
 		}
@@ -144,42 +145,41 @@ func (a *OktaAdapter) fetchEvents(url string) {
 	}
 }
 
-func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string, lastEventid string) ([]utils.Dict, string, string) {
+func (a *OktaAdapter) makeOneRequest(url string, notBefore time.Time) []utils.Dict {
 
 	// Prepare the request body.
 	reqData := opRequest{}
 	b, err := json.Marshal(reqData)
 	if err != nil {
 		a.doStop.Set()
-		return nil, "", ""
+		return nil
 	}
 
 	// Get request timestamp
-	currentTime := time.Now().Unix()
-	thirtySecondsAgo := time.Unix(currentTime-120, 0).UTC().Format(time.RFC3339)
-	until := time.Unix(currentTime-90, 0).UTC().Format(time.RFC3339)
+	currentTime := time.Now()
+	var start string
+	if t := currentTime.Add(-overlapPeriod); t.Before(notBefore) {
+		start = notBefore.UTC().Format(time.RFC3339)
+	} else {
+		start = currentTime.Add(-overlapPeriod).UTC().Format(time.RFC3339)
+	}
+	until := currentTime.UTC().Format(time.RFC3339)
 
 	// Prepare the request.
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?since=%s&until=%s", a.conf.URL, url, thirtySecondsAgo, until), nil)
-	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s until %s", a.conf.URL, url, thirtySecondsAgo, until))
-	if lastTimestamp != "" {
-		req, err = http.NewRequest("GET", fmt.Sprintf("%s%s?since=%s&until=%s", a.conf.URL, url, lastTimestamp, until), nil)
-		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s until %s", a.conf.URL, url, lastTimestamp, until))
-	}
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?since=%s&until=%s", a.conf.URL, url, start, until), nil)
+	// a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s until %s", a.conf.URL, url, start, until))
 	if err != nil {
 		a.doStop.Set()
-		return nil, "", ""
+		return nil
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("SSWS %s", a.conf.ApiKey))
-
-	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s?since=%s&until=%s", a.conf.URL, url, thirtySecondsAgo, until))
 
 	// Issue the request.
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-		return nil, "", ""
+		return nil
 	}
 	defer resp.Body.Close()
 
@@ -190,7 +190,7 @@ func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string, lastEvent
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("error code: %s", resp.StatusCode))
 
 		a.conf.ClientOptions.OnError(fmt.Errorf("okta api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
-		return nil, "", ""
+		return nil
 	}
 
 	body, _ := ioutil.ReadAll(resp.Body)
@@ -201,25 +201,34 @@ func (a *OktaAdapter) makeOneRequest(url string, lastTimestamp string, lastEvent
 	err = json.Unmarshal(body, &data)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("okta api invalid json: %v", err))
+		return nil
 	}
 
 	// Report if a cursor was returned
 	// as well as the items.
 	items := data
 
-	timestamp := ""
-	eventid := ""
 	var newItems []utils.Dict
 
 	for _, item := range items {
-		timestamp = item["published"].(string)
-		eventid = item["uuid"].(string)
-		if eventid != lastEventid {
-			newItems = append(newItems, item)
+		timestamp, _ := item["published"].(string)
+		eventid, _ := item["uuid"].(string)
+		if _, ok := a.dedupe[eventid]; ok {
+			continue
+		}
+		epoch, _ := time.Parse(time.RFC3339, timestamp)
+		a.dedupe[eventid] = epoch.Unix()
+		newItems = append(newItems, item)
+	}
+
+	// Cull old dedupe entries.
+	for k, v := range a.dedupe {
+		if v < time.Now().Add(-overlapPeriod).Unix() {
+			delete(a.dedupe, k)
 		}
 	}
 
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", timestamp))
 
-	return newItems, timestamp, eventid
+	return newItems
 }
