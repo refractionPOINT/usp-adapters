@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
@@ -311,7 +310,7 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 	}
 	defer resp.Body.Close()
 
-	body, _ := ioutil.ReadAll(resp.Body)
+	body, _ := io.ReadAll(resp.Body)
 
 	if resp.StatusCode == http.StatusBadRequest && strings.Contains(string(body), "already enabled") {
 		return nil, nil
@@ -325,14 +324,9 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 
 	// Parse the response.
 	respData := utils.Dict{}
-	rawResp, err := io.ReadAll(resp.Body)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api response error: %v", err))
-		return nil, err
-	}
-	if err := json.Unmarshal(rawResp, &respData); err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api invalid json: %v (%s)", err, string(rawResp)))
-		return nil, err
+	if err := json.Unmarshal(body, &respData); err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 start api invalid json: %v (%s)", err, string(body)))
+		return nil, fmt.Errorf("office365 start api invalid json: %v (%s)", err, string(body))
 	}
 
 	return respData, nil
@@ -358,7 +352,7 @@ func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil, url
 	}
@@ -398,7 +392,7 @@ func (a *Office365Adapter) makeOneContentRequest(url string) []byte {
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
 		return nil
 	}
