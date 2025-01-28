@@ -17,32 +17,33 @@ import (
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 
 	"github.com/refractionPOINT/go-uspclient"
-	"github.com/refractionPOINT/usp-adapters/1password"
-	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
-	"github.com/refractionPOINT/usp-adapters/cato"
-	"github.com/refractionPOINT/usp-adapters/defender"
-	"github.com/refractionPOINT/usp-adapters/duo"
-	"github.com/refractionPOINT/usp-adapters/entraid"
-	"github.com/refractionPOINT/usp-adapters/evtx"
-	"github.com/refractionPOINT/usp-adapters/file"
-	"github.com/refractionPOINT/usp-adapters/gcs"
-	"github.com/refractionPOINT/usp-adapters/imap"
-	"github.com/refractionPOINT/usp-adapters/itglue"
-	"github.com/refractionPOINT/usp-adapters/k8s_pods"
-	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
-	"github.com/refractionPOINT/usp-adapters/o365"
-	"github.com/refractionPOINT/usp-adapters/okta"
-	"github.com/refractionPOINT/usp-adapters/pubsub"
-	"github.com/refractionPOINT/usp-adapters/s3"
-	"github.com/refractionPOINT/usp-adapters/simulator"
-	"github.com/refractionPOINT/usp-adapters/slack"
-	"github.com/refractionPOINT/usp-adapters/sophos"
-	"github.com/refractionPOINT/usp-adapters/sqs"
-	"github.com/refractionPOINT/usp-adapters/sqs-files"
-	"github.com/refractionPOINT/usp-adapters/stdin"
-	"github.com/refractionPOINT/usp-adapters/syslog"
+	usp_1password "github.com/refractionPOINT/usp-adapters/1password"
+	usp_azure_event_hub "github.com/refractionPOINT/usp-adapters/azure_event_hub"
+	usp_cato "github.com/refractionPOINT/usp-adapters/cato"
+	usp_defender "github.com/refractionPOINT/usp-adapters/defender"
+	usp_duo "github.com/refractionPOINT/usp-adapters/duo"
+	usp_entraid "github.com/refractionPOINT/usp-adapters/entraid"
+	usp_evtx "github.com/refractionPOINT/usp-adapters/evtx"
+	usp_file "github.com/refractionPOINT/usp-adapters/file"
+	usp_gcs "github.com/refractionPOINT/usp-adapters/gcs"
+	usp_hubspot "github.com/refractionPOINT/usp-adapters/hubspot"
+	usp_imap "github.com/refractionPOINT/usp-adapters/imap"
+	usp_itglue "github.com/refractionPOINT/usp-adapters/itglue"
+	usp_k8s_pods "github.com/refractionPOINT/usp-adapters/k8s_pods"
+	usp_mac_unified_logging "github.com/refractionPOINT/usp-adapters/mac_unified_logging"
+	usp_o365 "github.com/refractionPOINT/usp-adapters/o365"
+	usp_okta "github.com/refractionPOINT/usp-adapters/okta"
+	usp_pubsub "github.com/refractionPOINT/usp-adapters/pubsub"
+	usp_s3 "github.com/refractionPOINT/usp-adapters/s3"
+	usp_simulator "github.com/refractionPOINT/usp-adapters/simulator"
+	usp_slack "github.com/refractionPOINT/usp-adapters/slack"
+	usp_sophos "github.com/refractionPOINT/usp-adapters/sophos"
+	usp_sqs "github.com/refractionPOINT/usp-adapters/sqs"
+	usp_sqs_files "github.com/refractionPOINT/usp-adapters/sqs-files"
+	usp_stdin "github.com/refractionPOINT/usp-adapters/stdin"
+	usp_syslog "github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
-	"github.com/refractionPOINT/usp-adapters/wel"
+	usp_wel "github.com/refractionPOINT/usp-adapters/wel"
 
 	"gopkg.in/yaml.v2"
 )
@@ -80,6 +81,7 @@ type GeneralConfigs struct {
 	K8sPods           usp_k8s_pods.K8sPodsConfig                      `json:"k8s_pods" yaml:"k8s_pods"`
 	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
+	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
 }
 
 type AdapterStats struct {
@@ -327,6 +329,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.Imap.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Imap)
 		client, chRunning, err = usp_imap.NewImapAdapter(configs.Imap)
+	} else if method == "hubspot" {
+		configs.HubSpot.ClientOptions = applyLogging(configs.HubSpot.ClientOptions)
+		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.HubSpot)
+		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(configs.HubSpot)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
