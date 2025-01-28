@@ -28,6 +28,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
+	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
 	"github.com/refractionPOINT/usp-adapters/o365"
@@ -80,6 +81,7 @@ type GeneralConfigs struct {
 	K8sPods           usp_k8s_pods.K8sPodsConfig                      `json:"k8s_pods" yaml:"k8s_pods"`
 	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
+	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
 }
 
 type AdapterStats struct {
@@ -327,6 +329,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.Imap.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Imap)
 		client, chRunning, err = usp_imap.NewImapAdapter(configs.Imap)
+	} else if method == "hubspot" {
+		configs.HubSpot.ClientOptions = applyLogging(configs.HubSpot.ClientOptions)
+		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.HubSpot)
+		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(configs.HubSpot)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
@@ -473,3 +480,4 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
+
