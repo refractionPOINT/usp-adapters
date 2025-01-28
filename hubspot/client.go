@@ -179,7 +179,11 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 			return nil
 		}
 
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("error: %v", err))
+			return nil
+		}
 
 		// Parse the response.
 		var response struct {
