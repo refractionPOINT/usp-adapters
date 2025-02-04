@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -126,10 +128,32 @@ func printStruct(prefix string, s interface{}, isTop bool) {
 	}
 }
 
-func printUsage() {
-	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
-	logError("Available configs:\n")
-	printStruct("", GeneralConfigs{}, true)
+// printUsage prints the usage information for the adapter entry points.
+//
+// If printAvailableConfigs is true, it also prints the available configurations.
+//
+// Arguments:
+//
+//	printAvailableConfigs: A boolean flag indicating whether to print the available configurations.
+func printUsage(printAvailableConfigs bool) {
+	binaryName := filepath.Base(os.Args[0])
+	logError("Usage: %s [-help] [-version] adapter_type [config_file.yaml | <param>...]", binaryName)
+	logError("")
+	if printAvailableConfigs {
+		logError("Available configs:\n")
+		printStruct("", GeneralConfigs{}, true)
+	} else {
+		logError("For a list of all the available configs, run: %s -help or run the program without any arguments", binaryName)
+	}
+}
+
+func printVersion() {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		log("Version: %s", info.Main.Version)
+	} else {
+		logError("Failed to obtain program version")
+
+	}
 }
 
 func printConfig(method string, c interface{}) {
@@ -139,6 +163,19 @@ func printConfig(method string, c interface{}) {
 
 func main() {
 	log("starting")
+
+	// TODO: Switch to actual better command line argument parsing library (e.g. flags package)
+	if len(os.Args) >= 2 {
+		if os.Args[1] == "-help" {
+			printUsage(true)
+			os.Exit(2)
+			return
+		} else if os.Args[1] == "-version" {
+			printVersion()
+			os.Exit(2)
+			return
+		}
+	}
 
 	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-") {
 		if err := serviceMode(os.Args[0], os.Args[1], os.Args[2:]); err != nil {
@@ -150,8 +187,9 @@ func main() {
 
 	method, configsToRun, err := parseConfigs(os.Args[1:])
 	if err != nil {
+		logError("")
 		logError("error: %s", err)
-		printUsage()
+		printUsage(err == ErrNotEnoughArguments)
 		os.Exit(1)
 	}
 	if len(configsToRun) == 0 {
@@ -353,11 +391,13 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 	return client, chRunning, nil
 }
 
+var ErrNotEnoughArguments = errors.New("not enough arguments")
+
 func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 	configsToRun := []*GeneralConfigs{}
 	var err error
 	if len(args) < 2 {
-		return "", nil, errors.New("not enough arguments")
+		return "", nil, ErrNotEnoughArguments
 	}
 
 	method := args[0]
@@ -386,12 +426,14 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		printUsage()
+		// TODO: main entry point already prints returned error so we don't want to print it twice
+		//printUsage(false)
 		return nil, errors.New(logError("os.Open(): %v", err))
 	}
 	b, err := io.ReadAll(f)
 	if err != nil {
-		printUsage()
+		// TODO: main entry point already prints returned error so we don't want to print it twice
+		//printUsage(false)
 		return nil, errors.New(logError("io.ReadAll(): %v", err))
 	}
 	yamlDecoder := yaml.NewDecoder(bytes.NewBuffer(b))
@@ -426,8 +468,9 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	}
 
 	if jsonErr != nil && yamlErr != nil {
-		printUsage()
-		return nil, errors.New(logError("decoding error: json=%v yaml=%v", jsonErr, yamlErr))
+		// TODO: main entry point already prints returned error so we don't want to print it twice
+		//printUsage(false)
+		return nil, fmt.Errorf("decoding error: json=%v yaml=%v", jsonErr, yamlErr)
 	}
 
 	return configsToRun, nil
@@ -436,7 +479,7 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 func parseConfigsFromParams(prefix string, params []string, configs *GeneralConfigs) error {
 	// Read the config from the CLI.
 	if err := utils.ParseCLI(prefix, params, configs); err != nil {
-		printUsage()
+		printUsage(false)
 		return errors.New(logError("ParseCLI(): %v", err))
 	}
 
@@ -480,4 +523,3 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
-
