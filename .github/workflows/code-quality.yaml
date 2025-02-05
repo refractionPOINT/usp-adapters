@@ -1,0 +1,78 @@
+name: Code Quality
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  schedule:
+    - cron: '0 1 * * *'
+
+permissions:
+  contents: read  # for actions/checkout to fetch code
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  code_quality:
+    name: Code Quality (Go ${{ matrix.go_version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+
+    strategy:
+      fail-fast: false
+      matrix:
+        go_version:
+          - "1.21"
+          - "1.22"
+          - "1.23"
+        os:
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@master
+        with:
+          fetch-depth: 1
+
+      - name: Set Go Version Output
+        id: go-version
+        run: echo "go_version=${{ matrix.go_version }}" >> $GITHUB_OUTPUT
+
+      # Needed for end to end tests
+      - name: Install Bats
+        run: |
+          git clone https://github.com/bats-core/bats-core.git
+          sudo ./bats-core/install.sh /usr/local
+
+      - name: Use Go ${{ matrix.go_version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go_version }}
+
+      - name: Install Go Modules
+        run: |
+          go mod download
+
+      - name: Run Unit Tests
+        run: |
+          go test ./... -v -coverprofile=coverage.out
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ matrix.go_version }}
+          path: coverage.out
+
+      - name: Build Go Binary
+        run: |
+          go build -o lc-adapter ./containers/general
+
+      - name: Run End to End Tests
+        env:
+          TERM: xterm
+        run: |
+          bats tests/end_to_end/lc_adapter_cli_args.sh
