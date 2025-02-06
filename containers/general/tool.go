@@ -164,7 +164,10 @@ func printConfig(method string, c interface{}) {
 func main() {
 	log("starting")
 
-	// TODO: Switch to actual better command line argument parsing library (e.g. flags package)
+	// TODO: Switch to actual better command line argument parsing library (e.g. flags package)?
+	// NOTE: Currently the code implements custom argument handling. Switchint to something like flags
+	// would require substantial compatibility layer to handle existing use case (service mode) and be
+	// backwards compatible with existing configurations. As such, it doesn't make much sense to switch.
 	if len(os.Args) >= 2 {
 		if os.Args[1] == "-help" {
 			printUsage(true)
@@ -177,7 +180,9 @@ func main() {
 		}
 	}
 
+	// Service mode
 	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-") {
+		log("service mode")
 		if err := serviceMode(os.Args[0], os.Args[1], os.Args[2:]); err != nil {
 			logError("service: %v", err)
 			os.Exit(1)
@@ -197,6 +202,7 @@ func main() {
 		os.Exit(1)
 		return
 	}
+	// TODO exit early on invalid adapter type
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
 	for _, config := range configsToRun {
