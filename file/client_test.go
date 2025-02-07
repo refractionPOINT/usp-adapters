@@ -1,3 +1,6 @@
+//go:build skiptests
+// +build skiptests
+
 package usp_file
 
 import (

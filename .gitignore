@@ -17,3 +17,6 @@
 
 #intellij
 .idea/
+
+# Code coverage data
+.coverage/

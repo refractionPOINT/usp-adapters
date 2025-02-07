@@ -87,13 +87,18 @@ jobs:
       - name: Run Unit Tests
         # TODO: use -race flag and fix existing races in tests
         run: |
-          go test ./... -v -coverprofile=coverage.out
+          # There is a race in tail package we use so we don't run those tests with race detectiion enabled
+          # (aka we run them separatly using build tag)
+          mkdir -p .coverage/unit
+          go test ./... -race -v -cover -args -test.gocoverdir="$PWD/.coverage/unit"
+          go test ./... -v -tags=skiptests -run "TestPoll.*Files"  -cover -args -test.gocoverdir="$PWD/.coverage/unit"
+          go tool covdata percent -i=./.coverage/unit
 
       - name: Upload Coverage Report
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report-${{ matrix.go_version }}
-          path: coverage.out
+          path: .coverage/
 
       - name: Build Go Binary
         run: |
