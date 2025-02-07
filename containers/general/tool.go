@@ -435,14 +435,10 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		// TODO: main entry point already prints returned error so we don't want to print it twice
-		//printUsage(false)
 		return nil, errors.New(logError("os.Open(): %v", err))
 	}
 	b, err := io.ReadAll(f)
 	if err != nil {
-		// TODO: main entry point already prints returned error so we don't want to print it twice
-		//printUsage(false)
 		return nil, errors.New(logError("io.ReadAll(): %v", err))
 	}
 	yamlDecoder := yaml.NewDecoder(bytes.NewBuffer(b))
@@ -477,8 +473,6 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	}
 
 	if jsonErr != nil && yamlErr != nil {
-		// TODO: main entry point already prints returned error so we don't want to print it twice
-		//printUsage(false)
 		return nil, fmt.Errorf("decoding error: json=%v yaml=%v", jsonErr, yamlErr)
 	}
 
