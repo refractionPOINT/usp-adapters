@@ -1,0 +1,12 @@
+syslog:
+  client_options:
+    identity:
+      installation_key: <installation_key>
+      oid: <oid>
+    platform: text
+    sensor_seed_key: syslog-secret-key
+    mapping:
+      event_type_path: '{{ "Syslog" }}'
+      parsing_re: '^<(?P<priority>\d+)>(?P<date>\w{3}\s+\d+\s\d+:\d+:\d+)\s(?P<hostname>\S+)\s(?P<process>[-\w]+)\[(?P<PID>\d+)\]:\s(?>'
+      rename_only: true
+    port: 4444

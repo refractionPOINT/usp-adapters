@@ -1,0 +1,111 @@
+name: Code Quality
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  schedule:
+    - cron: '0 1 * * *'
+
+permissions:
+  contents: read  # for actions/checkout to fetch code
+  pull-requests: read  # needed for golangci-lint and only-new-issues option
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - uses: actions/checkout@master
+        with:
+          fetch-depth: 1
+
+      - name: Use Go ${{ matrix.go_version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install Go Modules
+        run: |
+          go mod download
+
+      - name: Run Lint
+        run: |
+          test -z "$(go fmt ./...)" || (echo "Code needs formatting, run go fmt ./..." && exit 1)
+
+      - name: Run golangci-lint
+        uses: golangci/golangci-lint-action@e60da84bfae8c7920a47be973d75e15710aa8bd7  # v6.3.0
+        with:
+          version: v1.60
+          # There are existing issues in the code which haven't been fixed yet so for now, only report new issues
+          only-new-issues: true
+
+  tests:
+    name: Tests (Go ${{ matrix.go_version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+
+    strategy:
+      fail-fast: false
+      matrix:
+        go_version:
+          - "1.21"
+          - "1.22"
+          - "1.23"
+        os:
+          - ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@master
+        with:
+          fetch-depth: 1
+
+      # Needed for end to end tests
+      - name: Install Bats
+        run: |
+          git clone https://github.com/bats-core/bats-core.git
+          sudo ./bats-core/install.sh /usr/local
+
+      - name: Use Go ${{ matrix.go_version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go_version }}
+
+      - name: Install Go Modules
+        run: |
+          go mod download
+
+      - name: Run Unit Tests
+        # TODO: use -race flag and fix existing races in tests
+        run: |
+          # There is a race in tail package we use so we don't run those tests with race detectiion enabled
+          # (aka we run them separatly using build tag)
+          mkdir -p .coverage/unit
+          go test ./... -race -v -cover -args -test.gocoverdir="$PWD/.coverage/unit"
+          go test ./... -v -tags=skiptests -run "TestPoll.*Files"  -cover -args -test.gocoverdir="$PWD/.coverage/unit"
+          go tool covdata percent -i=./.coverage/unit
+
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-${{ matrix.go_version }}
+          path: .coverage/
+
+      - name: Build Go Binary
+        run: |
+          go build -o lc-adapter ./containers/general
+
+      - name: Run End to End Tests
+        env:
+          TERM: xterm
+        run: |
+          bats --timing tests/end_to_end/lc_adapter_cli_args.sh

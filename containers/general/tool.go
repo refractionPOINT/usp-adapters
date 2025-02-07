@@ -8,7 +8,9 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,9 +28,9 @@ import (
 	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
-	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
 	"github.com/refractionPOINT/usp-adapters/o365"
@@ -126,10 +128,32 @@ func printStruct(prefix string, s interface{}, isTop bool) {
 	}
 }
 
-func printUsage() {
-	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
-	logError("Available configs:\n")
-	printStruct("", GeneralConfigs{}, true)
+// printUsage prints the usage information for the adapter entry points.
+//
+// If printAvailableConfigs is true, it also prints the available configurations.
+//
+// Arguments:
+//
+//	printAvailableConfigs: A boolean flag indicating whether to print the available configurations.
+func printUsage(printAvailableConfigs bool) {
+	binaryName := filepath.Base(os.Args[0])
+	logError("Usage: %s [-help] [-version] adapter_type [config_file.yaml | <param>...]", binaryName)
+	logError("")
+	if printAvailableConfigs {
+		logError("Available configs:\n")
+		printStruct("", GeneralConfigs{}, true)
+	} else {
+		logError("For a list of all the available configs, run: %s -help or run the program without any arguments", binaryName)
+	}
+}
+
+func printVersion() {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		log("Version: %s", info.Main.Version)
+	} else {
+		logError("Failed to obtain program version")
+
+	}
 }
 
 func printConfig(method string, c interface{}) {
@@ -140,7 +164,24 @@ func printConfig(method string, c interface{}) {
 func main() {
 	log("starting")
 
+	// NOTE: Currently the code implements custom argument handling. Switchint to something like flags
+	// would require substantial compatibility layer to handle existing use case (service mode) and be
+	// backwards compatible with existing configurations. As such, it doesn't make much sense to switch.
+	if len(os.Args) >= 2 {
+		if os.Args[1] == "-help" {
+			printUsage(true)
+			os.Exit(2)
+			return
+		} else if os.Args[1] == "-version" {
+			printVersion()
+			os.Exit(2)
+			return
+		}
+	}
+
+	// Service mode
 	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-") {
+		log("service mode")
 		if err := serviceMode(os.Args[0], os.Args[1], os.Args[2:]); err != nil {
 			logError("service: %v", err)
 			os.Exit(1)
@@ -150,8 +191,9 @@ func main() {
 
 	method, configsToRun, err := parseConfigs(os.Args[1:])
 	if err != nil {
+		logError("")
 		logError("error: %s", err)
-		printUsage()
+		printUsage(err == ErrNotEnoughArguments)
 		os.Exit(1)
 	}
 	if len(configsToRun) == 0 {
@@ -159,6 +201,7 @@ func main() {
 		os.Exit(1)
 		return
 	}
+	// TODO exit early on invalid adapter type
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
 	for _, config := range configsToRun {
@@ -353,11 +396,15 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 	return client, chRunning, nil
 }
 
+var ErrNotEnoughArguments = errors.New("not enough arguments")
+
 func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 	configsToRun := []*GeneralConfigs{}
 	var err error
+	// TODO: This doesn't seem to work correctly since it won't work when options are specified using
+	// environment variables.
 	if len(args) < 2 {
-		return "", nil, errors.New("not enough arguments")
+		return "", nil, ErrNotEnoughArguments
 	}
 
 	method := args[0]
@@ -371,10 +418,12 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 	} else {
 		configs := &GeneralConfigs{}
 		// Read the config from the CLI.
+		log("loading config from CLI arguments")
 		if err = parseConfigsFromParams(method, args, configs); err != nil {
 			return "", nil, err
 		}
 		// Read the config from the Env.
+		log("loading config from environment variables")
 		if err = parseConfigsFromParams(method, os.Environ(), configs); err != nil {
 			return "", nil, err
 		}
@@ -386,12 +435,10 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		printUsage()
 		return nil, errors.New(logError("os.Open(): %v", err))
 	}
 	b, err := io.ReadAll(f)
 	if err != nil {
-		printUsage()
 		return nil, errors.New(logError("io.ReadAll(): %v", err))
 	}
 	yamlDecoder := yaml.NewDecoder(bytes.NewBuffer(b))
@@ -426,8 +473,7 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	}
 
 	if jsonErr != nil && yamlErr != nil {
-		printUsage()
-		return nil, errors.New(logError("decoding error: json=%v yaml=%v", jsonErr, yamlErr))
+		return nil, fmt.Errorf("decoding error: json=%v yaml=%v", jsonErr, yamlErr)
 	}
 
 	return configsToRun, nil
@@ -436,7 +482,7 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 func parseConfigsFromParams(prefix string, params []string, configs *GeneralConfigs) error {
 	// Read the config from the CLI.
 	if err := utils.ParseCLI(prefix, params, configs); err != nil {
-		printUsage()
+		printUsage(false)
 		return errors.New(logError("ParseCLI(): %v", err))
 	}
 
@@ -480,4 +526,3 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
-
