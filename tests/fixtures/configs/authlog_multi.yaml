@@ -1,0 +1,19 @@
+file:
+  client_options:
+    identity:
+      installation_key: <installation_key>
+      oid: 62a0a22f-f30c-446e-816b-18c379b766dc
+    platform: text
+    sensor_seed_key: audit-log-events-1
+  file_path: /var/log/auth.log
+  no_follow: false
+---
+file:
+  client_options:
+    identity:
+      installation_key: <installation_key>
+      oid: 62a0a22f-f30c-446e-816b-18c379b766dc
+    platform: text
+    sensor_seed_key: audit-log-events-2
+  file_path: /var/log/auth.log.1
+  no_follow: false

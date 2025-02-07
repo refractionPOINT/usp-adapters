@@ -79,4 +79,4 @@ jobs:
         env:
           TERM: xterm
         run: |
-          bats tests/end_to_end/lc_adapter_cli_args.sh
+          bats --timing tests/end_to_end/lc_adapter_cli_args.sh

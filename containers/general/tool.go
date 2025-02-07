@@ -164,7 +164,6 @@ func printConfig(method string, c interface{}) {
 func main() {
 	log("starting")
 
-	// TODO: Switch to actual better command line argument parsing library (e.g. flags package)?
 	// NOTE: Currently the code implements custom argument handling. Switchint to something like flags
 	// would require substantial compatibility layer to handle existing use case (service mode) and be
 	// backwards compatible with existing configurations. As such, it doesn't make much sense to switch.
@@ -402,6 +401,8 @@ var ErrNotEnoughArguments = errors.New("not enough arguments")
 func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 	configsToRun := []*GeneralConfigs{}
 	var err error
+	// TODO: This doesn't seem to work correctly since it won't work when options are specified using
+	// environment variables.
 	if len(args) < 2 {
 		return "", nil, ErrNotEnoughArguments
 	}
@@ -417,10 +418,12 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 	} else {
 		configs := &GeneralConfigs{}
 		// Read the config from the CLI.
+		log("loading config from CLI arguments")
 		if err = parseConfigsFromParams(method, args, configs); err != nil {
 			return "", nil, err
 		}
 		// Read the config from the Env.
+		log("loading config from environment variables")
 		if err = parseConfigsFromParams(method, os.Environ(), configs); err != nil {
 			return "", nil, err
 		}
