@@ -102,6 +102,8 @@ func (a *FileAdapter) pollFiles() {
 		reactivationThreshold = time.Duration(a.conf.ReactivationThreshold) * time.Second
 	}
 
+	isFirstRun := true
+
 	for {
 		matches, err := filepath.Glob(a.conf.FilePath)
 		if err != nil {
@@ -181,9 +183,11 @@ func (a *FileAdapter) pollFiles() {
 					continue
 				}
 
-				location := &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd} // start to ingest at the end for new files
-				if a.conf.Backfill {
-					location = &tail.SeekInfo{Offset: 0, Whence: io.SeekStart} // start to ingest at the beginning of files
+				// in general, tail existing files, but if a file appears after we started
+				// (or we are backfilling) then start from the beginning of the file so as not to miss any data
+				location := &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd}
+				if a.conf.Backfill || !isFirstRun {
+					location = &tail.SeekInfo{Offset: 0, Whence: io.SeekStart}
 				}
 
 				t, err := tail.TailFile(match, tail.Config{
@@ -211,6 +215,7 @@ func (a *FileAdapter) pollFiles() {
 		}
 		a.mu.Unlock()
 
+		isFirstRun = false
 		time.Sleep(defaultPollingInterval)
 	}
 }
