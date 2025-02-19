@@ -49,6 +49,7 @@ type FileAdapter struct {
 	tailFiles    map[string]*tailInfo
 	mu           sync.Mutex
 	serialFeed   *semaphore.Weighted
+	lineCb       func(line string) // callback for each line for testing
 }
 
 func (c *FileConfig) Validate() error {
@@ -244,6 +245,9 @@ func (a *FileAdapter) handleInput(t *tail.Tail) {
 func (a *FileAdapter) handleLine(line string) {
 	if len(line) == 0 {
 		return
+	}
+	if a.lineCb != nil {
+		a.lineCb(line)
 	}
 	msg := &protocol.DataMessage{
 		TextPayload: line,
