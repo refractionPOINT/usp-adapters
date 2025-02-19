@@ -224,6 +224,7 @@ func TestTailActiveFile(t *testing.T) {
 
 	// Write additional content to the file over a few seconds
 	expectedLines := []string{
+		"initial content",
 		"line added after 1 second",
 		"line added after 2 seconds",
 		"line added after 3 seconds",
@@ -236,7 +237,7 @@ func TestTailActiveFile(t *testing.T) {
 		"line added after 10 seconds",
 	}
 
-	for i := 0; i < len(expectedLines); i++ {
+	for i := 1; i < len(expectedLines); i++ {
 		time.Sleep(1 * time.Second)
 		err := appendToFile(testFile, expectedLines[i]+"\n")
 		assert.NoError(t, err)
