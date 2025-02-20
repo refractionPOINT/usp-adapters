@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
@@ -38,6 +39,7 @@ type tailInfo struct {
 	lastActive time.Time
 	isInactive bool
 	lastOffset int64
+	lastData   int64
 }
 
 type FileAdapter struct {
@@ -120,6 +122,7 @@ func (a *FileAdapter) pollFiles() {
 		for path, info := range a.tailFiles {
 			if stat, err := os.Stat(path); err == nil {
 				modTime := stat.ModTime()
+				lastData := atomic.LoadInt64(&info.lastData)
 				if info.isInactive {
 					// validate if an inactive file has been modified recently and we need to tail it
 					if now.Sub(modTime) <= reactivationThreshold {
@@ -142,12 +145,15 @@ func (a *FileAdapter) pollFiles() {
 
 						go func(t *tail.Tail) {
 							defer a.wg.Done()
-							a.handleInput(t)
+							a.handleInput(t, &info.lastData)
 						}(t)
 					}
 				} else {
 					// validate if an active file has become inactive and we need to stop tailing it
-					if now.Sub(modTime) > inactivityThreshold {
+					// We check for the last modified time AND we also check for the last time we saw
+					// data flow from the file. We do this because Microsoft Windows sometimes decides to
+					// stop updating the last modified time for things like IIS.
+					if now.Sub(modTime) > inactivityThreshold && now.Sub(time.Unix(lastData, 0)) > inactivityThreshold {
 						a.conf.ClientOptions.OnError(fmt.Errorf("file inactive: %s", path))
 						info.lastOffset, _ = info.tail.Tell() // store current position before stopping the tail in case we need to resume
 						err := info.tail.Stop()
@@ -202,15 +208,16 @@ func (a *FileAdapter) pollFiles() {
 					a.conf.ClientOptions.OnError(fmt.Errorf("tail error: %v", err))
 					continue
 				}
-				a.tailFiles[match] = &tailInfo{
+				info := &tailInfo{
 					tail:       t,
 					lastActive: time.Now(),
 					isInactive: false,
 				}
+				a.tailFiles[match] = info
 				a.wg.Add(1)
 				go func(t *tail.Tail) {
 					defer a.wg.Done()
-					a.handleInput(t)
+					a.handleInput(t, &info.lastData)
 				}(t)
 			}
 		}
@@ -221,7 +228,7 @@ func (a *FileAdapter) pollFiles() {
 	}
 }
 
-func (a *FileAdapter) handleInput(t *tail.Tail) {
+func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 	if a.conf.SerializeFiles {
 		// If we are serializing files, we need to acquire a semaphore to ensure we only tail one file at a time.
 		if err := a.serialFeed.Acquire(a.ctx, 1); err != nil {
@@ -235,6 +242,7 @@ func (a *FileAdapter) handleInput(t *tail.Tail) {
 			a.conf.ClientOptions.OnError(fmt.Errorf("tail.Line(): %v", line.Err))
 			break
 		}
+		atomic.StoreInt64(pLastData, time.Now().Unix())
 		a.handleLine(line.Text)
 	}
 	if a.conf.SerializeFiles {
