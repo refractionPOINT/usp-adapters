@@ -190,6 +190,8 @@ func (a *FileAdapter) pollFiles() {
 					continue
 				}
 
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("opening file: %s", match))
+
 				// in general, tail existing files, but if a file appears after we started
 				// (or we are backfilling) then start from the beginning of the file so as not to miss any data
 				location := &tail.SeekInfo{Offset: 0, Whence: io.SeekEnd}
