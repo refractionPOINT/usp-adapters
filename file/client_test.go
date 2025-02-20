@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 	"time"
 
@@ -43,7 +44,12 @@ func TestPollFiles(t *testing.T) {
 			FilePath:              filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold:   5,
 			ReactivationThreshold: 10,
-			ClientOptions:         uspclient.ClientOptions{OnError: mockClientOptions.OnError},
+			ClientOptions: uspclient.ClientOptions{
+				OnError: mockClientOptions.OnError,
+				DebugLog: func(msg string) {
+					return
+				},
+			},
 		},
 		tailFiles: make(map[string]*tailInfo),
 	}
@@ -161,17 +167,24 @@ func TestPollSerialFiles(t *testing.T) {
 	// We will check the order of things was correct by checking the debug logs.
 	// It's not ideal but will do the job.
 	expectedDebug1 := []string{
+		fmt.Sprintf("opening file: %s", testFile1),
+		fmt.Sprintf("opening file: %s", testFile2),
 		fmt.Sprintf("starting file %s in serial mode", testFile1),
 		fmt.Sprintf("finished file %s in serial mode", testFile1),
 		fmt.Sprintf("starting file %s in serial mode", testFile2),
 		fmt.Sprintf("finished file %s in serial mode", testFile2),
 	}
+	sort.Strings(expectedDebug1)
 	expectedDebug2 := []string{
-		fmt.Sprintf("starting file %s in serial mode", testFile2),
-		fmt.Sprintf("finished file %s in serial mode", testFile2),
+		fmt.Sprintf("opening file: %s", testFile1),
 		fmt.Sprintf("starting file %s in serial mode", testFile1),
 		fmt.Sprintf("finished file %s in serial mode", testFile1),
+		fmt.Sprintf("opening file: %s", testFile2),
+		fmt.Sprintf("starting file %s in serial mode", testFile2),
+		fmt.Sprintf("finished file %s in serial mode", testFile2),
 	}
+	sort.Strings(expectedDebug2)
+	sort.Strings(debugReceived)
 	if expectedDebug1[0] != debugReceived[0] {
 		assert.Equal(t, expectedDebug2, debugReceived)
 	} else {
@@ -208,7 +221,12 @@ func TestTailActiveFile(t *testing.T) {
 			InactivityThreshold:   2, // Set high to prevent inactivity
 			ReactivationThreshold: 1,
 			Backfill:              true,
-			ClientOptions:         uspclient.ClientOptions{OnError: mockClientOptions.OnError},
+			ClientOptions: uspclient.ClientOptions{
+				OnError: mockClientOptions.OnError,
+				DebugLog: func(msg string) {
+					return
+				},
+			},
 		},
 		tailFiles: make(map[string]*tailInfo),
 		uspClient: dummyUSPClient,

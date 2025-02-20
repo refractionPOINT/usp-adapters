@@ -1,6 +1,6 @@
 module github.com/refractionPOINT/usp-adapters
 
-go 1.22.7
+go 1.23
 
 toolchain go1.23.2
 
@@ -121,4 +121,4 @@ require (
 	www.velocidex.com/golang/go-pe v0.1.1-0.20220107093716-e91743c801de // indirect
 )
 
-replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20250213203620-c2c46aeb8103
+replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20250220221557-418deadc002f
