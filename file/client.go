@@ -234,6 +234,7 @@ func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 	if a.conf.SerializeFiles {
 		// If we are serializing files, we need to acquire a semaphore to ensure we only tail one file at a time.
 		if err := a.serialFeed.Acquire(a.ctx, 1); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("error acquiring semaphore: %v", err))
 			return
 		}
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting file %s in serial mode", t.Filename))
@@ -249,6 +250,8 @@ func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 	}
 	if a.conf.SerializeFiles {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("finished file %s in serial mode", t.Filename))
+	} else {
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("finished file %s in parallel mode", t.Filename))
 	}
 }
 
