@@ -13,7 +13,7 @@ require (
 	github.com/duosecurity/duo_api_golang v0.0.0-20250128191753-8aff7fde9979
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-message v0.18.2
-	github.com/fsnotify/fsnotify v1.8.0
+	github.com/fsnotify/fsnotify v1.7.0
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
