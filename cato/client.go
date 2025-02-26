@@ -99,7 +99,7 @@ func NewCatoAdapter(conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
 		}
 	}
 
-	go a.handleEvent(marker, strconv.Itoa(a.conf.AccountId), a.conf.ApiKey)
+	go a.handleEvent(&marker, strconv.Itoa(a.conf.AccountId), a.conf.ApiKey)
 
 	go func() {
 		a.wgSenders.Wait()
@@ -142,7 +142,7 @@ func (a *CatoAdapter) convertStructToMap(obj interface{}) map[string]interface{}
 	return mapRepresentation
 }
 
-func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key string) {
+func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key string) {
 
 	start = time.Now()
 
@@ -168,7 +168,7 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
       }
     }
   }
-}`, account_id, marker, eventFilterString, eventSubfilterString)
+}`, account_id, *marker, eventFilterString, eventSubfilterString)
 
 		var success bool
 		var resp map[string]interface{}
@@ -185,11 +185,11 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
 			attempts++
 		}
 
-		marker = resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["marker"].(string)
+		*marker = resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["marker"].(string)
 		fetchedCount := int(resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["fetchedCount"].(float64))
 		totalCount += fetchedCount
 
-		line := fmt.Sprintf("iteration:%d fetched:%d total_count:%d marker:%s", iteration, fetchedCount, totalCount, marker)
+		line := fmt.Sprintf("iteration:%d fetched:%d total_count:%d marker:%s", iteration, fetchedCount, totalCount, *marker)
 
 		records := resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["accounts"].([]interface{})[0].(map[string]interface{})["records"].([]interface{})
 		if len(records) > 0 {
@@ -232,7 +232,7 @@ func (a *CatoAdapter) handleEvent(marker string, account_id string, api_key stri
 			}
 		}
 
-		if err := ioutil.WriteFile(configFile, []byte(marker), 0644); err != nil {
+		if err := ioutil.WriteFile(configFile, []byte(*marker), 0644); err != nil {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("Error writing config file: %v", err))
 		}
 
