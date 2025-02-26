@@ -121,11 +121,13 @@ func (a *ZendeskAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", logsEndpoint))
 
-	adapterStart := time.Now()
+	since := time.Now()
+
 	for !a.doStop.WaitFor(30 * time.Second) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
-		items := a.makeOneRequest(adapterStart)
+		items, newSince, _ := a.makeOneRequest(since)
+		since = newSince
 		if items == nil {
 			continue
 		}
@@ -151,13 +153,14 @@ func (a *ZendeskAdapter) fetchEvents() {
 	}
 }
 
-func (a *ZendeskAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
+func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Time, error) {
 	var allItems []utils.Dict
 	currentTime := time.Now()
 	var start string
+	var lastDetectionTime time.Time
 
-	if t := currentTime.Add(-overlapPeriod); t.Before(notBefore) {
-		start = notBefore.UTC().Format(time.RFC3339)
+	if t := currentTime.Add(-overlapPeriod); t.Before(since) {
+		start = since.UTC().Format(time.RFC3339)
 	} else {
 		start = currentTime.Add(-overlapPeriod).UTC().Format(time.RFC3339)
 	}
@@ -169,7 +172,7 @@ func (a *ZendeskAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from https://%s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.conf.ZendeskDomain, logsEndpoint, start, until))
 		if err != nil {
 			a.doStop.Set()
-			return nil
+			return nil, lastDetectionTime, err
 		}
 
 		// Format the authentication string as "email/token:api_token"
@@ -185,7 +188,7 @@ func (a *ZendeskAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		resp, err := a.httpClient.Do(req)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-			return nil
+			return nil, lastDetectionTime, err
 		}
 		defer resp.Body.Close()
 
@@ -193,13 +196,13 @@ func (a *ZendeskAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
 			a.conf.ClientOptions.OnError(fmt.Errorf("zendesk api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(body), string(body)))
-			return nil
+			return nil, lastDetectionTime, err
 		}
 
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("error: %v", err))
-			return nil
+			return nil, lastDetectionTime, err
 		}
 
 		// Parse the response.
@@ -218,13 +221,14 @@ func (a *ZendeskAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		err = json.Unmarshal(body, &response)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("zendesk api invalid json: %v", err))
-			return nil
+			return nil, lastDetectionTime, err
 		}
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", response))
 
 		// Collect items.
 		items := response.AuditLogs
 		var newItems []utils.Dict
+		lastDetectionTime = since
 		for _, item := range items {
 			timestamp, _ := item["created_at"].(string)
 			eventid, _ := item["id"].(string)
@@ -234,11 +238,12 @@ func (a *ZendeskAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 			epoch, _ := time.Parse(time.RFC3339, timestamp)
 			a.dedupe[eventid] = epoch.Unix()
 			newItems = append(newItems, item)
+			lastDetectionTime = epoch
 		}
 		allItems = append(allItems, newItems...)
 
 		// Handle pagination if there is a next link.
-		if response.Meta.HasMore == false {
+		if !response.Meta.HasMore {
 			break
 		}
 		start = response.Links.Next
@@ -251,5 +256,5 @@ func (a *ZendeskAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		}
 	}
 
-	return allItems
+	return allItems, lastDetectionTime, nil
 }
