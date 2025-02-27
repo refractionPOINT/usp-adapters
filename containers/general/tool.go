@@ -29,8 +29,6 @@ import (
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
-	"github.com/refractionPOINT/usp-adapters/hubspot"
-	"github.com/refractionPOINT/usp-adapters/zendesk"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
 	"github.com/refractionPOINT/usp-adapters/ms_graph"
@@ -47,6 +45,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/usp-adapters/wel"
+	"github.com/refractionPOINT/usp-adapters/zendesk"
 	"gopkg.in/yaml.v2"
 )
 

@@ -123,7 +123,6 @@ func (a *FileAdapter) pollFiles() {
 			if stat, err := os.Stat(path); err == nil {
 				modTime := stat.ModTime()
 				lastData := atomic.LoadInt64(&info.lastData)
-				a.conf.ClientOptions.DebugLog(fmt.Sprintf("file: %s, modTime: %s, lastData: %d isInactive: %t", path, modTime, lastData, info.isInactive))
 				if info.isInactive {
 					// validate if an inactive file has been modified recently and we need to tail it
 					if now.Sub(modTime) <= reactivationThreshold {
@@ -192,7 +191,7 @@ func (a *FileAdapter) pollFiles() {
 					continue
 				}
 
-				a.conf.ClientOptions.DebugLog(fmt.Sprintf("opening file: %s backfill: %t isFirstRun: %t", match, a.conf.Backfill, isFirstRun))
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("opening file: %s", match))
 
 				// in general, tail existing files, but if a file appears after we started
 				// (or we are backfilling) then start from the beginning of the file so as not to miss any data
@@ -253,8 +252,6 @@ func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 	}
 	if a.conf.SerializeFiles {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("finished file %s in serial mode", t.Filename))
-	} else {
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("finished file %s in parallel mode", t.Filename))
 	}
 }
 
