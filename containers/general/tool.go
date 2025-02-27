@@ -26,12 +26,12 @@ import (
 	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
-	"github.com/refractionPOINT/usp-adapters/hubspot"
-	"github.com/refractionPOINT/usp-adapters/zendesk"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
+	"github.com/refractionPOINT/usp-adapters/ms_graph"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
@@ -45,7 +45,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/usp-adapters/wel"
-
+	"github.com/refractionPOINT/usp-adapters/zendesk"
 	"gopkg.in/yaml.v2"
 )
 
@@ -83,6 +83,7 @@ type GeneralConfigs struct {
 	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
+	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 }
 
@@ -336,6 +337,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.HubSpot)
 		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(configs.HubSpot)
+	} else if method == "ms_graph" {
+		configs.MsGraph.ClientOptions = applyLogging(configs.MsGraph.ClientOptions)
+		configs.MsGraph.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.MsGraph)
+		client, chRunning, err = usp_ms_graph.NewMsGraphAdapter(configs.MsGraph)
 	} else if method == "zendesk" {
 		configs.Zendesk.ClientOptions = applyLogging(configs.Zendesk.ClientOptions)
 		configs.Zendesk.ClientOptions.Architecture = "usp_adapter"
@@ -487,5 +493,3 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
-
-
