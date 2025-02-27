@@ -123,6 +123,7 @@ func (a *FileAdapter) pollFiles() {
 			if stat, err := os.Stat(path); err == nil {
 				modTime := stat.ModTime()
 				lastData := atomic.LoadInt64(&info.lastData)
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("file: %s, modTime: %s, lastData: %d isInactive: %t", path, modTime, lastData, info.isInactive))
 				if info.isInactive {
 					// validate if an inactive file has been modified recently and we need to tail it
 					if now.Sub(modTime) <= reactivationThreshold {
@@ -132,6 +133,7 @@ func (a *FileAdapter) pollFiles() {
 							MustExist:     true,
 							Follow:        !a.conf.NoFollow,
 							CompleteLines: true,
+							Poll:          a.conf.Poll,
 							Location:      &tail.SeekInfo{Offset: info.lastOffset, Whence: io.SeekStart}, // start to ingest from last known position
 						})
 						if err != nil {
@@ -190,7 +192,7 @@ func (a *FileAdapter) pollFiles() {
 					continue
 				}
 
-				a.conf.ClientOptions.DebugLog(fmt.Sprintf("opening file: %s", match))
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("opening file: %s backfill: %t isFirstRun: %t", match, a.conf.Backfill, isFirstRun))
 
 				// in general, tail existing files, but if a file appears after we started
 				// (or we are backfilling) then start from the beginning of the file so as not to miss any data
@@ -204,6 +206,7 @@ func (a *FileAdapter) pollFiles() {
 					MustExist:     true,
 					Follow:        !a.conf.NoFollow,
 					CompleteLines: true,
+					Poll:          a.conf.Poll,
 					Location:      location,
 				})
 				if err != nil {

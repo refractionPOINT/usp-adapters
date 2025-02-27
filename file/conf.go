@@ -13,4 +13,5 @@ type FileConfig struct {
 	ReactivationThreshold int                     `json:"reactivation_threshold" yaml:"reactivation_threshold"`
 	Backfill              bool                    `json:"backfill" yaml:"backfill"`
 	SerializeFiles        bool                    `json:"serialize_files" yaml:"serialize_files"`
+	Poll                  bool                    `json:"poll" yaml:"poll"`
 }
