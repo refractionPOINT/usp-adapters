@@ -29,6 +29,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
+	"github.com/refractionPOINT/usp-adapters/zendesk"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
 	"github.com/refractionPOINT/usp-adapters/o365"
@@ -82,6 +83,7 @@ type GeneralConfigs struct {
 	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
+	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 }
 
 type AdapterStats struct {
@@ -334,6 +336,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.HubSpot)
 		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(configs.HubSpot)
+	} else if method == "zendesk" {
+		configs.Zendesk.ClientOptions = applyLogging(configs.Zendesk.ClientOptions)
+		configs.Zendesk.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Zendesk)
+		client, chRunning, err = usp_zendesk.NewZendeskAdapter(configs.Zendesk)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
@@ -480,4 +487,5 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
+
 
