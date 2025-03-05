@@ -46,6 +46,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
+	"github.com/refractionPOINT/usp-adapters/pandadoc"
 	"gopkg.in/yaml.v2"
 )
 
@@ -85,6 +86,7 @@ type GeneralConfigs struct {
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
+	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
 }
 
 type AdapterStats struct {
@@ -347,6 +349,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.Zendesk.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.Zendesk)
 		client, chRunning, err = usp_zendesk.NewZendeskAdapter(configs.Zendesk)
+	} else if method == "pandadoc" {
+	        configs.PandaDoc.ClientOptions = applyLogging(configs.PandaDoc.ClientOptions)
+		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.PandaDoc)
+		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
