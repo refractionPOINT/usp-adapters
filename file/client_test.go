@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -283,6 +284,124 @@ collecting:
 
 	// Verify we got all expected lines in order
 	assert.Equal(t, expectedLines, receivedLinesSlice)
+
+	// Verify the file is still being tailed
+	adapter.mu.Lock()
+	info, exists := adapter.tailFiles[testFile]
+	assert.True(t, exists)
+	assert.False(t, info.isInactive)
+	adapter.mu.Unlock()
+}
+
+func TestMultiLineJSON(t *testing.T) {
+	// Create a temporary directory for test files
+	tmpDir, err := os.MkdirTemp("", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Create test file with multi-line JSON content
+	testFile := filepath.Join(tmpDir, "multiline.json")
+	initialJSON := `{
+		"event": "initial",
+		"timestamp": "2024-01-01T00:00:00Z",
+		"data": {
+			"field1": "value1",
+			"field2": 123
+		}
+	}`
+	createTestFile(t, testFile, initialJSON+"\n")
+
+	// Create channels to receive JSON messages
+	receivedJSON := make(chan string, 100)
+	mockClientOptions := new(MockClientOptions)
+	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Create FileAdapter instance with MultiLineJSON enabled
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:              filepath.Join(tmpDir, "*.json"),
+			InactivityThreshold:   5,
+			ReactivationThreshold: 1,
+			MultiLineJSON:         true,
+			Backfill:              true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError: mockClientOptions.OnError,
+				DebugLog: func(msg string) {
+					return
+				},
+			},
+		},
+		tailFiles: make(map[string]*tailInfo),
+		uspClient: dummyUSPClient,
+		lineCb: func(line string) {
+			receivedJSON <- line
+		},
+	}
+	mockClientOptions.On("OnError", mock.Anything).Return()
+
+	// Start the adapter
+	go adapter.pollFiles()
+	time.Sleep(100 * time.Millisecond) // Let the adapter start tailing
+
+	// Write additional multi-line JSON objects
+	additionalJSON := []string{
+		`{
+			"event": "second",
+			"timestamp": "2024-01-01T00:00:01Z",
+			"nested": {
+				"deep": {
+					"field": "value"
+				}
+			}
+		}`,
+		`{
+			"event": "third",
+			"timestamp": "2024-01-01T00:00:02Z",
+			"array": [
+				1,
+				2,
+				3
+			]
+		}`,
+	}
+
+	for _, jsonObj := range additionalJSON {
+		time.Sleep(100 * time.Millisecond)
+		err := appendToFile(testFile, jsonObj+"\n")
+		assert.NoError(t, err)
+	}
+
+	// Give some time for processing
+	time.Sleep(1 * time.Second)
+	close(receivedJSON)
+
+	// Collect received JSON objects
+	var receivedObjects []string
+	for json := range receivedJSON {
+		// Remove whitespace for comparison
+		compactJSON := strings.Join(strings.Fields(json), "")
+		receivedObjects = append(receivedObjects, compactJSON)
+	}
+
+	// Prepare expected JSON objects (removing whitespace for comparison)
+	expectedObjects := []string{
+		strings.Join(strings.Fields(initialJSON), ""),
+		strings.Join(strings.Fields(additionalJSON[0]), ""),
+		strings.Join(strings.Fields(additionalJSON[1]), ""),
+	}
+
+	// Verify we got all expected JSON objects
+	assert.Equal(t, len(expectedObjects), len(receivedObjects))
+	for i, expected := range expectedObjects {
+		assert.Equal(t, expected, receivedObjects[i])
+	}
 
 	// Verify the file is still being tailed
 	adapter.mu.Lock()

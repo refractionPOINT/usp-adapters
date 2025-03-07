@@ -14,4 +14,5 @@ type FileConfig struct {
 	Backfill              bool                    `json:"backfill" yaml:"backfill"`
 	SerializeFiles        bool                    `json:"serialize_files" yaml:"serialize_files"`
 	Poll                  bool                    `json:"poll" yaml:"poll"`
+	MultiLineJSON         bool                    `json:"multi_line_json" yaml:"multi_line_json"`
 }
