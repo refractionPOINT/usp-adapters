@@ -34,6 +34,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/ms_graph"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
+	"github.com/refractionPOINT/usp-adapters/pandadoc"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/simulator"
@@ -46,7 +47,6 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
-	"github.com/refractionPOINT/usp-adapters/pandadoc"
 	"gopkg.in/yaml.v2"
 )
 
@@ -350,7 +350,7 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		printConfig(method, configs.Zendesk)
 		client, chRunning, err = usp_zendesk.NewZendeskAdapter(configs.Zendesk)
 	} else if method == "pandadoc" {
-	        configs.PandaDoc.ClientOptions = applyLogging(configs.PandaDoc.ClientOptions)
+		configs.PandaDoc.ClientOptions = applyLogging(configs.PandaDoc.ClientOptions)
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.PandaDoc)
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)

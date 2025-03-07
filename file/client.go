@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -242,13 +243,35 @@ func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting file %s in serial mode", t.Filename))
 		defer a.serialFeed.Release(1)
 	}
-	for line := range t.Lines {
-		if line.Err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("tail.Line(): %v", line.Err))
-			break
+	if !a.conf.MultiLineJSON {
+		for line := range t.Lines {
+			if line.Err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("tail.Line(): %v", line.Err))
+				break
+			}
+			atomic.StoreInt64(pLastData, time.Now().Unix())
+			a.handleLine(line.Text)
 		}
-		atomic.StoreInt64(pLastData, time.Now().Unix())
-		a.handleLine(line.Text)
+	} else {
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting file %s in multi-line JSON mode", t.Filename))
+		var jsonLines []string
+		braceCount := 0
+
+		for line := range t.Lines {
+			line := strings.TrimSpace(line.Text)
+			if line == "" { // Skip empty lines.
+				continue
+			}
+			jsonLines = append(jsonLines, line)
+			braceCount += strings.Count(line, "{")
+			braceCount -= strings.Count(line, "}")
+
+			if braceCount == 0 && len(jsonLines) > 0 {
+				rawJSON := []byte(strings.Join(jsonLines, ""))
+				a.handleLine(string(rawJSON))
+				jsonLines = nil // Reset for the next object.
+			}
+		}
 	}
 	if a.conf.SerializeFiles {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("finished file %s in serial mode", t.Filename))
