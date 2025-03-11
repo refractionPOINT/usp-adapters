@@ -27,6 +27,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
+	"github.com/refractionPOINT/usp-adapters/crowdstrike"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
@@ -84,6 +85,7 @@ type GeneralConfigs struct {
 	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
+	CrowdStrike       usp_crowdstrike.CrowdStrikeConfig               `json:"crowdstrike" yaml:"crowdstrike"`
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
@@ -339,6 +341,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.HubSpot)
 		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(configs.HubSpot)
+	} else if method == "crowdstrike" {
+		configs.CrowdStrike.ClientOptions = applyLogging(configs.CrowdStrike.ClientOptions)
+		configs.CrowdStrike.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.CrowdStrike)
+		client, chRunning, err = usp_crowdstrike.NewCrowdStrikeAdapter(configs.CrowdStrike)
 	} else if method == "ms_graph" {
 		configs.MsGraph.ClientOptions = applyLogging(configs.MsGraph.ClientOptions)
 		configs.MsGraph.ClientOptions.Architecture = "usp_adapter"
@@ -500,3 +507,4 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
+
