@@ -1,4 +1,4 @@
-package usp_crowdstrike
+package usp_falconcloud
 
 import (
 	"context"
@@ -21,14 +21,14 @@ const (
 	defaultWriteTimeout = 60 * 10
 )
 
-type CrowdStrikeConfig struct {
+type FalconCloudConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ClientId        string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret    string                  `json:"client_secret" yaml:"client_secret"`
 }
 
-func (c *CrowdStrikeConfig) Validate() error {
+func (c *FalconCloudConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
@@ -41,8 +41,8 @@ func (c *CrowdStrikeConfig) Validate() error {
 	return nil
 }
 
-type CrowdStrikeAdapter struct {
-	conf         CrowdStrikeConfig
+type FalconCloudAdapter struct {
+	conf         FalconCloudConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
@@ -55,8 +55,8 @@ type CrowdStrikeAdapter struct {
 	ctx context.Context
 }
 
-func NewCrowdStrikeAdapter(conf CrowdStrikeConfig) (*CrowdStrikeAdapter, chan struct{}, error) {
-	a := &CrowdStrikeAdapter{
+func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
+	a := &FalconCloudAdapter{
 		conf:      conf,
 		isRunning: 1,
 	}
@@ -85,7 +85,7 @@ func NewCrowdStrikeAdapter(conf CrowdStrikeConfig) (*CrowdStrikeAdapter, chan st
 	return a, a.chStopped, nil
 }
 
-func (a *CrowdStrikeAdapter) Close() error {
+func (a *FalconCloudAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 
 	a.mRunning.Lock()
@@ -102,7 +102,7 @@ func (a *CrowdStrikeAdapter) Close() error {
 	return nil
 }
 
-func (a *CrowdStrikeAdapter) convertStructToMap(obj interface{}) map[string]interface{} {
+func (a *FalconCloudAdapter) convertStructToMap(obj interface{}) map[string]interface{} {
 	data, err := json.Marshal(obj)
 	if err != nil {
 		return nil
@@ -117,7 +117,7 @@ func (a *CrowdStrikeAdapter) convertStructToMap(obj interface{}) map[string]inte
 	return mapRepresentation
 }
 
-func (a *CrowdStrikeAdapter) handleEvent(clientId string, clientSecret string) uintptr {
+func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) uintptr {
 
 	client, err := falcon.NewClient(&falcon.ApiConfig{
 		ClientId:     clientId,
