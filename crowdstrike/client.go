@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"os"
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 
@@ -118,7 +118,6 @@ func (a *CrowdStrikeAdapter) convertStructToMap(obj interface{}) map[string]inte
 }
 
 func (a *CrowdStrikeAdapter) handleEvent(clientId string, clientSecret string) uintptr {
-	appName := flag.String("app-name", "falcon_event_stream", "Application name (needs to be unique in your Falcon environment)")
 
 	client, err := falcon.NewClient(&falcon.ApiConfig{
 		ClientId:     clientId,
@@ -130,8 +129,9 @@ func (a *CrowdStrikeAdapter) handleEvent(clientId string, clientSecret string) u
 	}
 
 	jsonFormat := "json"
+	appName := fmt.Sprintf("lc-adapter-%s", uuid.New().String()[:8])
 	response, err := client.EventStreams.ListAvailableStreamsOAuth2(&event_streams.ListAvailableStreamsOAuth2Params{
-		AppID:   *appName,
+		AppID:   appName,
 		Format:  &jsonFormat,
 		Context: context.Background(),
 	})
@@ -145,12 +145,12 @@ func (a *CrowdStrikeAdapter) handleEvent(clientId string, clientSecret string) u
 
 	availableStreams := response.Payload.Resources
 	if len(availableStreams) == 0 {
-		fmt.Printf("No available stream was found for AppID=%s. Ensure no other instance is running or check API permissions.\n", *appName)
+		fmt.Printf("No available stream was found for AppID=%s. Ensure no other instance is running or check API permissions.\n", appName)
 		return 0
 	}
 
 	for _, availableStream := range availableStreams {
-		stream, err := falcon.NewStream(context.Background(), client, *appName, availableStream, 0)
+		stream, err := falcon.NewStream(context.Background(), client, appName, availableStream, 0)
 		if err != nil {
 			panic(err)
 		}
