@@ -28,6 +28,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
+	"github.com/refractionPOINT/usp-adapters/mimecast"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
@@ -86,6 +87,7 @@ type GeneralConfigs struct {
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
 	FalconCloud       usp_falconcloud.FalconCloudConfig               `json:"falconcloud" yaml:"falconcloud"`
+	Mimecast		  usp_mimecast.MimecastConfig					  `json:"mimecast" yaml:"mimecast"`
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
@@ -346,6 +348,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.FalconCloud.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.FalconCloud)
 		client, chRunning, err = usp_falconcloud.NewFalconCloudAdapter(configs.FalconCloud)
+	} else if method == "mimecast" {
+		configs.Mimecast.ClientOptions = applyLogging(configs.Mimecast.ClientOptions)
+		configs.Mimecast.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.Mimecast)
+		client, chRunning, err = usp_mimecast.NewMimecastAdapter(configs.Mimecast)
 	} else if method == "ms_graph" {
 		configs.MsGraph.ClientOptions = applyLogging(configs.MsGraph.ClientOptions)
 		configs.MsGraph.ClientOptions.Architecture = "usp_adapter"
@@ -507,5 +514,6 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
+
 
 
