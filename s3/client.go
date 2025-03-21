@@ -161,41 +161,69 @@ func (a *S3Adapter) Close() error {
 }
 
 func (a *S3Adapter) lookForFiles() (bool, error) {
-	input := &s3.ListObjectsV2Input{
-		Bucket: aws.String(a.conf.BucketName),
-		Prefix: &a.conf.Prefix,
-	}
-
-	resp, err := a.awsS3.ListObjectsV2(input)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2(): %v", err))
-		// Ignore the error upstream so that we just keep retrying.
-		return false, nil
-	}
-
-	// Filter objects based on lastCheckTime if IsNotSink is true
-	var filteredContents []*s3.Object
 	var latestModTime time.Time
-	if a.conf.IsNotSink {
+	var continuationToken *string
+	isDataFound := false
+
+	for {
+		input := &s3.ListObjectsV2Input{
+			Bucket:            aws.String(a.conf.BucketName),
+			Prefix:            &a.conf.Prefix,
+			ContinuationToken: continuationToken,
+			// Use a reasonable page size to balance memory and requests
+			MaxKeys: aws.Int64(1000),
+		}
+
+		resp, err := a.awsS3.ListObjectsV2(input)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2(): %v", err))
+			// Ignore the error upstream so that we just keep retrying.
+			return false, nil
+		}
+
+		// Filter and track the latest modification time
+		var filteredContents []*s3.Object
 		for _, obj := range resp.Contents {
-			// Track the latest modification time we see
+			// Always track the latest modification time we see
 			if obj.LastModified.After(latestModTime) {
 				latestModTime = *obj.LastModified
 			}
 
-			if obj.LastModified.After(a.lastCheckTime) {
-				filteredContents = append(filteredContents, obj)
+			// If we're in not-sink mode, only process files newer than our last check
+			if a.conf.IsNotSink {
+				if !obj.LastModified.After(a.lastCheckTime) {
+					continue
+				}
 			}
+			filteredContents = append(filteredContents, obj)
 		}
-		resp.Contents = filteredContents
 
-		// Update lastCheckTime to the latest file modification time we've seen
-		// Only update if we found any files, otherwise keep the previous time
-		if !latestModTime.IsZero() {
-			a.lastCheckTime = latestModTime
+		// Process this batch of files
+		if len(filteredContents) > 0 {
+			isPageProcessed, err := a.processFileBatch(filteredContents)
+			if err != nil {
+				return false, err
+			}
+			isDataFound = isDataFound || isPageProcessed
 		}
+
+		// Check if there are more pages
+		if !aws.BoolValue(resp.IsTruncated) {
+			break
+		}
+		continuationToken = resp.NextContinuationToken
 	}
 
+	// Update our tracking only if we found newer files
+	if a.conf.IsNotSink && !latestModTime.IsZero() {
+		a.lastCheckTime = latestModTime
+	}
+
+	return isDataFound, nil
+}
+
+// New helper function to process a batch of files
+func (a *S3Adapter) processFileBatch(contents []*s3.Object) (bool, error) {
 	// We pipeline the downloading of files from S3 to support
 	// high throughputs. It is important we keep file ordering
 	// but beyond that we can download in parallel.
@@ -207,10 +235,10 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		}
 		filesMutex.Lock()
 		defer filesMutex.Unlock()
-		if nextFileIndex >= len(resp.Contents) {
+		if nextFileIndex >= len(contents) {
 			return nil, nil
 		}
-		e := resp.Contents[nextFileIndex]
+		e := contents[nextFileIndex]
 		nextFileIndex++
 		return &s3Record{Key: *e.Key, Size: *e.Size}, nil
 	}, a.conf.ParallelFetch, func(e utils.Element) utils.Element {
@@ -243,7 +271,6 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		}
 
 		isCompressed := false
-
 		if strings.HasSuffix(item.Key, ".gz") {
 			isCompressed = true
 		}
@@ -263,14 +290,6 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 	defer close()
 
 	isDataFound := false
-
-	// We will delete the files as
-	// we go asynchronously so that
-	// we can get higher throughput.
-	errMutex := sync.Mutex{}
-	var delErr error
-	delWg := sync.WaitGroup{}
-
 	for {
 		var newFile interface{}
 		newFile, err = genNewFile()
@@ -303,45 +322,20 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			continue
 		}
 
-		delWg.Add(1)
-		go func() {
-			defer delWg.Done()
-			if _, err = a.awsS3.DeleteObject(&s3.DeleteObjectInput{
-				Bucket: aws.String(a.conf.BucketName),
-				Key:    aws.String(localFile.Obj.Key),
-			}); err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("s3.DeleteObject(): %v", err))
-				// Since we rely on object deletion to prevent re-ingesting
-				// the same files over and over again, we need to abort
-				// if we cannot delete a file.
-				a.conf.ClientOptions.OnWarning("aborting because files cannot be deleted")
-				errMutex.Lock()
-				delErr = err
-				errMutex.Unlock()
-			}
-		}()
-
-		// Take the opportunity to check if a delete failed.
-		errMutex.Lock()
-		if delErr != nil {
-			err = delErr
-		}
-		errMutex.Unlock()
-
-		if err != nil {
-			break
+		if _, err = a.awsS3.DeleteObject(&s3.DeleteObjectInput{
+			Bucket: aws.String(a.conf.BucketName),
+			Key:    aws.String(localFile.Obj.Key),
+		}); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("s3.DeleteObject(): %v", err))
+			// Since we rely on object deletion to prevent re-ingesting
+			// the same files over and over again, we need to abort
+			// if we cannot delete a file.
+			a.conf.ClientOptions.OnWarning("aborting because files cannot be deleted")
+			return false, err
 		}
 
 		isDataFound = true
 	}
-
-	// Wait for all file deletes and confirm they did not error.
-	delWg.Wait()
-	errMutex.Lock()
-	if delErr != nil {
-		err = delErr
-	}
-	errMutex.Unlock()
 
 	return isDataFound, err
 }

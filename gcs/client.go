@@ -147,7 +147,19 @@ func (a *GCSAdapter) Close() error {
 }
 
 func (a *GCSAdapter) lookForFiles() (bool, error) {
-	query := &storage.Query{Prefix: a.conf.Prefix}
+	var latestModTime time.Time
+
+	// Create a query that filters by prefix and last check time
+	query := &storage.Query{
+		Prefix: a.conf.Prefix,
+	}
+
+	// Add a filter for modification time if in not-sink mode
+	if a.conf.IsNotSink {
+		// GCS Query Condition format: "metadata.field > timestamp"
+		// Convert lastCheckTime to RFC3339 format
+		query.Filter = fmt.Sprintf("timeCreated > %s", a.lastCheckTime.Format(time.RFC3339))
+	}
 
 	it := a.bucket.Objects(a.ctx, query)
 
@@ -155,7 +167,6 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 	// high throughputs. It is important we keep file ordering
 	// but beyond that we can download in parallel.
 	filesMutex := sync.Mutex{}
-	var latestModTime time.Time
 	genNewFile, close, err := utils.Pipeliner(func() (utils.Element, error) {
 		if atomic.LoadUint32(&a.isStop) == 1 {
 			return nil, nil
@@ -171,16 +182,10 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 			return nil, err
 		}
 
-		// Filter objects based on lastCheckTime if IsNotSink is true
+		// Still track the latest modification time we see
 		if a.conf.IsNotSink {
-			// Track the latest modification time we see
 			if attrs.Updated.After(latestModTime) {
 				latestModTime = attrs.Updated
-			}
-
-			if !attrs.Updated.After(a.lastCheckTime) {
-				// Skip this file and get the next one
-				return nil, nil
 			}
 		}
 
@@ -290,7 +295,6 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 	}
 
 	// Update lastCheckTime to the latest file modification time we've seen
-	// Only update if we found any files, otherwise keep the previous time
 	if a.conf.IsNotSink && !latestModTime.IsZero() {
 		a.lastCheckTime = latestModTime
 	}
