@@ -30,8 +30,9 @@ type GCSAdapter struct {
 	client *storage.Client
 	bucket *storage.BucketHandle
 
-	isStop uint32
-	wg     sync.WaitGroup
+	isStop        uint32
+	wg            sync.WaitGroup
+	lastCheckTime time.Time
 }
 
 type GCSConfig struct {
@@ -39,6 +40,7 @@ type GCSConfig struct {
 	BucketName          string                  `json:"bucket_name" yaml:"bucket_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 	IsOneTimeLoad       bool                    `json:"single_load" yaml:"single_load"`
+	IsNotSink           bool                    `json:"is_not_sink" yaml:"is_not_sink"`
 	Prefix              string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch       int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
 }
@@ -66,8 +68,9 @@ func NewGCSAdapter(conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
 		conf.ParallelFetch = 1
 	}
 	a := &GCSAdapter{
-		conf: conf,
-		ctx:  context.Background(),
+		conf:          conf,
+		ctx:           context.Background(),
+		lastCheckTime: time.Now().UTC(),
 	}
 
 	var err error
@@ -152,6 +155,7 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 	// high throughputs. It is important we keep file ordering
 	// but beyond that we can download in parallel.
 	filesMutex := sync.Mutex{}
+	var latestModTime time.Time
 	genNewFile, close, err := utils.Pipeliner(func() (utils.Element, error) {
 		if atomic.LoadUint32(&a.isStop) == 1 {
 			return nil, nil
@@ -165,6 +169,19 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 		}
 		if err != nil {
 			return nil, err
+		}
+
+		// Filter objects based on lastCheckTime if IsNotSink is true
+		if a.conf.IsNotSink {
+			// Track the latest modification time we see
+			if attrs.Updated.After(latestModTime) {
+				latestModTime = attrs.Updated
+			}
+
+			if !attrs.Updated.After(a.lastCheckTime) {
+				// Skip this file and get the next one
+				return nil, nil
+			}
 		}
 
 		return attrs, nil
@@ -270,6 +287,12 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 		}
 
 		isDataFound = true
+	}
+
+	// Update lastCheckTime to the latest file modification time we've seen
+	// Only update if we found any files, otherwise keep the previous time
+	if a.conf.IsNotSink && !latestModTime.IsZero() {
+		a.lastCheckTime = latestModTime
 	}
 
 	return isDataFound, err

@@ -33,8 +33,9 @@ type S3Adapter struct {
 	awsS3         *s3.S3
 	awsDownloader *s3manager.Downloader
 
-	isStop uint32
-	wg     sync.WaitGroup
+	isStop        uint32
+	wg            sync.WaitGroup
+	lastCheckTime time.Time
 }
 
 type S3Config struct {
@@ -43,6 +44,7 @@ type S3Config struct {
 	AccessKey     string                  `json:"access_key" yaml:"access_key"`
 	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
 	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
+	IsNotSink     bool                    `json:"is_not_sink" yaml:"is_not_sink"`
 	Prefix        string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
 }
@@ -80,8 +82,9 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 		conf.ParallelFetch = 1
 	}
 	a := &S3Adapter{
-		conf: conf,
-		ctx:  context.Background(),
+		conf:          conf,
+		ctx:           context.Background(),
+		lastCheckTime: time.Now().UTC(),
 	}
 
 	var err error
@@ -158,14 +161,39 @@ func (a *S3Adapter) Close() error {
 }
 
 func (a *S3Adapter) lookForFiles() (bool, error) {
-	resp, err := a.awsS3.ListObjectsV2(&s3.ListObjectsV2Input{
+	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(a.conf.BucketName),
 		Prefix: &a.conf.Prefix,
-	})
+	}
+
+	resp, err := a.awsS3.ListObjectsV2(input)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2(): %v", err))
 		// Ignore the error upstream so that we just keep retrying.
 		return false, nil
+	}
+
+	// Filter objects based on lastCheckTime if IsNotSink is true
+	var filteredContents []*s3.Object
+	var latestModTime time.Time
+	if a.conf.IsNotSink {
+		for _, obj := range resp.Contents {
+			// Track the latest modification time we see
+			if obj.LastModified.After(latestModTime) {
+				latestModTime = *obj.LastModified
+			}
+
+			if obj.LastModified.After(a.lastCheckTime) {
+				filteredContents = append(filteredContents, obj)
+			}
+		}
+		resp.Contents = filteredContents
+
+		// Update lastCheckTime to the latest file modification time we've seen
+		// Only update if we found any files, otherwise keep the previous time
+		if !latestModTime.IsZero() {
+			a.lastCheckTime = latestModTime
+		}
 	}
 
 	// We pipeline the downloading of files from S3 to support

@@ -24,15 +24,15 @@ import (
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
 	"github.com/refractionPOINT/usp-adapters/evtx"
+	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
-	"github.com/refractionPOINT/usp-adapters/falconcloud"
-	"github.com/refractionPOINT/usp-adapters/mimecast"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
+	"github.com/refractionPOINT/usp-adapters/mimecast"
 	"github.com/refractionPOINT/usp-adapters/ms_graph"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
@@ -87,7 +87,7 @@ type GeneralConfigs struct {
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
 	FalconCloud       usp_falconcloud.FalconCloudConfig               `json:"falconcloud" yaml:"falconcloud"`
-	Mimecast		  usp_mimecast.MimecastConfig					  `json:"mimecast" yaml:"mimecast"`
+	Mimecast          usp_mimecast.MimecastConfig                     `json:"mimecast" yaml:"mimecast"`
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
@@ -514,6 +514,3 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
-
-
-
