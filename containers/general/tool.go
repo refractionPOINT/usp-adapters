@@ -92,7 +92,7 @@ type GeneralConfigs struct {
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
-	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinelone" yaml:"sentinelone"`
+	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
 }
 
 type AdapterStats struct {
