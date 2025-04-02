@@ -177,12 +177,12 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 		isFirstRun = false
 		nextPage := ""
 		nFetched := 0
-		for {
+		for !a.doStop.IsSet() {
 			if nextPage != "" {
 				qValues.Set("cursor", nextPage)
 			}
 
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching from %s%s", endpoint, qValues.Encode()))
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching from %s?%s", endpoint, qValues.Encode()))
 			resp, err := a.s1Client.GetFromAPI(a.ctx, endpoint, qValues)
 			if err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("GetFromAPI(): %v", err))
@@ -197,10 +197,29 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 			for _, event := range resp.Data {
 				isDataFound = true
 				nFetched++
+
+				// The creeatedAt field varies per data source, but it's always either at the root
+				// or one level deep. So look for both.
+				lastCreatedAt, _ = getTimestampElement(event, "createdAt")
+				var ts uint64
+				if lastCreatedAt != "" {
+					if it, err := time.Parse("2006-01-02T15:04:05.999999Z", lastCreatedAt); err == nil {
+						ts = uint64(it.UnixMilli())
+					} else {
+						lastCreatedAt = ""
+					}
+				}
+				if lastCreatedAt == "" {
+					a.conf.ClientOptions.OnError(fmt.Errorf("createdAt not found in event: %v", event))
+					now = time.Now()
+					lastCreatedAt = now.Format("2006-01-02T15:04:05.999999Z")
+					ts = uint64(now.UnixMilli())
+				}
+
 				msg := &protocol.DataMessage{
 					EventType:   eventType,
 					JsonPayload: event,
-					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+					TimestampMs: ts,
 				}
 				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 					if err == uspclient.ErrorBufferFull {
@@ -213,27 +232,6 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 						break
 					}
 				}
-				// The creeatedAt field varies per data source, but it's always either at the root
-				// or one level deep. So look for both.
-				if lca, ok := event["createdAt"].(string); ok {
-					lastCreatedAt = lca
-				} else {
-					isFound := false
-					for _, v := range event {
-						subEvent, ok := v.(map[string]interface{})
-						if !ok {
-							continue
-						}
-						if lca, ok := subEvent["createdAt"].(string); ok {
-							lastCreatedAt = lca
-							isFound = true
-							break
-						}
-					}
-					if !isFound {
-						a.conf.ClientOptions.OnError(fmt.Errorf("createdAt not found in event: %v", event))
-					}
-				}
 			}
 			if nextPage == "" {
 				break
@@ -242,4 +240,20 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d events", nFetched))
 	}
+}
+
+func getTimestampElement(event map[string]interface{}, path string) (string, bool) {
+	if lca, ok := event[path].(string); ok {
+		return lca, true
+	}
+	for _, v := range event {
+		subEvent, ok := v.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if lca, ok := subEvent[path].(string); ok {
+			return lca, true
+		}
+	}
+	return "", false
 }
