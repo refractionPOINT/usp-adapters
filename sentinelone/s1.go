@@ -152,8 +152,8 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 	defer a.conf.ClientOptions.DebugLog("fetching of events exiting")
 
 	// Make the last component of the endpoint the event type.
-	eventType := strings.SplitN(endpoint, "/", 2)[1]
-
+	ets := strings.Split(endpoint, "/")
+	eventType := ets[len(ets)-1]
 	isFirstRun := true
 	lastCreatedAt := ""
 	isDataFound := false
