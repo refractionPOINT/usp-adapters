@@ -370,7 +370,7 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.PandaDoc)
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
-	} else if method == "sentinelone" {
+	} else if method == "sentinel_one" {
 		configs.SentinelOne.ClientOptions = applyLogging(configs.SentinelOne.ClientOptions)
 		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.SentinelOne)
