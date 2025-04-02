@@ -24,21 +24,22 @@ import (
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
 	"github.com/refractionPOINT/usp-adapters/evtx"
+	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
-	"github.com/refractionPOINT/usp-adapters/falconcloud"
-	"github.com/refractionPOINT/usp-adapters/mimecast"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
 	"github.com/refractionPOINT/usp-adapters/k8s_pods"
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
+	"github.com/refractionPOINT/usp-adapters/mimecast"
 	"github.com/refractionPOINT/usp-adapters/ms_graph"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
+	"github.com/refractionPOINT/usp-adapters/sentinelone"
 	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/sophos"
@@ -87,10 +88,11 @@ type GeneralConfigs struct {
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
 	FalconCloud       usp_falconcloud.FalconCloudConfig               `json:"falconcloud" yaml:"falconcloud"`
-	Mimecast		  usp_mimecast.MimecastConfig					  `json:"mimecast" yaml:"mimecast"`
+	Mimecast          usp_mimecast.MimecastConfig                     `json:"mimecast" yaml:"mimecast"`
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
+	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
 }
 
 type AdapterStats struct {
@@ -368,6 +370,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.PandaDoc)
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
+	} else if method == "sentinel_one" {
+		configs.SentinelOne.ClientOptions = applyLogging(configs.SentinelOne.ClientOptions)
+		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.SentinelOne)
+		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(configs.SentinelOne)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
@@ -514,6 +521,3 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
-
-
-
