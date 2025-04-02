@@ -39,6 +39,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
+	"github.com/refractionPOINT/usp-adapters/sentinelone"
 	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/sophos"
@@ -91,6 +92,7 @@ type GeneralConfigs struct {
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
+	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinelone" yaml:"sentinelone"`
 }
 
 type AdapterStats struct {
@@ -368,6 +370,11 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		printConfig(method, configs.PandaDoc)
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
+	} else if method == "sentinelone" {
+		configs.SentinelOne.ClientOptions = applyLogging(configs.SentinelOne.ClientOptions)
+		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
+		printConfig(method, configs.SentinelOne)
+		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(configs.SentinelOne)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}

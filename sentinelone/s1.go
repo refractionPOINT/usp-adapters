@@ -1,4 +1,4 @@
-package sentinelone
+package usp_sentinelone
 
 import (
 	"context"
@@ -21,6 +21,7 @@ type SentinelOneAdapter struct {
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 	s1Client   *SentinelOneClient
+	urls       []string
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -33,7 +34,7 @@ type SentinelOneConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Domain        string                  `json:"domain" yaml:"domain"`
 	APIKey        string                  `json:"api_key" yaml:"api_key"`
-	URLs          []string                `json:"urls" yaml:"urls"`
+	URLs          string                  `json:"urls" yaml:"urls"`
 	StartTime     string                  `json:"start_time" yaml:"start_time"`
 }
 
@@ -51,6 +52,9 @@ func (c *SentinelOneConfig) Validate() error {
 		c.Domain = "https://" + c.Domain
 	}
 	c.Domain = strings.TrimSuffix(c.Domain, "/")
+	if _, err := time.Parse("2006-01-02T15:04:05.999999Z", c.StartTime); c.StartTime != "" && err != nil {
+		return fmt.Errorf("invalid start_time: %v", err)
+	}
 	return nil
 }
 
@@ -81,23 +85,29 @@ func NewSentinelOneAdapter(conf SentinelOneConfig) (*SentinelOneAdapter, chan st
 	a.chStopped = make(chan struct{})
 
 	// Set sane default for the content types.
-	if len(a.conf.URLs) == 0 {
-		a.conf.URLs = []string{
-			"/web/api/v2.1/actvites",
-			"/web/api/v2.1/cloud-detecton/alerts",
+	if a.conf.URLs == "" {
+		a.urls = []string{
+			"/web/api/v2.1/activities",
+			"/web/api/v2.1/cloud-detection/alerts",
 			"/web/api/v2.1/threats",
 		}
+	} else {
+		for _, s := range strings.Split(a.conf.URLs, ",") {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				a.urls = append(a.urls, s)
+			}
+		}
 	}
-	for i, url := range a.conf.URLs {
+	for i, url := range a.urls {
 		if !strings.HasPrefix(url, "/") {
 			url = "/" + url
 		}
-		a.conf.URLs[i] = url
+		a.urls[i] = url
 	}
 
 	nCollecting := 0
-	for _, ct := range a.conf.URLs {
-		ct = strings.TrimSpace(ct)
+	for _, ct := range a.urls {
 		if ct == "" {
 			continue
 		}
@@ -106,8 +116,7 @@ func NewSentinelOneAdapter(conf SentinelOneConfig) (*SentinelOneAdapter, chan st
 		nCollecting++
 
 		a.wgSenders.Add(1)
-		url := fmt.Sprintf("%s%s", a.conf.Domain, ct)
-		go a.fetchEvents(url)
+		go a.fetchEvents(ct)
 	}
 
 	if nCollecting == 0 {
@@ -144,20 +153,23 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 
 	isFirstRun := true
 	lastCreatedAt := ""
-	for isFirstRun || (!a.doStop.IsSet()) || !a.doStop.WaitFor(1*time.Minute) {
+	isDataFound := false
+	for isFirstRun || isDataFound || !a.doStop.WaitFor(1*time.Minute) {
+		isDataFound = false
 		qValues := url.Values{}
 		now := time.Now().UTC()
 		if isFirstRun {
 			start := a.conf.StartTime
 			if start == "" {
-				start = now.Add(-15 * time.Second).Format("2006-01-02T15:04:05Z")
+				start = now.Add(-15 * time.Second).Format("2006-01-02T15:04:05.999999Z")
 			}
-			end := now.Format("2006-01-02T15:04:05Z")
-			qValues.Set("createdat__gte", start)
-			qValues.Set("createdat__lte", end)
+			lastCreatedAt = start
+			end := now.Format("2006-01-02T15:04:05.999999Z")
+			qValues.Set("createdAt__gte", start)
+			qValues.Set("createdAt__lte", end)
 		} else {
-			qValues.Set("createdat__gt", lastCreatedAt)
-			qValues.Set("createdat__lte", now.Format("2006-01-02T15:04:05Z"))
+			qValues.Set("createdAt__gt", lastCreatedAt)
+			qValues.Set("createdAt__lte", now.Format("2006-01-02T15:04:05.999999Z"))
 		}
 		isFirstRun = false
 		nextPage := ""
@@ -167,6 +179,7 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 				qValues.Set("cursor", nextPage)
 			}
 
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching from %s%s", endpoint, qValues.Encode()))
 			resp, err := a.s1Client.GetFromAPI(a.ctx, endpoint, qValues)
 			if err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("GetFromAPI(): %v", err))
@@ -179,6 +192,8 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 				nextPage = ""
 			}
 			for _, event := range resp.Data {
+				isDataFound = true
+				nFetched++
 				msg := &protocol.DataMessage{
 					JsonPayload: event,
 					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
