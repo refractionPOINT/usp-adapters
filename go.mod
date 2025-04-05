@@ -10,14 +10,16 @@ require (
 	cloud.google.com/go/storage v1.50.0
 	github.com/Azure/azure-event-hubs-go/v3 v3.6.2
 	github.com/aws/aws-sdk-go v1.55.6
+	github.com/crowdstrike/gofalcon v0.13.1
 	github.com/duosecurity/duo_api_golang v0.0.0-20250128191753-8aff7fde9979
 	github.com/emersion/go-imap v1.2.1
 	github.com/emersion/go-message v0.18.2
 	github.com/fsnotify/fsnotify v1.8.0
+	github.com/google/uuid v1.6.0
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20221217013001-bbcbd9938c6e
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
-	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20250303173334-f4d2b7307df3
+	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20250405181551-b8f35c6a9268
 	github.com/refractionPOINT/go-uspclient v1.4.4
 	github.com/stretchr/testify v1.10.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
@@ -61,7 +63,6 @@ require (
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20250121191232-2f005788dc42 // indirect
-	github.com/crowdstrike/gofalcon v0.13.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/devigned/tab v0.1.1 // indirect
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6 // indirect
@@ -85,7 +86,6 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/flatbuffers v25.2.10+incompatible // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.5 // indirect
 	github.com/googleapis/gax-go/v2 v2.14.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
