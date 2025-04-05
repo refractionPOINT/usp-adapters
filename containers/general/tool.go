@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
@@ -52,6 +53,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/containers/conf"
+	confupdateclient "github.com/refractionPOINT/usp-adapters/containers/general/conf_update_client"
 	"gopkg.in/yaml.v2"
 )
 
@@ -63,6 +65,16 @@ type AdapterStats struct {
 	m                sync.Mutex
 	lastAck          time.Time
 	lastBackPressure time.Time
+}
+
+type Configuration struct {
+	conf.GeneralConfigs
+
+	// If a literal config is not specified, the OID and GUID
+	// will be used to fetch the config from Limacharlie
+	// and update the config in real time.
+	OID      string `json:"oid" yaml:"oid"`
+	ConfGUID string `json:"conf_guid" yaml:"conf_guid"`
 }
 
 func logError(format string, elems ...interface{}) string {
@@ -104,7 +116,7 @@ func printStruct(prefix string, s interface{}, isTop bool) {
 func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 	logError("Available configs:\n")
-	printStruct("", conf.GeneralConfigs{}, true)
+	printStruct("", Configuration{}, true)
 }
 
 func printConfig(method string, c interface{}) {
@@ -138,6 +150,23 @@ func main() {
 	chRunnings := make(chan struct{})
 	healthCheckPortRequested := 0
 	for _, config := range configsToRun {
+		// If an OID and GUID are specified, we will start a conf update client
+		// to update the config in real time.
+		var confUpdateClient *confupdateclient.ConfUpdateClient
+		if config.OID != "" && config.ConfGUID != "" {
+			var confData map[string]interface{}
+			confUpdateClient, confData, err = confupdateclient.NewConfUpdateClient(config.OID, config.ConfGUID, &limacharlie.LCLoggerZerolog{})
+			if err != nil {
+				logError("error creating conf update client: %v", err)
+				os.Exit(1)
+			}
+			// Use this new config to run the adapter.
+			if err := limacharlie.Dict(confData).UnMarshalToStruct(config); err != nil {
+				logError("error unmarshalling conf update: %v", err)
+				os.Exit(1)
+			}
+		}
+
 		log("starting adapter: %s", method)
 		client, chRunning, err := runAdapter(method, *config)
 		if err != nil {
@@ -150,6 +179,25 @@ func main() {
 		}()
 		if config.Healthcheck != 0 {
 			healthCheckPortRequested = config.Healthcheck
+		}
+		if confUpdateClient != nil {
+			log("watching for conf updates")
+			go func() {
+				newConfig := Configuration{}
+				if err := confUpdateClient.WatchForChanges(10*time.Second, func(data map[string]interface{}) {
+					if err := limacharlie.Dict(data).UnMarshalToStruct(&newConfig); err != nil {
+						logError("error unmarshalling conf update: %v", err)
+					}
+					log("stopping previous adapter")
+					if err := client.Close(); err != nil {
+						logError("error closing client: %v", err)
+					}
+					log("starting new adapter")
+					client, chRunning, err = runAdapter(method, newConfig)
+				}); err != nil {
+					logError("error watching for conf updates: %v", err)
+				}
+			}()
 		}
 	}
 
@@ -181,7 +229,7 @@ func main() {
 	log("exited")
 }
 
-func runAdapter(method string, configs conf.GeneralConfigs) (USPClient, chan struct{}, error) {
+func runAdapter(method string, configs Configuration) (USPClient, chan struct{}, error) {
 	var client USPClient
 	var chRunning chan struct{}
 	var err error
@@ -362,8 +410,8 @@ func runAdapter(method string, configs conf.GeneralConfigs) (USPClient, chan str
 	return client, chRunning, nil
 }
 
-func parseConfigs(args []string) (string, []*conf.GeneralConfigs, error) {
-	configsToRun := []*conf.GeneralConfigs{}
+func parseConfigs(args []string) (string, []*Configuration, error) {
+	configsToRun := []*Configuration{}
 	var err error
 	if len(args) < 2 {
 		return "", nil, errors.New("not enough arguments")
@@ -378,7 +426,7 @@ func parseConfigs(args []string) (string, []*conf.GeneralConfigs, error) {
 		}
 		log("found %d configs to run", len(configsToRun))
 	} else {
-		configs := &conf.GeneralConfigs{}
+		configs := &Configuration{}
 		// Read the config from the CLI.
 		if err = parseConfigsFromParams(method, args, configs); err != nil {
 			return "", nil, err
@@ -392,7 +440,7 @@ func parseConfigs(args []string) (string, []*conf.GeneralConfigs, error) {
 	return method, configsToRun, nil
 }
 
-func parseConfigsFromFile(filePath string) ([]*conf.GeneralConfigs, error) {
+func parseConfigsFromFile(filePath string) ([]*Configuration, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		printUsage()
@@ -408,9 +456,9 @@ func parseConfigsFromFile(filePath string) ([]*conf.GeneralConfigs, error) {
 	var jsonErr error
 	var yamlErr error
 
-	configsToRun := []*conf.GeneralConfigs{}
+	configsToRun := []*Configuration{}
 	for {
-		configs := &conf.GeneralConfigs{}
+		configs := &Configuration{}
 
 		if jsonErr = jsonDecoder.Decode(configs); jsonErr != nil {
 			if jsonErr == io.EOF {
@@ -422,7 +470,7 @@ func parseConfigsFromFile(filePath string) ([]*conf.GeneralConfigs, error) {
 	}
 
 	for {
-		configs := &conf.GeneralConfigs{}
+		configs := &Configuration{}
 
 		if yamlErr = yamlDecoder.Decode(configs); yamlErr != nil {
 			if yamlErr == io.EOF {
@@ -442,7 +490,7 @@ func parseConfigsFromFile(filePath string) ([]*conf.GeneralConfigs, error) {
 	return configsToRun, nil
 }
 
-func parseConfigsFromParams(prefix string, params []string, configs *conf.GeneralConfigs) error {
+func parseConfigsFromParams(prefix string, params []string, configs *Configuration) error {
 	// Read the config from the CLI.
 	if err := utils.ParseCLI(prefix, params, configs); err != nil {
 		printUsage()
