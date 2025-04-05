@@ -14,11 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
-
-	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
+	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -47,52 +45,18 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/syslog"
-	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
+
+	"github.com/refractionPOINT/usp-adapters/utils"
+
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/usp-adapters/containers/conf"
 	"gopkg.in/yaml.v2"
 )
 
 type USPClient interface {
 	Close() error
-}
-
-type GeneralConfigs struct {
-	Healthcheck int `json:"healthcheck" yaml:"healthcheck"`
-
-	Syslog            usp_syslog.SyslogConfig                         `json:"syslog" yaml:"syslog"`
-	PubSub            usp_pubsub.PubSubConfig                         `json:"pubsub" yaml:"pubsub"`
-	S3                usp_s3.S3Config                                 `json:"s3" yaml:"s3"`
-	Stdin             usp_stdin.StdinConfig                           `json:"stdin" yaml:"stdin"`
-	OnePassword       usp_1password.OnePasswordConfig                 `json:"1password" yaml:"1password"`
-	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
-	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
-	EntraID           usp_entraid.EntraIDConfig                       `json:"entraid" yaml:"entraid"`
-	Defender          usp_defender.DefenderConfig                     `json:"defender" yaml:"defender"`
-	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
-	Okta              usp_okta.OktaConfig                             `json:"okta" yaml:"okta"`
-	Office365         usp_o365.Office365Config                        `json:"office365" yaml:"office365"`
-	Wel               usp_wel.WELConfig                               `json:"wel" yaml:"wel"`
-	MacUnifiedLogging usp_mac_unified_logging.MacUnifiedLoggingConfig `json:"mac_unified_logging" yaml:"mac_unified_logging"`
-	AzureEventHub     usp_azure_event_hub.EventHubConfig              `json:"azure_event_hub" yaml:"azure_event_hub"`
-	Duo               usp_duo.DuoConfig                               `json:"duo" yaml:"duo"`
-	Gcs               usp_gcs.GCSConfig                               `json:"gcs" yaml:"gcs"`
-	Slack             usp_slack.SlackConfig                           `json:"slack" yaml:"slack"`
-	Sqs               usp_sqs.SQSConfig                               `json:"sqs" yaml:"sqs"`
-	SqsFiles          usp_sqs_files.SQSFilesConfig                    `json:"sqs-files" yaml:"sqs-files"`
-	Simulator         usp_simulator.SimulatorConfig                   `json:"simulator" yaml:"simulator"`
-	File              usp_file.FileConfig                             `json:"file" yaml:"file"`
-	Evtx              usp_evtx.EVTXConfig                             `json:"evtx" yaml:"evtx"`
-	K8sPods           usp_k8s_pods.K8sPodsConfig                      `json:"k8s_pods" yaml:"k8s_pods"`
-	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
-	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
-	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
-	FalconCloud       usp_falconcloud.FalconCloudConfig               `json:"falconcloud" yaml:"falconcloud"`
-	Mimecast          usp_mimecast.MimecastConfig                     `json:"mimecast" yaml:"mimecast"`
-	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
-	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
-	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
-	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
 }
 
 type AdapterStats struct {
@@ -140,7 +104,7 @@ func printStruct(prefix string, s interface{}, isTop bool) {
 func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 	logError("Available configs:\n")
-	printStruct("", GeneralConfigs{}, true)
+	printStruct("", conf.GeneralConfigs{}, true)
 }
 
 func printConfig(method string, c interface{}) {
@@ -205,7 +169,7 @@ func main() {
 	log("exited")
 }
 
-func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}, error) {
+func runAdapter(method string, configs conf.GeneralConfigs) (USPClient, chan struct{}, error) {
 	var client USPClient
 	var chRunning chan struct{}
 	var err error
@@ -394,8 +358,8 @@ func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}
 	return client, chRunning, nil
 }
 
-func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
-	configsToRun := []*GeneralConfigs{}
+func parseConfigs(args []string) (string, []*conf.GeneralConfigs, error) {
+	configsToRun := []*conf.GeneralConfigs{}
 	var err error
 	if len(args) < 2 {
 		return "", nil, errors.New("not enough arguments")
@@ -410,7 +374,7 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 		}
 		log("found %d configs to run", len(configsToRun))
 	} else {
-		configs := &GeneralConfigs{}
+		configs := &conf.GeneralConfigs{}
 		// Read the config from the CLI.
 		if err = parseConfigsFromParams(method, args, configs); err != nil {
 			return "", nil, err
@@ -424,7 +388,7 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 	return method, configsToRun, nil
 }
 
-func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
+func parseConfigsFromFile(filePath string) ([]*conf.GeneralConfigs, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		printUsage()
@@ -440,9 +404,9 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	var jsonErr error
 	var yamlErr error
 
-	configsToRun := []*GeneralConfigs{}
+	configsToRun := []*conf.GeneralConfigs{}
 	for {
-		configs := &GeneralConfigs{}
+		configs := &conf.GeneralConfigs{}
 
 		if jsonErr = jsonDecoder.Decode(configs); jsonErr != nil {
 			if jsonErr == io.EOF {
@@ -454,7 +418,7 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	}
 
 	for {
-		configs := &GeneralConfigs{}
+		configs := &conf.GeneralConfigs{}
 
 		if yamlErr = yamlDecoder.Decode(configs); yamlErr != nil {
 			if yamlErr == io.EOF {
@@ -474,7 +438,7 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	return configsToRun, nil
 }
 
-func parseConfigsFromParams(prefix string, params []string, configs *GeneralConfigs) error {
+func parseConfigsFromParams(prefix string, params []string, configs *conf.GeneralConfigs) error {
 	// Read the config from the CLI.
 	if err := utils.ParseCLI(prefix, params, configs); err != nil {
 		printUsage()
