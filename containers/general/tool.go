@@ -136,6 +136,7 @@ func main() {
 	}
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
+	healthCheckPortRequested := 0
 	for _, config := range configsToRun {
 		log("starting adapter: %s", method)
 		client, chRunning, err := runAdapter(method, *config)
@@ -147,6 +148,17 @@ func main() {
 			<-chRunning
 			chRunnings <- struct{}{}
 		}()
+		if config.Healthcheck != 0 {
+			healthCheckPortRequested = config.Healthcheck
+		}
+	}
+
+	// If healthchecks were requested, start it.
+	if healthCheckPortRequested != 0 {
+		if err := startHealthChecks(healthCheckPortRequested); err != nil {
+			logError("error starting healthchecks: %v", err)
+			os.Exit(1)
+		}
 	}
 
 	osSignals := make(chan os.Signal, 1)
@@ -345,14 +357,6 @@ func runAdapter(method string, configs conf.GeneralConfigs) (USPClient, chan str
 
 	if err != nil {
 		return nil, nil, errors.New(logError("error instantiating client: %v", err))
-	}
-
-	// If healthchecks were requested, start it.
-	if configs.Healthcheck != 0 {
-		if err := startHealthChecks(configs.Healthcheck); err != nil {
-			client.Close()
-			return nil, nil, errors.New(logError("error starting healthchecks: %v", err))
-		}
 	}
 
 	return client, chRunning, nil
