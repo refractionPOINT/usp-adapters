@@ -70,11 +70,15 @@ type AdapterStats struct {
 type Configuration struct {
 	conf.GeneralConfigs
 
+	SensorType string `json:"sensor_type" yaml:"sensor_type"`
+
 	// If a literal config is not specified, the OID and GUID
 	// will be used to fetch the config from Limacharlie
 	// and update the config in real time.
-	OID      string `json:"oid" yaml:"oid"`
-	ConfGUID string `json:"conf_guid" yaml:"conf_guid"`
+	Cloud struct {
+		OID      string `json:"oid" yaml:"oid"`
+		ConfGUID string `json:"conf_guid" yaml:"conf_guid"`
+	} `json:"cloud" yaml:"cloud"`
 }
 
 func logError(format string, elems ...interface{}) string {
@@ -146,6 +150,7 @@ func main() {
 		os.Exit(1)
 		return
 	}
+	mCurrentlyRunning := sync.Mutex{}
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
 	healthCheckPortRequested := 0
@@ -153,9 +158,9 @@ func main() {
 		// If an OID and GUID are specified, we will start a conf update client
 		// to update the config in real time.
 		var confUpdateClient *confupdateclient.ConfUpdateClient
-		if config.OID != "" && config.ConfGUID != "" {
+		if config.Cloud.ConfGUID != "" && config.Cloud.OID != "" {
 			var confData map[string]interface{}
-			confUpdateClient, confData, err = confupdateclient.NewConfUpdateClient(config.OID, config.ConfGUID, &limacharlie.LCLoggerZerolog{})
+			confUpdateClient, confData, err = confupdateclient.NewConfUpdateClient(config.Cloud.OID, config.Cloud.ConfGUID, &limacharlie.LCLoggerZerolog{})
 			if err != nil {
 				logError("error creating conf update client: %v", err)
 				os.Exit(1)
@@ -165,16 +170,35 @@ func main() {
 				logError("error unmarshalling conf update: %v", err)
 				os.Exit(1)
 			}
+			method = config.SensorType
 		}
 
 		log("starting adapter: %s", method)
 		client, chRunning, err := runAdapter(method, *config)
 		if err != nil {
+			logError("error running adapter: %v", err)
 			os.Exit(1)
 		}
+		mCurrentlyRunning.Lock()
 		clients = append(clients, client)
+		mCurrentlyRunning.Unlock()
 		go func() {
 			<-chRunning
+			// Check if the client is still in the list.
+			// If it is not, it means that we are stopping
+			// the client in a controlled way and want to
+			// keep going.
+			isFound := false
+			mCurrentlyRunning.Lock()
+			for _, c := range clients {
+				if c == client {
+					isFound = true
+				}
+			}
+			mCurrentlyRunning.Unlock()
+			if !isFound {
+				return
+			}
 			chRunnings <- struct{}{}
 		}()
 		if config.Healthcheck != 0 {
@@ -189,9 +213,19 @@ func main() {
 						logError("error unmarshalling conf update: %v", err)
 					}
 					log("stopping previous adapter")
+					// Remove the previous client from the list.
+					mCurrentlyRunning.Lock()
+					for i, c := range clients {
+						if c == client {
+							clients = append(clients[:i], clients[i+1:]...)
+						}
+					}
+					mCurrentlyRunning.Unlock()
+
 					if err := client.Close(); err != nil {
 						logError("error closing client: %v", err)
 					}
+
 					log("starting new adapter")
 					client, chRunning, err = runAdapter(method, newConfig)
 				}); err != nil {
