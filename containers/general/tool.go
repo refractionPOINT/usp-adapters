@@ -210,7 +210,7 @@ func main() {
 				defer confUpdateClient.Close()
 
 				newConfig := Configuration{}
-				if err := confUpdateClient.WatchForChanges(10*time.Second, func(data map[string]interface{}) {
+				if err := confUpdateClient.WatchForChanges(1*time.Minute, func(data map[string]interface{}) {
 					if err := limacharlie.Dict(data).UnMarshalToStruct(&newConfig); err != nil {
 						logError("error unmarshalling conf update: %v", err)
 					}
