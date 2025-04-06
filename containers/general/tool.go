@@ -207,6 +207,8 @@ func main() {
 		if confUpdateClient != nil {
 			log("watching for conf updates")
 			go func() {
+				defer confUpdateClient.Close()
+
 				newConfig := Configuration{}
 				if err := confUpdateClient.WatchForChanges(10*time.Second, func(data map[string]interface{}) {
 					if err := limacharlie.Dict(data).UnMarshalToStruct(&newConfig); err != nil {
