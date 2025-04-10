@@ -14,11 +14,10 @@ import (
 	"syscall"
 	"time"
 
-	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
-
-	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
+	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -47,9 +46,14 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/syslog"
-	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
+
+	"github.com/refractionPOINT/usp-adapters/utils"
+
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/usp-adapters/containers/conf"
+	confupdateclient "github.com/refractionPOINT/usp-adapters/containers/general/conf_update_client"
 	"gopkg.in/yaml.v2"
 )
 
@@ -57,48 +61,25 @@ type USPClient interface {
 	Close() error
 }
 
-type GeneralConfigs struct {
-	Healthcheck int `json:"healthcheck" yaml:"healthcheck"`
-
-	Syslog            usp_syslog.SyslogConfig                         `json:"syslog" yaml:"syslog"`
-	PubSub            usp_pubsub.PubSubConfig                         `json:"pubsub" yaml:"pubsub"`
-	S3                usp_s3.S3Config                                 `json:"s3" yaml:"s3"`
-	Stdin             usp_stdin.StdinConfig                           `json:"stdin" yaml:"stdin"`
-	OnePassword       usp_1password.OnePasswordConfig                 `json:"1password" yaml:"1password"`
-	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
-	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
-	EntraID           usp_entraid.EntraIDConfig                       `json:"entraid" yaml:"entraid"`
-	Defender          usp_defender.DefenderConfig                     `json:"defender" yaml:"defender"`
-	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
-	Okta              usp_okta.OktaConfig                             `json:"okta" yaml:"okta"`
-	Office365         usp_o365.Office365Config                        `json:"office365" yaml:"office365"`
-	Wel               usp_wel.WELConfig                               `json:"wel" yaml:"wel"`
-	MacUnifiedLogging usp_mac_unified_logging.MacUnifiedLoggingConfig `json:"mac_unified_logging" yaml:"mac_unified_logging"`
-	AzureEventHub     usp_azure_event_hub.EventHubConfig              `json:"azure_event_hub" yaml:"azure_event_hub"`
-	Duo               usp_duo.DuoConfig                               `json:"duo" yaml:"duo"`
-	Gcs               usp_gcs.GCSConfig                               `json:"gcs" yaml:"gcs"`
-	Slack             usp_slack.SlackConfig                           `json:"slack" yaml:"slack"`
-	Sqs               usp_sqs.SQSConfig                               `json:"sqs" yaml:"sqs"`
-	SqsFiles          usp_sqs_files.SQSFilesConfig                    `json:"sqs-files" yaml:"sqs-files"`
-	Simulator         usp_simulator.SimulatorConfig                   `json:"simulator" yaml:"simulator"`
-	File              usp_file.FileConfig                             `json:"file" yaml:"file"`
-	Evtx              usp_evtx.EVTXConfig                             `json:"evtx" yaml:"evtx"`
-	K8sPods           usp_k8s_pods.K8sPodsConfig                      `json:"k8s_pods" yaml:"k8s_pods"`
-	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
-	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
-	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
-	FalconCloud       usp_falconcloud.FalconCloudConfig               `json:"falconcloud" yaml:"falconcloud"`
-	Mimecast          usp_mimecast.MimecastConfig                     `json:"mimecast" yaml:"mimecast"`
-	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
-	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
-	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
-	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
-}
-
 type AdapterStats struct {
 	m                sync.Mutex
 	lastAck          time.Time
 	lastBackPressure time.Time
+}
+
+type Configuration struct {
+	conf.GeneralConfigs
+
+	SensorType string `json:"sensor_type" yaml:"sensor_type"`
+
+	// If a literal config is not specified, the OID and GUID
+	// will be used to fetch the config from Limacharlie
+	// and update the config in real time.
+	Cloud struct {
+		OID        string `json:"oid" yaml:"oid"`
+		ConfGUID   string `json:"conf_guid" yaml:"conf_guid"`
+		ShowConfig bool   `json:"show_config" yaml:"show_config"`
+	} `json:"cloud" yaml:"cloud"`
 }
 
 func logError(format string, elems ...interface{}) string {
@@ -140,7 +121,7 @@ func printStruct(prefix string, s interface{}, isTop bool) {
 func printUsage() {
 	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
 	logError("Available configs:\n")
-	printStruct("", GeneralConfigs{}, true)
+	printStruct("", Configuration{}, true)
 }
 
 func printConfig(method string, c interface{}) {
@@ -170,19 +151,104 @@ func main() {
 		os.Exit(1)
 		return
 	}
+	mCurrentlyRunning := sync.Mutex{}
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
+	healthCheckPortRequested := 0
 	for _, config := range configsToRun {
+		// If an OID and GUID are specified, we will start a conf update client
+		// to update the config in real time.
+		showConfig := true
+		var confUpdateClient *confupdateclient.ConfUpdateClient
+		if config.Cloud.ConfGUID != "" && config.Cloud.OID != "" {
+			var confData map[string]interface{}
+			confUpdateClient, confData, err = confupdateclient.NewConfUpdateClient(config.Cloud.OID, config.Cloud.ConfGUID, &limacharlie.LCLoggerZerolog{})
+			if err != nil {
+				logError("error creating conf update client: %v", err)
+				os.Exit(1)
+			}
+			// Use this new config to run the adapter.
+			if err := limacharlie.Dict(confData).UnMarshalToStruct(config); err != nil {
+				logError("error unmarshalling conf update: %v", err)
+				os.Exit(1)
+			}
+			method = config.SensorType
+			showConfig = config.Cloud.ShowConfig
+		}
+
 		log("starting adapter: %s", method)
-		client, chRunning, err := runAdapter(method, *config)
+		client, chRunning, err := runAdapter(method, *config, showConfig)
 		if err != nil {
+			logError("error running adapter: %v", err)
 			os.Exit(1)
 		}
+		mCurrentlyRunning.Lock()
 		clients = append(clients, client)
+		mCurrentlyRunning.Unlock()
 		go func() {
 			<-chRunning
+			// Check if the client is still in the list.
+			// If it is not, it means that we are stopping
+			// the client in a controlled way and want to
+			// keep going.
+			isFound := false
+			mCurrentlyRunning.Lock()
+			for _, c := range clients {
+				if c == client {
+					isFound = true
+				}
+			}
+			mCurrentlyRunning.Unlock()
+			if !isFound {
+				return
+			}
 			chRunnings <- struct{}{}
 		}()
+		if config.Healthcheck != 0 {
+			healthCheckPortRequested = config.Healthcheck
+		}
+		if confUpdateClient != nil {
+			log("watching for conf updates")
+			go func() {
+				defer confUpdateClient.Close()
+
+				newConfig := Configuration{}
+				if err := confUpdateClient.WatchForChanges(1*time.Minute, func(data map[string]interface{}) {
+					if err := limacharlie.Dict(data).UnMarshalToStruct(&newConfig); err != nil {
+						logError("error unmarshalling conf update: %v", err)
+					}
+					log("stopping previous adapter")
+					// Remove the previous client from the list.
+					mCurrentlyRunning.Lock()
+					for i, c := range clients {
+						if c == client {
+							clients = append(clients[:i], clients[i+1:]...)
+						}
+					}
+					mCurrentlyRunning.Unlock()
+
+					if err := client.Close(); err != nil {
+						logError("error closing client: %v", err)
+					}
+
+					// Wait for the client to be closed.
+					<-chRunning
+
+					log("starting new adapter")
+					client, chRunning, err = runAdapter(method, newConfig, showConfig)
+				}); err != nil {
+					logError("error watching for conf updates: %v", err)
+				}
+			}()
+		}
+	}
+
+	// If healthchecks were requested, start it.
+	if healthCheckPortRequested != 0 {
+		if err := startHealthChecks(healthCheckPortRequested); err != nil {
+			logError("error starting healthchecks: %v", err)
+			os.Exit(1)
+		}
 	}
 
 	osSignals := make(chan os.Signal, 1)
@@ -205,197 +271,195 @@ func main() {
 	log("exited")
 }
 
-func runAdapter(method string, configs GeneralConfigs) (USPClient, chan struct{}, error) {
+func runAdapter(method string, configs Configuration, showConfig bool) (USPClient, chan struct{}, error) {
 	var client USPClient
 	var chRunning chan struct{}
 	var err error
 
+	var configToShow interface{}
+
 	if method == "syslog" {
 		configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
 		configs.Syslog.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Syslog)
+		configToShow = configs.Syslog
 		client, chRunning, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
 	} else if method == "pubsub" {
 		configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
 		configs.PubSub.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.PubSub)
+		configToShow = configs.PubSub
 		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
 	} else if method == "gcs" {
 		configs.Gcs.ClientOptions = applyLogging(configs.Gcs.ClientOptions)
 		configs.Gcs.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Gcs)
+		configToShow = configs.Gcs
 		client, chRunning, err = usp_gcs.NewGCSAdapter(configs.Gcs)
 	} else if method == "s3" {
 		configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
 		configs.S3.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.S3)
+		configToShow = configs.S3
 		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
 	} else if method == "stdin" {
 		configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
 		configs.Stdin.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Stdin)
+		configToShow = configs.Stdin
 		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
 	} else if method == "1password" {
 		configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
 		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.OnePassword)
+		configToShow = configs.OnePassword
 		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
 	} else if method == "itglue" {
 		configs.ITGlue.ClientOptions = applyLogging(configs.ITGlue.ClientOptions)
 		configs.ITGlue.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.ITGlue)
+		configToShow = configs.ITGlue
 		client, chRunning, err = usp_itglue.NewITGlueAdapter(configs.ITGlue)
 	} else if method == "sophos" {
 		configs.Sophos.ClientOptions = applyLogging(configs.Sophos.ClientOptions)
 		configs.Sophos.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Sophos)
+		configToShow = configs.Sophos
 		client, chRunning, err = usp_sophos.NewSophosAdapter(configs.Sophos)
 	} else if method == "okta" {
 		configs.Okta.ClientOptions = applyLogging(configs.Okta.ClientOptions)
 		configs.Okta.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Okta)
+		configToShow = configs.Okta
 		client, chRunning, err = usp_okta.NewOktaAdapter(configs.Okta)
 	} else if method == "office365" {
 		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
 		configs.Office365.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Office365)
+		configToShow = configs.Office365
 		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
 	} else if method == "wel" {
 		configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
 		configs.Wel.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Wel)
+		configToShow = configs.Wel
 		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
 	} else if method == "mac_unified_logging" {
 		configs.MacUnifiedLogging.ClientOptions = applyLogging(configs.MacUnifiedLogging.ClientOptions)
 		configs.MacUnifiedLogging.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.MacUnifiedLogging)
+		configToShow = configs.MacUnifiedLogging
 		client, chRunning, err = usp_mac_unified_logging.NewMacUnifiedLoggingAdapter(configs.MacUnifiedLogging)
 	} else if method == "azure_event_hub" {
 		configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
 		configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.AzureEventHub)
+		configToShow = configs.AzureEventHub
 		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
 	} else if method == "duo" {
 		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
 		configs.Duo.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Duo)
+		configToShow = configs.Duo
 		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
 	} else if method == "cato" {
 		configs.Cato.ClientOptions = applyLogging(configs.Cato.ClientOptions)
 		configs.Cato.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Cato)
+		configToShow = configs.Cato
 		client, chRunning, err = usp_cato.NewCatoAdapter(configs.Cato)
 	} else if method == "entraid" {
 		configs.EntraID.ClientOptions = applyLogging(configs.EntraID.ClientOptions)
 		configs.EntraID.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.EntraID)
+		configToShow = configs.EntraID
 		client, chRunning, err = usp_entraid.NewEntraIDAdapter(configs.EntraID)
 	} else if method == "defender" {
 		configs.Defender.ClientOptions = applyLogging(configs.Defender.ClientOptions)
 		configs.Defender.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Defender)
+		configToShow = configs.Defender
 		client, chRunning, err = usp_defender.NewDefenderAdapter(configs.Defender)
 	} else if method == "slack" {
 		configs.Slack.ClientOptions = applyLogging(configs.Slack.ClientOptions)
 		configs.Slack.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Slack)
+		configToShow = configs.Slack
 		client, chRunning, err = usp_slack.NewSlackAdapter(configs.Slack)
 	} else if method == "sqs" {
 		configs.Sqs.ClientOptions = applyLogging(configs.Sqs.ClientOptions)
 		configs.Sqs.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Sqs)
+		configToShow = configs.Sqs
 		client, chRunning, err = usp_sqs.NewSQSAdapter(configs.Sqs)
 	} else if method == "sqs-files" {
 		configs.SqsFiles.ClientOptions = applyLogging(configs.SqsFiles.ClientOptions)
 		configs.SqsFiles.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.SqsFiles)
+		configToShow = configs.SqsFiles
 		client, chRunning, err = usp_sqs_files.NewSQSFilesAdapter(configs.SqsFiles)
 	} else if method == "simulator" {
 		configs.Simulator.ClientOptions = applyLogging(configs.Simulator.ClientOptions)
 		configs.Simulator.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Simulator)
+		configToShow = configs.Simulator
 		client, chRunning, err = usp_simulator.NewSimulatorAdapter(configs.Simulator)
 	} else if method == "file" {
 		configs.File.ClientOptions = applyLogging(configs.File.ClientOptions)
 		configs.File.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.File)
+		configToShow = configs.File
 		client, chRunning, err = usp_file.NewFileAdapter(configs.File)
 	} else if method == "evtx" {
 		configs.Evtx.ClientOptions = applyLogging(configs.Evtx.ClientOptions)
 		configs.Evtx.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Evtx)
+		configToShow = configs.Evtx
 		client, chRunning, err = usp_evtx.NewEVTXAdapter(configs.Evtx)
 	} else if method == "k8s_pods" {
 		configs.K8sPods.ClientOptions = applyLogging(configs.K8sPods.ClientOptions)
 		configs.K8sPods.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.K8sPods)
+		configToShow = configs.K8sPods
 		client, chRunning, err = usp_k8s_pods.NewK8sPodsAdapter(configs.K8sPods)
 	} else if method == "bigquery" {
 		configs.BigQuery.ClientOptions = applyLogging(configs.BigQuery.ClientOptions)
 		configs.BigQuery.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.BigQuery)
+		configToShow = configs.BigQuery
 		client, chRunning, err = usp_bigquery.NewBigQueryAdapter(configs.BigQuery)
 	} else if method == "imap" {
 		configs.Imap.ClientOptions = applyLogging(configs.Imap.ClientOptions)
 		configs.Imap.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Imap)
+		configToShow = configs.Imap
 		client, chRunning, err = usp_imap.NewImapAdapter(configs.Imap)
 	} else if method == "hubspot" {
 		configs.HubSpot.ClientOptions = applyLogging(configs.HubSpot.ClientOptions)
 		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.HubSpot)
+		configToShow = configs.HubSpot
 		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(configs.HubSpot)
 	} else if method == "falconcloud" {
 		configs.FalconCloud.ClientOptions = applyLogging(configs.FalconCloud.ClientOptions)
 		configs.FalconCloud.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.FalconCloud)
+		configToShow = configs.FalconCloud
 		client, chRunning, err = usp_falconcloud.NewFalconCloudAdapter(configs.FalconCloud)
 	} else if method == "mimecast" {
 		configs.Mimecast.ClientOptions = applyLogging(configs.Mimecast.ClientOptions)
 		configs.Mimecast.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Mimecast)
+		configToShow = configs.Mimecast
 		client, chRunning, err = usp_mimecast.NewMimecastAdapter(configs.Mimecast)
 	} else if method == "ms_graph" {
 		configs.MsGraph.ClientOptions = applyLogging(configs.MsGraph.ClientOptions)
 		configs.MsGraph.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.MsGraph)
+		configToShow = configs.MsGraph
 		client, chRunning, err = usp_ms_graph.NewMsGraphAdapter(configs.MsGraph)
 	} else if method == "zendesk" {
 		configs.Zendesk.ClientOptions = applyLogging(configs.Zendesk.ClientOptions)
 		configs.Zendesk.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.Zendesk)
+		configToShow = configs.Zendesk
 		client, chRunning, err = usp_zendesk.NewZendeskAdapter(configs.Zendesk)
 	} else if method == "pandadoc" {
 		configs.PandaDoc.ClientOptions = applyLogging(configs.PandaDoc.ClientOptions)
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.PandaDoc)
+		configToShow = configs.PandaDoc
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
 	} else if method == "sentinel_one" {
 		configs.SentinelOne.ClientOptions = applyLogging(configs.SentinelOne.ClientOptions)
 		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
-		printConfig(method, configs.SentinelOne)
+		configToShow = configs.SentinelOne
 		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(configs.SentinelOne)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
+	}
+
+	if showConfig {
+		printConfig(method, configToShow)
 	}
 
 	if err != nil {
 		return nil, nil, errors.New(logError("error instantiating client: %v", err))
 	}
 
-	// If healthchecks were requested, start it.
-	if configs.Healthcheck != 0 {
-		if err := startHealthChecks(configs.Healthcheck); err != nil {
-			client.Close()
-			return nil, nil, errors.New(logError("error starting healthchecks: %v", err))
-		}
-	}
-
 	return client, chRunning, nil
 }
 
-func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
-	configsToRun := []*GeneralConfigs{}
+func parseConfigs(args []string) (string, []*Configuration, error) {
+	configsToRun := []*Configuration{}
 	var err error
 	if len(args) < 2 {
 		return "", nil, errors.New("not enough arguments")
@@ -410,7 +474,7 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 		}
 		log("found %d configs to run", len(configsToRun))
 	} else {
-		configs := &GeneralConfigs{}
+		configs := &Configuration{}
 		// Read the config from the CLI.
 		if err = parseConfigsFromParams(method, args, configs); err != nil {
 			return "", nil, err
@@ -424,7 +488,7 @@ func parseConfigs(args []string) (string, []*GeneralConfigs, error) {
 	return method, configsToRun, nil
 }
 
-func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
+func parseConfigsFromFile(filePath string) ([]*Configuration, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
 		printUsage()
@@ -440,9 +504,9 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	var jsonErr error
 	var yamlErr error
 
-	configsToRun := []*GeneralConfigs{}
+	configsToRun := []*Configuration{}
 	for {
-		configs := &GeneralConfigs{}
+		configs := &Configuration{}
 
 		if jsonErr = jsonDecoder.Decode(configs); jsonErr != nil {
 			if jsonErr == io.EOF {
@@ -454,7 +518,7 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	}
 
 	for {
-		configs := &GeneralConfigs{}
+		configs := &Configuration{}
 
 		if yamlErr = yamlDecoder.Decode(configs); yamlErr != nil {
 			if yamlErr == io.EOF {
@@ -474,7 +538,7 @@ func parseConfigsFromFile(filePath string) ([]*GeneralConfigs, error) {
 	return configsToRun, nil
 }
 
-func parseConfigsFromParams(prefix string, params []string, configs *GeneralConfigs) error {
+func parseConfigsFromParams(prefix string, params []string, configs *Configuration) error {
 	// Read the config from the CLI.
 	if err := utils.ParseCLI(prefix, params, configs); err != nil {
 		printUsage()
