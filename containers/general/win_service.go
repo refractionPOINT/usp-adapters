@@ -152,7 +152,7 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	chRunnings := make(chan struct{})
 	for _, config := range configsToRun {
 		log("starting adapter: %s", method)
-		client, chRunning, err := runAdapter(method, *config, true)
+		client, chRunning, err := runAdapter(method, *config, false)
 		if err != nil {
 			saveErrorOnDisk(logError("runAdapter(): %v", err))
 			return false, 1
