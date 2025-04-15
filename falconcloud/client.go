@@ -56,6 +56,10 @@ type FalconCloudAdapter struct {
 }
 
 func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &FalconCloudAdapter{
 		conf:      conf,
 		isRunning: 1,

@@ -76,6 +76,10 @@ type s3Record struct {
 }
 
 func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}

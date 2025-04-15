@@ -36,6 +36,10 @@ type MacUnifiedLoggingAdapter struct {
 }
 
 func NewMacUnifiedLoggingAdapter(conf MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &MacUnifiedLoggingAdapter{
 		conf:      conf,
 		isRunning: 1,

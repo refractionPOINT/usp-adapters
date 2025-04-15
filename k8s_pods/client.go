@@ -4,7 +4,6 @@
 package usp_k8s_pods
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"sync"
@@ -33,16 +32,6 @@ type K8sPodsAdapter struct {
 type runtimeOptions struct {
 	includePods *regexp.Regexp
 	excludePods *regexp.Regexp
-}
-
-func (c *K8sPodsConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Root == "" {
-		return errors.New("file_path missing")
-	}
-	return nil
 }
 
 func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, error) {

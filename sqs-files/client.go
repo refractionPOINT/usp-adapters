@@ -90,6 +90,10 @@ func (c *SQSFilesConfig) Validate() error {
 }
 
 func NewSQSFilesAdapter(conf SQSFilesConfig) (*SQSFilesAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}

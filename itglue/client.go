@@ -55,6 +55,10 @@ func (c *ITGlueConfig) Validate() error {
 }
 
 func NewITGlueAdapter(conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &ITGlueAdapter{
 		conf:   conf,

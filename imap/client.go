@@ -70,6 +70,10 @@ func (c *ImapConfig) Validate() error {
 }
 
 func NewImapAdapter(conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &IMAPAdapter{
 		conf: conf,
 		ctx:  context.Background(),

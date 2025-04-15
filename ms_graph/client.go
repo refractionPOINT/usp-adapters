@@ -59,10 +59,15 @@ func (c *MsGraphConfig) Validate() error {
 	if c.URL == "" {
 		return errors.New("missing url")
 	}
+	c.URL = strings.TrimPrefix(c.URL, "/")
 	return nil
 }
 
 func NewMsGraphAdapter(conf MsGraphConfig) (*MsGraphAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &MsGraphAdapter{
 		conf:   conf,
@@ -86,13 +91,10 @@ func NewMsGraphAdapter(conf MsGraphConfig) (*MsGraphAdapter, chan struct{}, erro
 
 	a.chStopped = make(chan struct{})
 
-	// Strip the / prefix if in the URL.
-	url := strings.TrimPrefix(a.conf.URL, "/")
-
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts from %s", URLPrefix+url))
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts from %s", URLPrefix+a.conf.URL))
 
 	a.wgSenders.Add(1)
-	go a.fetchEvents(URLPrefix + url)
+	go a.fetchEvents(URLPrefix + a.conf.URL)
 
 	go func() {
 		a.wgSenders.Wait()

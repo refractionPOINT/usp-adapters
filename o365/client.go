@@ -95,6 +95,10 @@ func (c *Office365Config) Validate() error {
 }
 
 func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 
 	// If no deduper is provided, use a local one.

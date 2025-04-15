@@ -61,6 +61,10 @@ func (c *DefenderConfig) Validate() error {
 }
 
 func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &DefenderAdapter{
 		conf:   conf,
@@ -84,7 +88,7 @@ func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, e
 
 	a.chStopped = make(chan struct{})
 
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts"))
+	a.conf.ClientOptions.DebugLog("starting to fetch alerts")
 
 	a.wgSenders.Add(1)
 	go a.fetchEvents(URL["get_alerts"])

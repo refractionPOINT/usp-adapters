@@ -51,10 +51,17 @@ func (c *SyslogConfig) Validate() error {
 	if c.Port == 0 {
 		return errors.New("missing port")
 	}
+	if c.IsUDP && (c.SslCertPath != "" || c.SslKeyPath != "") {
+		return errors.New("ssl cannot be enabled for udp")
+	}
 	return nil
 }
 
 func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &SyslogAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -64,10 +71,6 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 		a.conf.WriteTimeoutSec = defaultWriteTimeout
 	}
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
-
-	if conf.IsUDP && (conf.SslCertPath != "" || conf.SslKeyPath != "") {
-		return nil, nil, errors.New("ssl cannot be enabled for udp")
-	}
 
 	addr := fmt.Sprintf("%s:%d", conf.Interface, conf.Port)
 	var l net.Listener

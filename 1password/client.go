@@ -76,6 +76,10 @@ func (c *OnePasswordConfig) Validate() error {
 }
 
 func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &OnePasswordAdapter{
 		conf:   conf,

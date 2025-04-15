@@ -52,6 +52,10 @@ func (c *SimulatorConfig) Validate() error {
 }
 
 func NewSimulatorAdapter(conf SimulatorConfig) (*SimulatorAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &SimulatorAdapter{
 		conf:      conf,
 		isRunning: 1,

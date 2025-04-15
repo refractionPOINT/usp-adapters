@@ -67,6 +67,10 @@ func (c *ZendeskConfig) Validate() error {
 }
 
 func NewZendeskAdapter(conf ZendeskConfig) (*ZendeskAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &ZendeskAdapter{
 		conf:   conf,

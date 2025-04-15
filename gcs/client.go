@@ -62,6 +62,10 @@ type gcsLocalFile struct {
 }
 
 func NewGCSAdapter(conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}

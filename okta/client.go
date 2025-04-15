@@ -61,6 +61,10 @@ func (c *OktaConfig) Validate() error {
 }
 
 func NewOktaAdapter(conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &OktaAdapter{
 		conf:   conf,

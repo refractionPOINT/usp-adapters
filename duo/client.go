@@ -56,6 +56,10 @@ func (c *DuoConfig) Validate() error {
 }
 
 func NewDuoAdapter(conf DuoConfig) (*DuoAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &DuoAdapter{
 		conf:   conf,

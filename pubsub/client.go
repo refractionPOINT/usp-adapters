@@ -54,6 +54,10 @@ func (c *PubSubConfig) Validate() error {
 }
 
 func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &PubSubAdapter{
 		conf: conf,
 		ctx:  context.Background(),

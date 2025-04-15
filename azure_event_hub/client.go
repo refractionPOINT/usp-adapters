@@ -43,6 +43,10 @@ func (c *EventHubConfig) Validate() error {
 }
 
 func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &EventHubAdapter{
 		conf: conf,
 		ctx:  context.Background(),

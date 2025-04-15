@@ -59,6 +59,10 @@ func (c *SentinelOneConfig) Validate() error {
 }
 
 func NewSentinelOneAdapter(conf SentinelOneConfig) (*SentinelOneAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 
 	a := &SentinelOneAdapter{

@@ -30,6 +30,10 @@ type WELAdapter struct {
 }
 
 func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &WELAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -39,10 +43,6 @@ func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
 		a.conf.WriteTimeoutSec = defaultWriteTimeout
 	}
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
-
-	if a.conf.EvtSources == "" {
-		return nil, nil, errors.New("missing evt_sources, a csv of SOURCE-NAME:FILTER")
-	}
 
 	var err error
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)

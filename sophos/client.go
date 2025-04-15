@@ -68,6 +68,10 @@ func (c *SophosConfig) Validate() error {
 }
 
 func NewSophosAdapter(conf SophosConfig) (*SophosAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &SophosAdapter{
 		conf:   conf,

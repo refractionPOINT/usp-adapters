@@ -64,11 +64,13 @@ type CatoAdapter struct {
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
-
-	ctx context.Context
 }
 
 func NewCatoAdapter(conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &CatoAdapter{
 		conf:      conf,
 		isRunning: 1,

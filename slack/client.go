@@ -56,6 +56,10 @@ func (c *SlackConfig) Validate() error {
 }
 
 func NewSlackAdapter(conf SlackConfig) (*SlackAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &SlackAdapter{
 		conf:   conf,

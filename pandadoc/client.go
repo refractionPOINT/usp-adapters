@@ -58,6 +58,10 @@ func (c *PandaDocConfig) Validate() error {
 }
 
 func NewPandaDocAdapter(conf PandaDocConfig) (*PandaDocAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &PandaDocAdapter{
 		conf:   conf,

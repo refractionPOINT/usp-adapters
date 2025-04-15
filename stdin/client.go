@@ -38,6 +38,10 @@ func (c *StdinConfig) Validate() error {
 }
 
 func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &StdinAdapter{
 		conf:      conf,
 		isRunning: 1,

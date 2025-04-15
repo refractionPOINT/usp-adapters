@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +35,7 @@ type MimecastAdapter struct {
 	ctx context.Context
 
 	dedupe map[string]int64
+	urls   []string
 }
 
 type AuthResponse struct {
@@ -89,6 +91,7 @@ type MimecastConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ClientId      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
+	URLs          string                  `json:"urls" yaml:"urls"`
 }
 
 func (c *MimecastConfig) Validate() error {
@@ -101,17 +104,41 @@ func (c *MimecastConfig) Validate() error {
 	if c.ClientSecret == "" {
 		return errors.New("missing client secret")
 	}
-
+	// URLs is optional as we have a default
 	return nil
 }
 
 func NewMimecastAdapter(conf MimecastConfig) (*MimecastAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &MimecastAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 		dedupe: make(map[string]int64),
+	}
+
+	// Initialize base URLs
+	if conf.URLs != "" {
+		// Split URLs and trim spaces
+		for _, url := range strings.Split(conf.URLs, ",") {
+			url = strings.TrimSpace(url)
+			if url == "" {
+				continue
+			}
+			// Make sure the URL starts with a slash
+			if !strings.HasPrefix(url, "/") {
+				url = "/" + url
+			}
+			a.urls = append(a.urls, url)
+		}
+	}
+	// Add default URL if no URLs specified
+	if len(a.urls) == 0 {
+		a.urls = []string{"/api/audit/get-audit-events"}
 	}
 
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
@@ -130,8 +157,11 @@ func NewMimecastAdapter(conf MimecastConfig) (*MimecastAdapter, chan struct{}, e
 
 	a.chStopped = make(chan struct{})
 
-	a.wgSenders.Add(1)
-	go a.fetchEvents()
+	// Start a fetcher for each URL
+	for _, url := range a.urls {
+		a.wgSenders.Add(1)
+		go a.fetchEvents(baseURL + url)
+	}
 
 	go func() {
 		a.wgSenders.Wait()
@@ -156,22 +186,23 @@ func (a *MimecastAdapter) Close() error {
 	return err2
 }
 
-func (a *MimecastAdapter) fetchEvents() {
+func (a *MimecastAdapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", baseURL))
 
 	since := time.Now().Add(-400 * time.Hour)
 
 	for !a.doStop.WaitFor(30 * time.Second) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
-		items, newSince, _ := a.makeOneRequest(since)
+		items, newSince, _ := a.makeOneRequest(url, since)
 		since = newSince
 		if items == nil {
 			continue
 		}
 
 		for _, item := range items {
+			// Add source URL to the event data
+			item["source_url"] = url
+
 			msg := &protocol.DataMessage{
 				JsonPayload: item,
 				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
@@ -192,7 +223,7 @@ func (a *MimecastAdapter) fetchEvents() {
 	}
 }
 
-func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Time, error) {
+func (a *MimecastAdapter) makeOneRequest(url string, since time.Time) ([]utils.Dict, time.Time, error) {
 	var allItems []utils.Dict
 	currentTime := time.Now()
 	var start string
@@ -206,7 +237,6 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 	end := currentTime.UTC().Format("2006-01-02T15:04:05-0700")
 
 	pageToken := ""
-	url := baseURL + "/api/audit/get-audit-events"
 
 	for {
 		// Prepare the request.

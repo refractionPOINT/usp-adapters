@@ -61,6 +61,10 @@ func (c *EntraIDConfig) Validate() error {
 }
 
 func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	var err error
 	a := &EntraIDAdapter{
 		conf:   conf,
@@ -84,7 +88,7 @@ func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, erro
 
 	a.chStopped = make(chan struct{})
 
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts"))
+	a.conf.ClientOptions.DebugLog("starting to fetch alerts")
 
 	a.wgSenders.Add(1)
 	go a.fetchEvents(URL["get_alerts"])

@@ -45,6 +45,10 @@ func (c *EVTXConfig) Validate() error {
 }
 
 func NewEVTXAdapter(conf EVTXConfig) (*EVTXAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &EVTXAdapter{
 		conf: conf,
 	}

@@ -59,6 +59,10 @@ func (c *SQSConfig) Validate() error {
 }
 
 func NewSQSAdapter(conf SQSConfig) (*SQSAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
+
 	a := &SQSAdapter{
 		conf: conf,
 		ctx:  context.Background(),
