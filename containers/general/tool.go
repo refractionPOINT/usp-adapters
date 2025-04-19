@@ -19,6 +19,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
@@ -438,6 +439,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.PandaDoc
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
+	} else if method == "sublime" {
+		configs.Sublime.ClientOptions = applyLogging(configs.Sublime.ClientOptions)
+		configs.Sublime.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Sublime
+		client, chRunning, err = usp_sublime.NewSublimeAdapter(configs.Sublime)
 	} else if method == "sentinel_one" {
 		configs.SentinelOne.ClientOptions = applyLogging(configs.SentinelOne.ClientOptions)
 		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
