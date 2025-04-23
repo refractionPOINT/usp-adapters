@@ -69,7 +69,7 @@ type AdapterStats struct {
 }
 
 type Configuration struct {
-	conf.GeneralConfigs `yaml:",inline"`
+	conf.GeneralConfigs `json:",inline" yaml:",inline"`
 
 	SensorType string `json:"sensor_type" yaml:"sensor_type"`
 
