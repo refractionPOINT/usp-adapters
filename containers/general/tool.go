@@ -19,7 +19,6 @@ import (
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"github.com/refractionPOINT/usp-adapters/cato"
-	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
@@ -46,6 +45,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sqs"
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
+	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
@@ -69,7 +69,7 @@ type AdapterStats struct {
 }
 
 type Configuration struct {
-	conf.GeneralConfigs
+	conf.GeneralConfigs `yaml:",inline"`
 
 	SensorType string `json:"sensor_type" yaml:"sensor_type"`
 
