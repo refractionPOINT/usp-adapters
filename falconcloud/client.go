@@ -43,7 +43,6 @@ func (c *FalconCloudConfig) Validate() error {
 
 type FalconCloudAdapter struct {
 	conf         FalconCloudConfig
-	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
 	uspClient    *uspclient.Client
@@ -75,7 +74,10 @@ func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan st
 	a.chStopped = make(chan struct{})
 
 	a.wgSenders.Add(1)
-	go a.handleEvent(a.conf.ClientId, a.conf.ClientSecret)
+	go func() {
+		defer a.wgSenders.Done()
+		a.handleEvent(a.conf.ClientId, a.conf.ClientSecret)
+	}()
 
 	go func() {
 		a.wgSenders.Wait()
@@ -92,8 +94,7 @@ func (a *FalconCloudAdapter) Close() error {
 	a.isRunning = 0
 	a.mRunning.Unlock()
 
-	a.wg.Done()
-	a.wg.Wait()
+	a.wgSenders.Wait()
 
 	_, err := a.uspClient.Close()
 	if err != nil {
