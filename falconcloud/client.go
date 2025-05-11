@@ -52,7 +52,8 @@ type FalconCloudAdapter struct {
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
 
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
@@ -72,6 +73,7 @@ func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan st
 		return nil, nil, err
 	}
 
+	a.ctx, a.cancel = context.WithCancel(context.Background())
 	a.chStopped = make(chan struct{})
 
 	a.wgSenders.Add(1)
@@ -94,6 +96,9 @@ func (a *FalconCloudAdapter) Close() error {
 	a.mRunning.Lock()
 	a.isRunning = 0
 	a.mRunning.Unlock()
+
+	// Cancel the context to stop all streams
+	a.cancel()
 
 	a.wgSenders.Wait()
 
@@ -123,7 +128,7 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 	client, err := falcon.NewClient(&falcon.ApiConfig{
 		ClientId:     clientId,
 		ClientSecret: clientSecret,
-		Context:      context.Background(),
+		Context:      a.ctx,
 	})
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewClient(): %v", err))
@@ -135,7 +140,7 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 	response, err := client.EventStreams.ListAvailableStreamsOAuth2(&event_streams.ListAvailableStreamsOAuth2Params{
 		AppID:   appName,
 		Format:  &jsonFormat,
-		Context: context.Background(),
+		Context: a.ctx,
 	})
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.EventStreams.ListAvailableStreamsOAuth2(): %v", err))
@@ -165,7 +170,7 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 }
 
 func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecification, appName string, streamInfo *models.MainAvailableStreamV2) {
-	streamHandle, err := falcon.NewStream(context.Background(), client, appName, streamInfo, 0)
+	streamHandle, err := falcon.NewStream(a.ctx, client, appName, streamInfo, 0)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewStream(): %v", err))
 		return
@@ -173,15 +178,9 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 	defer streamHandle.Close()
 
 	for {
-		// Check if we should exit
-		a.mRunning.RLock()
-		if a.isRunning == 0 {
-			a.mRunning.RUnlock()
-			return
-		}
-		a.mRunning.RUnlock()
-
 		select {
+		case <-a.ctx.Done():
+			return
 		case err := <-streamHandle.Errors:
 			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
 			return
