@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"time"
 
@@ -14,7 +13,9 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 
 	"github.com/crowdstrike/gofalcon/falcon"
+	"github.com/crowdstrike/gofalcon/falcon/client"
 	"github.com/crowdstrike/gofalcon/falcon/client/event_streams"
+	"github.com/crowdstrike/gofalcon/falcon/models"
 )
 
 const (
@@ -51,7 +52,8 @@ type FalconCloudAdapter struct {
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
 
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
@@ -71,6 +73,7 @@ func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan st
 		return nil, nil, err
 	}
 
+	a.ctx, a.cancel = context.WithCancel(context.Background())
 	a.chStopped = make(chan struct{})
 
 	a.wgSenders.Add(1)
@@ -93,6 +96,9 @@ func (a *FalconCloudAdapter) Close() error {
 	a.mRunning.Lock()
 	a.isRunning = 0
 	a.mRunning.Unlock()
+
+	// Cancel the context to stop all streams
+	a.cancel()
 
 	a.wgSenders.Wait()
 
@@ -118,15 +124,15 @@ func (a *FalconCloudAdapter) convertStructToMap(obj interface{}) map[string]inte
 	return mapRepresentation
 }
 
-func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) uintptr {
-
+func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 	client, err := falcon.NewClient(&falcon.ApiConfig{
 		ClientId:     clientId,
 		ClientSecret: clientSecret,
-		Context:      context.Background(),
+		Context:      a.ctx,
 	})
 	if err != nil {
-		panic(err)
+		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewClient(): %v", err))
+		return
 	}
 
 	jsonFormat := "json"
@@ -134,55 +140,63 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) u
 	response, err := client.EventStreams.ListAvailableStreamsOAuth2(&event_streams.ListAvailableStreamsOAuth2Params{
 		AppID:   appName,
 		Format:  &jsonFormat,
-		Context: context.Background(),
+		Context: a.ctx,
 	})
 	if err != nil {
-		panic(falcon.ErrorExplain(err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.EventStreams.ListAvailableStreamsOAuth2(): %v", err))
+		return
 	}
 
 	if err = falcon.AssertNoError(response.Payload.Errors); err != nil {
-		panic(err)
+		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.AssertNoError(): %v", err))
+		return
 	}
 
 	availableStreams := response.Payload.Resources
 	if len(availableStreams) == 0 {
-		fmt.Printf("No available stream was found for AppID=%s. Ensure no other instance is running or check API permissions.\n", appName)
-		return 0
+		a.conf.ClientOptions.OnError(fmt.Errorf("No available stream was found for AppID=%s. Ensure no other instance is running or check API permissions.\n", appName))
+		return
 	}
 
-	for _, availableStream := range availableStreams {
-		stream, err := falcon.NewStream(context.Background(), client, appName, availableStream, 0)
-		if err != nil {
-			panic(err)
-		}
-		defer stream.Close()
+	var wg sync.WaitGroup
+	for _, streamInfo := range availableStreams {
+		wg.Add(1)
+		go func(streamInfo *models.MainAvailableStreamV2) {
+			defer wg.Done()
+			a.handleStream(client, appName, streamInfo)
+		}(streamInfo)
+	}
+	wg.Wait()
+}
 
-		var fatalErr error
-		for fatalErr == nil {
-			select {
-			case err := <-stream.Errors:
-				if err.Fatal {
-					fatalErr = err.Err
-				} else {
-					fmt.Fprintln(os.Stderr, err)
-				}
-			case event := <-stream.Events:
-				msg := &protocol.DataMessage{
-					JsonPayload: a.convertStructToMap(event),
-					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-				}
-				err := a.uspClient.Ship(msg, a.writeTimeout)
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 0)
-				}
-				if err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				}
+func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecification, appName string, streamInfo *models.MainAvailableStreamV2) {
+	streamHandle, err := falcon.NewStream(a.ctx, client, appName, streamInfo, 0)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewStream(): %v", err))
+		return
+	}
+	defer streamHandle.Close()
+
+	for {
+		select {
+		case <-a.ctx.Done():
+			return
+		case err := <-streamHandle.Errors:
+			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
+			return
+		case event := <-streamHandle.Events:
+			msg := &protocol.DataMessage{
+				JsonPayload: a.convertStructToMap(event),
+				TimestampMs: uint64(time.Now().UnixMilli()),
+			}
+			err := a.uspClient.Ship(msg, a.writeTimeout)
+			if err == uspclient.ErrorBufferFull {
+				a.conf.ClientOptions.OnWarning("stream falling behind")
+				err = a.uspClient.Ship(msg, 0)
+			}
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 			}
 		}
-		panic(fatalErr)
 	}
-
-	return 0
 }
