@@ -39,6 +39,10 @@ type WizConfig struct {
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
 	URL           string                  `json:"url" yaml:"url"`
 	Query         string                  `json:"query" yaml:"query"`
+	Variables     map[string]interface{}  `json:"variables" yaml:"variables"`
+	TimeField     string                  `json:"time_field" yaml:"time_field"` // e.g., "createdAt", "updatedAt"
+	DataPath      []string                `json:"data_path" yaml:"data_path"`   // e.g., ["data", "securityIssues", "issues"]
+	IDField       string                  `json:"id_field" yaml:"id_field"`     // e.g., "id"
 }
 
 func (c *WizConfig) Validate() error {
@@ -56,6 +60,15 @@ func (c *WizConfig) Validate() error {
 	}
 	if c.Query == "" {
 		return errors.New("missing query")
+	}
+	if c.TimeField == "" {
+		return errors.New("missing time_field")
+	}
+	if len(c.DataPath) == 0 {
+		return errors.New("missing data_path")
+	}
+	if c.IDField == "" {
+		return errors.New("missing id_field")
 	}
 	return nil
 }
@@ -193,33 +206,27 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 	var alerts []map[string]interface{}
 	var lastDetectionTime, eventId string
 
-	// GraphQL query for security issues
-	query := a.conf.Query
-	query = `
-	query GetSecurityIssues($filter: SecurityIssueFilters) {
-		securityIssues(filter: $filter) {
-			issues {
-				id
-				createdAt
-				severity
-				status
-				title
-				description
-				details
-			}
-		}
-	}`
+	// Create a copy of the variables to avoid modifying the original
+	variables := make(map[string]interface{})
+	for k, v := range a.conf.Variables {
+		variables[k] = v
+	}
 
-	variables := map[string]interface{}{
-		"filter": map[string]interface{}{
-			"createdAt": map[string]string{
+	// Add time filter to variables
+	if timeFilter, ok := variables["filter"].(map[string]interface{}); ok {
+		timeFilter[a.conf.TimeField] = map[string]string{
+			"after": since,
+		}
+	} else {
+		variables["filter"] = map[string]interface{}{
+			a.conf.TimeField: map[string]string{
 				"after": since,
 			},
-		},
+		}
 	}
 
 	requestBody := map[string]interface{}{
-		"query":     query,
+		"query":     a.conf.Query,
 		"variables": variables,
 	}
 
@@ -261,42 +268,49 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		return nil, since, "", fmt.Errorf("error parsing response: %v", err)
 	}
 
-	data, ok := result["data"].(map[string]interface{})
-	if !ok {
-		return nil, since, "", fmt.Errorf("invalid response format")
-	}
+	// Navigate through the data path to find the items
+	current := result
+	for i, path := range a.conf.DataPath {
+		isLastPath := i == len(a.conf.DataPath)-1
 
-	securityIssues, ok := data["securityIssues"].(map[string]interface{})
-	if !ok {
-		return nil, since, "", fmt.Errorf("invalid security issues format")
-	}
-
-	issues, ok := securityIssues["issues"].([]interface{})
-	if !ok {
-		return nil, since, "", fmt.Errorf("invalid issues format")
-	}
-
-	for _, issue := range issues {
-		issueMap, ok := issue.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		id, ok := issueMap["id"].(string)
-		if !ok {
-			continue
-		}
-
-		if id != lastEventId {
-			createdAt, ok := issueMap["createdAt"].(string)
+		if isLastPath {
+			// Last path element should be an array
+			items, ok := current[path].([]interface{})
 			if !ok {
-				continue
+				return nil, since, "", fmt.Errorf("expected array at path %s, got %T", path, current[path])
 			}
 
-			lastDetectionTime = createdAt
-			alerts = append(alerts, issueMap)
-			eventId = id
+			for _, item := range items {
+				itemMap, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				id, ok := itemMap[a.conf.IDField].(string)
+				if !ok {
+					continue
+				}
+
+				if id != lastEventId {
+					timeValue, ok := itemMap[a.conf.TimeField].(string)
+					if !ok {
+						continue
+					}
+
+					lastDetectionTime = timeValue
+					alerts = append(alerts, itemMap)
+					eventId = id
+				}
+			}
+			return alerts, lastDetectionTime, eventId, nil
 		}
+
+		// Not the last path element, should be an object
+		next, ok := current[path].(map[string]interface{})
+		if !ok {
+			return nil, since, "", fmt.Errorf("expected object at path %s, got %T", path, current[path])
+		}
+		current = next
 	}
 
 	return alerts, lastDetectionTime, eventId, nil
