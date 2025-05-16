@@ -35,6 +35,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/wel"
+	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
 )
 
@@ -75,4 +76,5 @@ type GeneralConfigs struct {
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
 	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
+	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
 }

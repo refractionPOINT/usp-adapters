@@ -17,10 +17,6 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-const (
-	graphqlEndpoint = "https://api.wiz.io/graphql"
-)
-
 type WizAdapter struct {
 	conf       WizConfig
 	uspClient  *uspclient.Client
@@ -126,7 +122,9 @@ func (a *WizAdapter) Close() error {
 }
 
 func (a *WizAdapter) fetchToken() (string, error) {
-	url := "https://auth.wiz.io/oauth/token"
+	a.conf.ClientOptions.DebugLog("fetching token")
+
+	url := "https://auth.app.wiz.io/oauth/token"
 	payload := fmt.Sprintf("grant_type=client_credentials&client_id=%s&client_secret=%s&audience=beyond-api",
 		a.conf.ClientID,
 		a.conf.ClientSecret)
@@ -240,7 +238,7 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		return nil, since, "", fmt.Errorf("error fetching token: %v", err)
 	}
 
-	req, err := http.NewRequest("POST", graphqlEndpoint, bytes.NewBuffer(jsonBody))
+	req, err := http.NewRequest("POST", a.conf.URL, bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, since, "", fmt.Errorf("error creating request: %v", err)
 	}
@@ -259,8 +257,10 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		return nil, since, "", fmt.Errorf("error reading response: %v", err)
 	}
 
+	fmt.Printf("response: %s\n", string(body))
+
 	if resp.StatusCode != http.StatusOK {
-		return nil, since, "", fmt.Errorf("error response from Wiz API: %s", body)
+		return nil, since, "", fmt.Errorf("error response from Wiz API (%d): %s", resp.StatusCode, string(body))
 	}
 
 	var result map[string]interface{}
