@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	boxEndpoint   = "https://api.box.com/2.0/events?stream_type=admin_logs"
+	boxBaseURL    = "https://api.box.com/2.0/events"
 	tokenEndpoint = "https://api.box.com/oauth2/token"
 )
 
@@ -61,6 +61,7 @@ type BoxAdapter struct {
 	ctx            context.Context
 	dedupe         map[string]int64
 	streamPosition string
+	initialized    bool
 }
 
 func NewBoxAdapter(conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
@@ -71,6 +72,7 @@ func NewBoxAdapter(conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
 		doStop:         utils.NewEvent(),
 		dedupe:         make(map[string]int64),
 		streamPosition: "",
+		initialized:    false,
 	}
 
 	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
@@ -154,6 +156,15 @@ func (a *BoxAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog("Box event collection stopping")
 
+	if !a.initialized {
+		items, streamPos, err := a.makeOneRequest("now")
+		a.initialized = true
+		if err == nil {
+			a.streamPosition = streamPos
+		}
+		_ = items // discard
+	}
+
 	for !a.doStop.WaitFor(30 * time.Second) {
 		items, newStreamPosition, _ := a.makeOneRequest(a.streamPosition)
 		if newStreamPosition != "" {
@@ -192,12 +203,17 @@ func (a *BoxAdapter) makeOneRequest(streamPosition string) ([]utils.Dict, string
 		return nil, streamPosition, err
 	}
 
-	urlWithPos := boxEndpoint
-	if streamPosition != "" {
-		urlWithPos += "&stream_position=" + url.QueryEscape(streamPosition)
+	reqUrl := boxBaseURL + "?stream_type=admin_logs"
+	if streamPosition == "now" || streamPosition == "0" {
+		createdAfter := time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339)
+		reqUrl += "&created_after=" + createdAfter
+	} else {
+		reqUrl += "&stream_position=" + url.QueryEscape(streamPosition)
 	}
+	// print the request url
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting: %s", reqUrl))
 
-	req, err := http.NewRequest("GET", urlWithPos, nil)
+	req, err := http.NewRequest("GET", reqUrl, nil)
 	if err != nil {
 		return nil, streamPosition, err
 	}
@@ -216,12 +232,18 @@ func (a *BoxAdapter) makeOneRequest(streamPosition string) ([]utils.Dict, string
 	}
 
 	var parsed struct {
-		Entries       []utils.Dict `json:"entries"`
-		NextStreamPos string       `json:"next_stream_position"`
+		Entries          []utils.Dict `json:"entries"`
+		NextStreamPos    json.Number  `json:"next_stream_position"`
+		CurrentStreamPos string       `json:"current_stream_position"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("unmarshal: %v", err))
 		return nil, streamPosition, err
+	}
+
+	nextStreamPosStr := parsed.NextStreamPos.String()
+	if nextStreamPosStr == "0" {
+		nextStreamPosStr = "now"
 	}
 
 	for _, entry := range parsed.Entries {
@@ -243,5 +265,5 @@ func (a *BoxAdapter) makeOneRequest(streamPosition string) ([]utils.Dict, string
 		}
 	}
 
-	return allItems, parsed.NextStreamPos, nil
+	return allItems, nextStreamPosStr, nil
 }
