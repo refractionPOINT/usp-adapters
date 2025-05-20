@@ -205,7 +205,7 @@ func (a *BoxAdapter) makeOneRequest(streamPosition string) ([]utils.Dict, string
 
 	reqUrl := boxBaseURL + "?stream_type=admin_logs"
 	if streamPosition == "now" || streamPosition == "0" {
-		createdAfter := time.Now().UTC().Add(-30 * time.Second).Format(time.RFC3339)
+		createdAfter := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
 		reqUrl += "&created_after=" + createdAfter
 	} else {
 		reqUrl += "&stream_position=" + url.QueryEscape(streamPosition)
