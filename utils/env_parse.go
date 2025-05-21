@@ -3,6 +3,7 @@ package utils
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -15,6 +16,13 @@ var arrayIndexRE = regexp.MustCompile(`(.+)\[(\d+)\]$`)
 // population of configuration structs via CLI
 // of a container without a custom container.
 func ParseCLI(prefix string, args []string, out interface{}) error {
+	// Get the type information of the output struct
+	outType := reflect.TypeOf(out).Elem()
+
+	// Create a map to store field types by JSON tag
+	fieldTypes := make(map[string]reflect.Type)
+	buildFieldTypesMap(outType, "", fieldTypes)
+
 	data := map[string]interface{}{}
 	for _, k := range args {
 		tmp := data
@@ -28,6 +36,11 @@ func ParseCLI(prefix string, args []string, out interface{}) error {
 		if prefix != "" {
 			pathElems = append([]string{prefix}, pathElems...)
 		}
+
+		// Get the full path for type lookup
+		fullPath := strings.Join(pathElems, ".")
+		fieldType := fieldTypes[fullPath]
+
 		for i, v := range pathElems {
 			if matches := arrayIndexRE.FindStringSubmatch(v); len(matches) == 3 {
 				index, err := strconv.Atoi(matches[2])
@@ -47,11 +60,9 @@ func ParseCLI(prefix string, args []string, out interface{}) error {
 					}
 				}
 				if i == len(pathElems)-1 {
-					if num, err := strconv.ParseInt(val, 10, 64); err == nil {
-						tmp[actualKey].([]interface{})[index] = num
-					} else {
-						tmp[actualKey].([]interface{})[index] = val
-					}
+					// Convert value based on field type
+					convertedVal := convertValue(val, fieldType)
+					tmp[actualKey].([]interface{})[index] = convertedVal
 				} else {
 					if tmp[actualKey].([]interface{})[index] != nil {
 						existingDict, ok := tmp[actualKey].([]interface{})[index].(map[string]interface{})
@@ -68,13 +79,9 @@ func ParseCLI(prefix string, args []string, out interface{}) error {
 				continue
 			}
 			if i == len(pathElems)-1 {
-				if b, err := strconv.ParseBool(val); val != "0" && val != "1" && err == nil {
-					tmp[v] = b
-				} else if num, err := strconv.ParseInt(val, 10, 64); err == nil {
-					tmp[v] = num
-				} else {
-					tmp[v] = val
-				}
+				// Convert value based on field type
+				convertedVal := convertValue(val, fieldType)
+				tmp[v] = convertedVal
 				continue
 			}
 			if existing, ok := tmp[v]; ok {
@@ -99,4 +106,71 @@ func ParseCLI(prefix string, args []string, out interface{}) error {
 		return err
 	}
 	return nil
+}
+
+// buildFieldTypesMap recursively builds a map of JSON tag paths to their corresponding types
+func buildFieldTypesMap(t reflect.Type, prefix string, fieldTypes map[string]reflect.Type) {
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		jsonTag := field.Tag.Get("json")
+		if jsonTag == "" {
+			jsonTag = field.Name
+		}
+		jsonTag = strings.Split(jsonTag, ",")[0] // Remove any options
+
+		currentPath := jsonTag
+		if prefix != "" {
+			currentPath = prefix + "." + jsonTag
+		}
+
+		if field.Type.Kind() == reflect.Struct {
+			buildFieldTypesMap(field.Type, currentPath, fieldTypes)
+		} else if field.Type.Kind() == reflect.Slice {
+			// For slices, we need to handle the element type
+			elemType := field.Type.Elem()
+			if elemType.Kind() == reflect.Struct {
+				buildFieldTypesMap(elemType, currentPath, fieldTypes)
+			}
+		}
+		fieldTypes[currentPath] = field.Type
+	}
+}
+
+// convertValue converts a string value to the appropriate type based on the target field type
+func convertValue(val string, fieldType reflect.Type) interface{} {
+	if fieldType == nil {
+		// If we don't know the type, try to guess
+		if b, err := strconv.ParseBool(val); val != "0" && val != "1" && err == nil {
+			return b
+		}
+		if num, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return num
+		}
+		return val
+	}
+
+	switch fieldType.Kind() {
+	case reflect.Bool:
+		if b, err := strconv.ParseBool(val); err == nil {
+			return b
+		}
+		return val
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if num, err := strconv.ParseInt(val, 10, 64); err == nil {
+			return num
+		}
+		return val
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if num, err := strconv.ParseUint(val, 10, 64); err == nil {
+			return num
+		}
+		return val
+	case reflect.Float32, reflect.Float64:
+		if num, err := strconv.ParseFloat(val, 64); err == nil {
+			return num
+		}
+		return val
+	default:
+		return val
+	}
 }

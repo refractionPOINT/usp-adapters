@@ -18,6 +18,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
+	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -46,7 +47,6 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
-	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
@@ -597,4 +597,3 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
-

@@ -9,6 +9,8 @@ type testStruct1 struct {
 	A1 string      `json:"a1"`
 	A2 testStruct2 `json:"b"`
 	A3 bool        `json:"a3"`
+	A4 string      `json:"a4"`
+	A5 string      `json:"a5"`
 }
 
 type testStruct2 struct {
@@ -40,6 +42,8 @@ func TestParseCLI(t *testing.T) {
 			},
 		},
 		A3: true,
+		A4: "42",
+		A5: "true",
 	}
 	testData := []string{
 		"a1=aaa",
@@ -50,6 +54,8 @@ func TestParseCLI(t *testing.T) {
 		"b.b3[1].c1=yyy",
 		"b.b3[1].c2=ooo",
 		"a3=true",
+		"a4=42",
+		"a5=true",
 	}
 	actualData := testStruct1{}
 
