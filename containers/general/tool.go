@@ -46,6 +46,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
+	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
@@ -439,6 +440,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.PandaDoc
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
+	} else if method == "box" {
+		configs.Box.ClientOptions = applyLogging(configs.Box.ClientOptions)
+		configs.Box.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Box
+		client, chRunning, err = usp_box.NewBoxAdapter(configs.Box)
 	} else if method == "sublime" {
 		configs.Sublime.ClientOptions = applyLogging(configs.Sublime.ClientOptions)
 		configs.Sublime.ClientOptions.Architecture = "usp_adapter"
@@ -591,3 +597,4 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	return o
 }
+
