@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -28,21 +27,12 @@ type BoxConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-	SubjectID     interface{}             `json:"subject_id" yaml:"subject_id"`
+	SubjectID     string                  `json:"subject_id" yaml:"subject_id"`
 }
 
 func (c *BoxConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
-	}
-
-	switch v := c.SubjectID.(type) {
-	case string:
-		c.SubjectID = strings.Trim(v, `"'`)
-	case float64:
-		c.SubjectID = fmt.Sprintf("%.0f", v)
-	default:
-		return fmt.Errorf("invalid type for subject_id: %T", c.SubjectID)
 	}
 
 	if c.ClientID == "" || c.ClientSecret == "" || c.SubjectID == "" {
