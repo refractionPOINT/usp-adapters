@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -58,9 +59,10 @@ type SQSFilesConfig struct {
 	Region    string `json:"region" yaml:"region"`
 
 	// S3 specific
-	ParallelFetch int    `json:"parallel_fetch" yaml:"parallel_fetch"`
-	BucketPath    string `json:"bucket_path,omitempty" yaml:"bucket_path,omitempty"`
-	FilePath      string `json:"file_path,omitempty" yaml:"file_path,omitempty"`
+	ParallelFetch     int    `json:"parallel_fetch" yaml:"parallel_fetch"`
+	BucketPath        string `json:"bucket_path,omitempty" yaml:"bucket_path,omitempty"`
+	FilePath          string `json:"file_path,omitempty" yaml:"file_path,omitempty"`
+	IsDecodeObjectKey bool   `json:"is_decode_object_key,omitempty" yaml:"is_decode_object_key,omitempty"`
 	// Optional: alternative to BucketPath
 	Bucket string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
 }
@@ -268,25 +270,35 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 
 func (a *SQSFilesAdapter) processFiles() error {
 	for f := range a.chFiles {
+		path := f.path
+		if a.conf.IsDecodeObjectKey {
+			// URL Decode the path
+			var err error
+			path, err = url.QueryUnescape(path)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("url.QueryUnescape(): %v", err))
+				continue
+			}
+		}
 		startTime := time.Now().UTC()
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s", f.path))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s", path))
 
 		writerAt := aws.NewWriteAtBuffer([]byte{})
 
 		if _, err := a.awsDownloader.Download(writerAt, &s3.GetObjectInput{
 			Bucket: aws.String(f.bucket),
-			Key:    aws.String(f.path),
+			Key:    aws.String(path),
 		}); err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
 			return err
 		}
 		isCompressed := false
 
-		if strings.HasSuffix(f.path, ".gz") {
+		if strings.HasSuffix(path, ".gz") {
 			isCompressed = true
 		}
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v", f.path, time.Since(startTime)))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v", path, time.Since(startTime)))
 
 		a.processEvent(writerAt.Bytes(), isCompressed)
 	}
