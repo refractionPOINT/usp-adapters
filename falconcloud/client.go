@@ -27,6 +27,8 @@ type FalconCloudConfig struct {
 	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ClientId        string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret    string                  `json:"client_secret" yaml:"client_secret"`
+	IsUsingOffset   bool                    `json:"is_using_offset" yaml:"is_using_offset"`
+	Offset          uint64                  `json:"offset" yaml:"offset"`
 }
 
 func (c *FalconCloudConfig) Validate() error {
@@ -170,7 +172,17 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 }
 
 func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecification, appName string, streamInfo *models.MainAvailableStreamV2) {
-	streamHandle, err := falcon.NewStream(a.ctx, client, appName, streamInfo, 0)
+	// If IsUsingOffset is true, use the offset, otherwise use 0
+	// and drop all events where the timestamp is before the start
+	// time of the stream.
+	var notBefore time.Time
+	offset := uint64(0)
+	if a.conf.IsUsingOffset {
+		offset = a.conf.Offset
+	} else {
+		notBefore = time.Now()
+	}
+	streamHandle, err := falcon.NewStream(a.ctx, client, appName, streamInfo, offset)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewStream(): %v", err))
 		return
@@ -185,6 +197,12 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
 			return
 		case event := <-streamHandle.Events:
+			if !notBefore.IsZero() && !notBefore.After(time.UnixMilli(int64(event.Metadata.EventCreationTime))) {
+				// This is a very ugly hack for what is a bad API design.
+				// It implies we HAVE to consume the entire 30 days of events
+				// retained by Crowdstrike every time the adapter starts.
+				continue
+			}
 			msg := &protocol.DataMessage{
 				JsonPayload: a.convertStructToMap(event),
 				TimestampMs: uint64(time.Now().UnixMilli()),
