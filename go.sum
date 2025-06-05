@@ -282,8 +282,8 @@ github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d h1:5OLPrBvVR
 github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d/go.mod h1:7S4MA6zBzHBCOlHUFK+X+lgQq+pHiR0OZtW0v3VJOkY=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20250519221319-4704dd7283c7 h1:yEAOiYr9cCz4xg71dPKZmP8UT2zS5BE29FsDs1lp4Vk=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20250519221319-4704dd7283c7/go.mod h1:PNX+k1I6Bl+tDWUJM3j+C6JQVS7digPSnXk9I6m+4QE=
-github.com/refractionPOINT/go-uspclient v1.4.4 h1:pmW/xXd9uSeMdtv7UqxUk6Ib/PubB3T/eygxBFR5qV0=
-github.com/refractionPOINT/go-uspclient v1.4.4/go.mod h1:eivdnIABSXqrgSMSP9lzODs1bPE0aTQP55eE06fNOtE=
+github.com/refractionPOINT/go-uspclient v1.4.5 h1:8gCVr36jbzQwW6zkEO3EX0HWyWs8vWZwO0YudOokJ/s=
+github.com/refractionPOINT/go-uspclient v1.4.5/go.mod h1:X+x89stadkcpcEHKVCzXRhhHwUAYZgCpgzt79u59IS0=
 github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6 h1:1+7g49ZLqdbxFcqy0ISBs6tXq5dl/D0WV/VQgcvqWhY=
 github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6/go.mod h1:A+9rV4WFp4DKg1Ym1v6YtCrJ2vvlt1ZA/iml0CNuu2A=
 github.com/rogpeppe/go-internal v1.13.1 h1:KvO1DLK/DRN07sQ1LQKScxyZJuNnedQ5/wKSR38lUII=
