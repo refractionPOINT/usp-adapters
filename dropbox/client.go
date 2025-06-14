@@ -111,7 +111,7 @@ func (a *DropboxAdapter) fetchEvents() {
 			a.cursor = cursor
 			lastEventTime = lastTime
 		}
-		// Process initial items
+
 		for _, item := range items {
 			msg := &protocol.DataMessage{
 				JsonPayload: item,
@@ -185,7 +185,6 @@ func (a *DropboxAdapter) makeOneRequest(cursor, lastEventTime string) ([]utils.D
 	}
 	endTime := time.Now().UTC().Format(time.RFC3339)
 
-	// Always use the initial request structure with time range
 	reqUrl = dropboxEventsURL
 	bodyPayload, _ = json.Marshal(map[string]interface{}{
 		"limit": 100,
@@ -229,7 +228,7 @@ func (a *DropboxAdapter) makeOneRequest(cursor, lastEventTime string) ([]utils.D
 
 	allItems = append(allItems, parsed.Events...)
 
-	// Update the existing lastEventTime variable instead of redeclaring it
+	// Update the existing lastEventTime
 	if len(parsed.Events) > 0 {
 		if ts, ok := parsed.Events[len(parsed.Events)-1]["timestamp"].(string); ok {
 			lastEventTime = ts
