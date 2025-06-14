@@ -21,6 +21,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/defender"
+        "github.com/refractionPOINT/usp-adapters/dropbox"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
 	"github.com/refractionPOINT/usp-adapters/evtx"
@@ -445,6 +446,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.Box.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Box
 		client, chRunning, err = usp_box.NewBoxAdapter(configs.Box)
+        } else if method == "dropbox" {
+                configs.Dropbox.ClientOptions = applyLogging(configs.Dropbox.ClientOptions)
+                configs.Dropbox.ClientOptions.Architecture = "usp_adapter"
+                configToShow = configs.Dropbox
+                client, chRunning, err = usp_dropbox.NewDropboxAdapter(configs.Dropbox)
 	} else if method == "sublime" {
 		configs.Sublime.ClientOptions = applyLogging(configs.Sublime.ClientOptions)
 		configs.Sublime.ClientOptions.Architecture = "usp_adapter"
