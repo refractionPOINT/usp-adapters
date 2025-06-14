@@ -18,7 +18,6 @@ import (
 )
 
 const dropboxEventsURL = "https://api.dropboxapi.com/2/team_log/get_events"
-const dropboxContinueURL = "https://api.dropboxapi.com/2/team_log/get_events/continue"
 
 type DropboxConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
