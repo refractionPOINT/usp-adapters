@@ -20,6 +20,7 @@ import (
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
@@ -355,6 +356,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.Cato.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Cato
 		client, chRunning, err = usp_cato.NewCatoAdapter(configs.Cato)
+	} else if method == "cylance" {
+		configs.Cylance.ClientOptions = applyLogging(configs.Cylance.ClientOptions)
+		configs.Cylance.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Cylance
+		client, chRunning, err = usp_cylance.NewCylanceAdapter(configs.Cylance)
 	} else if method == "entraid" {
 		configs.EntraID.ClientOptions = applyLogging(configs.EntraID.ClientOptions)
 		configs.EntraID.ClientOptions.Architecture = "usp_adapter"
