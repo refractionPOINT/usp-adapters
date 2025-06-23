@@ -150,6 +150,7 @@ func (a *CylanceAdapter) fetchEvents() {
 		idField   string
 		timeField string
 		detailFn  func(ctx context.Context, id string) (*CylanceEventsResponse, error)
+		dedupe    map[string]int64
 	}{
 		{
 			key:       "detections",
@@ -159,6 +160,7 @@ func (a *CylanceAdapter) fetchEvents() {
 			detailFn: func(ctx context.Context, id string) (*CylanceEventsResponse, error) {
 				return a.requestDetectionDetails(ctx, id)
 			},
+			dedupe: a.detectionDedupe,
 		},
 		{
 			key:       "threats",
@@ -168,6 +170,7 @@ func (a *CylanceAdapter) fetchEvents() {
 			detailFn: func(ctx context.Context, id string) (*CylanceEventsResponse, error) {
 				return a.requestThreatDetails(ctx, id)
 			},
+			dedupe: a.threatDedupe,
 		},
 		{
 			key:       "memoryProtection",
@@ -175,6 +178,7 @@ func (a *CylanceAdapter) fetchEvents() {
 			idField:   "device_image_file_event_id",
 			timeField: "created",
 			detailFn:  nil,
+			dedupe:    a.memoryProtectionDedupe,
 		},
 	}
 
@@ -192,7 +196,7 @@ func (a *CylanceAdapter) fetchEvents() {
 
 			for _, api := range apis {
 				pageUrl := fmt.Sprintf("%s%s", a.conf.LoggingBaseURL, api.endpoint)
-				items, newSince, err := a.getEventsRequest(a.ctx, pageUrl, api.key, a.detectionDedupe, api.idField, api.timeField, since[api.key])
+				items, newSince, err := a.getEventsRequest(a.ctx, pageUrl, api.key, api.dedupe, api.idField, api.timeField, since[api.key])
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", since[api.key], err))
 					continue
