@@ -222,6 +222,7 @@ func (a *CylanceAdapter) fetchEvents() {
 								break
 							}
 							a.conf.ClientOptions.OnError(fmt.Errorf("%s details fetch failed: %w", api.key, err))
+							continue
 						}
 						allItems = append(allItems, response.Events...)
 					}
