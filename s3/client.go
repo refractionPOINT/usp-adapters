@@ -35,6 +35,8 @@ type S3Adapter struct {
 
 	isStop uint32
 	wg     sync.WaitGroup
+
+	region string
 }
 
 type S3Config struct {
@@ -91,6 +93,8 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 		return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
 	}
 
+	a.region = region
+
 	a.awsConfig = &aws.Config{
 		Region:      aws.String(region),
 		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
@@ -140,27 +144,33 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 }
 
 func (a *S3Adapter) getRegion() (string, error) {
-	// Step 1: Try GovCloud regions first
+	// Step 1: Try commercial regions first with proper region detection
+	sess := session.Must(session.NewSession(&aws.Config{
+		Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+	}))
+
+	regionFound, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, "us-east-1")
+	if err == nil {
+		return regionFound, nil
+	}
+
+	// Step 2: Try GovCloud regions if commercial detection failed
 	govRegions := []string{"us-gov-west-1", "us-gov-east-1"}
 
 	for _, region := range govRegions {
-		sess := session.Must(session.NewSession(&aws.Config{
-			Region: aws.String(region),
+		govSess := session.Must(session.NewSession(&aws.Config{
+			Region:      aws.String(region),
+			Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
 		}))
 
-		regionFound, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, region)
+		regionFound, err := s3manager.GetBucketRegion(a.ctx, govSess, a.conf.BucketName, region)
 		if err == nil {
 			return regionFound, nil
 		}
 	}
 
-	// Step 2: Fallback to commercial default logic
-	return s3manager.GetBucketRegion(
-		a.ctx,
-		session.Must(session.NewSession(&aws.Config{})), // uses SDK's default resolver
-		a.conf.BucketName,
-		"us-east-1", // recommended default region hint
-	)
+	// Step 3: If both failed, return the original error from commercial attempt
+	return "", fmt.Errorf("unable to determine bucket region: %v", err)
 }
 
 func (a *S3Adapter) Close() error {
@@ -183,7 +193,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		Prefix: &a.conf.Prefix,
 	})
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2() @ %s: %v", a.region, err))
 		// Ignore the error upstream so that we just keep retrying.
 		return false, nil
 	}
