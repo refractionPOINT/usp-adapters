@@ -35,6 +35,8 @@ type S3Adapter struct {
 
 	isStop uint32
 	wg     sync.WaitGroup
+
+	region string
 }
 
 type S3Config struct {
@@ -90,6 +92,8 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	if region, err = a.getRegion(); err != nil {
 		return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
 	}
+
+	a.region = region
 
 	a.awsConfig = &aws.Config{
 		Region:      aws.String(region),
@@ -183,7 +187,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		Prefix: &a.conf.Prefix,
 	})
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2() @ %s: %v", a.region, err))
 		// Ignore the error upstream so that we just keep retrying.
 		return false, nil
 	}
