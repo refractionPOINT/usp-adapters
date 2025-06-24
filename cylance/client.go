@@ -221,7 +221,7 @@ func (a *CylanceAdapter) fetchEvents() {
 							if a.refreshFailLimitMet {
 								break
 							}
-							a.conf.ClientOptions.OnError(fmt.Errorf("detection details fetch failed: %w", err))
+							a.conf.ClientOptions.OnError(fmt.Errorf("%s details fetch failed: %w", api.key, err))
 						}
 						allItems = append(allItems, response.Events...)
 					}
