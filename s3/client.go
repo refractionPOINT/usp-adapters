@@ -144,27 +144,33 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 }
 
 func (a *S3Adapter) getRegion() (string, error) {
-	// Step 1: Try GovCloud regions first
+	// Step 1: Try commercial regions first with proper region detection
+	sess := session.Must(session.NewSession(&aws.Config{
+		Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+	}))
+
+	regionFound, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, "us-east-1")
+	if err == nil {
+		return regionFound, nil
+	}
+
+	// Step 2: Try GovCloud regions if commercial detection failed
 	govRegions := []string{"us-gov-west-1", "us-gov-east-1"}
 
 	for _, region := range govRegions {
-		sess := session.Must(session.NewSession(&aws.Config{
-			Region: aws.String(region),
+		govSess := session.Must(session.NewSession(&aws.Config{
+			Region:      aws.String(region),
+			Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
 		}))
 
-		regionFound, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, region)
+		regionFound, err := s3manager.GetBucketRegion(a.ctx, govSess, a.conf.BucketName, region)
 		if err == nil {
 			return regionFound, nil
 		}
 	}
 
-	// Step 2: Fallback to commercial default logic
-	return s3manager.GetBucketRegion(
-		a.ctx,
-		session.Must(session.NewSession(&aws.Config{})), // uses SDK's default resolver
-		a.conf.BucketName,
-		"us-east-1", // recommended default region hint
-	)
+	// Step 3: If both failed, return the original error from commercial attempt
+	return "", fmt.Errorf("unable to determine bucket region: %v", err)
 }
 
 func (a *S3Adapter) Close() error {
