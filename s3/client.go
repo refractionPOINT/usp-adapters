@@ -151,10 +151,25 @@ func (a *S3Adapter) getRegion() (string, error) {
 
 	regionFound, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, "us-east-1")
 	if err == nil {
-		return regionFound, nil
+		// Verify the credentials actually work with this region by making a test call
+		testSess := session.Must(session.NewSession(&aws.Config{
+			Region:      aws.String(regionFound),
+			Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+		}))
+		s3Svc := s3.New(testSess)
+		
+		// Test with a simple HeadBucket call
+		_, testErr := s3Svc.HeadBucketWithContext(a.ctx, &s3.HeadBucketInput{
+			Bucket: aws.String(a.conf.BucketName),
+		})
+		
+		if testErr == nil {
+			return regionFound, nil
+		}
+		// If test failed, continue to try GovCloud regions
 	}
 
-	// Step 2: Try GovCloud regions if commercial detection failed
+	// Step 2: Try GovCloud regions if commercial detection failed or credentials don't work
 	govRegions := []string{"us-gov-west-1", "us-gov-east-1"}
 
 	for _, region := range govRegions {
@@ -165,7 +180,15 @@ func (a *S3Adapter) getRegion() (string, error) {
 
 		regionFound, err := s3manager.GetBucketRegion(a.ctx, govSess, a.conf.BucketName, region)
 		if err == nil {
-			return regionFound, nil
+			// Verify the credentials work with this GovCloud region
+			s3Svc := s3.New(govSess)
+			_, testErr := s3Svc.HeadBucketWithContext(a.ctx, &s3.HeadBucketInput{
+				Bucket: aws.String(a.conf.BucketName),
+			})
+			
+			if testErr == nil {
+				return regionFound, nil
+			}
 		}
 	}
 
