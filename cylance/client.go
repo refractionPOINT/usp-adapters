@@ -57,8 +57,37 @@ type CylanceAdapter struct {
 	refreshFailLimitMet bool
 }
 
+type CylanceResponse interface {
+	GetDict() []utils.Dict
+	HasNextPage() bool
+}
+
 type CylanceEventsResponse struct {
-	Events []utils.Dict `json:"events"`
+	PageItems          []utils.Dict `json:"page_items"`
+	PageSize           int64        `json:"page_size"`
+	TotalPages         int64        `json:"total_pages"`
+	TotalNumberOfItems int64        `json:"total_number_of_items"`
+	PageNumber         int64        `json:"page_number"`
+}
+
+func (r CylanceEventsResponse) GetDict() []utils.Dict {
+	return r.PageItems
+}
+
+func (r CylanceEventsResponse) HasNextPage() bool {
+	return !(r.PageNumber >= r.TotalPages)
+}
+
+type CylanceEventResponse struct {
+	Event []utils.Dict
+}
+
+func (r CylanceEventResponse) GetDict() []utils.Dict {
+	return r.Event
+}
+
+func (r CylanceEventResponse) HasNextPage() bool {
+	return false
 }
 
 func NewCylanceAdapter(conf CylanceConfig) (*CylanceAdapter, chan struct{}, error) {
@@ -137,6 +166,17 @@ func (a *CylanceAdapter) Close() error {
 	return err2
 }
 
+type Api struct {
+	key                string
+	endpoint           string
+	idField            string
+	timeField          string
+	startFilterField   string
+	returnedTimeFormat string
+	detailFn           func(ctx context.Context, id string) (CylanceResponse, error)
+	dedupe             map[string]int64
+}
+
 func (a *CylanceAdapter) fetchEvents() {
 	since := map[string]time.Time{
 		"detections":        time.Now().Add(-1 * queryInterval * time.Minute),
@@ -144,41 +184,42 @@ func (a *CylanceAdapter) fetchEvents() {
 		"memoryProtections": time.Now().Add(-1 * queryInterval * time.Minute),
 	}
 
-	apis := []struct {
-		key       string
-		endpoint  string
-		idField   string
-		timeField string
-		detailFn  func(ctx context.Context, id string) (*CylanceEventsResponse, error)
-		dedupe    map[string]int64
-	}{
+	apis := []Api{
 		{
-			key:       "detections",
-			endpoint:  detectionsEndpoint,
-			idField:   "Id",
-			timeField: "ReceivedTime",
-			detailFn: func(ctx context.Context, id string) (*CylanceEventsResponse, error) {
+			key:                "detections",
+			endpoint:           detectionsEndpoint,
+			idField:            "Id",
+			timeField:          "ReceivedTime",
+			startFilterField:   "start",
+			returnedTimeFormat: time.RFC3339,
+			detailFn: func(ctx context.Context, id string) (CylanceResponse, error) {
 				return a.requestDetectionDetails(ctx, id)
 			},
 			dedupe: a.detectionDedupe,
 		},
 		{
-			key:       "threats",
-			endpoint:  threatsEndpoint,
-			idField:   "sha256",
-			timeField: "dateDetected",
-			detailFn: func(ctx context.Context, id string) (*CylanceEventsResponse, error) {
+			key:                "threats",
+			endpoint:           threatsEndpoint,
+			idField:            "sha256",
+			timeField:          "dateDetected",
+			startFilterField:   "start_time",
+			returnedTimeFormat: time.RFC3339,
+			detailFn: func(ctx context.Context, id string) (CylanceResponse, error) {
 				return a.requestThreatDetails(ctx, id)
 			},
 			dedupe: a.threatDedupe,
 		},
 		{
-			key:       "memoryProtection",
-			endpoint:  memoryProtectionEndpoint,
-			idField:   "device_image_file_event_id",
-			timeField: "created",
-			detailFn:  nil,
-			dedupe:    a.memoryProtectionDedupe,
+			key:                "memoryProtections",
+			endpoint:           memoryProtectionEndpoint,
+			idField:            "device_image_file_event_id",
+			timeField:          "created",
+			startFilterField:   "start_time",
+			returnedTimeFormat: "2006-01-02T15:04:05",
+			detailFn: func(ctx context.Context, id string) (CylanceResponse, error) {
+				return a.requestMemoryProtectionDetails(a.ctx, id)
+			},
+			dedupe: a.memoryProtectionDedupe,
 		},
 	}
 
@@ -196,7 +237,7 @@ func (a *CylanceAdapter) fetchEvents() {
 
 			for _, api := range apis {
 				pageUrl := fmt.Sprintf("%s%s", a.conf.LoggingBaseURL, api.endpoint)
-				items, newSince, err := a.getEventsRequest(a.ctx, pageUrl, api.key, api.dedupe, api.idField, api.timeField, since[api.key])
+				items, newSince, err := a.getEventsRequest(a.ctx, pageUrl, api, since[api.key])
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", since[api.key], err))
 					continue
@@ -216,7 +257,7 @@ func (a *CylanceAdapter) fetchEvents() {
 							a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s field is not a string on %s event: %v", api.idField, api.key, event))
 							continue
 						}
-						response, err := api.detailFn(a.ctx, id)
+						detailResponse, err := api.detailFn(a.ctx, id)
 						if err != nil {
 							if a.refreshFailLimitMet {
 								break
@@ -224,12 +265,13 @@ func (a *CylanceAdapter) fetchEvents() {
 							a.conf.ClientOptions.OnError(fmt.Errorf("%s details fetch failed: %w", api.key, err))
 							continue
 						}
-						allItems = append(allItems, response.Events...)
+						allItems = append(allItems, detailResponse.GetDict()...)
 					}
 				}
 			}
 
 			if len(allItems) > 0 {
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf("All Items: %#v", allItems))
 				a.submitEvents(allItems)
 			}
 
@@ -271,6 +313,23 @@ func (a *CylanceAdapter) tokenError(errorMessage string, refreshFails int, sleep
 	return refreshFails
 }
 
+func getJWTExpiration(tokenString string) (time.Time, error) {
+	var expirationTime time.Time
+	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse token: %v", err)
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok {
+		if exp, ok := claims["exp"].(float64); ok {
+			expirationTime = time.Unix(int64(exp), 0).UTC()
+		} else {
+			return time.Time{}, fmt.Errorf("exp claim not found or invalid")
+		}
+	}
+	return expirationTime, nil
+}
+
 func (a *CylanceAdapter) refreshToken(ctx context.Context) error {
 	refreshFails := 0
 
@@ -293,7 +352,7 @@ func (a *CylanceAdapter) refreshToken(ctx context.Context) error {
 			"sub": a.conf.AppID,
 			"tid": a.conf.TenantID,
 			"jti": jti,
-			"scp": []string{"opticsdetect:list", "opticsdetect:read", "device:list", "threat:read", "memoryprotection:list"},
+			"scp": []string{"opticsdetect:list", "opticsdetect:read", "device:list", "device:read", "threat:list", "threat:read", "memoryprotection:list"},
 		}
 
 		jwtToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
@@ -348,13 +407,12 @@ func (a *CylanceAdapter) refreshToken(ctx context.Context) error {
 			continue
 		}
 		if status != http.StatusOK {
-			refreshFails = a.tokenError(fmt.Sprintf("cylance auth api non-200: %d\nRESPONSE %s", status, string(respBody)), refreshFails, 60*time.Second)
+			refreshFails = a.tokenError(fmt.Sprintf("cylance auth api non-200: %dnRESPONSE %s", status, string(respBody)), refreshFails, 60*time.Second)
 			continue
 		}
 
 		var response struct {
 			AccessToken string `json:"access_token"`
-			ExpiresAt   int64  `json:"expires_at"`
 		}
 		err = json.Unmarshal(respBody, &response)
 		if err != nil {
@@ -363,7 +421,10 @@ func (a *CylanceAdapter) refreshToken(ctx context.Context) error {
 		}
 
 		a.accessToken = response.AccessToken
-		a.tokenExpiresAt = time.Unix(response.ExpiresAt, 0).UTC()
+		a.tokenExpiresAt, err = getJWTExpiration(a.accessToken)
+		if err != nil {
+			a.tokenExpiresAt = time.Time{}
+		}
 		refreshFails = 0
 
 		return nil
@@ -389,7 +450,7 @@ func (a *CylanceAdapter) submitEvents(items []utils.Dict) {
 	}
 }
 
-func (a *CylanceAdapter) doWithRetry(ctx context.Context, url string, apiName string) (*CylanceEventsResponse, error) {
+func (a *CylanceAdapter) doWithRetry(ctx context.Context, url string, apiName string, responseType CylanceResponse) (CylanceResponse, error) {
 	for {
 		var respBody []byte
 		var status int
@@ -444,66 +505,64 @@ func (a *CylanceAdapter) doWithRetry(ctx context.Context, url string, apiName st
 				a.tokenExpiresAt = time.Now()
 				continue
 			}
-			a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api non-200: %d\nRESPONSE %s", apiName, status, string(respBody)))
-			return nil, fmt.Errorf("cylance %s api non-200: %d\nRESPONSE %s", apiName, status, string(respBody))
+			a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api non-200: %dnRESPONSE %s", apiName, status, string(respBody)))
+			return nil, fmt.Errorf("cylance %s api non-200: %dnRESPONSE %s", apiName, status, string(respBody))
 		}
 
-		var response CylanceEventsResponse
-
-		err = json.Unmarshal(respBody, &response)
+		err = json.Unmarshal(respBody, &responseType)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api invalid json: %v", apiName, err))
 			return nil, err
 		}
 
-		return &response, nil
+		return responseType, nil
 	}
 }
 
-func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, apiName string, apiDedupe map[string]int64, apiIDField string, apiTimeField string, since time.Time) ([]utils.Dict, time.Time, error) {
+func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, api Api, since time.Time) ([]utils.Dict, time.Time, error) {
 	var allItems []utils.Dict
 	lastDetectionTime := since
 	page := 1
 	pageSize := pageLimit
 
 	defer func() {
-		for k, v := range apiDedupe {
+		for k, v := range api.dedupe {
 			if v < since.Unix() {
-				delete(apiDedupe, k)
+				delete(api.dedupe, k)
 			}
 		}
 	}()
 
 	for {
-		url := fmt.Sprintf("%s?page=%d&page_size=%d&start=%s", pageUrl, page, pageSize, lastDetectionTime.UTC().Format(time.RFC3339))
+		url := fmt.Sprintf("%s?page=%d&page_size=%d&%s=%s", pageUrl, page, pageSize, api.startFilterField, lastDetectionTime.UTC().Format(api.returnedTimeFormat))
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
 
-		response, err := a.doWithRetry(ctx, url, apiName)
+		response, err := a.doWithRetry(ctx, url, api.key, &CylanceEventsResponse{})
 		if err != nil {
 			return nil, lastDetectionTime, err
 		}
 
 		var newItems []utils.Dict
-		for _, event := range response.Events {
-			id, ok := event[apiIDField].(string)
+		for _, event := range response.GetDict() {
+			id, ok := event[api.idField].(string)
 			if !ok {
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("event id not a string: %s", event))
 				continue
 			}
-			createdAtStr, ok := event[apiTimeField].(string)
+			createdAtStr, ok := event[api.timeField].(string)
 			if !ok {
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("event time not a string: %s", event))
 				continue
 			}
 
-			if _, seen := apiDedupe[id]; !seen {
-				CreatedAt, err := time.Parse(time.RFC3339, createdAtStr)
+			if _, seen := api.dedupe[id]; !seen {
+				CreatedAt, err := time.Parse(api.returnedTimeFormat, createdAtStr)
 				if err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api invalid timestamp: %v", apiName, err))
+					a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api invalid timestamp: %v", api.key, err))
 					continue
 				}
 				if CreatedAt.After(since) {
-					apiDedupe[id] = CreatedAt.Unix()
+					api.dedupe[id] = CreatedAt.Unix()
 					newItems = append(newItems, event)
 					if CreatedAt.After(lastDetectionTime) {
 						lastDetectionTime = CreatedAt
@@ -514,7 +573,7 @@ func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, a
 
 		allItems = append(allItems, newItems...)
 
-		if len(response.Events) < pageSize {
+		if !response.HasNextPage() {
 			break
 		}
 		page++
@@ -523,14 +582,19 @@ func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, a
 	return allItems, lastDetectionTime, nil
 }
 
-func (a *CylanceAdapter) requestDetectionDetails(ctx context.Context, detectionId string) (*CylanceEventsResponse, error) {
+func (a *CylanceAdapter) requestDetectionDetails(ctx context.Context, detectionId string) (CylanceResponse, error) {
 	url := fmt.Sprintf("%s%s/%s/details", a.conf.LoggingBaseURL, detectionsEndpoint, detectionId)
-	return a.doWithRetry(ctx, url, "detect")
+	return a.doWithRetry(ctx, url, "detect", &CylanceEventResponse{})
 }
 
-func (a *CylanceAdapter) requestThreatDetails(ctx context.Context, sha256 string) (*CylanceEventsResponse, error) {
+func (a *CylanceAdapter) requestThreatDetails(ctx context.Context, sha256 string) (CylanceResponse, error) {
 	url := fmt.Sprintf("%s%s/%s", a.conf.LoggingBaseURL, threatsEndpoint, sha256)
-	return a.doWithRetry(ctx, url, "threat")
+	return a.doWithRetry(ctx, url, "threat", &CylanceEventResponse{})
+}
+
+func (a *CylanceAdapter) requestMemoryProtectionDetails(ctx context.Context, memoryProtectionId string) (CylanceResponse, error) {
+	url := fmt.Sprintf("%s%s/%s", a.conf.LoggingBaseURL, threatsEndpoint, memoryProtectionId)
+	return a.doWithRetry(ctx, url, "memoryProtection", &CylanceEventResponse{})
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {
