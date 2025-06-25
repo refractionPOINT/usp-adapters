@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -47,6 +48,7 @@ type S3Config struct {
 	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
 	Prefix        string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
+	Region        string                  `json:"region" yaml:"region"`
 }
 
 func (c *S3Config) Validate() error {
@@ -89,9 +91,14 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	var err error
 	var region string
 
-	if region, err = a.getRegion(); err != nil {
-		return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
+	if conf.Region != "" {
+		region = conf.Region
+	} else {
+		if region, err = a.getRegion(); err != nil {
+			return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
+		}
 	}
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("s3 region for %q: %s", a.conf.BucketName, region))
 
 	a.region = region
 
@@ -144,33 +151,57 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 }
 
 func (a *S3Adapter) getRegion() (string, error) {
-	// Step 1: Try commercial regions first with proper region detection
-	sess := session.Must(session.NewSession(&aws.Config{
-		Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
-	}))
-
-	regionFound, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, "us-east-1")
-	if err == nil {
-		return regionFound, nil
+	// Try commercial partition first
+	sess, err := session.NewSession(&aws.Config{
+		Region:           aws.String("us-east-1"),
+		Credentials:      credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+		S3ForcePathStyle: aws.Bool(false),
+	})
+	if err != nil {
+		return "", err
 	}
 
-	// Step 2: Try GovCloud regions if commercial detection failed
-	govRegions := []string{"us-gov-west-1", "us-gov-east-1"}
+	region, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, "us-east-1")
+	if err == nil {
+		if region == "" {
+			region = "us-east-1"
+		}
+		return region, nil
+	}
 
-	for _, region := range govRegions {
-		govSess := session.Must(session.NewSession(&aws.Config{
-			Region:      aws.String(region),
-			Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
-		}))
+	// If commercial failed and error suggests access issues, try GovCloud
+	if !isNotFound(err) {
+		// Try GovCloud partition
+		govSess, govErr := session.NewSession(&aws.Config{
+			Region:           aws.String("us-gov-west-1"),
+			Credentials:      credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+			S3ForcePathStyle: aws.Bool(false),
+		})
+		if govErr != nil {
+			return "", govErr
+		}
 
-		regionFound, err := s3manager.GetBucketRegion(a.ctx, govSess, a.conf.BucketName, region)
-		if err == nil {
-			return regionFound, nil
+		govRegion, govRegionErr := s3manager.GetBucketRegion(a.ctx, govSess, a.conf.BucketName, "us-gov-west-1")
+		if govRegionErr == nil {
+			if govRegion == "" {
+				govRegion = "us-gov-west-1"
+			}
+			return govRegion, nil
+		}
+		err = fmt.Errorf("govcloud region: %v, commercial region: %v", govRegionErr, err)
+	}
+
+	return "", fmt.Errorf("bucket %q not found in commercial or GovCloud partitions: %w", a.conf.BucketName, err)
+}
+
+func isNotFound(err error) bool {
+	if aerr, ok := err.(awserr.Error); ok {
+		switch aerr.Code() {
+		case "NoSuchBucket", "NotFound":
+			return true
 		}
 	}
-
-	// Step 3: If both failed, return the original error from commercial attempt
-	return "", fmt.Errorf("unable to determine bucket region: %v", err)
+	return false
 }
 
 func (a *S3Adapter) Close() error {
@@ -236,7 +267,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			Bucket: aws.String(a.conf.BucketName),
 			Key:    aws.String(item.Key),
 		}); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download() @ %s: %v", a.region, err))
 			return &s3LocalFile{
 				Obj:  item,
 				Data: nil,
