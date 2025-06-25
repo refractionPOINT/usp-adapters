@@ -30,6 +30,8 @@ type listItem struct {
 	ContentExpiration string `json:"contentExpiration,omitempty"`
 }
 
+// Office 365 Management API endpoints for different cloud environments
+// Reference: https://docs.microsoft.com/en-us/office/office-365-management-api/office-365-management-apis-overview#office-365-management-apis-overview
 var URL = map[string]string{
 	"enterprise":   "https://manage.office.com/api/v1.0/",
 	"gcc-gov":      "https://manage-gcc.office.com/api/v1.0/",
@@ -37,6 +39,11 @@ var URL = map[string]string{
 	"dod-gov":      "https://manage.protection.apps.mil/api/v1.0/",
 }
 
+// OAuth2 token endpoints for different cloud environments
+// References:
+// - Commercial/GCC: https://docs.microsoft.com/en-us/azure/active-directory/develop/authentication-national-clouds#azure-ad-authentication-endpoints
+// - GCC High/DoD: https://docs.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure#azure-active-directory-premium-p1-and-p2
+// - Government clouds: https://docs.microsoft.com/en-us/graph/deployments#microsoft-graph-and-graph-explorer-service-root-endpoints
 var TokenURL = map[string]string{
 	"enterprise":   "https://login.windows.net/",
 	"gcc-gov":      "https://login.windows.net/",
@@ -44,6 +51,8 @@ var TokenURL = map[string]string{
 	"dod-gov":      "https://login.microsoftonline.us/",
 }
 
+// Resource scopes for OAuth2 authentication, must match the target API environment
+// Reference: https://docs.microsoft.com/en-us/office/office-365-management-api/get-started-with-office-365-management-apis#specify-the-permissions-your-app-requires-to-access-the-office-365-management-apis
 var ResourceScope = map[string]string{
 	"enterprise":   "https://manage.office.com",
 	"gcc-gov":      "https://manage.office.com",
@@ -296,6 +305,8 @@ func (a *Office365Adapter) fetchEvents(url string) {
 
 func (a *Office365Adapter) updateBearerToken() error {
 	// Determine the correct OAuth2 token URL and resource scope based on the endpoint type
+	// This is critical for government clouds to avoid "Confidential Client is not supported in Cross Cloud request" errors
+	// Reference: https://docs.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure#guidance-for-developers
 	var tokenURL, resourceScope string
 	
 	if a.endpointType == "custom" {
