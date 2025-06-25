@@ -30,6 +30,8 @@ type listItem struct {
 	ContentExpiration string `json:"contentExpiration,omitempty"`
 }
 
+// Office 365 Management API endpoints for different cloud environments
+// Reference: https://docs.microsoft.com/en-us/office/office-365-management-api/office-365-management-apis-overview#office-365-management-apis-overview
 var URL = map[string]string{
 	"enterprise":   "https://manage.office.com/api/v1.0/",
 	"gcc-gov":      "https://manage-gcc.office.com/api/v1.0/",
@@ -37,12 +39,34 @@ var URL = map[string]string{
 	"dod-gov":      "https://manage.protection.apps.mil/api/v1.0/",
 }
 
+// OAuth2 token endpoints for different cloud environments
+// References:
+// - Commercial/GCC: https://docs.microsoft.com/en-us/azure/active-directory/develop/authentication-national-clouds#azure-ad-authentication-endpoints
+// - GCC High/DoD: https://docs.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure#azure-active-directory-premium-p1-and-p2
+// - Government clouds: https://docs.microsoft.com/en-us/graph/deployments#microsoft-graph-and-graph-explorer-service-root-endpoints
+var TokenURL = map[string]string{
+	"enterprise":   "https://login.windows.net/",
+	"gcc-gov":      "https://login.windows.net/",
+	"gcc-high-gov": "https://login.microsoftonline.us/",
+	"dod-gov":      "https://login.microsoftonline.us/",
+}
+
+// Resource scopes for OAuth2 authentication, must match the target API environment
+// Reference: https://docs.microsoft.com/en-us/office/office-365-management-api/get-started-with-office-365-management-apis#specify-the-permissions-your-app-requires-to-access-the-office-365-management-apis
+var ResourceScope = map[string]string{
+	"enterprise":   "https://manage.office.com",
+	"gcc-gov":      "https://manage.office.com",
+	"gcc-high-gov": "https://manage.office365.us",
+	"dod-gov":      "https://manage.protection.apps.mil",
+}
+
 type Office365Adapter struct {
 	conf       Office365Config
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
-	endpoint string
+	endpoint     string
+	endpointType string
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -113,8 +137,10 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 
 	if strings.HasPrefix(conf.Endpoint, "https://") {
 		a.endpoint = conf.Endpoint
+		a.endpointType = "custom"
 	} else if v, ok := URL[conf.Endpoint]; ok {
 		a.endpoint = v
+		a.endpointType = conf.Endpoint
 	} else {
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
@@ -278,12 +304,37 @@ func (a *Office365Adapter) fetchEvents(url string) {
 }
 
 func (a *Office365Adapter) updateBearerToken() error {
+	// Determine the correct OAuth2 token URL and resource scope based on the endpoint type
+	// This is critical for government clouds to avoid "Confidential Client is not supported in Cross Cloud request" errors
+	// Reference: https://docs.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure#guidance-for-developers
+	var tokenURL, resourceScope string
+	
+	if a.endpointType == "custom" {
+		// For custom endpoints, default to enterprise settings
+		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
+		resourceScope = "https://manage.office.com"
+	} else if baseTokenURL, ok := TokenURL[a.endpointType]; ok {
+		// Use the correct OAuth2 endpoint for the cloud environment
+		if a.endpointType == "gcc-high-gov" || a.endpointType == "dod-gov" {
+			// For GCC High and DoD, use tenant ID and v2.0 endpoint
+			tokenURL = fmt.Sprintf("%s%s/oauth2/v2.0/token", baseTokenURL, a.conf.TenantID)
+		} else {
+			// For enterprise and GCC, use domain and v1.0 endpoint
+			tokenURL = fmt.Sprintf("%s%s/oauth2/token?api-version=1.0", baseTokenURL, a.conf.Domain)
+		}
+		resourceScope = ResourceScope[a.endpointType]
+	} else {
+		// Fallback to enterprise settings
+		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
+		resourceScope = "https://manage.office.com"
+	}
+
 	conf := &clientcredentials.Config{
 		ClientID:     a.conf.ClientID,
 		ClientSecret: a.conf.ClientSecret,
-		TokenURL:     fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain),
+		TokenURL:     tokenURL,
 		EndpointParams: url.Values{
-			"resource": []string{"https://manage.office.com"},
+			"resource": []string{resourceScope},
 		},
 	}
 
