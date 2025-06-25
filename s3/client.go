@@ -48,6 +48,7 @@ type S3Config struct {
 	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
 	Prefix        string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
+	Region        string                  `json:"region" yaml:"region"`
 }
 
 func (c *S3Config) Validate() error {
@@ -90,8 +91,12 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	var err error
 	var region string
 
-	if region, err = a.getRegion(); err != nil {
-		return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
+	if conf.Region != "" {
+		region = conf.Region
+	} else {
+		if region, err = a.getRegion(); err != nil {
+			return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
+		}
 	}
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf("s3 region for %q: %s", a.conf.BucketName, region))
 
