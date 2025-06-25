@@ -509,6 +509,17 @@ func (a *CylanceAdapter) doWithRetry(ctx context.Context, url string, apiName st
 			return nil, fmt.Errorf("cylance %s api non-200: %dnRESPONSE %s", apiName, status, string(respBody))
 		}
 
+		if eventResponse, ok := responseType.(*CylanceEventResponse); ok {
+			var singleEvent utils.Dict
+			err = json.Unmarshal(respBody, &singleEvent)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api invalid json: %v", apiName, err))
+				return nil, err
+			}
+			eventResponse.Event = []utils.Dict{singleEvent}
+			return eventResponse, nil
+		}
+
 		err = json.Unmarshal(respBody, &responseType)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api invalid json: %v", apiName, err))
