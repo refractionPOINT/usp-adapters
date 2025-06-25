@@ -37,12 +37,27 @@ var URL = map[string]string{
 	"dod-gov":      "https://manage.protection.apps.mil/api/v1.0/",
 }
 
+var TokenURL = map[string]string{
+	"enterprise":   "https://login.windows.net/",
+	"gcc-gov":      "https://login.windows.net/",
+	"gcc-high-gov": "https://login.microsoftonline.us/",
+	"dod-gov":      "https://login.microsoftonline.us/",
+}
+
+var ResourceScope = map[string]string{
+	"enterprise":   "https://manage.office.com",
+	"gcc-gov":      "https://manage.office.com",
+	"gcc-high-gov": "https://manage.office365.us",
+	"dod-gov":      "https://manage.protection.apps.mil",
+}
+
 type Office365Adapter struct {
 	conf       Office365Config
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
-	endpoint string
+	endpoint     string
+	endpointType string
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -113,8 +128,10 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 
 	if strings.HasPrefix(conf.Endpoint, "https://") {
 		a.endpoint = conf.Endpoint
+		a.endpointType = "custom"
 	} else if v, ok := URL[conf.Endpoint]; ok {
 		a.endpoint = v
+		a.endpointType = conf.Endpoint
 	} else {
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
@@ -278,12 +295,35 @@ func (a *Office365Adapter) fetchEvents(url string) {
 }
 
 func (a *Office365Adapter) updateBearerToken() error {
+	// Determine the correct OAuth2 token URL and resource scope based on the endpoint type
+	var tokenURL, resourceScope string
+	
+	if a.endpointType == "custom" {
+		// For custom endpoints, default to enterprise settings
+		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
+		resourceScope = "https://manage.office.com"
+	} else if baseTokenURL, ok := TokenURL[a.endpointType]; ok {
+		// Use the correct OAuth2 endpoint for the cloud environment
+		if a.endpointType == "gcc-high-gov" || a.endpointType == "dod-gov" {
+			// For GCC High and DoD, use tenant ID and v2.0 endpoint
+			tokenURL = fmt.Sprintf("%s%s/oauth2/v2.0/token", baseTokenURL, a.conf.TenantID)
+		} else {
+			// For enterprise and GCC, use domain and v1.0 endpoint
+			tokenURL = fmt.Sprintf("%s%s/oauth2/token?api-version=1.0", baseTokenURL, a.conf.Domain)
+		}
+		resourceScope = ResourceScope[a.endpointType]
+	} else {
+		// Fallback to enterprise settings
+		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
+		resourceScope = "https://manage.office.com"
+	}
+
 	conf := &clientcredentials.Config{
 		ClientID:     a.conf.ClientID,
 		ClientSecret: a.conf.ClientSecret,
-		TokenURL:     fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain),
+		TokenURL:     tokenURL,
 		EndpointParams: url.Values{
-			"resource": []string{"https://manage.office.com"},
+			"resource": []string{resourceScope},
 		},
 	}
 
