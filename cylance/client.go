@@ -57,66 +57,6 @@ type CylanceAdapter struct {
 	refreshFailLimitMet bool
 }
 
-type CylanceResponse interface {
-	GetDict() []utils.Dict
-	HasNextPage() bool
-	SetMeta(ObjectSource string, ObjectType string)
-}
-
-type CylanceEventsResponse struct {
-	PageItems          []utils.Dict `json:"page_items"`
-	PageSize           int64        `json:"page_size"`
-	TotalPages         int64        `json:"total_pages"`
-	TotalNumberOfItems int64        `json:"total_number_of_items"`
-	PageNumber         int64        `json:"page_number"`
-}
-
-func (r CylanceEventsResponse) GetDict() []utils.Dict {
-	return r.PageItems
-}
-
-func (r CylanceEventsResponse) HasNextPage() bool {
-	return !(r.PageNumber >= r.TotalPages)
-}
-
-func (r *CylanceEventsResponse) SetMeta(ObjectSource string, ObjectType string) {
-	for _, item := range r.PageItems {
-		if val, exists := item["ObjectSource"]; !exists || val == nil {
-			// set a default—or compute it however you like
-			item["ObjectSource"] = ObjectSource
-		}
-		if val, exists := item["ObjectType"]; !exists || val == nil {
-			// set a default—or compute it however you like
-			item["ObjectType"] = ObjectType
-		}
-	}
-}
-
-type CylanceEventResponse struct {
-	Event []utils.Dict
-}
-
-func (r CylanceEventResponse) GetDict() []utils.Dict {
-	return r.Event
-}
-
-func (r CylanceEventResponse) HasNextPage() bool {
-	return false
-}
-
-func (r *CylanceEventResponse) SetMeta(ObjectSource string, ObjectType string) {
-	for _, item := range r.Event {
-		if val, exists := item["ObjectSource"]; !exists || val == nil {
-			// set a default—or compute it however you like
-			item["ObjectSource"] = ObjectSource
-		}
-		if val, exists := item["ObjectType"]; !exists || val == nil {
-			// set a default—or compute it however you like
-			item["ObjectType"] = ObjectType
-		}
-	}
-}
-
 func NewCylanceAdapter(conf CylanceConfig) (*CylanceAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
@@ -193,18 +133,6 @@ func (a *CylanceAdapter) Close() error {
 	return err2
 }
 
-type Api struct {
-	key                string
-	objectType         string
-	endpoint           string
-	idField            string
-	timeField          string
-	startFilterField   string
-	returnedTimeFormat string
-	detailFn           func(ctx context.Context, id string) (CylanceResponse, error)
-	dedupe             map[string]int64
-}
-
 func (a *CylanceAdapter) fetchEvents() {
 	since := map[string]time.Time{
 		"detections":        time.Now().Add(-1 * queryInterval * time.Minute),
@@ -231,9 +159,9 @@ func (a *CylanceAdapter) fetchEvents() {
 			objectType:         "Threat",
 			endpoint:           threatsEndpoint,
 			idField:            "sha256",
-			timeField:          "dateDetected",
+			timeField:          "last_found",
 			startFilterField:   "start_time",
-			returnedTimeFormat: time.RFC3339,
+			returnedTimeFormat: "2006-01-02T15:04:05",
 			detailFn: func(ctx context.Context, id string) (CylanceResponse, error) {
 				return a.requestThreatDetails(ctx, id)
 			},
@@ -302,7 +230,6 @@ func (a *CylanceAdapter) fetchEvents() {
 			}
 
 			if len(allItems) > 0 {
-				a.conf.ClientOptions.DebugLog(fmt.Sprintf("All Items: %#v", allItems))
 				a.submitEvents(allItems)
 			}
 
@@ -313,6 +240,78 @@ func (a *CylanceAdapter) fetchEvents() {
 			}
 		}
 	}
+}
+
+type CylanceResponse interface {
+	GetDict() []utils.Dict
+	HasNextPage() bool
+	SetMeta(ObjectSource string, ObjectType string)
+}
+
+type CylanceEventsResponse struct {
+	PageItems          []utils.Dict `json:"page_items"`
+	PageSize           int64        `json:"page_size"`
+	TotalPages         int64        `json:"total_pages"`
+	TotalNumberOfItems int64        `json:"total_number_of_items"`
+	PageNumber         int64        `json:"page_number"`
+}
+
+func (r CylanceEventsResponse) GetDict() []utils.Dict {
+	return r.PageItems
+}
+
+func (r CylanceEventsResponse) HasNextPage() bool {
+	return !(r.PageNumber >= r.TotalPages)
+}
+
+func (r *CylanceEventsResponse) SetMeta(ObjectSource string, ObjectType string) {
+	for _, item := range r.PageItems {
+		if val, exists := item["ObjectSource"]; !exists || val == nil {
+			// set a default—or compute it however you like
+			item["ObjectSource"] = ObjectSource
+		}
+		if val, exists := item["ObjectType"]; !exists || val == nil {
+			// set a default—or compute it however you like
+			item["ObjectType"] = ObjectType
+		}
+	}
+}
+
+type CylanceEventResponse struct {
+	Event []utils.Dict
+}
+
+func (r CylanceEventResponse) GetDict() []utils.Dict {
+	return r.Event
+}
+
+func (r CylanceEventResponse) HasNextPage() bool {
+	return false
+}
+
+func (r *CylanceEventResponse) SetMeta(ObjectSource string, ObjectType string) {
+	for _, item := range r.Event {
+		if val, exists := item["ObjectSource"]; !exists || val == nil {
+			// set a default—or compute it however you like
+			item["ObjectSource"] = ObjectSource
+		}
+		if val, exists := item["ObjectType"]; !exists || val == nil {
+			// set a default—or compute it however you like
+			item["ObjectType"] = ObjectType
+		}
+	}
+}
+
+type Api struct {
+	key                string
+	objectType         string
+	endpoint           string
+	idField            string
+	timeField          string
+	startFilterField   string
+	returnedTimeFormat string
+	detailFn           func(ctx context.Context, id string) (CylanceResponse, error)
+	dedupe             map[string]int64
 }
 
 func (a *CylanceAdapter) getToken(ctx context.Context) (string, error) {
@@ -342,23 +341,6 @@ func (a *CylanceAdapter) tokenError(errorMessage string, refreshFails int, sleep
 		return refreshFails
 	}
 	return refreshFails
-}
-
-func getJWTExpiration(tokenString string) (time.Time, error) {
-	var expirationTime time.Time
-	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
-	if err != nil {
-		return time.Time{}, fmt.Errorf("failed to parse token: %v", err)
-	}
-
-	if claims, ok := token.Claims.(jwt.MapClaims); ok {
-		if exp, ok := claims["exp"].(float64); ok {
-			expirationTime = time.Unix(int64(exp), 0).UTC()
-		} else {
-			return time.Time{}, fmt.Errorf("exp claim not found or invalid")
-		}
-	}
-	return expirationTime, nil
 }
 
 func (a *CylanceAdapter) refreshToken(ctx context.Context) error {
@@ -540,8 +522,6 @@ func (a *CylanceAdapter) doWithRetry(ctx context.Context, url string, apiName st
 			return nil, fmt.Errorf("cylance %s api non-200: %dnRESPONSE %s", apiName, status, string(respBody))
 		}
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%v: ", string(respBody)))
-
 		if eventResponse, ok := responseType.(*CylanceEventResponse); ok {
 			var singleEvent utils.Dict
 			err = json.Unmarshal(respBody, &singleEvent)
@@ -579,7 +559,6 @@ func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, a
 
 	for {
 		url := fmt.Sprintf("%s?page=%d&page_size=%d&%s=%s", pageUrl, page, pageSize, api.startFilterField, lastDetectionTime.UTC().Format(api.returnedTimeFormat))
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
 
 		response, err := a.doWithRetry(ctx, url, api.key, &CylanceEventsResponse{})
 		if err != nil {
@@ -628,20 +607,34 @@ func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, a
 
 func (a *CylanceAdapter) requestDetectionDetails(ctx context.Context, detectionId string) (CylanceResponse, error) {
 	url := fmt.Sprintf("%s%s/%s/details", a.conf.LoggingBaseURL, detectionsEndpoint, detectionId)
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
 	return a.doWithRetry(ctx, url, "detect", &CylanceEventResponse{})
 }
 
 func (a *CylanceAdapter) requestThreatDetails(ctx context.Context, sha256 string) (CylanceResponse, error) {
 	url := fmt.Sprintf("%s%s/%s", a.conf.LoggingBaseURL, threatsEndpoint, sha256)
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
 	return a.doWithRetry(ctx, url, "threat", &CylanceEventResponse{})
 }
 
 func (a *CylanceAdapter) requestMemoryProtectionDetails(ctx context.Context, memoryProtectionId string) (CylanceResponse, error) {
 	url := fmt.Sprintf("%s%s/%s", a.conf.LoggingBaseURL, memoryProtectionEndpoint, memoryProtectionId)
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
 	return a.doWithRetry(ctx, url, "memoryProtection", &CylanceEventResponse{})
+}
+
+func getJWTExpiration(tokenString string) (time.Time, error) {
+	var expirationTime time.Time
+	token, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{})
+	if err != nil {
+		return time.Time{}, fmt.Errorf("failed to parse token: %v", err)
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok {
+		if exp, ok := claims["exp"].(float64); ok {
+			expirationTime = time.Unix(int64(exp), 0).UTC()
+		} else {
+			return time.Time{}, fmt.Errorf("exp claim not found or invalid")
+		}
+	}
+	return expirationTime, nil
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {
