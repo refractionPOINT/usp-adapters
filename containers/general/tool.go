@@ -38,6 +38,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
+	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/sentinelone"
@@ -446,6 +447,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.PandaDoc
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
+	} else if method == "proofpoint_tap" {
+		configs.ProofpointTap.ClientOptions = applyLogging(configs.ProofpointTap.ClientOptions)
+		configs.ProofpointTap.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.ProofpointTap
+		client, chRunning, err = usp_proofpoint_tap.NewProofpointTapAdapter(configs.ProofpointTap)
 	} else if method == "box" {
 		configs.Box.ClientOptions = applyLogging(configs.Box.ClientOptions)
 		configs.Box.ClientOptions.Architecture = "usp_adapter"

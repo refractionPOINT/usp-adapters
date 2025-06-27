@@ -25,6 +25,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
+	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/sentinelone"
@@ -76,6 +77,7 @@ type GeneralConfigs struct {
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
+	ProofpointTap     usp_proofpoint_tap.ProofpointTapConfig          `json:"proofpoint_tap" yaml:"proofpoint_tap"`
 	Box               usp_box.BoxConfig                               `json:"box" yaml:"box"`
 	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
