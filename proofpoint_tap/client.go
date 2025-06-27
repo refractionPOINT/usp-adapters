@@ -204,7 +204,7 @@ func (a *ProofpointTapAdapter) makeOneRequest(since time.Time) ([]utils.Dict, ti
 		}
 
 		a.messageDedupe[guid] = time.Now().Unix()
-		event["eventType"] = "Message Delivered"
+		event["eventType"] = "message_delivered"
 		newItems = append(newItems, event)
 	}
 
