@@ -250,7 +250,7 @@ func (a *ProofpointTapAdapter) makeOneRequest(since time.Time) ([]utils.Dict, ti
 		}
 
 		a.clickDedupe[id] = time.Now().Unix()
-		event["eventType"] = "Click Blocked"
+		event["eventType"] = "click_blocked"
 		newItems = append(newItems, event)
 	}
 
