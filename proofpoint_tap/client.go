@@ -216,7 +216,7 @@ func (a *ProofpointTapAdapter) makeOneRequest(since time.Time) ([]utils.Dict, ti
 		}
 
 		a.messageDedupe[guid] = time.Now().Unix()
-		event["eventType"] = "Message Blocked"
+		event["eventType"] = "message_blocked"
 		newItems = append(newItems, event)
 	}
 
