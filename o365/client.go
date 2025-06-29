@@ -329,13 +329,26 @@ func (a *Office365Adapter) updateBearerToken() error {
 		resourceScope = "https://manage.office.com"
 	}
 
-	conf := &clientcredentials.Config{
-		ClientID:     a.conf.ClientID,
-		ClientSecret: a.conf.ClientSecret,
-		TokenURL:     tokenURL,
-		EndpointParams: url.Values{
-			"resource": []string{resourceScope},
-		},
+	var conf *clientcredentials.Config
+	
+	// GCC High and DoD use v2.0 endpoints which require 'scope' parameter instead of 'resource'
+	if a.endpointType == "gcc-high-gov" || a.endpointType == "dod-gov" {
+		conf = &clientcredentials.Config{
+			ClientID:     a.conf.ClientID,
+			ClientSecret: a.conf.ClientSecret,
+			TokenURL:     tokenURL,
+			Scopes:       []string{resourceScope + "/.default"},
+		}
+	} else {
+		// Enterprise and regular GCC use v1.0 endpoints with 'resource' parameter
+		conf = &clientcredentials.Config{
+			ClientID:     a.conf.ClientID,
+			ClientSecret: a.conf.ClientSecret,
+			TokenURL:     tokenURL,
+			EndpointParams: url.Values{
+				"resource": []string{resourceScope},
+			},
+		}
 	}
 
 	a.httpClient = conf.Client(context.Background())
