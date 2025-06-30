@@ -269,8 +269,6 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		return nil, since, "", fmt.Errorf("error reading response: %v", err)
 	}
 
-	fmt.Printf("response: %s\n", string(body))
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, since, "", fmt.Errorf("error response from Wiz API (%d): %s", resp.StatusCode, string(body))
 	}
