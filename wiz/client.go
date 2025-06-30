@@ -26,7 +26,9 @@ type WizAdapter struct {
 	wgSenders sync.WaitGroup
 	doStop    *utils.Event
 
-	ctx context.Context
+	ctx         context.Context
+	accessToken string
+	expiresAt   time.Time
 }
 
 type WizConfig struct {
@@ -122,10 +124,15 @@ func (a *WizAdapter) Close() error {
 }
 
 func (a *WizAdapter) fetchToken() (string, error) {
+
+	if a.accessToken != "" && time.Until(a.expiresAt) > time.Minute {
+		return a.accessToken, nil
+	}
+
 	a.conf.ClientOptions.DebugLog("fetching token")
 
 	url := "https://auth.app.wiz.io/oauth/token"
-	payload := fmt.Sprintf("grant_type=client_credentials&client_id=%s&client_secret=%s&audience=beyond-api",
+	payload := fmt.Sprintf("grant_type=client_credentials&client_id=%s&client_secret=%s&audience=wiz-api",
 		a.conf.ClientID,
 		a.conf.ClientSecret)
 
@@ -153,6 +160,11 @@ func (a *WizAdapter) fetchToken() (string, error) {
 	}
 
 	if accessToken, ok := result["access_token"].(string); ok {
+		if expiresIn, ok := result["expires_in"].(float64); ok {
+			expiresIn := time.Duration(expiresIn) * time.Second
+			a.expiresAt = time.Now().Add(time.Duration(expiresIn))
+		}
+		a.accessToken = accessToken
 		return accessToken, nil
 	}
 
@@ -211,12 +223,12 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 	}
 
 	// Add time filter to variables
-	if timeFilter, ok := variables["filter"].(map[string]interface{}); ok {
+	if timeFilter, ok := variables["filterBy"].(map[string]interface{}); ok {
 		timeFilter[a.conf.TimeField] = map[string]string{
 			"after": since,
 		}
 	} else {
-		variables["filter"] = map[string]interface{}{
+		variables["filterBy"] = map[string]interface{}{
 			a.conf.TimeField: map[string]string{
 				"after": since,
 			},
@@ -257,8 +269,6 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		return nil, since, "", fmt.Errorf("error reading response: %v", err)
 	}
 
-	fmt.Printf("response: %s\n", string(body))
-
 	if resp.StatusCode != http.StatusOK {
 		return nil, since, "", fmt.Errorf("error response from Wiz API (%d): %s", resp.StatusCode, string(body))
 	}
@@ -280,7 +290,7 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 				return nil, since, "", fmt.Errorf("expected array at path %s, got %T", path, current[path])
 			}
 
-			for _, item := range items {
+			for i, item := range items {
 				itemMap, ok := item.(map[string]interface{})
 				if !ok {
 					continue
@@ -291,17 +301,30 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 					continue
 				}
 
-				if id != lastEventId {
-					timeValue, ok := itemMap[a.conf.TimeField].(string)
-					if !ok {
-						continue
-					}
-
-					lastDetectionTime = timeValue
-					alerts = append(alerts, itemMap)
-					eventId = id
+				if id == lastEventId {
+					break
 				}
+
+				timeValue, ok := itemMap[a.conf.TimeField].(string)
+				if !ok {
+					continue
+				}
+
+				if i == 0 {
+					lastDetectionTime = timeValue
+				}
+
+				alerts = append(alerts, itemMap)
+				eventId = id
 			}
+
+			if lastDetectionTime == "" {
+				lastDetectionTime = since
+			}
+			if eventId == "" {
+				eventId = lastEventId
+			}
+
 			return alerts, lastDetectionTime, eventId, nil
 		}
 
