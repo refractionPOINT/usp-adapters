@@ -26,6 +26,7 @@ const (
 )
 
 func TestEngine(t *testing.T) {
+	os.RemoveAll(testDir)
 	if err := os.Mkdir(testDir, 0755); err != nil {
 		t.Fatal(err)
 	}

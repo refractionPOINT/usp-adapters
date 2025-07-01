@@ -18,7 +18,9 @@ import (
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
+	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
@@ -36,6 +38,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
+	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/sentinelone"
@@ -360,6 +363,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.Cato.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Cato
 		client, chRunning, err = usp_cato.NewCatoAdapter(configs.Cato)
+	} else if method == "cylance" {
+		configs.Cylance.ClientOptions = applyLogging(configs.Cylance.ClientOptions)
+		configs.Cylance.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Cylance
+		client, chRunning, err = usp_cylance.NewCylanceAdapter(configs.Cylance)
 	} else if method == "entraid" {
 		configs.EntraID.ClientOptions = applyLogging(configs.EntraID.ClientOptions)
 		configs.EntraID.ClientOptions.Architecture = "usp_adapter"
@@ -445,6 +453,16 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.PandaDoc
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
+	} else if method == "proofpoint_tap" {
+		configs.ProofpointTap.ClientOptions = applyLogging(configs.ProofpointTap.ClientOptions)
+		configs.ProofpointTap.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.ProofpointTap
+		client, chRunning, err = usp_proofpoint_tap.NewProofpointTapAdapter(configs.ProofpointTap)
+	} else if method == "box" {
+		configs.Box.ClientOptions = applyLogging(configs.Box.ClientOptions)
+		configs.Box.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Box
+		client, chRunning, err = usp_box.NewBoxAdapter(configs.Box)
 	} else if method == "sublime" {
 		configs.Sublime.ClientOptions = applyLogging(configs.Sublime.ClientOptions)
 		configs.Sublime.ClientOptions.Architecture = "usp_adapter"
