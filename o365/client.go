@@ -308,7 +308,7 @@ func (a *Office365Adapter) updateBearerToken() error {
 	// This is critical for government clouds to avoid "Confidential Client is not supported in Cross Cloud request" errors
 	// Reference: https://docs.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure#guidance-for-developers
 	var tokenURL, resourceScope string
-	
+
 	if a.endpointType == "custom" {
 		// For custom endpoints, default to enterprise settings
 		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
@@ -330,7 +330,7 @@ func (a *Office365Adapter) updateBearerToken() error {
 	}
 
 	var conf *clientcredentials.Config
-	
+
 	// GCC High and DoD use v2.0 endpoints which require 'scope' parameter instead of 'resource'
 	if a.endpointType == "gcc-high-gov" || a.endpointType == "dod-gov" {
 		conf = &clientcredentials.Config{
