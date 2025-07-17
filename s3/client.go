@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -20,6 +23,38 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
+
+// connResetRetryer extends the default AWS SDK retryer so that
+// transient transport errors like "connection reset by peer"
+// (or the related unexpected EOF that follows an RST) are retried
+// transparently.
+//
+// S3, NAT gateways or load‑balancers will silently drop idle TLS
+// connections. When the SDK tries to reuse that socket it receives
+// an RST on the first read and surfaces a syscall.ECONNRESET which
+// is *not* retried by default in v1 of the AWS SDK.
+// Adding the pattern match here lets us keep the rest of the default
+// exponential‑back‑off semantics intact.
+
+type connResetRetryer struct {
+	client.DefaultRetryer
+}
+
+func (r connResetRetryer) ShouldRetry(req *request.Request) bool {
+	// honour the built‑in rules first
+	if r.DefaultRetryer.ShouldRetry(req) {
+		return true
+	}
+	// fallback: look for TCP‑level resets that are safe to retry
+	if req.Error != nil {
+		msg := req.Error.Error()
+		if strings.Contains(msg, "connection reset by peer") ||
+			strings.Contains(msg, "unexpected EOF") {
+			return true
+		}
+	}
+	return false
+}
 
 const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
@@ -102,9 +137,31 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 
 	a.region = region
 
+	// ---------------------------
+	// HTTP client tuned for S3
+	// ---------------------------
+
+	tr := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 200,
+		// 25 s is comfortably below the ~60 s keep‑alive employed by S3 ELBs
+		// and WAY below the 350 s idle‑flow timeout of NAT Gateways.
+		IdleConnTimeout: 25 * time.Second,
+	}
+
+	httpClient := &http.Client{
+		Transport: tr,
+		// no global timeout – we stream large objects, per‑request
+		// context deadlines should be used instead.
+	}
+
 	a.awsConfig = &aws.Config{
 		Region:      aws.String(region),
 		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
+		HTTPClient:  httpClient,
+		Retryer: connResetRetryer{
+			DefaultRetryer: client.DefaultRetryer{NumMaxRetries: 8},
+		},
 	}
 
 	if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {
