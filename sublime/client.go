@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	logsEndpoint  = "https://platform.sublime.security/v0/audit-log/events"
-	overlapPeriod = 30 * time.Second
-	pageLimit     = 500
+	defaultBaseURL = "https://platform.sublime.security"
+	logsPath       = "/v0/audit-log/events"
+	overlapPeriod  = 30 * time.Second
+	pageLimit      = 500
 )
 
 type SublimeAdapter struct {
@@ -38,6 +39,7 @@ type SublimeAdapter struct {
 type SublimeConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"api_key" yaml:"api_key"`
+	BaseURL       string                  `json:"base_url" yaml:"base_url"`
 }
 
 func (c *SublimeConfig) Validate() error {
@@ -46,6 +48,9 @@ func (c *SublimeConfig) Validate() error {
 	}
 	if c.ApiKey == "" {
 		return errors.New("missing api key")
+	}
+	if c.BaseURL == "" {
+		c.BaseURL = defaultBaseURL
 	}
 	return nil
 }
@@ -99,7 +104,7 @@ func (a *SublimeAdapter) Close() error {
 
 func (a *SublimeAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", logsEndpoint))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s%s events exiting", a.conf.BaseURL, logsPath))
 
 	since := time.Now()
 
@@ -137,7 +142,7 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 	lastDetectionTime := since
 
 	for {
-		url := fmt.Sprintf("%s?limit=%d&offset=%d", logsEndpoint, pageLimit, offset)
+		url := fmt.Sprintf("%s%s?limit=%d&offset=%d", a.conf.BaseURL, logsPath, pageLimit, offset)
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
 
 		req, err := http.NewRequest("GET", url, nil)
