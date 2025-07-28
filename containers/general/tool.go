@@ -51,6 +51,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/wel"
+	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
 
 	"github.com/refractionPOINT/usp-adapters/utils"
@@ -58,7 +59,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/containers/conf"
 	confupdateclient "github.com/refractionPOINT/usp-adapters/containers/general/conf_update_client"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 type USPClient interface {
@@ -146,8 +147,8 @@ func main() {
 
 	method, configsToRun, err := parseConfigs(os.Args[1:])
 	if err != nil {
-		logError("error: %s", err)
 		printUsage()
+		logError("\nerror: %s", err)
 		os.Exit(1)
 	}
 	if len(configsToRun) == 0 {
@@ -332,6 +333,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.Office365.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Office365
 		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
+	} else if method == "wiz" {
+		configs.Wiz.ClientOptions = applyLogging(configs.Wiz.ClientOptions)
+		configs.Wiz.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Wiz
+		client, chRunning, err = usp_wiz.NewWizAdapter(configs.Wiz)
 	} else if method == "wel" {
 		configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
 		configs.Wel.ClientOptions.Architecture = "usp_adapter"
