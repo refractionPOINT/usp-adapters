@@ -10,8 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"reflect"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,19 +36,23 @@ const (
 )
 
 type AbnormalSecurityConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	AccessToken   string                  `json:"access_token" yaml:"access_token"`
-	BaseURL       string                  `json:"base_url" yaml:"base_url"`
+	ClientOptions        uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	AccessToken          string                  `json:"access_token" yaml:"access_token"`
+	BaseURL              string                  `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	MaxConcurrentWorkers int                     `json:"max_concurrent_workers,omitempty" yaml:"max_concurrent_workers,omitempty"`
 }
 
 type AbnormalSecurityAdapter struct {
-	conf       AbnormalSecurityConfig
-	uspClient  *uspclient.Client
-	httpClient *http.Client
-	chStopped  chan struct{}
-	once       sync.Once
-	ctx        context.Context
-	cancel     context.CancelFunc
+	conf        AbnormalSecurityConfig
+	uspClient   *uspclient.Client
+	httpClient  *http.Client
+	chStopped   chan struct{}
+	chFetchLoop chan struct{}
+	chRetry     chan InternalServerErrorRetry
+	closeOnce   sync.Once
+	fetchOnce   sync.Once
+	ctx         context.Context
+	cancel      context.CancelFunc
 
 	fnvHasher                       hash.Hash64
 	abuseCampaignsDedupe            map[string]int64
@@ -74,6 +81,7 @@ func NewAbnormalSecurityAdapter(conf AbnormalSecurityConfig) (*AbnormalSecurityA
 	a.fnvHasher = fnv.New64a()
 
 	rootCtx, cancel := context.WithCancel(context.Background())
+
 	a.ctx = rootCtx
 	a.cancel = cancel
 
@@ -96,6 +104,8 @@ func NewAbnormalSecurityAdapter(conf AbnormalSecurityConfig) (*AbnormalSecurityA
 	}
 
 	a.chStopped = make(chan struct{})
+	a.chFetchLoop = make(chan struct{})
+	a.chRetry = make(chan InternalServerErrorRetry, 1000)
 
 	go a.fetchEvents()
 
@@ -112,17 +122,27 @@ func (c *AbnormalSecurityConfig) Validate() error {
 	if c.BaseURL == "" {
 		c.BaseURL = defaultBaseURL
 	}
+	if c.MaxConcurrentWorkers == 0 {
+		// If unset, default to 10
+		c.MaxConcurrentWorkers = 10
+	}
 	return nil
 }
 
 func (a *AbnormalSecurityAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	var err1, err2 error
-	a.once.Do(func() {
+	a.closeOnce.Do(func() {
 		a.cancel()
+		select {
+		case <-a.chFetchLoop:
+		case <-time.After(10 * time.Second):
+			a.conf.ClientOptions.OnWarning("timeout waiting for fetch loop to exit; proceeding with cleanup")
+		}
 		err1 = a.uspClient.Drain(1 * time.Minute)
 		_, err2 = a.uspClient.Close()
 		a.httpClient.CloseIdleConnections()
+		close(a.chRetry)
 		close(a.chStopped)
 	})
 	if err1 != nil {
@@ -134,6 +154,8 @@ func (a *AbnormalSecurityAdapter) Close() error {
 type AbnormalSecurityReponse interface {
 	GetDicts() []utils.Dict
 	HasNextPage() bool
+	HasID() bool
+	HasTimestamp() bool
 }
 
 type AbnormalSecurityCampaignsResponse struct {
@@ -147,7 +169,15 @@ func (r AbnormalSecurityCampaignsResponse) GetDicts() []utils.Dict {
 }
 
 func (r AbnormalSecurityCampaignsResponse) HasNextPage() bool {
-	return r.NextPageNumber != 0
+	return r.NextPageNumber != 0 && r.NextPageNumber != r.PageNumber
+}
+
+func (r AbnormalSecurityCampaignsResponse) HasID() bool {
+	return true
+}
+
+func (r AbnormalSecurityCampaignsResponse) HasTimestamp() bool {
+	return false
 }
 
 type AbnormalSecurityCampaignsNotAnalyzedResponse struct {
@@ -161,7 +191,15 @@ func (r AbnormalSecurityCampaignsNotAnalyzedResponse) GetDicts() []utils.Dict {
 }
 
 func (r AbnormalSecurityCampaignsNotAnalyzedResponse) HasNextPage() bool {
-	return r.NextPageNumber != 0
+	return r.NextPageNumber != 0 && r.NextPageNumber != r.PageNumber
+}
+
+func (r AbnormalSecurityCampaignsNotAnalyzedResponse) HasID() bool {
+	return true
+}
+
+func (r AbnormalSecurityCampaignsNotAnalyzedResponse) HasTimestamp() bool {
+	return true
 }
 
 type AbnormalSecurityCasesResponse struct {
@@ -175,7 +213,15 @@ func (r AbnormalSecurityCasesResponse) GetDicts() []utils.Dict {
 }
 
 func (r AbnormalSecurityCasesResponse) HasNextPage() bool {
-	return r.NextPageNumber != 0
+	return r.NextPageNumber != 0 && r.NextPageNumber != r.PageNumber
+}
+
+func (r AbnormalSecurityCasesResponse) HasID() bool {
+	return true
+}
+
+func (r AbnormalSecurityCasesResponse) HasTimestamp() bool {
+	return false
 }
 
 type AbnormalSecurityThreatsResponse struct {
@@ -189,7 +235,15 @@ func (r AbnormalSecurityThreatsResponse) GetDicts() []utils.Dict {
 }
 
 func (r AbnormalSecurityThreatsResponse) HasNextPage() bool {
-	return r.NextPageNumber != 0
+	return r.NextPageNumber != 0 && r.NextPageNumber != r.PageNumber
+}
+
+func (r AbnormalSecurityThreatsResponse) HasID() bool {
+	return true
+}
+
+func (r AbnormalSecurityThreatsResponse) HasTimestamp() bool {
+	return false
 }
 
 type AbnormalSecurityAuditLogsResponse struct {
@@ -203,7 +257,15 @@ func (r AbnormalSecurityAuditLogsResponse) GetDicts() []utils.Dict {
 }
 
 func (r AbnormalSecurityAuditLogsResponse) HasNextPage() bool {
-	return r.NextPageNumber != 0
+	return r.NextPageNumber != 0 && r.NextPageNumber != r.PageNumber
+}
+
+func (r AbnormalSecurityAuditLogsResponse) HasID() bool {
+	return false
+}
+
+func (r AbnormalSecurityAuditLogsResponse) HasTimestamp() bool {
+	return true
 }
 
 type AbnormalSecurityVendorCasesResponse struct {
@@ -217,7 +279,15 @@ func (r AbnormalSecurityVendorCasesResponse) GetDicts() []utils.Dict {
 }
 
 func (r AbnormalSecurityVendorCasesResponse) HasNextPage() bool {
-	return r.NextPageNumber != 0
+	return r.NextPageNumber != 0 && r.NextPageNumber != r.PageNumber
+}
+
+func (r AbnormalSecurityVendorCasesResponse) HasID() bool {
+	return true
+}
+
+func (r AbnormalSecurityVendorCasesResponse) HasTimestamp() bool {
+	return false
 }
 
 type AbnormalSecurityFlatSingleResponse struct {
@@ -232,109 +302,245 @@ func (r AbnormalSecurityFlatSingleResponse) HasNextPage() bool {
 	return false
 }
 
+func (r AbnormalSecurityFlatSingleResponse) HasID() bool {
+	return true
+}
+
+func (r AbnormalSecurityFlatSingleResponse) HasTimestamp() bool {
+	return true
+}
+
+type AbnormalSecurityThreatsFlatSingleResponse struct {
+	ThreatId       string       `json:"threatId"`
+	Event          []utils.Dict `json:"messages"`
+	PageNumber     int          `json:"pageNumber"`
+	NextPageNumber int          `json:"nextPageNumber"`
+}
+
+func (r AbnormalSecurityThreatsFlatSingleResponse) GetDicts() []utils.Dict {
+	return r.Event
+}
+
+func (r AbnormalSecurityThreatsFlatSingleResponse) HasNextPage() bool {
+	return false
+}
+
+func (r AbnormalSecurityThreatsFlatSingleResponse) HasID() bool {
+	return true
+}
+
+func (r AbnormalSecurityThreatsFlatSingleResponse) HasTimestamp() bool {
+	return true
+}
+
 type Api struct {
-	key          string
-	endpoint     string
-	idField      string
-	timeField    string
-	dedupe       map[string]int64
-	responseType AbnormalSecurityReponse
-	parameters   []string
-	detailFn     func(ctx context.Context, id string) ([]utils.Dict, error)
+	mu                 sync.Mutex
+	key                string
+	endpoint           string
+	since              time.Time
+	idField            string
+	timeField          string
+	timeFieldSecondary string
+	active             bool
+	dedupe             map[string]int64
+	responseType       AbnormalSecurityReponse
+	parameters         []string
+	detailFn           func(ctx context.Context, id string) ([]utils.Dict, time.Time, error)
+	detailResponseType AbnormalSecurityReponse
+	baseTimestamp      bool
+}
+
+type InternalServerErrorRetry struct {
+	ctx       context.Context
+	pageUrl   string
+	api       *Api
+	details   bool
+	retryTime time.Time
+	attempt   int
 }
 
 func (a *AbnormalSecurityAdapter) fetchEvents() {
-	since := map[string]time.Time{
-		"abuseCampaigns":            time.Now().Add(-1 * queryInterval * time.Second),
-		"abuseCampaignsNotAnalyzed": time.Now().Add(-1 * queryInterval * time.Second),
-		"auditLogs":                 time.Now().Add(-1 * queryInterval * time.Second),
-		"cases":                     time.Now().Add(-1 * queryInterval * time.Second),
-		"threats":                   time.Now().Add(-1 * queryInterval * time.Second),
-		"vendorCases":               time.Now().Add(-1 * queryInterval * time.Second),
-	}
-
 	apis := []Api{
 		{
-			key:          "abuseCampaigns",
-			endpoint:     abuseCampaignsEndpoint,
-			idField:      "campaignId",
-			timeField:    "receivedTime",
-			dedupe:       a.abuseCampaignsDedupe,
-			responseType: &AbnormalSecurityCampaignsResponse{},
-			detailFn: func(ctx context.Context, id string) ([]utils.Dict, error) {
-				response, err := a.doWithRetry(ctx, fmt.Sprintf("%s/%s/%s", a.conf.BaseURL, abuseCampaignsEndpoint, id), "abuseCampaigns", &AbnormalSecurityFlatSingleResponse{})
-				if err != nil {
-					return nil, err
-				}
-				return response.GetDicts(), nil
-			},
+			key:                "abuseCampaigns",
+			endpoint:           abuseCampaignsEndpoint,
+			since:              time.Now().Add(-1 * queryInterval * time.Second),
+			idField:            "campaignId",
+			timeField:          "receivedTime",
+			timeFieldSecondary: "lastReported",
+			active:             true,
+			dedupe:             a.abuseCampaignsDedupe,
+			responseType:       &AbnormalSecurityCampaignsResponse{},
+			detailResponseType: &AbnormalSecurityFlatSingleResponse{},
 		},
 		{
-			key:          "abuseCampaignsNotAnalyzed",
-			endpoint:     abuseCampaignsNotAnalyzedEndpoint,
-			idField:      "abx_message_id",
-			timeField:    "reported_datetime",
-			dedupe:       a.abuseCampaignsNotAnalyzedDedupe,
-			responseType: &AbnormalSecurityCampaignsNotAnalyzedResponse{},
-			parameters:   []string{"start"},
-			detailFn:     nil,
+			key:                "cases",
+			endpoint:           casesEndpoint,
+			since:              time.Now().Add(-1 * queryInterval * time.Second),
+			idField:            "caseId",
+			timeField:          "lastModifiedTime",
+			timeFieldSecondary: "customerVisibleTime",
+			active:             true,
+			dedupe:             a.casesDedupe,
+			responseType:       &AbnormalSecurityCasesResponse{},
+			detailResponseType: &AbnormalSecurityFlatSingleResponse{},
 		},
 		{
-			key:          "auditLogs",
-			endpoint:     auditLogsEndpoint,
-			idField:      "",
-			timeField:    "timestamp",
-			dedupe:       a.auditLogsDedupe,
-			responseType: &AbnormalSecurityAuditLogsResponse{},
-			detailFn:     nil,
+			key:                "threats",
+			endpoint:           threatsEndpoint,
+			since:              time.Now().Add(-1 * queryInterval * time.Second),
+			idField:            "threatId",
+			timeField:          "receivedTime",
+			active:             true,
+			dedupe:             a.threatsDedupe,
+			responseType:       &AbnormalSecurityThreatsResponse{},
+			detailResponseType: &AbnormalSecurityThreatsFlatSingleResponse{},
 		},
 		{
-			key:          "cases",
-			endpoint:     casesEndpoint,
-			idField:      "caseId",
-			timeField:    "lastModifiedTime",
-			dedupe:       a.casesDedupe,
-			responseType: &AbnormalSecurityCasesResponse{},
-			detailFn: func(ctx context.Context, id string) ([]utils.Dict, error) {
-				response, err := a.doWithRetry(ctx, fmt.Sprintf("%s/%s/%s", a.conf.BaseURL, casesEndpoint, id), "cases", &AbnormalSecurityFlatSingleResponse{})
-				if err != nil {
-					return nil, err
-				}
-				return response.GetDicts(), nil
-			},
+			key:                "vendorCases",
+			endpoint:           vendorCasesEndpoint,
+			since:              time.Now().Add(-1 * queryInterval * time.Second),
+			idField:            "vendorCaseId",
+			timeField:          "lastModifiedTime",
+			active:             true,
+			dedupe:             a.vendorCasesDedupe,
+			responseType:       &AbnormalSecurityVendorCasesResponse{},
+			detailResponseType: &AbnormalSecurityFlatSingleResponse{},
 		},
 		{
-			key:          "threats",
-			endpoint:     threatsEndpoint,
-			idField:      "threatId",
-			timeField:    "receivedTime",
-			dedupe:       a.threatsDedupe,
-			responseType: &AbnormalSecurityThreatsResponse{},
-			detailFn: func(ctx context.Context, id string) ([]utils.Dict, error) {
-				response, err := a.doWithRetry(ctx, fmt.Sprintf("%s/%s/%s", a.conf.BaseURL, threatsEndpoint, id), "threats", &AbnormalSecurityFlatSingleResponse{})
-				if err != nil {
-					return nil, err
-				}
-				return response.GetDicts(), nil
-			},
+			key:           "abuseCampaignsNotAnalyzed",
+			endpoint:      abuseCampaignsNotAnalyzedEndpoint,
+			since:         time.Now().Add(-1 * queryInterval * time.Second),
+			idField:       "abx_message_id",
+			timeField:     "reported_datetime",
+			active:        true,
+			dedupe:        a.abuseCampaignsNotAnalyzedDedupe,
+			responseType:  &AbnormalSecurityCampaignsNotAnalyzedResponse{},
+			parameters:    []string{"start"},
+			baseTimestamp: true,
 		},
 		{
-			key:          "vendorCases",
-			endpoint:     vendorCasesEndpoint,
-			idField:      "vendorCaseId",
-			timeField:    "lastModifiedTime",
-			dedupe:       a.vendorCasesDedupe,
-			responseType: &AbnormalSecurityVendorCasesResponse{},
-			detailFn: func(ctx context.Context, id string) ([]utils.Dict, error) {
-				response, err := a.doWithRetry(ctx, fmt.Sprintf("%s/%s/%s", a.conf.BaseURL, vendorCasesEndpoint, id), "vendorCases", &AbnormalSecurityFlatSingleResponse{})
-				if err != nil {
-					return nil, err
-				}
-				return response.GetDicts(), nil
-			},
+			key:           "auditLogs",
+			endpoint:      auditLogsEndpoint,
+			since:         time.Now().Add(-1 * queryInterval * time.Second),
+			idField:       "",
+			timeField:     "timestamp",
+			active:        true,
+			dedupe:        a.auditLogsDedupe,
+			responseType:  &AbnormalSecurityAuditLogsResponse{},
+			baseTimestamp: true,
 		},
 	}
 
+	// Each Api struct needs to be self referencial for the detailFn (if applied)
+	// Because of this, the detailFn needs to be set after initialization.
+	apis[0].detailFn = func(ctx context.Context, id string) ([]utils.Dict, time.Time, error) {
+		newEvents, newSince, err := a.getEvents(ctx, fmt.Sprintf("%s%s/%s", a.conf.BaseURL, abuseCampaignsEndpoint, id), &apis[0], true)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		return newEvents, newSince, err
+	}
+	apis[1].detailFn = func(ctx context.Context, id string) ([]utils.Dict, time.Time, error) {
+		newEvents, newSince, err := a.getEvents(ctx, fmt.Sprintf("%s%s/%s", a.conf.BaseURL, casesEndpoint, id), &apis[1], true)
+		if err != nil {
+			return nil, newSince, err
+		}
+		return newEvents, time.Time{}, err
+	}
+	apis[2].detailFn = func(ctx context.Context, id string) ([]utils.Dict, time.Time, error) {
+		newEvents, newSince, err := a.getEvents(ctx, fmt.Sprintf("%s%s/%s", a.conf.BaseURL, threatsEndpoint, id), &apis[2], true)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		return newEvents, newSince, err
+	}
+	apis[3].detailFn = func(ctx context.Context, id string) ([]utils.Dict, time.Time, error) {
+		newEvents, newSince, err := a.getEvents(ctx, fmt.Sprintf("%s%s/%s", a.conf.BaseURL, vendorCasesEndpoint, id), &apis[3], true)
+		if err != nil {
+			return nil, time.Time{}, err
+		}
+		return newEvents, newSince, err
+	}
+
+	pApis := make([]*Api, len(apis))
+	for i := range apis {
+		pApis[i] = &apis[i]
+	}
+
+	go func() {
+		retryCheck := 30 * time.Second
+		ticker := time.NewTicker(retryCheck)
+		defer ticker.Stop()
+
+		retryManager := []InternalServerErrorRetry{}
+
+		for {
+			select {
+			case <-a.ctx.Done():
+				if len(retryManager) > 0 {
+					a.conf.ClientOptions.DebugLog(fmt.Sprintf("retryManager abandoned %d retries", len(retryManager)))
+				}
+				return
+			case newRetry := <-a.chRetry:
+				switch newRetry.attempt {
+				case 1:
+					newRetry.retryTime = time.Now().Add(1 * time.Minute)
+				case 2:
+					newRetry.retryTime = time.Now().Add(5 * time.Minute)
+				case 3:
+					newRetry.retryTime = time.Now().Add(10 * time.Minute)
+				}
+				retryManager = append(retryManager, newRetry)
+			case <-ticker.C:
+				for i := len(retryManager) - 1; i >= 0; i-- {
+					if time.Now().After(retryManager[i].retryTime) {
+						retry := retryManager[i]
+						retryManager = slices.Delete(retryManager, i, i+1)
+
+						items, _, err := a.getEvents(retry.ctx, retry.pageUrl, retry.api, retry.details)
+						if err != nil {
+							if retry.attempt >= 3 {
+								a.conf.ClientOptions.OnError(fmt.Errorf("retry abandoned after 3 attempts for %s: %w", retry.pageUrl, err))
+							} else {
+								retry.attempt++
+								a.chRetry <- retry
+							}
+						}
+						if len(items) > 0 {
+							a.submitEvents(items)
+						}
+					}
+				}
+			}
+		}
+	}()
+
+	a.RunFetchLoop(pApis)
+}
+
+func (a *AbnormalSecurityAdapter) shouldShutdown(apis []*Api) bool {
+	// If no APIs are active due to 'Forbidden' messages, shutdown
+	for _, api := range apis {
+		if api.active {
+			return false
+		}
+	}
+	a.conf.ClientOptions.OnWarning("all apis are disabled due to forbidden messages. shutting down")
+	return true
+}
+
+// Returned results from fetch routines
+type routineResult struct {
+	key   string
+	items []utils.Dict
+	err   error
+}
+
+func (a *AbnormalSecurityAdapter) RunFetchLoop(apis []*Api) {
+	cycleSem := make(chan struct{}, 1)
+	shipperSem := make(chan struct{}, 2)
+	workerSem := make(chan struct{}, a.conf.MaxConcurrentWorkers)
 	ticker := time.NewTicker(queryInterval * time.Second)
 	defer ticker.Stop()
 
@@ -342,101 +548,346 @@ func (a *AbnormalSecurityAdapter) fetchEvents() {
 		select {
 		case <-a.ctx.Done():
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.conf.BaseURL))
-		case <-ticker.C:
 
-			allItems := []utils.Dict{}
-
-			for _, api := range apis {
-				pageURL := fmt.Sprintf("%s%s", a.conf.BaseURL, api.endpoint)
-				items, newSince, err := a.getEvents(a.ctx, pageURL, api, since[api.key])
-				if err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", api.key, err))
-					continue
-				}
-				since[api.key] = newSince
-				allItems = append(allItems, items...)
-
-				if api.detailFn != nil {
-					for _, event := range items {
-						rawID, ok := event[api.idField]
-						if !ok {
-							a.conf.ClientOptions.OnWarning(fmt.Sprintf("no %s field on %s event: %v", api.idField, api.key, event))
-							continue
-						}
-						id, ok := rawID.(string)
-						if !ok {
-							a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s field is not a string on %s event: %v", api.idField, api.key, event))
-							continue
-						}
-						response, err := api.detailFn(a.ctx, id)
-						if err != nil {
-							a.conf.ClientOptions.OnError(fmt.Errorf("%s details fetch failed: %w", api.key, err))
-							continue
-						}
-						allItems = append(allItems, response...)
-					}
-				}
+			// Wait for any ongoing cycle to complete with timeout
+			select {
+			case cycleSem <- struct{}{}:
+				// No cycle in progress, safe to exit
+				<-cycleSem
+			case <-time.After(30 * time.Second):
+				a.conf.ClientOptions.OnWarning("timeout waiting for fetch cycle to complete during shutdown")
 			}
 
-			if len(allItems) > 0 {
-				a.submitEvents(allItems)
+			// Fetch loop isn't running, safe to close
+			a.fetchOnce.Do(func() { close(a.chFetchLoop) })
+			return
+		case <-ticker.C:
+			select {
+			case cycleSem <- struct{}{}:
+				go func() {
+					// Hold cycle semaphore until cycle completes
+					defer func() { <-cycleSem }()
+
+					// If no APIs are active due to forbidden messages, shutdown
+					if a.shouldShutdown(apis) {
+						// acknowledge fetch loop isn't running
+						a.Close()
+						return
+					}
+
+					// Communication channel to send results to shipper routine
+					shipCh := make(chan []utils.Dict)
+					// Used to flag when the shipper routine is done.
+					shipDone := make(chan struct{})
+
+					// shipper routine
+					go func() {
+						var shipperWg sync.WaitGroup
+						var mu sync.Mutex
+
+						count := 0
+
+						defer func() {
+							a.conf.ClientOptions.DebugLog(fmt.Sprintf("shipped %d events", count))
+							close(shipDone)
+						}()
+
+						// shipper routine will run until shipCh closes
+						for events := range shipCh {
+							eventsCopy := events
+							// Consume a slot when spinning up a shipper routine
+							shipperSem <- struct{}{}
+							shipperWg.Add(1)
+							go func(events []utils.Dict) {
+								// Release a slot when done shipping
+								// Decrement shipperWg
+								defer func() {
+									<-shipperSem
+									shipperWg.Done()
+								}()
+								mu.Lock()
+								count += len(events)
+								mu.Unlock()
+								a.submitEvents(events)
+							}(eventsCopy)
+
+						}
+						shipperWg.Wait()
+					}()
+
+					// Channel for returning fetch data and checking for errors
+					resultCh := make(chan routineResult)
+
+					var wg sync.WaitGroup
+
+					// fetchApi routines
+					for i := range apis {
+						// Check if signal to close has been sent before starting any fetches
+						select {
+						case <-a.ctx.Done():
+							return
+						default:
+						}
+						// If the current api is disabled due to forbidden message, skip
+						if !(apis[i].active) {
+							continue
+						}
+						workerSem <- struct{}{}
+						wg.Add(1)
+						go func(api *Api) {
+							defer func() {
+								<-workerSem
+								wg.Done()
+							}()
+							a.fetchApi(api, resultCh, workerSem, &wg)
+						}(apis[i])
+					}
+
+					go func() {
+						wg.Wait()
+						// Wait until all fetch goroutines are done to close the channel
+						close(resultCh)
+					}()
+
+					// Blocking while fetchApi routines collect events
+					// Events are passed off as they come in to the shipper routine
+					for res := range resultCh {
+						if res.err != nil {
+							a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", res.key, res.err))
+							continue
+						}
+						shipCh <- res.items
+					}
+
+					// resultCh has closed, meaning all events have been pooled for shipping
+					close(shipCh)
+
+					// Wait until shipping is done
+					<-shipDone
+				}()
+			default:
+				a.conf.ClientOptions.OnWarning("previous fetch cycle is still in progress, skipping this cycle")
 			}
 		}
 	}
 }
 
-func (a *AbnormalSecurityAdapter) getEvents(ctx context.Context, pageUrl string, api Api, since time.Time) ([]utils.Dict, time.Time, error) {
+func (a *AbnormalSecurityAdapter) fetchApi(api *Api, resultCh chan<- routineResult, workerSem chan struct{}, wg *sync.WaitGroup) {
+	fetchCtx, cancelFetch := context.WithCancel(a.ctx)
+	defer cancelFetch()
+
+	toReturn := []utils.Dict{}
+	pageURL := fmt.Sprintf("%s%s", a.conf.BaseURL, api.endpoint)
+	// Check for a close signal
+	select {
+	case <-fetchCtx.Done():
+		return
+	default:
+	}
+
+	items, newSince, err := a.getEvents(a.ctx, pageURL, api, false)
+
+	if newSince.After(api.since) {
+		api.mu.Lock()
+		api.since = newSince
+		api.mu.Unlock()
+	}
+
+	if err != nil {
+		resultCh <- routineResult{api.key, nil, err}
+		return
+	}
+
+	// Append events to return -- ommitting non-event data
+	for _, item := range items {
+		if _, ok := item[api.timeField]; ok {
+			toReturn = append(toReturn, item)
+		}
+	}
+
+	if len(toReturn) > 0 {
+		resultCh <- routineResult{api.key, toReturn, nil}
+	}
+
+	// If non-event data was returned, use it to pull the events
+	if api.detailFn != nil {
+		type detailRoutineResult struct {
+			detailItems []utils.Dict
+			newSince    time.Time
+			err         error
+		}
+		var mu sync.Mutex
+		var latestTimeStamp time.Time
+		detailResult := make(chan detailRoutineResult)
+
+		go func(latestTimeStamp *time.Time) {
+			for result := range detailResult {
+				if result.newSince.After(*latestTimeStamp) {
+					mu.Lock()
+					*latestTimeStamp = result.newSince
+					mu.Unlock()
+				}
+				// Because detailFn is sending a request for every specific event,
+				// and because dealing with errors involves waiting and retrying,
+				// we don't want to pool and hold onto all events until we have them all collected
+				resultCh <- routineResult{api.key, result.detailItems, result.err}
+			}
+		}(&latestTimeStamp)
+
+		for _, event := range items {
+			// Check for a close signal
+			select {
+			case <-fetchCtx.Done():
+				return
+			default:
+			}
+			// Get Event ID
+			rawID, ok := event[api.idField]
+			if !ok {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("no %s field on %s event: %v", api.idField, api.key, event))
+				continue
+			}
+			id, ok := rawID.(string)
+			if !ok {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s field is not a string on %s event: %v", api.idField, api.key, event))
+				continue
+			}
+
+			workerSem <- struct{}{}
+			wg.Add(1)
+			go func(id string) {
+				defer func() {
+					<-workerSem
+					wg.Done()
+				}()
+				detailItems, newSince, err := api.detailFn(a.ctx, id)
+				if err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("%s details fetch failed: %w", api.key, err))
+					return
+				}
+				detailResult <- detailRoutineResult{detailItems, newSince, err}
+			}(id)
+		}
+
+		go func() {
+			wg.Wait()
+			close(detailResult)
+		}()
+
+		if latestTimeStamp.After(api.since) {
+			api.mu.Lock()
+			api.since = latestTimeStamp
+			api.mu.Unlock()
+		}
+	}
+}
+
+func (a *AbnormalSecurityAdapter) getEvents(ctx context.Context, pageUrl string, api *Api, details bool) ([]utils.Dict, time.Time, error) {
 	var allItems []utils.Dict
-	lastDetectionTime := since
+	lastDetectionTime := api.since
 	page := 1
 
 	defer func() {
+		api.mu.Lock()
 		for k, v := range api.dedupe {
-			if v < since.Unix() {
+			if v < api.since.Unix() {
 				delete(api.dedupe, k)
 			}
 		}
+		api.mu.Unlock()
 	}()
 
 	if api.parameters == nil {
+		api.mu.Lock()
 		api.parameters = []string{"filter", "pageNumber", "pageSize"}
+		api.mu.Unlock()
 	}
 
 	for {
-		url := fmt.Sprintf("%s%s", pageUrl, "?")
-
-		if slices.Contains(api.parameters, "filter") {
-			url = fmt.Sprintf("%sfilter=%s gte %s", url, api.timeField, lastDetectionTime.UTC().Format(time.RFC3339))
-		} else if slices.Contains(api.parameters, "start") {
-			url = fmt.Sprintf("%sstart=%s", url, lastDetectionTime.UTC().Format(time.RFC3339))
+		select {
+		case <-ctx.Done():
+			return nil, time.Time{}, ctx.Err()
+		default:
 		}
 
-		if slices.Contains(api.parameters, "pageNumber") {
-			url = fmt.Sprintf("%s&pageNumber=%d", url, page)
-		}
-		if slices.Contains(api.parameters, "pageSize") {
-			url = fmt.Sprintf("%s&pageSize=%d", url, pageSize)
-		}
-
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
-
-		response, err := a.doWithRetry(ctx, url, api.key, api.responseType)
+		u, err := url.Parse(pageUrl)
 		if err != nil {
-			return nil, lastDetectionTime, err
+			return nil, time.Time{}, err
+		}
+
+		has := func(p string) bool { return slices.Contains(api.parameters, p) }
+
+		q := u.Query()
+
+		if has("filter") {
+			q.Set("filter", fmt.Sprintf("%s gte %s", api.timeField, lastDetectionTime.UTC().Format(time.RFC3339)))
+		} else if has("start") {
+			q.Set("start", lastDetectionTime.UTC().Format(time.RFC3339))
+		}
+
+		if has("pageNumber") {
+			q.Set("pageNumber", strconv.Itoa(page))
+		}
+		if has("pageSize") {
+			q.Set("pageSize", strconv.Itoa(pageSize))
+		}
+
+		u.RawQuery = q.Encode()
+		url := u.String()
+
+		var response AbnormalSecurityReponse
+		if details {
+			response, err = a.doWithRetry(ctx, url, api, true)
+			if err != nil {
+				return nil, time.Time{}, err
+			}
+		} else {
+			response, err = a.doWithRetry(ctx, url, api, false)
+			if err != nil {
+				return nil, time.Time{}, err
+			}
 		}
 
 		var newItems []utils.Dict
+
 		for _, event := range response.GetDicts() {
 			var id string
-			if event[api.idField] != "" {
-				rawID, ok := event[api.idField].(string)
-				if !ok {
-					a.conf.ClientOptions.OnWarning(fmt.Sprintf("abnormal security %s event contains an id that's not a string: %s", api.key, event))
-					continue
-				} else {
-					id = rawID
+
+			if response.HasID() && event[api.idField] != "" {
+				switch t := event[api.idField].(type) {
+				case string:
+					id = t
+
+				case int:
+					id = strconv.Itoa(t)
+
+				case int32:
+					id = strconv.FormatInt(int64(t), 10)
+
+				case int64:
+					id = strconv.FormatInt(t, 10)
+
+				case uint:
+					id = strconv.FormatUint(uint64(t), 10)
+
+				case uint32:
+					id = strconv.FormatUint(uint64(t), 10)
+
+				case uint64:
+					id = strconv.FormatUint(t, 10)
+
+				case json.Number:
+					if idInt, err := t.Int64(); err == nil {
+						id = strconv.FormatInt(idInt, 10)
+					} else {
+						id = t.String()
+					}
+
+				default:
+					id = fmt.Sprintf("%v", t) // Fallback for anything else
 				}
 			} else {
+				// If the event doesn't have an id, generate an id by hashing the event
 				a.fnvHasher.Reset()
 				b, err := json.Marshal(event)
 				if err != nil {
@@ -449,24 +900,62 @@ func (a *AbnormalSecurityAdapter) getEvents(ctx context.Context, pageUrl string,
 				}
 				id = fmt.Sprintf("%d", a.fnvHasher.Sum64())
 			}
-			timeStr, ok := event[api.timeField].(string)
-			if !ok {
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("abnormal security %s event time not a string: %s", api.key, event))
-				continue
+
+			var parsedTime time.Time
+			var raw any
+			if response.HasTimestamp() {
+				val, ok := event[api.timeField]
+				if ok && val != nil {
+					raw = val
+				} else {
+					val2, ok2 := event[api.timeFieldSecondary]
+					if ok2 && val2 != nil {
+						raw = val2
+					} else {
+						a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api invalid timestamp: %s", api.key, event))
+					}
+				}
+
+				switch t := raw.(type) {
+				case string:
+					iso := strings.ReplaceAll(t, " ", "T")
+					parsedTime, err = time.Parse(time.RFC3339, iso)
+					if err != nil {
+						a.conf.ClientOptions.OnError(fmt.Errorf("bad timestamp %q: %w", t, err))
+					}
+
+				case json.Number:
+					if i, err := t.Int64(); err == nil {
+						parsedTime = time.Unix(i, 0)
+					} else {
+						a.conf.ClientOptions.OnError(fmt.Errorf("bad json.Number %q: %w", t, err))
+					}
+
+				case float64:
+					parsedTime = time.Unix(int64(t), 0)
+
+				case int, int32, int64:
+					parsedTime = time.Unix(reflect.ValueOf(t).Int(), 0)
+
+				default:
+					a.conf.ClientOptions.OnError(fmt.Errorf("unsupported timestamp type %T for %v", t, t))
+				}
 			}
 
+			// We don't want to reprocess if the ID already exists in the dedupe for both reference or event.
 			if _, seen := api.dedupe[id]; !seen {
-				parsedTime, err := time.Parse(time.RFC3339, timeStr)
-				if err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api invalid timestamp: %v", api.key, err))
-					continue
-				}
-				if parsedTime.After(since) {
+				// If a timestamp is not provided, it's a reference to the event
+				// The event will be added to the dedupe after it gets requested
+				if response.HasTimestamp() && (parsedTime != time.Time{}) && parsedTime.After(api.since) {
+					api.mu.Lock()
 					api.dedupe[id] = parsedTime.Unix()
+					api.mu.Unlock()
 					newItems = append(newItems, event)
 					if parsedTime.After(lastDetectionTime) {
 						lastDetectionTime = parsedTime
 					}
+				} else if !response.HasTimestamp() {
+					newItems = append(newItems, event)
 				}
 			}
 		}
@@ -480,10 +969,29 @@ func (a *AbnormalSecurityAdapter) getEvents(ctx context.Context, pageUrl string,
 		page++
 	}
 
+	for i := range allItems {
+		allItems[i]["event-type"] = api.key
+	}
+
 	return allItems, lastDetectionTime, nil
 }
 
-func (a *AbnormalSecurityAdapter) doWithRetry(ctx context.Context, url string, apiName string, responseType AbnormalSecurityReponse) (AbnormalSecurityReponse, error) {
+func (a *AbnormalSecurityAdapter) doWithRetry(ctx context.Context, url string, api *Api, details bool) (AbnormalSecurityReponse, error) {
+	var respType AbnormalSecurityReponse
+	if details {
+		respType = api.detailResponseType
+	} else {
+		respType = api.responseType
+	}
+
+	t := reflect.TypeOf(respType)
+	if t.Kind() != reflect.Ptr {
+		return nil, fmt.Errorf("expected a pointer, got %v", t)
+	}
+
+	v := reflect.New(t.Elem())
+	resp := v.Interface().(AbnormalSecurityReponse)
+
 	for {
 		var respBody []byte
 		var status int
@@ -496,7 +1004,7 @@ func (a *AbnormalSecurityAdapter) doWithRetry(ctx context.Context, url string, a
 
 			req, err := http.NewRequestWithContext(loopCtx, "GET", url, nil)
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api request error: %v", apiName, err))
+				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api request error: %v", api.key, err))
 				return err
 			}
 
@@ -505,7 +1013,7 @@ func (a *AbnormalSecurityAdapter) doWithRetry(ctx context.Context, url string, a
 			resp, err := a.httpClient.Do(req)
 
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api do error: %v", apiName, err))
+				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api do error: %v", api.key, err))
 				return err
 			}
 
@@ -513,7 +1021,7 @@ func (a *AbnormalSecurityAdapter) doWithRetry(ctx context.Context, url string, a
 
 			respBody, err = io.ReadAll(resp.Body)
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api read error: %v", apiName, err))
+				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api read error: %v", api.key, err))
 				return err
 			}
 			status = resp.StatusCode
@@ -560,27 +1068,39 @@ func (a *AbnormalSecurityAdapter) doWithRetry(ctx context.Context, url string, a
 		if status == http.StatusUnauthorized {
 			return nil, errors.New("getEvents got 401 'Unauthorized' response")
 		}
+		if status == http.StatusForbidden {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("due to 'Forbidden' response, the %s api will be deactivated for query", api.key))
+			api.mu.Lock()
+			api.active = false
+			api.mu.Unlock()
+			return nil, errors.New("getEvents got a 403 'Forbidden' response")
+		}
+		if status >= 500 && status < 600 && details { // internal server error
+			a.chRetry <- InternalServerErrorRetry{ctx, url, api, details, time.Time{}, 1}
+			return nil, fmt.Errorf("server error %d scheduled for retry", status)
+		}
 		if status != http.StatusOK {
-			return nil, fmt.Errorf("abnormal security %s api non-200: %d\nRESPONSE %s", apiName, status, string(respBody))
+			return nil, fmt.Errorf("abnormal security %s api non-200: %d\nRESPONSE %s", api.key, status, string(respBody))
 		}
 
-		if flatResponse, ok := responseType.(*AbnormalSecurityFlatSingleResponse); ok {
+		switch concrete := resp.(type) {
+		case *AbnormalSecurityFlatSingleResponse:
 			var singleEvent utils.Dict
 			err = json.Unmarshal(respBody, &singleEvent)
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api invalid json: %v", apiName, err))
+				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api invalid json: %v", api.key, err))
 				return nil, err
 			}
-			flatResponse.Event = []utils.Dict{singleEvent}
-			return flatResponse, nil
+			concrete.Event = []utils.Dict{singleEvent}
+			return resp, nil
+		default:
+			err = json.Unmarshal(respBody, concrete)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api invalid json: %v", api.key, err))
+				return nil, err
+			}
 		}
-
-		err = json.Unmarshal(respBody, &responseType)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("abnormal security %s api invalid json: %v", apiName, err))
-			return nil, err
-		}
-		return responseType, nil
+		return resp, nil
 	}
 }
 
