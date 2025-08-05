@@ -4,6 +4,7 @@ import (
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 
 	"github.com/refractionPOINT/usp-adapters/1password"
+	"github.com/refractionPOINT/usp-adapters/abnormal_security"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
@@ -82,5 +83,6 @@ type GeneralConfigs struct {
 	Box               usp_box.BoxConfig                               `json:"box" yaml:"box"`
 	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
+	AbnormalSecurity  usp_abnormal_security.AbnormalSecurityConfig    `json:"abnormal_security" yaml:"abnormal_security"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
 }

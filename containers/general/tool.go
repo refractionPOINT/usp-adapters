@@ -16,6 +16,7 @@ import (
 
 	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/usp-adapters/1password"
+	"github.com/refractionPOINT/usp-adapters/abnormal_security"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"github.com/refractionPOINT/usp-adapters/box"
@@ -473,6 +474,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.SentinelOne
 		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(configs.SentinelOne)
+	} else if method == "abnormal_security" {
+		configs.AbnormalSecurity.ClientOptions = applyLogging(configs.AbnormalSecurity.ClientOptions)
+		configs.AbnormalSecurity.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.AbnormalSecurity
+		client, chRunning, err = usp_abnormal_security.NewAbnormalSecurityAdapter(configs.AbnormalSecurity)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
