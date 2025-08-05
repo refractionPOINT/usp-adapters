@@ -4,13 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -19,6 +23,38 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
+
+// connResetRetryer extends the default AWS SDK retryer so that
+// transient transport errors like "connection reset by peer"
+// (or the related unexpected EOF that follows an RST) are retried
+// transparently.
+//
+// S3, NAT gateways or load‑balancers will silently drop idle TLS
+// connections. When the SDK tries to reuse that socket it receives
+// an RST on the first read and surfaces a syscall.ECONNRESET which
+// is *not* retried by default in v1 of the AWS SDK.
+// Adding the pattern match here lets us keep the rest of the default
+// exponential‑back‑off semantics intact.
+
+type connResetRetryer struct {
+	client.DefaultRetryer
+}
+
+func (r connResetRetryer) ShouldRetry(req *request.Request) bool {
+	// honour the built‑in rules first
+	if r.DefaultRetryer.ShouldRetry(req) {
+		return true
+	}
+	// fallback: look for TCP‑level resets that are safe to retry
+	if req.Error != nil {
+		msg := req.Error.Error()
+		if strings.Contains(msg, "connection reset by peer") ||
+			strings.Contains(msg, "unexpected EOF") {
+			return true
+		}
+	}
+	return false
+}
 
 const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
@@ -35,6 +71,8 @@ type S3Adapter struct {
 
 	isStop uint32
 	wg     sync.WaitGroup
+
+	region string
 }
 
 type S3Config struct {
@@ -45,6 +83,7 @@ type S3Config struct {
 	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
 	Prefix        string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
+	Region        string                  `json:"region" yaml:"region"`
 }
 
 func (c *S3Config) Validate() error {
@@ -87,13 +126,42 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	var err error
 	var region string
 
-	if region, err = a.getRegion(); err != nil {
-		return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
+	if conf.Region != "" {
+		region = conf.Region
+	} else {
+		if region, err = a.getRegion(); err != nil {
+			return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
+		}
+	}
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("s3 region for %q: %s", a.conf.BucketName, region))
+
+	a.region = region
+
+	// ---------------------------
+	// HTTP client tuned for S3
+	// ---------------------------
+
+	tr := &http.Transport{
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 200,
+		// 25 s is comfortably below the ~60 s keep‑alive employed by S3 ELBs
+		// and WAY below the 350 s idle‑flow timeout of NAT Gateways.
+		IdleConnTimeout: 25 * time.Second,
+	}
+
+	httpClient := &http.Client{
+		Transport: tr,
+		// no global timeout – we stream large objects, per‑request
+		// context deadlines should be used instead.
 	}
 
 	a.awsConfig = &aws.Config{
 		Region:      aws.String(region),
 		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
+		HTTPClient:  httpClient,
+		Retryer: connResetRetryer{
+			DefaultRetryer: client.DefaultRetryer{NumMaxRetries: 8},
+		},
 	}
 
 	if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {
@@ -140,27 +208,57 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 }
 
 func (a *S3Adapter) getRegion() (string, error) {
-	// Step 1: Try GovCloud regions first
-	govRegions := []string{"us-gov-west-1", "us-gov-east-1"}
-
-	for _, region := range govRegions {
-		sess := session.Must(session.NewSession(&aws.Config{
-			Region: aws.String(region),
-		}))
-
-		regionFound, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, region)
-		if err == nil {
-			return regionFound, nil
-		}
+	// Try commercial partition first
+	sess, err := session.NewSession(&aws.Config{
+		Region:           aws.String("us-east-1"),
+		Credentials:      credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+		S3ForcePathStyle: aws.Bool(false),
+	})
+	if err != nil {
+		return "", err
 	}
 
-	// Step 2: Fallback to commercial default logic
-	return s3manager.GetBucketRegion(
-		a.ctx,
-		session.Must(session.NewSession(&aws.Config{})), // uses SDK's default resolver
-		a.conf.BucketName,
-		"us-east-1", // recommended default region hint
-	)
+	region, err := s3manager.GetBucketRegion(a.ctx, sess, a.conf.BucketName, "us-east-1")
+	if err == nil {
+		if region == "" {
+			region = "us-east-1"
+		}
+		return region, nil
+	}
+
+	// If commercial failed and error suggests access issues, try GovCloud
+	if !isNotFound(err) {
+		// Try GovCloud partition
+		govSess, govErr := session.NewSession(&aws.Config{
+			Region:           aws.String("us-gov-west-1"),
+			Credentials:      credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+			S3ForcePathStyle: aws.Bool(false),
+		})
+		if govErr != nil {
+			return "", govErr
+		}
+
+		govRegion, govRegionErr := s3manager.GetBucketRegion(a.ctx, govSess, a.conf.BucketName, "us-gov-west-1")
+		if govRegionErr == nil {
+			if govRegion == "" {
+				govRegion = "us-gov-west-1"
+			}
+			return govRegion, nil
+		}
+		err = fmt.Errorf("govcloud region: %v, commercial region: %v", govRegionErr, err)
+	}
+
+	return "", fmt.Errorf("bucket %q not found in commercial or GovCloud partitions: %w", a.conf.BucketName, err)
+}
+
+func isNotFound(err error) bool {
+	if aerr, ok := err.(awserr.Error); ok {
+		switch aerr.Code() {
+		case "NoSuchBucket", "NotFound":
+			return true
+		}
+	}
+	return false
 }
 
 func (a *S3Adapter) Close() error {
@@ -183,7 +281,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		Prefix: &a.conf.Prefix,
 	})
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2(): %v", err))
+		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2() @ %s: %v", a.region, err))
 		// Ignore the error upstream so that we just keep retrying.
 		return false, nil
 	}
@@ -226,7 +324,7 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			Bucket: aws.String(a.conf.BucketName),
 			Key:    aws.String(item.Key),
 		}); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download() @ %s: %v", a.region, err))
 			return &s3LocalFile{
 				Obj:  item,
 				Data: nil,

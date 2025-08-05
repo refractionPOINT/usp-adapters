@@ -30,6 +30,8 @@ type listItem struct {
 	ContentExpiration string `json:"contentExpiration,omitempty"`
 }
 
+// Office 365 Management API endpoints for different cloud environments
+// Reference: https://docs.microsoft.com/en-us/office/office-365-management-api/office-365-management-apis-overview#office-365-management-apis-overview
 var URL = map[string]string{
 	"enterprise":   "https://manage.office.com/api/v1.0/",
 	"gcc-gov":      "https://manage-gcc.office.com/api/v1.0/",
@@ -37,12 +39,34 @@ var URL = map[string]string{
 	"dod-gov":      "https://manage.protection.apps.mil/api/v1.0/",
 }
 
+// OAuth2 token endpoints for different cloud environments
+// References:
+// - Commercial/GCC: https://docs.microsoft.com/en-us/azure/active-directory/develop/authentication-national-clouds#azure-ad-authentication-endpoints
+// - GCC High/DoD: https://docs.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure#azure-active-directory-premium-p1-and-p2
+// - Government clouds: https://docs.microsoft.com/en-us/graph/deployments#microsoft-graph-and-graph-explorer-service-root-endpoints
+var TokenURL = map[string]string{
+	"enterprise":   "https://login.windows.net/",
+	"gcc-gov":      "https://login.windows.net/",
+	"gcc-high-gov": "https://login.microsoftonline.us/",
+	"dod-gov":      "https://login.microsoftonline.us/",
+}
+
+// Resource scopes for OAuth2 authentication, must match the target API environment
+// Reference: https://docs.microsoft.com/en-us/office/office-365-management-api/get-started-with-office-365-management-apis#specify-the-permissions-your-app-requires-to-access-the-office-365-management-apis
+var ResourceScope = map[string]string{
+	"enterprise":   "https://manage.office.com",
+	"gcc-gov":      "https://manage.office.com",
+	"gcc-high-gov": "https://manage.office365.us",
+	"dod-gov":      "https://manage.protection.apps.mil",
+}
+
 type Office365Adapter struct {
 	conf       Office365Config
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
-	endpoint string
+	endpoint     string
+	endpointType string
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -113,8 +137,10 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 
 	if strings.HasPrefix(conf.Endpoint, "https://") {
 		a.endpoint = conf.Endpoint
+		a.endpointType = "custom"
 	} else if v, ok := URL[conf.Endpoint]; ok {
 		a.endpoint = v
+		a.endpointType = conf.Endpoint
 	} else {
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
@@ -278,13 +304,51 @@ func (a *Office365Adapter) fetchEvents(url string) {
 }
 
 func (a *Office365Adapter) updateBearerToken() error {
-	conf := &clientcredentials.Config{
-		ClientID:     a.conf.ClientID,
-		ClientSecret: a.conf.ClientSecret,
-		TokenURL:     fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain),
-		EndpointParams: url.Values{
-			"resource": []string{"https://manage.office.com"},
-		},
+	// Determine the correct OAuth2 token URL and resource scope based on the endpoint type
+	// This is critical for government clouds to avoid "Confidential Client is not supported in Cross Cloud request" errors
+	// Reference: https://docs.microsoft.com/en-us/azure/azure-government/compare-azure-government-global-azure#guidance-for-developers
+	var tokenURL, resourceScope string
+
+	if a.endpointType == "custom" {
+		// For custom endpoints, default to enterprise settings
+		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
+		resourceScope = "https://manage.office.com"
+	} else if baseTokenURL, ok := TokenURL[a.endpointType]; ok {
+		// Use the correct OAuth2 endpoint for the cloud environment
+		if a.endpointType == "gcc-high-gov" || a.endpointType == "dod-gov" {
+			// For GCC High and DoD, use tenant ID and v2.0 endpoint
+			tokenURL = fmt.Sprintf("%s%s/oauth2/v2.0/token", baseTokenURL, a.conf.TenantID)
+		} else {
+			// For enterprise and GCC, use domain and v1.0 endpoint
+			tokenURL = fmt.Sprintf("%s%s/oauth2/token?api-version=1.0", baseTokenURL, a.conf.Domain)
+		}
+		resourceScope = ResourceScope[a.endpointType]
+	} else {
+		// Fallback to enterprise settings
+		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
+		resourceScope = "https://manage.office.com"
+	}
+
+	var conf *clientcredentials.Config
+
+	// GCC High and DoD use v2.0 endpoints which require 'scope' parameter instead of 'resource'
+	if a.endpointType == "gcc-high-gov" || a.endpointType == "dod-gov" {
+		conf = &clientcredentials.Config{
+			ClientID:     a.conf.ClientID,
+			ClientSecret: a.conf.ClientSecret,
+			TokenURL:     tokenURL,
+			Scopes:       []string{resourceScope + "/.default"},
+		}
+	} else {
+		// Enterprise and regular GCC use v1.0 endpoints with 'resource' parameter
+		conf = &clientcredentials.Config{
+			ClientID:     a.conf.ClientID,
+			ClientSecret: a.conf.ClientSecret,
+			TokenURL:     tokenURL,
+			EndpointParams: url.Values{
+				"resource": []string{resourceScope},
+			},
+		}
 	}
 
 	a.httpClient = conf.Client(context.Background())
@@ -333,75 +397,199 @@ func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, e
 }
 
 func (a *Office365Adapter) makeOneListRequest(url string) ([]listItem, string) {
-	// Prepare the request.
-	req, err := http.NewRequest("GET", url, &bytes.Buffer{})
-	if err != nil {
-		a.doStop.Set()
-		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
-		return nil, ""
+	const maxRetryDuration = 5 * time.Minute
+	const initialDelay = 1 * time.Second
+	const maxDelay = 30 * time.Second
+
+	startTime := time.Now()
+	delay := initialDelay
+
+	for {
+		// Check if we should stop
+		if a.doStop.IsSet() {
+			return nil, ""
+		}
+
+		// Prepare the request.
+		req, err := http.NewRequest("GET", url, &bytes.Buffer{})
+		if err != nil {
+			a.doStop.Set()
+			a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
+			return nil, ""
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		// Issue the request.
+		resp, err := a.httpClient.Do(req)
+		if err != nil {
+			// Check if we should retry or if we've been asked to stop
+			if time.Since(startTime) < maxRetryDuration && !a.doStop.IsSet() {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("HTTP request failed, retrying in %v: %v", delay, err))
+				if !a.doStop.WaitFor(delay) {
+					// We were asked to stop during the wait
+					return nil, ""
+				}
+				delay = time.Duration(float64(delay) * 1.5)
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
+			return nil, ""
+		}
+
+		// Read the body once and handle the response
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if readErr != nil {
+			if time.Since(startTime) < maxRetryDuration && !a.doStop.IsSet() {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("Failed to read response body, retrying in %v: %v", delay, readErr))
+				if !a.doStop.WaitFor(delay) {
+					return nil, ""
+				}
+				delay = time.Duration(float64(delay) * 1.5)
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("failed to read response body: %v", readErr))
+			return nil, ""
+		}
+
+		// Check for retryable status codes (503, 504)
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+			if time.Since(startTime) < maxRetryDuration && !a.doStop.IsSet() {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 list api %d, retrying in %v: %s\nREQUEST: %s\nRESPONSE: %s",
+					resp.StatusCode, delay, resp.Status, url, string(body)))
+				if !a.doStop.WaitFor(delay) {
+					return nil, ""
+				}
+				delay = time.Duration(float64(delay) * 1.5)
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
+			// Retries exhausted
+			a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api %d after retries: %s\nREQUEST: %s\nRESPONSE: %s",
+				resp.StatusCode, resp.Status, url, string(body)))
+			return nil, url
+		}
+
+		// Evaluate if success.
+		if resp.StatusCode != http.StatusOK {
+			a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+			return nil, url
+		}
+
+		// Parse the response.
+		respData := []listItem{}
+		if err := json.Unmarshal(body, &respData); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api invalid json: %v", err))
+			return nil, ""
+		}
+
+		nextPage := resp.Header.Get("NextPageUri")
+
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("listed %d events (with page: %v)", len(respData), nextPage != ""))
+
+		return respData, nextPage
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	// Issue the request.
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-		return nil, ""
-	}
-	defer resp.Body.Close()
-
-	// Evaluate if success.
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
-		return nil, url
-	}
-
-	// Parse the response.
-	respData := []listItem{}
-	jsonDecoder := json.NewDecoder(resp.Body)
-	if err := jsonDecoder.Decode(&respData); err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api invalid json: %v", err))
-		return nil, ""
-	}
-
-	nextPage := resp.Header.Get("NextPageUri")
-
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("listed %d events (with page: %v)", len(respData), nextPage != ""))
-
-	return respData, nextPage
 }
 
 func (a *Office365Adapter) makeOneContentRequest(url string) []byte {
-	// Prepare the request.
-	req, err := http.NewRequest("GET", url, &bytes.Buffer{})
-	if err != nil {
-		a.doStop.Set()
-		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
-		return nil
-	}
-	req.Header.Set("Content-Type", "application/json")
+	const maxRetryDuration = 5 * time.Minute
+	const initialDelay = 1 * time.Second
+	const maxDelay = 30 * time.Second
 
-	// Issue the request.
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-		return nil
-	}
-	defer resp.Body.Close()
+	startTime := time.Now()
+	delay := initialDelay
 
-	// Evaluate if success.
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
-		return nil
-	}
+	for {
+		// Check if we should stop
+		if a.doStop.IsSet() {
+			return nil
+		}
 
-	// Parse the response.
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api invalid json: %v", err))
-		return nil
+		// Prepare the request.
+		req, err := http.NewRequest("GET", url, &bytes.Buffer{})
+		if err != nil {
+			a.doStop.Set()
+			a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
+			return nil
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		// Issue the request.
+		resp, err := a.httpClient.Do(req)
+		if err != nil {
+			// Check if we should retry or if we've been asked to stop
+			if time.Since(startTime) < maxRetryDuration && !a.doStop.IsSet() {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("HTTP request failed, retrying in %v: %v", delay, err))
+				if !a.doStop.WaitFor(delay) {
+					// We were asked to stop during the wait
+					return nil
+				}
+				delay = time.Duration(float64(delay) * 1.5)
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
+			return nil
+		}
+
+		// Read the body once and handle the response
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if readErr != nil {
+			if time.Since(startTime) < maxRetryDuration && !a.doStop.IsSet() {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("Failed to read response body, retrying in %v: %v", delay, readErr))
+				if !a.doStop.WaitFor(delay) {
+					return nil
+				}
+				delay = time.Duration(float64(delay) * 1.5)
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("failed to read response body: %v", readErr))
+			return nil
+		}
+
+		// Check for retryable status codes (503, 504)
+		if resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout {
+			if time.Since(startTime) < maxRetryDuration && !a.doStop.IsSet() {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api %d, retrying in %v: %s\nREQUEST: %s\nRESPONSE: %s",
+					resp.StatusCode, delay, resp.Status, url, string(body)))
+				if !a.doStop.WaitFor(delay) {
+					return nil
+				}
+				delay = time.Duration(float64(delay) * 1.5)
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				continue
+			}
+			// Retries exhausted
+			a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api %d after retries: %s\nREQUEST: %s\nRESPONSE: %s",
+				resp.StatusCode, resp.Status, url, string(body)))
+			return nil
+		}
+
+		// Evaluate if success.
+		if resp.StatusCode != http.StatusOK {
+			a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body)))
+			return nil
+		}
+
+		// Return the successful response body
+		return body
 	}
-	return data
 }
