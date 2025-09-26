@@ -203,7 +203,7 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
 			return
 		case event := <-streamHandle.Events:
-			if !notBefore.IsZero() && !notBefore.After(time.UnixMilli(int64(event.Metadata.EventCreationTime))) {
+			if !notBefore.IsZero() && notBefore.After(time.UnixMilli(int64(event.Metadata.EventCreationTime))) {
 				// This is a very ugly hack for what is a bad API design.
 				// It implies we HAVE to consume the entire 30 days of events
 				// retained by Crowdstrike every time the adapter starts.
