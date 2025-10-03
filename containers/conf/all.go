@@ -5,6 +5,7 @@ import (
 
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
+	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/cylance"
@@ -37,6 +38,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
+	"github.com/refractionPOINT/usp-adapters/trendmicro"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
@@ -50,6 +52,7 @@ type GeneralConfigs struct {
 	S3                usp_s3.S3Config                                 `json:"s3" yaml:"s3"`
 	Stdin             usp_stdin.StdinConfig                           `json:"stdin" yaml:"stdin"`
 	OnePassword       usp_1password.OnePasswordConfig                 `json:"1password" yaml:"1password"`
+	Bitwarden         usp_bitwarden.BitwardenConfig                   `json:"bitwarden" yaml:"bitwarden"`
 	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
 	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
 	EntraID           usp_entraid.EntraIDConfig                       `json:"entraid" yaml:"entraid"`
@@ -82,5 +85,6 @@ type GeneralConfigs struct {
 	Box               usp_box.BoxConfig                               `json:"box" yaml:"box"`
 	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
+	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
 }
