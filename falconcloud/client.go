@@ -29,6 +29,7 @@ type FalconCloudConfig struct {
 	ClientSecret    string                  `json:"client_secret" yaml:"client_secret"`
 	IsUsingOffset   bool                    `json:"is_using_offset" yaml:"is_using_offset"`
 	Offset          uint64                  `json:"offset" yaml:"offset"`
+	NotBefore       *time.Time              `json:"not_before,omitempty" yaml:"not_before,omitempty"`
 }
 
 func (c *FalconCloudConfig) Validate() error {
@@ -180,7 +181,12 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 	if a.conf.IsUsingOffset {
 		offset = a.conf.Offset
 	} else {
-		notBefore = time.Now()
+		// If NotBefore is configured, use it; otherwise use current time
+		if a.conf.NotBefore != nil && !a.conf.NotBefore.IsZero() {
+			notBefore = *a.conf.NotBefore
+		} else {
+			notBefore = time.Now()
+		}
 	}
 	streamHandle, err := falcon.NewStream(a.ctx, client, appName, streamInfo, offset)
 	if err != nil {
