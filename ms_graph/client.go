@@ -117,14 +117,14 @@ func (a *MsGraphAdapter) Close() error {
 	return err2
 }
 
-func (a *MsGraphAdapter) fetchToken() (token string) {
+func (a *MsGraphAdapter) fetchToken() (string, error) {
 
 	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.conf.TenantID)
 	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
 	if err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -132,25 +132,26 @@ func (a *MsGraphAdapter) fetchToken() (token string) {
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return fmt.Sprintf("No bearer token returned: %s", err)
+		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
-	if accessToken, ok := result["access_token"].(string); ok {
-		return accessToken
+	accessToken, ok := result["access_token"].(string)
+	if !ok {
+		return "", fmt.Errorf("no bearer token returned: %#v", result)
 	}
 
-	return ""
+	return accessToken, nil
 
 }
 
@@ -204,16 +205,29 @@ func (a *MsGraphAdapter) makeOneListRequest(eventsUrl string, since string, last
 		query := "%20ge%20"
 		date_filter := fmt.Sprintf("?%sfilter=createdDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
 
-		// Append query parameters to the URL
-		eventsUrl += date_filter
+		// Create the full request URL with query parameters (don't modify eventsUrl to avoid corruption on retries)
+		requestUrl := eventsUrl + date_filter
 
-		req, err := http.NewRequest("GET", eventsUrl, nil)
+		authToken, err := a.fetchToken()
+		if err != nil {
+			// Retry if token fetch failed, but continue to the next iteration
+			if attempt < 3 {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("error fetching token (attempt %d), retrying: %s", attempt, err))
+				time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
+				continue
+			}
+			// Return after 3 failed attempts
+			a.conf.ClientOptions.OnError(fmt.Errorf("error fetching token after 3 attempts: %s", err))
+			return nil, since, "", fmt.Errorf("error fetching token after 3 attempts: %s", err)
+		}
+
+		req, err := http.NewRequest("GET", requestUrl, nil)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("error creating request: %s", err))
 			return nil, since, "", err
 		}
 
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.fetchToken()))
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
 		req.Header.Set("Content-Type", "application/json")
 
 		client := &http.Client{}
@@ -231,13 +245,24 @@ func (a *MsGraphAdapter) makeOneListRequest(eventsUrl string, since string, last
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt %d): %s", attempt, body))
-			// Retry if the status code is not OK, but continue to the next iteration
-			if attempt < 3 {
-				continue
+			// Check for retryable status codes (503, 504) - likely Microsoft infrastructure issues
+			isRetryable := resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout
+
+			if isRetryable {
+				// Retry for transient infrastructure errors
+				if attempt < 3 {
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf("Microsoft API returned %d (attempt %d), retrying: %s", resp.StatusCode, attempt, body))
+					time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
+					continue
+				}
+				// Final attempt for retryable error
+				a.conf.ClientOptions.OnError(fmt.Errorf("Microsoft API returned %d after 3 attempts: %s", resp.StatusCode, body))
+				return nil, since, "", fmt.Errorf("Microsoft API returned %d after 3 attempts: %s", resp.StatusCode, body)
+			} else {
+				// Non-retryable error (auth, permission, etc) - fail immediately
+				a.conf.ClientOptions.OnError(fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s", body))
+				return nil, since, "", fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s", body)
 			}
-			// Return after 3 failed attempts
-			return nil, since, "", fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status (attempt 3): %s", body)
 		}
 
 		// If the response is OK, parse the body and process detections
