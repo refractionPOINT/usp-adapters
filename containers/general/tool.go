@@ -18,6 +18,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/1password"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
+	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/cylance"
@@ -50,6 +51,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
+	"github.com/refractionPOINT/usp-adapters/trendmicro"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
@@ -313,6 +315,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.OnePassword
 		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
+	} else if method == "bitwarden" {
+		configs.Bitwarden.ClientOptions = applyLogging(configs.Bitwarden.ClientOptions)
+		configs.Bitwarden.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Bitwarden
+		client, chRunning, err = usp_bitwarden.NewBitwardenAdapter(configs.Bitwarden)
 	} else if method == "itglue" {
 		configs.ITGlue.ClientOptions = applyLogging(configs.ITGlue.ClientOptions)
 		configs.ITGlue.ClientOptions.Architecture = "usp_adapter"
@@ -473,6 +480,11 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.SentinelOne
 		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(configs.SentinelOne)
+	} else if method == "trendmicro" {
+		configs.TrendMicro.ClientOptions = applyLogging(configs.TrendMicro.ClientOptions)
+		configs.TrendMicro.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.TrendMicro
+		client, chRunning, err = usp_trendmicro.NewTrendMicroAdapter(configs.TrendMicro)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
