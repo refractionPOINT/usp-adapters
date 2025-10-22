@@ -3,6 +3,9 @@ package usp_mimecast
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,13 +15,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
-	baseURL       = "https://api.services.mimecast.com"
 	overlapPeriod = 30 * time.Second
 )
 
@@ -34,10 +37,6 @@ type MimecastAdapter struct {
 	ctx context.Context
 
 	dedupe map[string]int64
-}
-
-type AuthResponse struct {
-	AccessToken string `json:"access_token"`
 }
 
 type AuditRequest struct {
@@ -87,19 +86,31 @@ type AuditLog struct {
 
 type MimecastConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientId      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
+	AccessKey     string                  `json:"access_key" yaml:"access_key"`
+	SecretKey     string                  `json:"secret_key" yaml:"secret_key"`
+	AppId         string                  `json:"app_id" yaml:"app_id"`
+	AppKey        string                  `json:"app_key" yaml:"app_key"`
+	BaseURL       string                  `json:"base_url" yaml:"base_url"`
 }
 
 func (c *MimecastConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
-	if c.ClientId == "" {
-		return errors.New("missing client id")
+	if c.AccessKey == "" {
+		return errors.New("missing access_key")
 	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client secret")
+	if c.SecretKey == "" {
+		return errors.New("missing secret_key")
+	}
+	if c.AppId == "" {
+		return errors.New("missing app_id")
+	}
+	if c.AppKey == "" {
+		return errors.New("missing app_key")
+	}
+	if c.BaseURL == "" {
+		return errors.New("missing base_url (e.g., https://us-api.mimecast.com)")
 	}
 
 	return nil
@@ -156,9 +167,43 @@ func (a *MimecastAdapter) Close() error {
 	return err2
 }
 
+// generateHMACHeaders generates the required Mimecast HMAC-SHA1 authentication headers
+func (a *MimecastAdapter) generateHMACHeaders(uri string) (map[string]string, error) {
+	// Generate request ID (GUID)
+	reqId := uuid.New().String()
+
+	// Generate timestamp in RFC format: "Mon, 02 Jan 2006 15:04:05 MST"
+	// Mimecast expects UTC timezone
+	timestamp := time.Now().UTC().Format("Mon, 02 Jan 2006 15:04:05 MST")
+
+	// Construct the data to sign: {timestamp}:{reqId}:{uri}:{appKey}
+	dataToSign := fmt.Sprintf("%s:%s:%s:%s", timestamp, reqId, uri, a.conf.AppKey)
+
+	// Base64-decode the secret key
+	decodedSecret, err := base64.StdEncoding.DecodeString(a.conf.SecretKey)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode secret key: %v", err)
+	}
+
+	// Generate HMAC-SHA1 signature
+	h := hmac.New(sha1.New, decodedSecret)
+	h.Write([]byte(dataToSign))
+	signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	// Return all required headers
+	headers := map[string]string{
+		"Authorization": fmt.Sprintf("MC %s:%s", a.conf.AccessKey, signature),
+		"x-mc-req-id":   reqId,
+		"x-mc-date":     timestamp,
+		"x-mc-app-id":   a.conf.AppId,
+	}
+
+	return headers, nil
+}
+
 func (a *MimecastAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", baseURL))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.conf.BaseURL))
 
 	since := time.Now().Add(-400 * time.Hour)
 
@@ -199,14 +244,15 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 	var lastDetectionTime time.Time
 
 	if t := currentTime.Add(-overlapPeriod); t.Before(since) {
-		start = since.UTC().Format("2006-01-02T15:04:05-0700")
+		start = since.UTC().Format(time.RFC3339)
 	} else {
-		start = currentTime.Add(-overlapPeriod).UTC().Format("2006-01-02T15:04:05-0700")
+		start = currentTime.Add(-overlapPeriod).UTC().Format(time.RFC3339)
 	}
-	end := currentTime.UTC().Format("2006-01-02T15:04:05-0700")
+	end := currentTime.UTC().Format(time.RFC3339)
 
 	pageToken := ""
-	url := baseURL + "/api/audit/get-audit-events"
+	endpoint := "/api/audit/get-audit-events"
+	url := a.conf.BaseURL + endpoint
 
 	for {
 		// Prepare the request.
@@ -239,11 +285,18 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 		if err != nil {
 			return nil, lastDetectionTime, err
 		}
-		token, err := a.getAuthToken()
+
+		// Generate HMAC authentication headers
+		headers, err := a.generateHMACHeaders(endpoint)
 		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("failed to generate HMAC headers: %v", err))
 			return nil, lastDetectionTime, err
 		}
-		req.Header.Set("Authorization", "Bearer "+token)
+
+		// Set all required Mimecast headers
+		for key, value := range headers {
+			req.Header.Set(key, value)
+		}
 		req.Header.Set("Content-Type", "application/json")
 
 		client := &http.Client{Timeout: 10 * time.Second}
@@ -256,7 +309,8 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 		// Evaluate if success.
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
-			a.conf.ClientOptions.OnError(fmt.Errorf("mimecast api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(body), string(body)))
+			err := fmt.Errorf("mimecast api non-200: %s\nRESPONSE: %s", resp.Status, string(body))
+			a.conf.ClientOptions.OnError(err)
 			return nil, lastDetectionTime, err
 		}
 
@@ -273,6 +327,18 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("mimecast api invalid json: %v", err))
 			return nil, lastDetectionTime, err
+		}
+
+		// Check for Mimecast-specific errors in the fail array
+		if len(response.Fail) > 0 {
+			var errorMessages []string
+			for _, failure := range response.Fail {
+				for _, errDetail := range failure.Errors {
+					errorMessages = append(errorMessages, fmt.Sprintf("%s: %s (retryable: %v)", errDetail.Code, errDetail.Message, errDetail.Retryable))
+				}
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("mimecast api returned errors: %v", errorMessages))
+			return nil, lastDetectionTime, fmt.Errorf("mimecast api errors: %v", errorMessages)
 		}
 		//responseStr, _ := json.Marshal(response)
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", responseStr))
@@ -319,34 +385,4 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 	}
 
 	return allItems, lastDetectionTime, nil
-}
-
-func (a *MimecastAdapter) getAuthToken() (string, error) {
-	url := baseURL + "/oauth/token"
-	body := "grant_type=client_credentials&client_id=" + a.conf.ClientId + "&client_secret=" + a.conf.ClientSecret
-
-	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(body)))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to get token, status code: %d", resp.StatusCode)
-	}
-
-	respBody, _ := ioutil.ReadAll(resp.Body)
-	var authResp AuthResponse
-	if err := json.Unmarshal(respBody, &authResp); err != nil {
-		return "", err
-	}
-
-	return authResp.AccessToken, nil
 }
