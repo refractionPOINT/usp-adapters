@@ -31,11 +31,12 @@ type SentinelOneAdapter struct {
 }
 
 type SentinelOneConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Domain        string                  `json:"domain" yaml:"domain"`
-	APIKey        string                  `json:"api_key" yaml:"api_key"`
-	URLs          string                  `json:"urls" yaml:"urls"`
-	StartTime     string                  `json:"start_time" yaml:"start_time"`
+	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	Domain              string                  `json:"domain" yaml:"domain"`
+	APIKey              string                  `json:"api_key" yaml:"api_key"`
+	URLs                string                  `json:"urls" yaml:"urls"`
+	StartTime           string                  `json:"start_time" yaml:"start_time"`
+	TimeBetweenRequests time.Duration           `json:"time_between_requests" yaml:"time_between_requests"`
 }
 
 func (c *SentinelOneConfig) Validate() error {
@@ -54,6 +55,9 @@ func (c *SentinelOneConfig) Validate() error {
 	c.Domain = strings.TrimSuffix(c.Domain, "/")
 	if _, err := time.Parse("2006-01-02T15:04:05.999999Z", c.StartTime); c.StartTime != "" && err != nil {
 		return fmt.Errorf("invalid start_time: %v", err)
+	}
+	if c.TimeBetweenRequests == 0 {
+		c.TimeBetweenRequests = 1 * time.Minute
 	}
 	return nil
 }
@@ -157,7 +161,7 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 	isFirstRun := true
 	lastCreatedAt := ""
 	isDataFound := false
-	for isFirstRun || isDataFound || !a.doStop.WaitFor(1*time.Minute) {
+	for isFirstRun || isDataFound || !a.doStop.WaitFor(a.conf.TimeBetweenRequests) {
 		isDataFound = false
 		qValues := url.Values{}
 		now := time.Now().UTC()
