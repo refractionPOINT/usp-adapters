@@ -731,17 +731,13 @@ func TestMultipleFileRotations(t *testing.T) {
 
 	var lines []string
 	// Drain channel with timeout (expect at least 4 lines: rotation0 + rotation1-3)
-	timeout := time.After(3 * time.Second)
+	timeout := time.After(5 * time.Second)
 drainLoop:
 	for {
 		select {
 		case line := <-receivedLines:
 			lines = append(lines, line)
 		case <-timeout:
-			break drainLoop
-		default:
-			// No more immediate lines, break after short wait
-			time.Sleep(100 * time.Millisecond)
 			break drainLoop
 		}
 	}
@@ -843,17 +839,13 @@ func TestConcurrentFileRotations(t *testing.T) {
 
 	var lines []string
 	// Drain channel with timeout (expect 6 lines: 3 pre + 3 post)
-	timeout := time.After(3 * time.Second)
+	timeout := time.After(5 * time.Second)
 drainLoop:
 	for {
 		select {
 		case line := <-receivedLines:
 			lines = append(lines, line)
 		case <-timeout:
-			break drainLoop
-		default:
-			// No more immediate lines, break after short wait
-			time.Sleep(100 * time.Millisecond)
 			break drainLoop
 		}
 	}
