@@ -155,7 +155,7 @@ func (a *FileAdapter) pollFiles() {
 						path, info.inode, currentInode))
 
 					// Stop the old tail that's reading from the wrong inode
-					info.lastOffset, _ = info.tail.Tell()
+					// Note: We don't call Tell() here to avoid racing with the tail library's internal cleanup
 					err := info.tail.Stop()
 					if err != nil {
 						a.conf.ClientOptions.OnError(fmt.Errorf("error stopping tail after rotation: %v", err))
@@ -169,8 +169,8 @@ func (a *FileAdapter) pollFiles() {
 				if info.isInactive {
 					// validate if an inactive file has been modified recently and we need to tail it
 					if now.Sub(modTime) <= reactivationThreshold {
-						a.conf.ClientOptions.OnError(fmt.Errorf("[REACTIVATION] File reactivated: %s | inode=%d | offset=%d | mtime=%s",
-							path, currentInode, info.lastOffset, modTime.Format(time.RFC3339)))
+						a.conf.ClientOptions.OnError(fmt.Errorf("[REACTIVATION] File reactivated: %s | inode=%d | restarting from beginning | mtime=%s",
+							path, currentInode, modTime.Format(time.RFC3339)))
 
 						t, err := tail.TailFile(path, tail.Config{
 							ReOpen:        !a.conf.NoFollow,
@@ -178,7 +178,7 @@ func (a *FileAdapter) pollFiles() {
 							Follow:        !a.conf.NoFollow,
 							CompleteLines: true,
 							Poll:          a.conf.Poll,
-							Location:      &tail.SeekInfo{Offset: info.lastOffset, Whence: io.SeekStart}, // start to ingest from last known position
+							Location:      &tail.SeekInfo{Offset: 0, Whence: io.SeekStart}, // start from beginning (safer than trying to resume)
 						})
 						if err != nil {
 							a.conf.ClientOptions.OnError(fmt.Errorf("tail error on reactivation: %v", err))
@@ -211,8 +211,9 @@ func (a *FileAdapter) pollFiles() {
 						a.conf.ClientOptions.OnError(fmt.Errorf("[INACTIVITY] File inactive: %s | timeSinceMtime=%s timeSinceData=%s | threshold=%s",
 							path, timeSinceModTime, timeSinceLastData, inactivityThreshold))
 
-						info.lastOffset, _ = info.tail.Tell() // store current position before stopping the tail in case we need to resume
-						a.conf.ClientOptions.DebugLog(fmt.Sprintf("[INACTIVITY] Stored offset=%d for %s before stopping", info.lastOffset, path))
+						// Note: We don't call Tell() here to avoid racing with the tail library's internal cleanup
+						// Reactivation will start from offset 0, which is safe even if we miss some data
+						a.conf.ClientOptions.DebugLog(fmt.Sprintf("[INACTIVITY] Stopping tail for %s (will restart from beginning if reactivated)", path))
 
 						err := info.tail.Stop()
 						if err != nil {

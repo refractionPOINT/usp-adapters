@@ -143,7 +143,6 @@ func TestPollSerialFiles(t *testing.T) {
 					debugMu.Lock()
 					debugReceived = append(debugReceived, msg)
 					debugMu.Unlock()
-					time.Sleep(1 * time.Second)
 				},
 			},
 		},
