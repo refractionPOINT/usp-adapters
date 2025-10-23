@@ -354,7 +354,7 @@ func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 
 				if line.Err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("[TAIL ERROR] tail.Line() error for %s: %v", filename, line.Err))
-					break
+					return
 				}
 
 				atomic.StoreInt64(pLastData, time.Now().Unix())

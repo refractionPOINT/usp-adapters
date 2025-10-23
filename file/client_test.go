@@ -119,6 +119,7 @@ func TestPollSerialFiles(t *testing.T) {
 	createTestFile(t, testFile1, "initial content 1")
 	createTestFile(t, testFile2, "initial content 2")
 
+	var debugMu sync.Mutex
 	debugReceived := []string{}
 
 	mockClientOptions := new(MockClientOptions)
@@ -139,7 +140,9 @@ func TestPollSerialFiles(t *testing.T) {
 			ClientOptions: uspclient.ClientOptions{
 				OnError: mockClientOptions.OnError,
 				DebugLog: func(msg string) {
+					debugMu.Lock()
 					debugReceived = append(debugReceived, msg)
+					debugMu.Unlock()
 					time.Sleep(1 * time.Second)
 				},
 			},
@@ -178,12 +181,14 @@ func TestPollSerialFiles(t *testing.T) {
 
 	for _, required := range requiredSubstrings {
 		found := false
+		debugMu.Lock()
 		for _, debug := range debugReceived {
 			if strings.Contains(debug, required) {
 				found = true
 				break
 			}
 		}
+		debugMu.Unlock()
 		assert.True(t, found, "Expected to find substring in debug logs: %s", required)
 	}
 }
@@ -259,7 +264,6 @@ func TestTailActiveFile(t *testing.T) {
 
 	// Give some time for processing
 	time.Sleep(1 * time.Second)
-	close(receivedLines)
 
 	// Verify all lines were received
 	var receivedLinesSlice []string
@@ -375,14 +379,21 @@ func TestMultiLineJSON(t *testing.T) {
 
 	// Give some time for processing
 	time.Sleep(1 * time.Second)
-	close(receivedJSON)
 
-	// Collect received JSON objects
+	// Collect received JSON objects with timeout
 	var receivedObjects []string
-	for json := range receivedJSON {
-		// Remove whitespace for comparison
-		compactJSON := strings.Join(strings.Fields(json), "")
-		receivedObjects = append(receivedObjects, compactJSON)
+	expectedCount := 3 // initial + 2 additional
+	timeout := time.After(5 * time.Second)
+collectLoop:
+	for len(receivedObjects) < expectedCount {
+		select {
+		case json := <-receivedJSON:
+			// Remove whitespace for comparison
+			compactJSON := strings.Join(strings.Fields(json), "")
+			receivedObjects = append(receivedObjects, compactJSON)
+		case <-timeout:
+			break collectLoop
+		}
 	}
 
 	// Prepare expected JSON objects (removing whitespace for comparison)
@@ -717,11 +728,22 @@ func TestMultipleFileRotations(t *testing.T) {
 
 	// Collect all lines
 	time.Sleep(2 * time.Second)
-	close(receivedLines)
 
 	var lines []string
-	for line := range receivedLines {
-		lines = append(lines, line)
+	// Drain channel with timeout (expect at least 4 lines: rotation0 + rotation1-3)
+	timeout := time.After(3 * time.Second)
+drainLoop:
+	for {
+		select {
+		case line := <-receivedLines:
+			lines = append(lines, line)
+		case <-timeout:
+			break drainLoop
+		default:
+			// No more immediate lines, break after short wait
+			time.Sleep(100 * time.Millisecond)
+			break drainLoop
+		}
 	}
 
 	// Should have lines from all rotations
@@ -818,11 +840,22 @@ func TestConcurrentFileRotations(t *testing.T) {
 
 	// Collect lines
 	time.Sleep(3 * time.Second)
-	close(receivedLines)
 
 	var lines []string
-	for line := range receivedLines {
-		lines = append(lines, line)
+	// Drain channel with timeout (expect 6 lines: 3 pre + 3 post)
+	timeout := time.After(3 * time.Second)
+drainLoop:
+	for {
+		select {
+		case line := <-receivedLines:
+			lines = append(lines, line)
+		case <-timeout:
+			break drainLoop
+		default:
+			// No more immediate lines, break after short wait
+			time.Sleep(100 * time.Millisecond)
+			break drainLoop
+		}
 	}
 
 	// Verify all files' data received
