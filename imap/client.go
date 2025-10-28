@@ -357,7 +357,7 @@ func (a *IMAPAdapter) messageToJSON(message *imap.Message) (*protocol.DataMessag
 			if err != nil {
 				return nil, fmt.Errorf("ReadAll(): %v", err)
 			}
-			if a.conf.AttachmentIngestKey != "" && (a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize) {
+			if a.conf.IncludeAttachments && a.conf.AttachmentIngestKey != "" && (a.conf.MaxBodySize == 0 || len(message.Body) <= a.conf.MaxBodySize) {
 				mr, err := mail.CreateReader(bytes.NewReader(fullBody))
 				if err != nil {
 					return nil, fmt.Errorf("CreateReader(): %v", err)
