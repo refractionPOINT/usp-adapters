@@ -196,6 +196,16 @@ func (a *SQSFilesAdapter) getBucketRegion(bucket string) (string, error) {
 	return s3manager.GetBucketRegion(a.ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
 }
 
+// getAvailableKeys returns a list of top-level keys from a Dict
+// for use in error messages to help users debug configuration issues
+func getAvailableKeys(d utils.Dict) []string {
+	keys := make([]string, 0, len(d))
+	for k := range d {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func (a *SQSFilesAdapter) receiveEvents() error {
 	defer close(a.chFiles)
 
@@ -238,10 +248,13 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 			filePaths := d.ExpandableFindString(a.conf.FilePath)
 
 			if bucket == "" {
-				a.conf.ClientOptions.OnError(errors.New("sqsClient.Message: missing bucket"))
+				availableKeys := getAvailableKeys(d)
+				a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.Message: missing bucket - attempted path '%s', available keys in message: %v", a.conf.BucketPath, availableKeys))
 				continue
 			}
 			if len(filePaths) == 0 {
+				availableKeys := getAvailableKeys(d)
+				a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.Message: missing file paths - attempted path '%s', available keys in message: %v", a.conf.FilePath, availableKeys))
 				continue
 			}
 			if err := a.initS3SDKs(bucket); err != nil {
