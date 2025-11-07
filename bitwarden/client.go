@@ -26,10 +26,12 @@ const (
 )
 
 type BitwardenConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientID      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-	Region        string                  `json:"region" yaml:"region"` // "us" or "eu", defaults to "us"
+	ClientOptions     uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	ClientID          string                  `json:"client_id" yaml:"client_id"`
+	ClientSecret      string                  `json:"client_secret" yaml:"client_secret"`
+	Region            string                  `json:"region" yaml:"region"`                         // "us" or "eu", defaults to "us"
+	TokenEndpointURL  string                  `json:"token_endpoint_url" yaml:"token_endpoint_url"` // Custom token endpoint URL for self-hosted instances
+	EventsBaseURL     string                  `json:"events_base_url" yaml:"events_base_url"`       // Custom events base URL for self-hosted instances
 }
 
 func (c *BitwardenConfig) Validate() error {
@@ -43,12 +45,31 @@ func (c *BitwardenConfig) Validate() error {
 	if c.ClientSecret == "" {
 		return errors.New("missing client_secret")
 	}
-	if c.Region == "" {
-		c.Region = "us"
+
+	// Check if custom URLs are provided
+	hasCustomURLs := c.TokenEndpointURL != "" || c.EventsBaseURL != ""
+
+	if hasCustomURLs {
+		// If custom URLs are provided, both must be set and region must be empty
+		if c.TokenEndpointURL == "" {
+			return errors.New("token_endpoint_url must be set when events_base_url is provided")
+		}
+		if c.EventsBaseURL == "" {
+			return errors.New("events_base_url must be set when token_endpoint_url is provided")
+		}
+		if c.Region != "" {
+			return errors.New("region cannot be set when using custom URLs (token_endpoint_url and events_base_url)")
+		}
+	} else {
+		// If custom URLs are not provided, use region-based configuration
+		if c.Region == "" {
+			c.Region = "us"
+		}
+		if c.Region != "us" && c.Region != "eu" {
+			return fmt.Errorf("invalid region: %s (must be 'us' or 'eu')", c.Region)
+		}
 	}
-	if c.Region != "us" && c.Region != "eu" {
-		return fmt.Errorf("invalid region: %s (must be 'us' or 'eu')", c.Region)
-	}
+
 	return nil
 }
 
@@ -81,8 +102,11 @@ func NewBitwardenAdapter(conf BitwardenConfig) (*BitwardenAdapter, chan struct{}
 		chStopped: make(chan struct{}),
 	}
 
-	// Set region-specific URLs
-	if conf.Region == "eu" {
+	// Set URLs: use custom URLs if provided, otherwise use region-specific URLs
+	if conf.TokenEndpointURL != "" && conf.EventsBaseURL != "" {
+		a.tokenEndpoint = conf.TokenEndpointURL
+		a.eventsBaseURL = conf.EventsBaseURL
+	} else if conf.Region == "eu" {
 		a.eventsBaseURL = eventsBaseURLEU
 		a.tokenEndpoint = tokenEndpointEU
 	} else {
