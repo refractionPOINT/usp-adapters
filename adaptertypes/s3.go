@@ -1,5 +1,10 @@
 package adaptertypes
 
+import (
+	"errors"
+	"fmt"
+)
+
 // S3Config defines the configuration for the Amazon S3 adapter
 type S3Config struct {
 	ClientOptions ClientOptions `json:"client_options" yaml:"client_options" description:"USP client configuration for data ingestion" category:"client"`
@@ -17,4 +22,20 @@ type S3Config struct {
 	ParallelFetch int `json:"parallel_fetch" yaml:"parallel_fetch" description:"Number of parallel file downloads from S3" category:"performance" default:"1" llmguidance:"Increase for better throughput on large buckets. Recommended: 5-10 for most use cases. Higher values use more memory"`
 
 	Region string `json:"region" yaml:"region" description:"AWS region where the bucket is located" category:"source" example:"us-east-1" llmguidance:"Optional. If not specified, the region will be auto-detected. Specify to avoid the auto-detection API call"`
+}
+
+func (c *S3Config) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.BucketName == "" {
+		return errors.New("missing bucket_name")
+	}
+	if c.AccessKey == "" {
+		return errors.New("missing access_key")
+	}
+	if c.SecretKey == "" {
+		return errors.New("missing secret_key")
+	}
+	return nil
 }

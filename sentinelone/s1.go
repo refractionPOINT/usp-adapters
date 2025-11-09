@@ -13,11 +13,12 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 type SentinelOneAdapter struct {
-	conf       SentinelOneConfig
+	conf       adaptertypes.SentinelOneConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 	s1Client   *SentinelOneClient
@@ -30,39 +31,7 @@ type SentinelOneAdapter struct {
 	ctx context.Context
 }
 
-type SentinelOneConfig struct {
-	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Domain              string                  `json:"domain" yaml:"domain"`
-	APIKey              string                  `json:"api_key" yaml:"api_key"`
-	URLs                string                  `json:"urls" yaml:"urls"`
-	StartTime           string                  `json:"start_time" yaml:"start_time"`
-	TimeBetweenRequests time.Duration           `json:"time_between_requests" yaml:"time_between_requests"`
-}
-
-func (c *SentinelOneConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Domain == "" {
-		return errors.New("missing domain")
-	}
-	if c.APIKey == "" {
-		return errors.New("missing api_key")
-	}
-	if !strings.HasPrefix(c.Domain, "https://") {
-		c.Domain = "https://" + c.Domain
-	}
-	c.Domain = strings.TrimSuffix(c.Domain, "/")
-	if _, err := time.Parse("2006-01-02T15:04:05.999999Z", c.StartTime); c.StartTime != "" && err != nil {
-		return fmt.Errorf("invalid start_time: %v", err)
-	}
-	if c.TimeBetweenRequests == 0 {
-		c.TimeBetweenRequests = 1 * time.Minute
-	}
-	return nil
-}
-
-func NewSentinelOneAdapter(conf SentinelOneConfig) (*SentinelOneAdapter, chan struct{}, error) {
+func NewSentinelOneAdapter(conf adaptertypes.SentinelOneConfig) (*SentinelOneAdapter, chan struct{}, error) {
 	var err error
 
 	a := &SentinelOneAdapter{

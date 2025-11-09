@@ -1,5 +1,10 @@
 package adaptertypes
 
+import (
+	"errors"
+	"fmt"
+)
+
 type SyslogConfig struct {
 	ClientOptions     ClientOptions `json:"client_options" yaml:"client_options" description:"USP client configuration for data ingestion" category:"client"`
 	Port              uint16        `json:"port" yaml:"port" description:"Port number to listen on for syslog messages" category:"source" example:"514" llmguidance:"Standard syslog port is 514 (requires root). Use 1514 or higher for non-root"`
@@ -9,4 +14,14 @@ type SyslogConfig struct {
 	SslKeyPath        string        `json:"ssl_key" yaml:"ssl_key" description:"Path to SSL/TLS private key file" category:"auth" sensitive:"true" example:"/etc/ssl/private/server.key" llmguidance:"Required for TLS syslog. PEM format private key file"`
 	MutualTlsCertPath string        `json:"mutual_tls_cert,omitempty" yaml:"mutual_tls_cert,omitempty" description:"Path to mutual TLS CA certificate for client authentication" category:"auth" example:"/etc/ssl/certs/ca.crt" llmguidance:"Optional. Enable mutual TLS by providing CA cert to verify client certificates"`
 	WriteTimeoutSec   uint64        `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty" description:"Timeout in seconds for writing data to USP" category:"performance" default:"600"`
+}
+
+func (c *SyslogConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.Port == 0 {
+		return errors.New("missing port")
+	}
+	return nil
 }

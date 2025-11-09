@@ -3,7 +3,6 @@ package usp_hubspot
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -28,7 +28,7 @@ type opRequest struct {
 }
 
 type HubSpotAdapter struct {
-	conf       HubSpotConfig
+	conf       adaptertypes.HubSpotConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -41,22 +41,7 @@ type HubSpotAdapter struct {
 	dedupe map[string]int64
 }
 
-type HubSpotConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	AccessToken   string                  `json:"access_token" yaml:"access_token"`
-}
-
-func (c *HubSpotConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.AccessToken == "" {
-		return errors.New("missing access token")
-	}
-	return nil
-}
-
-func NewHubSpotAdapter(conf HubSpotConfig) (*HubSpotAdapter, chan struct{}, error) {
+func NewHubSpotAdapter(conf adaptertypes.HubSpotConfig) (*HubSpotAdapter, chan struct{}, error) {
 	var err error
 	a := &HubSpotAdapter{
 		conf:   conf,

@@ -20,6 +20,7 @@ require (
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20250728014624-2a3d8e58cb31
 	github.com/refractionPOINT/go-uspclient v1.5.1
+	github.com/refractionPOINT/usp-adapters/adaptertypes v0.0.0-00010101000000-000000000000
 	github.com/stretchr/testify v1.10.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/net v0.42.0
@@ -145,3 +146,5 @@ require (
 )
 
 replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6
+
+replace github.com/refractionPOINT/usp-adapters/adaptertypes => ./adaptertypes

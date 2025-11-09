@@ -2,7 +2,6 @@ package usp_s3
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -21,6 +20,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -59,7 +59,7 @@ func (r connResetRetryer) ShouldRetry(req *request.Request) bool {
 const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type S3Adapter struct {
-	conf      S3Config
+	conf      adaptertypes.S3Config
 	uspClient *uspclient.Client
 
 	ctx context.Context
@@ -75,33 +75,6 @@ type S3Adapter struct {
 	region string
 }
 
-type S3Config struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	BucketName    string                  `json:"bucket_name" yaml:"bucket_name"`
-	AccessKey     string                  `json:"access_key" yaml:"access_key"`
-	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
-	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
-	Prefix        string                  `json:"prefix" yaml:"prefix"`
-	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
-	Region        string                  `json:"region" yaml:"region"`
-}
-
-func (c *S3Config) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.BucketName == "" {
-		return errors.New("missing bucket_name")
-	}
-	if c.AccessKey == "" {
-		return errors.New("missing access_key")
-	}
-	if c.SecretKey == "" {
-		return errors.New("missing secret_key")
-	}
-	return nil
-}
-
 type s3LocalFile struct {
 	Obj          *s3Record
 	Data         []byte
@@ -114,7 +87,7 @@ type s3Record struct {
 	Size int64
 }
 
-func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
+func NewS3Adapter(conf adaptertypes.S3Config) (*S3Adapter, chan struct{}, error) {
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}

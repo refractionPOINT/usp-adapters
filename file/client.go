@@ -5,7 +5,6 @@ package usp_file
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 
 	"github.com/nxadm/tail"
 
@@ -58,7 +58,7 @@ type tailInfo struct {
 
 type FileAdapter struct {
 	ctx          context.Context
-	conf         FileConfig
+	conf         adaptertypes.FileConfig
 	wg           sync.WaitGroup
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
@@ -68,17 +68,7 @@ type FileAdapter struct {
 	lineCb       func(line string) // callback for each line for testing
 }
 
-func (c *FileConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.FilePath == "" {
-		return errors.New("file_path missing")
-	}
-	return nil
-}
-
-func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
+func NewFileAdapter(conf adaptertypes.FileConfig) (*FileAdapter, chan struct{}, error) {
 	a := &FileAdapter{
 		conf:       conf,
 		tailFiles:  make(map[string]*tailInfo),

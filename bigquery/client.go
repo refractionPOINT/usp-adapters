@@ -7,8 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/refractionPOINT/go-uspclient"
-	"github.com/refractionPOINT/go-uspclient/protocol"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +14,14 @@ import (
 	"cloud.google.com/go/bigquery"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 )
 
 type BigQueryAdapter struct {
-	conf      BigQueryConfig
+	conf      adaptertypes.BigQueryConfig
 	client    *bigquery.Client
 	dataset   *bigquery.Dataset
 	table     *bigquery.Table
@@ -30,27 +32,7 @@ type BigQueryAdapter struct {
 	cancel    context.CancelFunc
 }
 
-func (bq *BigQueryConfig) Validate() error {
-	if bq.ProjectId == "" {
-		return errors.New("missing project_id")
-	}
-	// this will usually be th same as projectID but could be different if using outside project dataset such as a public data set
-	if bq.BigQueryProject == "" {
-		return errors.New("missing bigquery project name")
-	}
-	if bq.DatasetName == "" {
-		return errors.New("missing dataset_name")
-	}
-	if bq.TableName == "" {
-		return errors.New("missing table_name")
-	}
-	if bq.SqlQuery == "" {
-		return errors.New("missing sql query")
-	}
-	return nil
-}
-
-func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
+func NewBigQueryAdapter(conf adaptertypes.BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
 	// Create bq cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
 	bq := &BigQueryAdapter{

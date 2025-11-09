@@ -3,7 +3,6 @@ package usp_falconcloud
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 
 	"github.com/crowdstrike/gofalcon/falcon"
 	"github.com/crowdstrike/gofalcon/falcon/client"
@@ -22,31 +22,8 @@ const (
 	defaultWriteTimeout = 60 * 10
 )
 
-type FalconCloudConfig struct {
-	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientId        string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret    string                  `json:"client_secret" yaml:"client_secret"`
-	IsUsingOffset   bool                    `json:"is_using_offset" yaml:"is_using_offset"`
-	Offset          uint64                  `json:"offset" yaml:"offset"`
-	NotBefore       *time.Time              `json:"not_before,omitempty" yaml:"not_before,omitempty"`
-}
-
-func (c *FalconCloudConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.ClientId == "" {
-		return errors.New("missing client id")
-	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client secret")
-	}
-	return nil
-}
-
 type FalconCloudAdapter struct {
-	conf         FalconCloudConfig
+	conf         adaptertypes.FalconCloudConfig
 	isRunning    uint32
 	mRunning     sync.RWMutex
 	uspClient    *uspclient.Client
@@ -59,7 +36,7 @@ type FalconCloudAdapter struct {
 	cancel context.CancelFunc
 }
 
-func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
+func NewFalconCloudAdapter(conf adaptertypes.FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
 	a := &FalconCloudAdapter{
 		conf:      conf,
 		isRunning: 1,

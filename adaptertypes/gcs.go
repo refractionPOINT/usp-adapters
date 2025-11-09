@@ -1,5 +1,10 @@
 package adaptertypes
 
+import (
+	"errors"
+	"fmt"
+)
+
 // GCSConfig defines the configuration for the Google Cloud Storage adapter
 type GCSConfig struct {
 	ClientOptions       ClientOptions `json:"client_options" yaml:"client_options" description:"USP client configuration for data ingestion" category:"client"`
@@ -8,4 +13,14 @@ type GCSConfig struct {
 	IsOneTimeLoad       bool          `json:"single_load" yaml:"single_load" description:"If true, loads all files once without deletion. If false, continuously monitors bucket and deletes files after successful ingestion" category:"behavior" default:"false" llmguidance:"Set to true for one-time historical data imports. Set to false for continuous live monitoring. When false, files are deleted after processing"`
 	Prefix              string        `json:"prefix" yaml:"prefix" description:"Object prefix to filter which objects to process" category:"source" example:"logs/application/" llmguidance:"Optional. Use to limit processing to specific paths within the bucket. Leave empty to process all objects"`
 	ParallelFetch       int           `json:"parallel_fetch" yaml:"parallel_fetch" description:"Number of parallel file downloads from GCS" category:"performance" default:"1" llmguidance:"Increase for better throughput. Recommended: 5-10 for most use cases. Higher values use more memory"`
+}
+
+func (c *GCSConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.BucketName == "" {
+		return errors.New("missing bucket_name")
+	}
+	return nil
 }

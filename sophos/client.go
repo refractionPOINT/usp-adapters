@@ -3,7 +3,6 @@ package usp_sophos
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -29,7 +29,7 @@ type opRequest struct {
 }
 
 type SophosAdapter struct {
-	conf       SophosConfig
+	conf       adaptertypes.SophosConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -40,34 +40,7 @@ type SophosAdapter struct {
 	ctx context.Context
 }
 
-type SophosConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientId      string                  `json:"clientid" yaml:"clientid"`
-	ClientSecret  string                  `json:"clientsecret" yaml:"clientsecret"`
-	TenantId      string                  `json:"tenantid" yaml:"tenantid"`
-	URL           string                  `json:"url" yaml:"url"`
-}
-
-func (c *SophosConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.URL == "" {
-		return errors.New("missing url")
-	}
-	if c.ClientId == "" {
-		return errors.New("missing client id")
-	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client secret")
-	}
-	if c.TenantId == "" {
-		return errors.New("missing tenant id")
-	}
-	return nil
-}
-
-func NewSophosAdapter(conf SophosConfig) (*SophosAdapter, chan struct{}, error) {
+func NewSophosAdapter(conf adaptertypes.SophosConfig) (*SophosAdapter, chan struct{}, error) {
 	var err error
 	a := &SophosAdapter{
 		conf:   conf,

@@ -2,7 +2,6 @@ package usp_evtx
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"sync"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 
 	"github.com/refractionPOINT/evtx"
 )
@@ -19,7 +19,7 @@ const (
 )
 
 type EVTXAdapter struct {
-	conf         EVTXConfig
+	conf         adaptertypes.EVTXConfig
 	wg           sync.WaitGroup
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
@@ -28,23 +28,7 @@ type EVTXAdapter struct {
 	fClose   func()
 }
 
-type EVTXConfig struct {
-	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-	FilePath        string                  `json:"file_path" yaml:"file_path"`
-}
-
-func (c *EVTXConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.FilePath == "" {
-		return errors.New("file_path missing")
-	}
-	return nil
-}
-
-func NewEVTXAdapter(conf EVTXConfig) (*EVTXAdapter, chan struct{}, error) {
+func NewEVTXAdapter(conf adaptertypes.EVTXConfig) (*EVTXAdapter, chan struct{}, error) {
 	a := &EVTXAdapter{
 		conf: conf,
 	}

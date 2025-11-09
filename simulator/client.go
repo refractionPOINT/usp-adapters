@@ -11,6 +11,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -20,7 +21,7 @@ const (
 )
 
 type SimulatorAdapter struct {
-	conf         SimulatorConfig
+	conf         adaptertypes.SimulatorConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	uspClient    *uspclient.Client
@@ -31,27 +32,13 @@ type SimulatorAdapter struct {
 	lastSentTime  int64
 }
 
-type SimulatorConfig struct {
-	ClientOptions  uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Reader         io.ReadCloser           `json:"-" yaml:"-"`
-	FilePath       string                  `json:"file_path" yaml:"file_path"`
-	IsReplayTiming bool                    `json:"is_replay_timing" yaml:"is_replay_timing"`
-}
-
 type basicLCEvent struct {
 	Routing struct {
 		EventTime int64 `json:"event_time"`
 	} `json:"routing"`
 }
 
-func (c *SimulatorConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	return nil
-}
-
-func NewSimulatorAdapter(conf SimulatorConfig) (*SimulatorAdapter, chan struct{}, error) {
+func NewSimulatorAdapter(conf adaptertypes.SimulatorConfig) (*SimulatorAdapter, chan struct{}, error) {
 	a := &SimulatorAdapter{
 		conf:      conf,
 		isRunning: 1,

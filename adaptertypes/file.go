@@ -1,5 +1,10 @@
 package adaptertypes
 
+import (
+	"errors"
+	"fmt"
+)
+
 // FileConfig defines the configuration for the file adapter
 type FileConfig struct {
 	ClientOptions ClientOptions `json:"client_options" yaml:"client_options" description:"USP client configuration for data ingestion" category:"client"`
@@ -21,4 +26,14 @@ type FileConfig struct {
 	Poll bool `json:"poll" yaml:"poll" description:"If true, use polling instead of inotify/fsevents for file changes" category:"behavior" default:"false" llmguidance:"Enable if running in environments where file system notifications don't work (NFS, some containers)"`
 
 	MultiLineJSON bool `json:"multi_line_json" yaml:"multi_line_json" description:"If true, parse multi-line formatted JSON objects" category:"parsing" default:"false" llmguidance:"Enable if JSON objects span multiple lines (pretty-printed JSON). Disable for line-delimited JSON (JSONL/NDJSON)"`
+}
+
+func (c *FileConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.FilePath == "" {
+		return errors.New("file_path missing")
+	}
+	return nil
 }

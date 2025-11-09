@@ -5,7 +5,6 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"golang.org/x/net/context/ctxhttp"
 )
 
@@ -34,28 +34,8 @@ var (
 	configFile             string = "./config.txt"
 )
 
-type CatoConfig struct {
-	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-	ApiKey          string                  `json:"apikey" yaml:"apikey"`
-	AccountId       int                     `json:"accountid" yaml:"accountid"`
-}
-
-func (c *CatoConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.AccountId == 0 {
-		return errors.New("missing account id")
-	}
-	if c.ApiKey == "" {
-		return errors.New("missing api key")
-	}
-	return nil
-}
-
 type CatoAdapter struct {
-	conf         CatoConfig
+	conf         adaptertypes.CatoConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
@@ -68,7 +48,7 @@ type CatoAdapter struct {
 	ctx context.Context
 }
 
-func NewCatoAdapter(conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
+func NewCatoAdapter(conf adaptertypes.CatoConfig) (*CatoAdapter, chan struct{}, error) {
 	a := &CatoAdapter{
 		conf:      conf,
 		isRunning: 1,

@@ -1,6 +1,10 @@
 package adaptertypes
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"time"
+)
 
 // FalconCloudConfig defines the configuration for the CrowdStrike Falcon adapter
 type FalconCloudConfig struct {
@@ -11,4 +15,17 @@ type FalconCloudConfig struct {
 	IsUsingOffset   bool          `json:"is_using_offset" yaml:"is_using_offset" description:"Use offset-based pagination instead of time-based" category:"behavior" default:"false"`
 	Offset          uint64        `json:"offset" yaml:"offset" description:"Starting offset for event stream" category:"behavior" default:"0"`
 	NotBefore       *time.Time    `json:"not_before,omitempty" yaml:"not_before,omitempty" description:"Only fetch events after this timestamp" category:"behavior"`
+}
+
+func (c *FalconCloudConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.ClientId == "" {
+		return errors.New("missing client id")
+	}
+	if c.ClientSecret == "" {
+		return errors.New("missing client secret")
+	}
+	return nil
 }

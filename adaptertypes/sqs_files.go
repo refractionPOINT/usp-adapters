@@ -1,5 +1,10 @@
 package adaptertypes
 
+import (
+	"errors"
+	"fmt"
+)
+
 // SQSFilesConfig defines the configuration for the AWS SQS+S3 files adapter
 type SQSFilesConfig struct {
 	ClientOptions     ClientOptions `json:"client_options" yaml:"client_options" description:"USP client configuration for data ingestion" category:"client"`
@@ -12,4 +17,23 @@ type SQSFilesConfig struct {
 	FilePath          string        `json:"file_path,omitempty" yaml:"file_path,omitempty" description:"S3 file key path from SQS message" category:"parsing" llmguidance:"JSON path to object key in SQS message"`
 	IsDecodeObjectKey bool          `json:"is_decode_object_key,omitempty" yaml:"is_decode_object_key,omitempty" description:"URL decode the object key from SQS message" category:"parsing" default:"false"`
 	Bucket            string        `json:"bucket,omitempty" yaml:"bucket,omitempty" description:"Override bucket name from SQS message" category:"source" llmguidance:"Optional. Use if all files are in same bucket"`
+}
+
+func (c *SQSFilesConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.AccessKey == "" {
+		return errors.New("missing access_key")
+	}
+	if c.SecretKey == "" {
+		return errors.New("missing secret_key")
+	}
+	if c.Region == "" {
+		return errors.New("missing region")
+	}
+	if c.QueueURL == "" {
+		return errors.New("missing queue_url")
+	}
+	return nil
 }

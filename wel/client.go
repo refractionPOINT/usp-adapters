@@ -12,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 )
 
 const (
@@ -19,7 +20,7 @@ const (
 )
 
 type WELAdapter struct {
-	conf         WELConfig
+	conf         adaptertypes.WELConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
@@ -29,7 +30,7 @@ type WELAdapter struct {
 	hSubs []EVT_HANDLE
 }
 
-func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
+func NewWELAdapter(conf adaptertypes.WELConfig) (*WELAdapter, chan struct{}, error) {
 	a := &WELAdapter{
 		conf:      conf,
 		isRunning: 1,

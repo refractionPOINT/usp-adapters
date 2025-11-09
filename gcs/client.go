@@ -2,7 +2,6 @@ package usp_gcs
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -16,13 +15,14 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type GCSAdapter struct {
-	conf      GCSConfig
+	conf      adaptertypes.GCSConfig
 	uspClient *uspclient.Client
 
 	ctx context.Context
@@ -34,25 +34,6 @@ type GCSAdapter struct {
 	wg     sync.WaitGroup
 }
 
-type GCSConfig struct {
-	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	BucketName          string                  `json:"bucket_name" yaml:"bucket_name"`
-	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
-	IsOneTimeLoad       bool                    `json:"single_load" yaml:"single_load"`
-	Prefix              string                  `json:"prefix" yaml:"prefix"`
-	ParallelFetch       int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
-}
-
-func (c *GCSConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.BucketName == "" {
-		return errors.New("missing bucket_name")
-	}
-	return nil
-}
-
 type gcsLocalFile struct {
 	Obj          *storage.ObjectHandle
 	Attrs        *storage.ObjectAttrs
@@ -61,7 +42,7 @@ type gcsLocalFile struct {
 	Err          error
 }
 
-func NewGCSAdapter(conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
+func NewGCSAdapter(conf adaptertypes.GCSConfig) (*GCSAdapter, chan struct{}, error) {
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}

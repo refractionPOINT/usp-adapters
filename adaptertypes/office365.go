@@ -1,5 +1,11 @@
 package adaptertypes
 
+import (
+	"errors"
+	"fmt"
+	"strings"
+)
+
 // Office365Config defines the configuration for the Office 365 adapter
 type Office365Config struct {
 	ClientOptions ClientOptions `json:"client_options" yaml:"client_options" description:"USP client configuration for data ingestion" category:"client"`
@@ -13,4 +19,41 @@ type Office365Config struct {
 	StartTime     string        `json:"start_time" yaml:"start_time" description:"Start time for initial fetch" category:"behavior" llmguidance:"RFC3339 format. Leave empty to start from current time"`
 
 	Deduper Deduper `json:"-" yaml:"-"`
+}
+
+// Office 365 Management API endpoints for different cloud environments
+var office365URL = map[string]string{
+	"enterprise":   "https://manage.office.com/api/v1.0/",
+	"gcc-gov":      "https://manage-gcc.office.com/api/v1.0/",
+	"gcc-high-gov": "https://manage.office365.us/api/v1.0/",
+	"dod-gov":      "https://manage.protection.apps.mil/api/v1.0/",
+}
+
+func (c *Office365Config) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.Domain == "" {
+		return errors.New("missing domain")
+	}
+	if c.TenantID == "" {
+		return errors.New("missing tenant_id")
+	}
+	if c.PublisherID == "" {
+		return errors.New("missing publisher_id")
+	}
+	if c.ClientID == "" {
+		return errors.New("missing client_id")
+	}
+	if c.ClientSecret == "" {
+		return errors.New("missing client_secret")
+	}
+	if c.Endpoint == "" {
+		return errors.New("missing endpoint")
+	}
+	_, ok := office365URL[c.Endpoint]
+	if !strings.HasPrefix(c.Endpoint, "https://") && !ok {
+		return fmt.Errorf("invalid endpoint, not https or in %v", office365URL)
+	}
+	return nil
 }
