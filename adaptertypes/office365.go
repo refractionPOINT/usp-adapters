@@ -11,4 +11,6 @@ type Office365Config struct {
 	Endpoint      string        `json:"endpoint" yaml:"endpoint" description:"Office 365 endpoint" category:"source" example:"commercial" llmguidance:"Options: 'commercial', 'gcc', 'gcchigh', 'dod'"`
 	ContentTypes  string        `json:"content_types" yaml:"content_types" description:"Comma-separated list of content types to fetch" category:"source" example:"Audit.AzureActiveDirectory,Audit.Exchange" llmguidance:"Common: Audit.AzureActiveDirectory, Audit.Exchange, Audit.SharePoint, Audit.General"`
 	StartTime     string        `json:"start_time" yaml:"start_time" description:"Start time for initial fetch" category:"behavior" llmguidance:"RFC3339 format. Leave empty to start from current time"`
+
+	Deduper Deduper `json:"-" yaml:"-"`
 }

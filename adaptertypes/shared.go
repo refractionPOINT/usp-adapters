@@ -1,8 +1,11 @@
 package adaptertypes
 
 import (
+	"io"
+
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 // Re-export common types used across all adapters
@@ -14,3 +17,5 @@ type AckBufferOptions = uspclient.AckBufferOptions
 type MappingDescriptor = protocol.MappingDescriptor
 type IndexDescriptor = protocol.IndexDescriptor
 type FieldMapping = protocol.FieldMapping
+type Deduper = utils.Deduper
+type ReadCloser = io.ReadCloser
