@@ -3,7 +3,6 @@ package usp_trendmicro
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -26,31 +26,8 @@ var regionalDomains = map[string]string{
 	"au": "https://api.au.xdr.trendmicro.com",
 }
 
-type TrendMicroConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	APIToken      string                  `json:"api_token" yaml:"api_token"`
-	Region        string                  `json:"region" yaml:"region"` // "us", "eu", "sg", "jp", "in", "au" - defaults to "us"
-}
-
-func (c *TrendMicroConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-
-	if c.APIToken == "" {
-		return errors.New("missing api_token")
-	}
-	if c.Region == "" {
-		c.Region = "us"
-	}
-	if _, ok := regionalDomains[c.Region]; !ok {
-		return fmt.Errorf("invalid region: %s (must be one of: us, eu, sg, jp, in, au)", c.Region)
-	}
-	return nil
-}
-
 type TrendMicroAdapter struct {
-	conf       TrendMicroConfig
+	conf       adaptertypes.TrendMicroConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 	chStopped  chan struct{}
@@ -61,7 +38,7 @@ type TrendMicroAdapter struct {
 	lastFetch  time.Time
 }
 
-func NewTrendMicroAdapter(conf TrendMicroConfig) (*TrendMicroAdapter, chan struct{}, error) {
+func NewTrendMicroAdapter(conf adaptertypes.TrendMicroConfig) (*TrendMicroAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}

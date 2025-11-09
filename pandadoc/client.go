@@ -3,7 +3,6 @@ package usp_pandadoc
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -28,7 +28,7 @@ type opRequest struct {
 }
 
 type PandaDocAdapter struct {
-	conf       PandaDocConfig
+	conf       adaptertypes.PandaDocConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -41,23 +41,7 @@ type PandaDocAdapter struct {
 	dedupe map[string]int64
 }
 
-type PandaDocConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ApiKey        string                  `json:"api_key" yaml:"api_key"`
-}
-
-func (c *PandaDocConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.ApiKey == "" {
-		return errors.New("missing api key")
-	}
-
-	return nil
-}
-
-func NewPandaDocAdapter(conf PandaDocConfig) (*PandaDocAdapter, chan struct{}, error) {
+func NewPandaDocAdapter(conf adaptertypes.PandaDocConfig) (*PandaDocAdapter, chan struct{}, error) {
 	var err error
 	a := &PandaDocAdapter{
 		conf:   conf,

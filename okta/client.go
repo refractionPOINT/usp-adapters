@@ -3,7 +3,6 @@ package usp_okta
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -28,7 +28,7 @@ type opRequest struct {
 }
 
 type OktaAdapter struct {
-	conf       OktaConfig
+	conf       adaptertypes.OktaConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -41,26 +41,7 @@ type OktaAdapter struct {
 	dedupe map[string]int64
 }
 
-type OktaConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ApiKey        string                  `json:"apikey" yaml:"apikey"`
-	URL           string                  `json:"url" yaml:"url"`
-}
-
-func (c *OktaConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.URL == "" {
-		return errors.New("missing url")
-	}
-	if c.ApiKey == "" {
-		return errors.New("missing api key")
-	}
-	return nil
-}
-
-func NewOktaAdapter(conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
+func NewOktaAdapter(conf adaptertypes.OktaConfig) (*OktaAdapter, chan struct{}, error) {
 	var err error
 	a := &OktaAdapter{
 		conf:   conf,

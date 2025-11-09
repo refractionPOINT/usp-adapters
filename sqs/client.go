@@ -13,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 )
 
 const (
@@ -20,7 +21,7 @@ const (
 )
 
 type SQSAdapter struct {
-	conf      SQSConfig
+	conf      adaptertypes.SQSConfig
 	uspClient *uspclient.Client
 
 	awsConfig  *aws.Config
@@ -31,34 +32,7 @@ type SQSAdapter struct {
 	isStop bool
 }
 
-type SQSConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	AccessKey     string                  `json:"access_key" yaml:"access_key"`
-	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
-	QueueURL      string                  `json:"queue_url" yaml:"queue_url"`
-	Region        string                  `json:"region" yaml:"region"`
-}
-
-func (c *SQSConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.AccessKey == "" {
-		return errors.New("missing access_key")
-	}
-	if c.SecretKey == "" {
-		return errors.New("missing secret_key")
-	}
-	if c.Region == "" {
-		return errors.New("missing region")
-	}
-	if c.QueueURL == "" {
-		return errors.New("missing queue_url")
-	}
-	return nil
-}
-
-func NewSQSAdapter(conf SQSConfig) (*SQSAdapter, chan struct{}, error) {
+func NewSQSAdapter(conf adaptertypes.SQSConfig) (*SQSAdapter, chan struct{}, error) {
 	a := &SQSAdapter{
 		conf: conf,
 		ctx:  context.Background(),

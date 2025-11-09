@@ -4,7 +4,6 @@
 package usp_k8s_pods
 
 import (
-	"errors"
 	"fmt"
 	"regexp"
 	"sync"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -20,7 +20,7 @@ const (
 )
 
 type K8sPodsAdapter struct {
-	conf         K8sPodsConfig
+	conf         adaptertypes.K8sPodsConfig
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 	wg           sync.WaitGroup
@@ -35,17 +35,7 @@ type runtimeOptions struct {
 	excludePods *regexp.Regexp
 }
 
-func (c *K8sPodsConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Root == "" {
-		return errors.New("file_path missing")
-	}
-	return nil
-}
-
-func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, error) {
+func NewK8sPodsAdapter(conf adaptertypes.K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, error) {
 	a := &K8sPodsAdapter{
 		conf: conf,
 	}

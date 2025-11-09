@@ -2,7 +2,6 @@ package usp_pubsub
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 )
 
 const (
@@ -19,7 +19,7 @@ const (
 )
 
 type PubSubAdapter struct {
-	conf      PubSubConfig
+	conf      adaptertypes.PubSubConfig
 	uspClient *uspclient.Client
 
 	psClient *pubsub.Client
@@ -29,31 +29,7 @@ type PubSubAdapter struct {
 	stopSub  context.CancelFunc
 }
 
-type PubSubConfig struct {
-	ClientOptions       uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	SubscriptionName    string                  `json:"sub_name" yaml:"sub_name"`
-	ProjectName         string                  `json:"project_name" yaml:"project_name"`
-	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
-	MaxPSBuffer         int                     `json:"max_ps_buffer,omitempty" yaml:"max_ps_buffer,omitempty"`
-}
-
-func (c *PubSubConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.SubscriptionName == "" {
-		return errors.New("missing sub_name")
-	}
-	if c.ProjectName == "" {
-		return errors.New("missing project_name")
-	}
-	if c.ServiceAccountCreds == "" {
-		return errors.New("missing service_account_creds")
-	}
-	return nil
-}
-
-func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) {
+func NewPubSubAdapter(conf adaptertypes.PubSubConfig) (*PubSubAdapter, chan struct{}, error) {
 	a := &PubSubAdapter{
 		conf: conf,
 		ctx:  context.Background(),

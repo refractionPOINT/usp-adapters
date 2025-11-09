@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -22,7 +22,7 @@ const scope = "https://graph.microsoft.com/.default"
 const URLPrefix = "https://graph.microsoft.com/v1.0/"
 
 type MsGraphAdapter struct {
-	conf       MsGraphConfig
+	conf       adaptertypes.MsGraphConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -35,34 +35,7 @@ type MsGraphAdapter struct {
 	ctx context.Context
 }
 
-type MsGraphConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
-	ClientID      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-	URL           string                  `json:"url" yaml:"url"`
-}
-
-func (c *MsGraphConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.TenantID == "" {
-		return errors.New("missing tenant_id")
-	}
-	if c.ClientID == "" {
-		return errors.New("missing client_id")
-	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client_secret")
-	}
-	if c.URL == "" {
-		return errors.New("missing url")
-	}
-	return nil
-}
-
-func NewMsGraphAdapter(conf MsGraphConfig) (*MsGraphAdapter, chan struct{}, error) {
+func NewMsGraphAdapter(conf adaptertypes.MsGraphConfig) (*MsGraphAdapter, chan struct{}, error) {
 	var err error
 	a := &MsGraphAdapter{
 		conf:   conf,

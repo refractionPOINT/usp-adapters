@@ -3,7 +3,6 @@ package usp_itglue
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -28,7 +28,7 @@ type opRequest struct {
 }
 
 type ITGlueAdapter struct {
-	conf       ITGlueConfig
+	conf       adaptertypes.ITGlueConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -39,22 +39,7 @@ type ITGlueAdapter struct {
 	ctx context.Context
 }
 
-type ITGlueConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Token         string                  `json:"token" yaml:"token"`
-}
-
-func (c *ITGlueConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Token == "" {
-		return errors.New("missing token")
-	}
-	return nil
-}
-
-func NewITGlueAdapter(conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) {
+func NewITGlueAdapter(conf adaptertypes.ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) {
 	var err error
 	a := &ITGlueAdapter{
 		conf:   conf,

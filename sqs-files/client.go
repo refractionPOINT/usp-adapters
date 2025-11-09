@@ -19,6 +19,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -27,7 +28,7 @@ const (
 )
 
 type SQSFilesAdapter struct {
-	conf      SQSFilesConfig
+	conf      adaptertypes.SQSFilesConfig
 	uspClient *uspclient.Client
 
 	chFiles chan fileInfo
@@ -49,49 +50,12 @@ type SQSFilesAdapter struct {
 	wg     sync.WaitGroup
 }
 
-type SQSFilesConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-
-	// SQS specific
-	AccessKey string `json:"access_key" yaml:"access_key"`
-	SecretKey string `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
-	QueueURL  string `json:"queue_url" yaml:"queue_url"`
-	Region    string `json:"region" yaml:"region"`
-
-	// S3 specific
-	ParallelFetch     int    `json:"parallel_fetch" yaml:"parallel_fetch"`
-	BucketPath        string `json:"bucket_path,omitempty" yaml:"bucket_path,omitempty"`
-	FilePath          string `json:"file_path,omitempty" yaml:"file_path,omitempty"`
-	IsDecodeObjectKey bool   `json:"is_decode_object_key,omitempty" yaml:"is_decode_object_key,omitempty"`
-	// Optional: alternative to BucketPath
-	Bucket string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
-}
-
 type fileInfo struct {
 	bucket string
 	path   string
 }
 
-func (c *SQSFilesConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.AccessKey == "" {
-		return errors.New("missing access_key")
-	}
-	if c.SecretKey == "" {
-		return errors.New("missing secret_key")
-	}
-	if c.Region == "" {
-		return errors.New("missing region")
-	}
-	if c.QueueURL == "" {
-		return errors.New("missing queue_url")
-	}
-	return nil
-}
-
-func NewSQSFilesAdapter(conf SQSFilesConfig) (*SQSFilesAdapter, chan struct{}, error) {
+func NewSQSFilesAdapter(conf adaptertypes.SQSFilesConfig) (*SQSFilesAdapter, chan struct{}, error) {
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}

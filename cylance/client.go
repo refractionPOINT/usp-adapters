@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -30,16 +31,8 @@ const (
 	memoryProtectionEndpoint  = "/memoryprotection/v2"
 )
 
-type CylanceConfig struct {
-	ClientOptions  uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	TenantID       string                  `json:"tenant_id" yaml:"tenant_id"`
-	AppID          string                  `json:"app_id" yaml:"app_id"`
-	AppSecret      string                  `json:"app_secret" yaml:"app_secret"`
-	LoggingBaseURL string                  `json:"logging_base_url" yaml:"logging_base_url"`
-}
-
 type CylanceAdapter struct {
-	conf       CylanceConfig
+	conf       adaptertypes.CylanceConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 	chStopped  chan struct{}
@@ -57,7 +50,7 @@ type CylanceAdapter struct {
 	refreshFailLimitMet bool
 }
 
-func NewCylanceAdapter(conf CylanceConfig) (*CylanceAdapter, chan struct{}, error) {
+func NewCylanceAdapter(conf adaptertypes.CylanceConfig) (*CylanceAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -96,25 +89,6 @@ func NewCylanceAdapter(conf CylanceConfig) (*CylanceAdapter, chan struct{}, erro
 	go a.fetchEvents()
 
 	return a, a.chStopped, nil
-}
-
-func (c *CylanceConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.TenantID == "" {
-		return errors.New("missing tenant id")
-	}
-	if c.AppID == "" {
-		return errors.New("missing app id")
-	}
-	if c.AppSecret == "" {
-		return errors.New("missing app secret")
-	}
-	if c.LoggingBaseURL == "" {
-		c.LoggingBaseURL = defaultLoggingBaseURL
-	}
-	return nil
 }
 
 func (a *CylanceAdapter) Close() error {

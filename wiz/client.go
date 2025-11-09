@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -14,11 +13,12 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 type WizAdapter struct {
-	conf       WizConfig
+	conf       adaptertypes.WizConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -31,47 +31,7 @@ type WizAdapter struct {
 	expiresAt   time.Time
 }
 
-type WizConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientID      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-	URL           string                  `json:"url" yaml:"url"`
-	Query         string                  `json:"query" yaml:"query"`
-	Variables     map[string]interface{}  `json:"variables" yaml:"variables"`
-	TimeField     string                  `json:"time_field" yaml:"time_field"` // e.g., "createdAt", "updatedAt"
-	DataPath      []string                `json:"data_path" yaml:"data_path"`   // e.g., ["data", "securityIssues", "issues"]
-	IDField       string                  `json:"id_field" yaml:"id_field"`     // e.g., "id"
-}
-
-func (c *WizConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.ClientID == "" {
-		return errors.New("missing client_id")
-	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client_secret")
-	}
-	if c.URL == "" {
-		return errors.New("missing url")
-	}
-	if c.Query == "" {
-		return errors.New("missing query")
-	}
-	if c.TimeField == "" {
-		return errors.New("missing time_field")
-	}
-	if len(c.DataPath) == 0 {
-		return errors.New("missing data_path")
-	}
-	if c.IDField == "" {
-		return errors.New("missing id_field")
-	}
-	return nil
-}
-
-func NewWizAdapter(conf WizConfig) (*WizAdapter, chan struct{}, error) {
+func NewWizAdapter(conf adaptertypes.WizConfig) (*WizAdapter, chan struct{}, error) {
 	var err error
 	a := &WizAdapter{
 		conf:   conf,

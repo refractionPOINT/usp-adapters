@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -31,15 +31,8 @@ type opRequest struct {
 	Cursor    string `json:"cursor,omitempty"`
 }
 
-var URL = map[string]string{
-	"business":   "https://events.1password.com",
-	"enterprise": "https://events.ent.1password.com",
-	"ca":         "https://events.1password.ca",
-	"eu":         "https://events.1password.eu",
-}
-
 type OnePasswordAdapter struct {
-	conf       OnePasswordConfig
+	conf       adaptertypes.OnePasswordConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -52,30 +45,7 @@ type OnePasswordAdapter struct {
 	ctx context.Context
 }
 
-type OnePasswordConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Token         string                  `json:"token" yaml:"token"`
-	Endpoint      string                  `json:"endpoint" yaml:"endpoint"`
-}
-
-func (c *OnePasswordConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Token == "" {
-		return errors.New("missing token")
-	}
-	if c.Endpoint == "" {
-		return errors.New("missing endpoint")
-	}
-	_, ok := URL[c.Endpoint]
-	if !strings.HasPrefix(c.Endpoint, "https://") && !ok {
-		return fmt.Errorf("invalid endpoint, not https or in %v", URL)
-	}
-	return nil
-}
-
-func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
+func NewOnePasswordpAdapter(conf adaptertypes.OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
 	var err error
 	a := &OnePasswordAdapter{
 		conf:   conf,
@@ -85,7 +55,7 @@ func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan s
 
 	if strings.HasPrefix(conf.Endpoint, "https://") {
 		a.endpoint = conf.Endpoint
-	} else if v, ok := URL[conf.Endpoint]; ok {
+	} else if v, ok := adaptertypes.OnePasswordURL[conf.Endpoint]; ok {
 		a.endpoint = v
 	} else {
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -42,7 +43,7 @@ func TestPollFiles(t *testing.T) {
 	mockClientOptions := new(MockClientOptions)
 	// Create FileAdapter instance
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:              filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold:   5,
 			ReactivationThreshold: 10,
@@ -131,7 +132,7 @@ func TestPollSerialFiles(t *testing.T) {
 	}
 	// Create FileAdapter instance
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:              filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold:   5,
 			ReactivationThreshold: 10,
@@ -216,7 +217,7 @@ func TestTailActiveFile(t *testing.T) {
 
 	// Create FileAdapter instance
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:              filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold:   2, // Set high to prevent inactivity
 			ReactivationThreshold: 1,
@@ -323,7 +324,7 @@ func TestMultiLineJSON(t *testing.T) {
 
 	// Create FileAdapter instance with MultiLineJSON enabled
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:              filepath.Join(tmpDir, "*.json"),
 			InactivityThreshold:   5,
 			ReactivationThreshold: 1,
@@ -440,7 +441,7 @@ func TestFileRotationDetection(t *testing.T) {
 	require.NoError(t, err)
 
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:              filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold:   60, // High to prevent inactivity
 			ReactivationThreshold: 10,
@@ -579,7 +580,7 @@ func TestFileRotationPreservesData(t *testing.T) {
 	require.NoError(t, err)
 
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:              filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold:   120,
 			ReactivationThreshold: 10,
@@ -689,7 +690,7 @@ func TestMultipleFileRotations(t *testing.T) {
 	require.NoError(t, err)
 
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:            filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold: 120,
 			Backfill:            true,
@@ -794,7 +795,7 @@ func TestConcurrentFileRotations(t *testing.T) {
 	require.NoError(t, err)
 
 	adapter := &FileAdapter{
-		conf: FileConfig{
+		conf: adaptertypes.FileConfig{
 			FilePath:            filepath.Join(tmpDir, "*.log"),
 			InactivityThreshold: 120,
 			Backfill:            true,

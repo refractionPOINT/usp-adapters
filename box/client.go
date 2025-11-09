@@ -15,6 +15,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -23,26 +24,8 @@ const (
 	tokenEndpoint = "https://api.box.com/oauth2/token"
 )
 
-type BoxConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientID      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-	SubjectID     string                  `json:"subject_id" yaml:"subject_id"`
-}
-
-func (c *BoxConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-
-	if c.ClientID == "" || c.ClientSecret == "" || c.SubjectID == "" {
-		return errors.New("missing Box client ID, secret, or subject ID")
-	}
-	return nil
-}
-
 type BoxAdapter struct {
-	conf           BoxConfig
+	conf           adaptertypes.BoxConfig
 	uspClient      *uspclient.Client
 	httpClient     *http.Client
 	chStopped      chan struct{}
@@ -54,7 +37,7 @@ type BoxAdapter struct {
 	initialized    bool
 }
 
-func NewBoxAdapter(conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
+func NewBoxAdapter(conf adaptertypes.BoxConfig) (*BoxAdapter, chan struct{}, error) {
 	var err error
 	a := &BoxAdapter{
 		conf:           conf,

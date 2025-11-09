@@ -2,7 +2,6 @@ package usp_proofpoint_tap
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -22,7 +22,7 @@ const (
 )
 
 type ProofpointTapAdapter struct {
-	conf       ProofpointTapConfig
+	conf       adaptertypes.ProofpointTapConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -34,26 +34,7 @@ type ProofpointTapAdapter struct {
 	clickDedupe   map[string]int64
 }
 
-type ProofpointTapConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Principal     string                  `json:"principal" yaml:"principal"`
-	Secret        string                  `json:"secret" yaml:"secret"`
-}
-
-func (c *ProofpointTapConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Principal == "" {
-		return errors.New("missing principal")
-	}
-	if c.Secret == "" {
-		return errors.New("missing secret")
-	}
-	return nil
-}
-
-func NewProofpointTapAdapter(conf ProofpointTapConfig) (*ProofpointTapAdapter, chan struct{}, error) {
+func NewProofpointTapAdapter(conf adaptertypes.ProofpointTapConfig) (*ProofpointTapAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}

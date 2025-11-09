@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -24,7 +24,7 @@ var URL = map[string]string{
 }
 
 type EntraIDAdapter struct {
-	conf       EntraIDConfig
+	conf       adaptertypes.EntraIDConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -37,30 +37,7 @@ type EntraIDAdapter struct {
 	ctx context.Context
 }
 
-type EntraIDConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
-	ClientID      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-}
-
-func (c *EntraIDConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.TenantID == "" {
-		return errors.New("missing tenant_id")
-	}
-	if c.ClientID == "" {
-		return errors.New("missing client_id")
-	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client_secret")
-	}
-	return nil
-}
-
-func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, error) {
+func NewEntraIDAdapter(conf adaptertypes.EntraIDConfig) (*EntraIDAdapter, chan struct{}, error) {
 	var err error
 	a := &EntraIDAdapter{
 		conf:   conf,

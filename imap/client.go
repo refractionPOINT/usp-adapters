@@ -19,6 +19,7 @@ import (
 	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 )
 
 var (
@@ -26,7 +27,7 @@ var (
 )
 
 type IMAPAdapter struct {
-	conf      ImapConfig
+	conf      adaptertypes.ImapConfig
 	uspClient *uspclient.Client
 
 	imapClient *client.Client
@@ -39,37 +40,7 @@ type IMAPAdapter struct {
 	ctx context.Context
 }
 
-type ImapConfig struct {
-	ClientOptions           uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Server                  string                  `json:"server" yaml:"server"`
-	UserName                string                  `json:"username" yaml:"username"`
-	Password                string                  `json:"password" yaml:"password"`
-	InboxName               string                  `json:"inbox_name" yaml:"inbox_name"`
-	IsInsecure              bool                    `json:"is_insecure" yaml:"is_insecure"`
-	FromZero                bool                    `json:"from_zero" yaml:"from_zero"`
-	IncludeAttachments      bool                    `json:"include_attachments" yaml:"include_attachments"`
-	MaxBodySize             int                     `json:"max_body_size" yaml:"max_body_size"`
-	AttachmentIngestKey     string                  `json:"attachment_ingest_key" yaml:"attachment_ingest_key"`
-	AttachmentRetentionDays int                     `json:"attachment_retention_days" yaml:"attachment_retention_days"`
-}
-
-func (c *ImapConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Server == "" {
-		return errors.New("missing server")
-	}
-	if c.UserName == "" {
-		return errors.New("missing username")
-	}
-	if c.Password == "" {
-		return errors.New("missing password")
-	}
-	return nil
-}
-
-func NewImapAdapter(conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
+func NewImapAdapter(conf adaptertypes.ImapConfig) (*IMAPAdapter, chan struct{}, error) {
 	a := &IMAPAdapter{
 		conf: conf,
 		ctx:  context.Background(),

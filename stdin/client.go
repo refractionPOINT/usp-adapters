@@ -10,6 +10,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -18,26 +19,14 @@ const (
 )
 
 type StdinAdapter struct {
-	conf         StdinConfig
+	conf         adaptertypes.StdinConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
 }
 
-type StdinConfig struct {
-	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-}
-
-func (c *StdinConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	return nil
-}
-
-func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
+func NewStdinAdapter(conf adaptertypes.StdinConfig) (*StdinAdapter, chan struct{}, error) {
 	a := &StdinAdapter{
 		conf:      conf,
 		isRunning: 1,

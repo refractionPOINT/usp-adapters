@@ -3,7 +3,6 @@ package usp_sublime
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -24,7 +24,7 @@ const (
 )
 
 type SublimeAdapter struct {
-	conf       SublimeConfig
+	conf       adaptertypes.SublimeConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -36,26 +36,7 @@ type SublimeAdapter struct {
 	dedupe map[string]int64
 }
 
-type SublimeConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ApiKey        string                  `json:"api_key" yaml:"api_key"`
-	BaseURL       string                  `json:"base_url" yaml:"base_url"`
-}
-
-func (c *SublimeConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.ApiKey == "" {
-		return errors.New("missing api key")
-	}
-	if c.BaseURL == "" {
-		c.BaseURL = defaultBaseURL
-	}
-	return nil
-}
-
-func NewSublimeAdapter(conf SublimeConfig) (*SublimeAdapter, chan struct{}, error) {
+func NewSublimeAdapter(conf adaptertypes.SublimeConfig) (*SublimeAdapter, chan struct{}, error) {
 	var err error
 	a := &SublimeAdapter{
 		conf:   conf,

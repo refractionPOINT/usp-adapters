@@ -14,6 +14,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -23,7 +24,7 @@ const (
 )
 
 type SyslogAdapter struct {
-	conf         SyslogConfig
+	conf         adaptertypes.SyslogConfig
 	listener     net.Listener
 	udpListener  *net.UDPConn
 	connMutex    sync.Mutex
@@ -33,28 +34,7 @@ type SyslogAdapter struct {
 	writeTimeout time.Duration
 }
 
-type SyslogConfig struct {
-	ClientOptions     uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Port              uint16                  `json:"port" yaml:"port"`
-	Interface         string                  `json:"iface" yaml:"iface"`
-	IsUDP             bool                    `json:"is_udp,omitempty" yaml:"is_udp,omitempty"`
-	SslCertPath       string                  `json:"ssl_cert" yaml:"ssl_cert"`
-	SslKeyPath        string                  `json:"ssl_key" yaml:"ssl_key"`
-	MutualTlsCertPath string                  `json:"mutual_tls_cert,omitempty" yaml:"mutual_tls_cert,omitempty"`
-	WriteTimeoutSec   uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-}
-
-func (c *SyslogConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Port == 0 {
-		return errors.New("missing port")
-	}
-	return nil
-}
-
-func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
+func NewSyslogAdapter(conf adaptertypes.SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
 	a := &SyslogAdapter{
 		conf:      conf,
 		isRunning: 1,

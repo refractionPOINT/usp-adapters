@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -22,7 +22,7 @@ const (
 )
 
 type SlackAdapter struct {
-	conf       SlackConfig
+	conf       adaptertypes.SlackConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -40,22 +40,7 @@ type slackResponse struct {
 	} `json:"response_metadata"`
 }
 
-type SlackConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Token         string                  `json:"token" yaml:"token"`
-}
-
-func (c *SlackConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Token == "" {
-		return errors.New("missing token")
-	}
-	return nil
-}
-
-func NewSlackAdapter(conf SlackConfig) (*SlackAdapter, chan struct{}, error) {
+func NewSlackAdapter(conf adaptertypes.SlackConfig) (*SlackAdapter, chan struct{}, error) {
 	var err error
 	a := &SlackAdapter{
 		conf:   conf,

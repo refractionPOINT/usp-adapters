@@ -15,6 +15,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 )
 
 const (
@@ -22,7 +23,7 @@ const (
 )
 
 type MacUnifiedLoggingAdapter struct {
-	conf         MacUnifiedLoggingConfig
+	conf         adaptertypes.MacUnifiedLoggingConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
@@ -35,7 +36,7 @@ type MacUnifiedLoggingAdapter struct {
 	ctx context.Context
 }
 
-func NewMacUnifiedLoggingAdapter(conf MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
+func NewMacUnifiedLoggingAdapter(conf adaptertypes.MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
 	a := &MacUnifiedLoggingAdapter{
 		conf:      conf,
 		isRunning: 1,

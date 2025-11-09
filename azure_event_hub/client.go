@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/Azure/azure-event-hubs-go/v3"
+	eventhub "github.com/Azure/azure-event-hubs-go/v3"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 )
 
 const (
@@ -17,7 +18,7 @@ const (
 )
 
 type EventHubAdapter struct {
-	conf      EventHubConfig
+	conf      adaptertypes.EventHubConfig
 	uspClient *uspclient.Client
 
 	hub       *eventhub.Hub
@@ -27,22 +28,7 @@ type EventHubAdapter struct {
 	chStopped chan struct{}
 }
 
-type EventHubConfig struct {
-	ClientOptions    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ConnectionString string                  `json:"connection_string" yaml:"connection_string"`
-}
-
-func (c *EventHubConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.ConnectionString == "" {
-		return errors.New("missing connection_string")
-	}
-	return nil
-}
-
-func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
+func NewEventHubAdapter(conf adaptertypes.EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
 	a := &EventHubAdapter{
 		conf: conf,
 		ctx:  context.Background(),

@@ -17,6 +17,7 @@ import (
 	"github.com/refractionPOINT/gjson"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 
 	"golang.org/x/oauth2/clientcredentials"
@@ -61,7 +62,7 @@ var ResourceScope = map[string]string{
 }
 
 type Office365Adapter struct {
-	conf       Office365Config
+	conf       adaptertypes.Office365Config
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -75,50 +76,7 @@ type Office365Adapter struct {
 	ctx context.Context
 }
 
-type Office365Config struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Domain        string                  `json:"domain" yaml:"domain"`
-	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
-	PublisherID   string                  `json:"publisher_id" yaml:"publisher_id"`
-	ClientID      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-	Endpoint      string                  `json:"endpoint" yaml:"endpoint"`
-	ContentTypes  string                  `json:"content_types" yaml:"content_types"`
-	StartTime     string                  `json:"start_time" yaml:"start_time"`
-
-	Deduper utils.Deduper `json:"-" yaml:"-"`
-}
-
-func (c *Office365Config) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.Domain == "" {
-		return errors.New("missing domain")
-	}
-	if c.TenantID == "" {
-		return errors.New("missing tenant_id")
-	}
-	if c.PublisherID == "" {
-		return errors.New("missing publisher_id")
-	}
-	if c.ClientID == "" {
-		return errors.New("missing client_id")
-	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client_secret")
-	}
-	if c.Endpoint == "" {
-		return errors.New("missing endpoint")
-	}
-	_, ok := URL[c.Endpoint]
-	if !strings.HasPrefix(c.Endpoint, "https://") && !ok {
-		return fmt.Errorf("invalid endpoint, not https or in %v", URL)
-	}
-	return nil
-}
-
-func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}, error) {
+func NewOffice365Adapter(conf adaptertypes.Office365Config) (*Office365Adapter, chan struct{}, error) {
 	var err error
 
 	// If no deduper is provided, use a local one.

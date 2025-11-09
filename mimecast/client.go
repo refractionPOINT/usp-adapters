@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -23,7 +23,7 @@ const (
 )
 
 type MimecastAdapter struct {
-	conf       MimecastConfig
+	conf       adaptertypes.MimecastConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -85,27 +85,7 @@ type AuditLog struct {
 	Category  string `json:"category"`
 }
 
-type MimecastConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientId      string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
-}
-
-func (c *MimecastConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.ClientId == "" {
-		return errors.New("missing client id")
-	}
-	if c.ClientSecret == "" {
-		return errors.New("missing client secret")
-	}
-
-	return nil
-}
-
-func NewMimecastAdapter(conf MimecastConfig) (*MimecastAdapter, chan struct{}, error) {
+func NewMimecastAdapter(conf adaptertypes.MimecastConfig) (*MimecastAdapter, chan struct{}, error) {
 	var err error
 	a := &MimecastAdapter{
 		conf:   conf,

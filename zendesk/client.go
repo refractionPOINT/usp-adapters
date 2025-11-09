@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/adaptertypes"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -29,7 +29,7 @@ type opRequest struct {
 }
 
 type ZendeskAdapter struct {
-	conf       ZendeskConfig
+	conf       adaptertypes.ZendeskConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
 
@@ -42,31 +42,7 @@ type ZendeskAdapter struct {
 	dedupe map[string]int64
 }
 
-type ZendeskConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ApiToken      string                  `json:"api_token" yaml:"api_token"`
-	ZendeskDomain string                  `json:"zendesk_domain" yaml:"zendesk_domain"`
-	ZendeskEmail  string                  `json:"zendesk_email" yaml:"zendesk_email"`
-}
-
-func (c *ZendeskConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.ApiToken == "" {
-		return errors.New("missing api token")
-	}
-	if c.ZendeskDomain == "" {
-		return errors.New("missing zendesk domain (e.g., 'your-company.zendesk.com')")
-	}
-	if c.ZendeskEmail == "" {
-		return errors.New("missing zendesk email")
-	}
-
-	return nil
-}
-
-func NewZendeskAdapter(conf ZendeskConfig) (*ZendeskAdapter, chan struct{}, error) {
+func NewZendeskAdapter(conf adaptertypes.ZendeskConfig) (*ZendeskAdapter, chan struct{}, error) {
 	var err error
 	a := &ZendeskAdapter{
 		conf:   conf,
