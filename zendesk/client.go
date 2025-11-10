@@ -30,7 +30,7 @@ type opRequest struct {
 
 type ZendeskAdapter struct {
 	conf       ZendeskConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 
 	chStopped chan struct{}
@@ -47,6 +47,7 @@ type ZendeskConfig struct {
 	ApiToken      string                  `json:"api_token" yaml:"api_token"`
 	ZendeskDomain string                  `json:"zendesk_domain" yaml:"zendesk_domain"`
 	ZendeskEmail  string                  `json:"zendesk_email" yaml:"zendesk_email"`
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *ZendeskConfig) Validate() error {
@@ -75,9 +76,20 @@ func NewZendeskAdapter(conf ZendeskConfig) (*ZendeskAdapter, chan struct{}, erro
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

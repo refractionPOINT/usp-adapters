@@ -28,6 +28,7 @@ type BoxConfig struct {
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
 	SubjectID     string                  `json:"subject_id" yaml:"subject_id"`
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *BoxConfig) Validate() error {
@@ -43,7 +44,7 @@ func (c *BoxConfig) Validate() error {
 
 type BoxAdapter struct {
 	conf           BoxConfig
-	uspClient      *uspclient.Client
+	uspClient      utils.Shipper
 	httpClient     *http.Client
 	chStopped      chan struct{}
 	wgSenders      sync.WaitGroup
@@ -65,9 +66,20 @@ func NewBoxAdapter(conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
 		initialized:    false,
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

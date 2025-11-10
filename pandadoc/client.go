@@ -29,7 +29,7 @@ type opRequest struct {
 
 type PandaDocAdapter struct {
 	conf       PandaDocConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 
 	chStopped chan struct{}
@@ -44,6 +44,7 @@ type PandaDocAdapter struct {
 type PandaDocConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"api_key" yaml:"api_key"`
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *PandaDocConfig) Validate() error {
@@ -66,9 +67,20 @@ func NewPandaDocAdapter(conf PandaDocConfig) (*PandaDocAdapter, chan struct{}, e
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

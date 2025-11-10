@@ -12,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -20,7 +21,7 @@ const (
 
 type PubSubAdapter struct {
 	conf      PubSubConfig
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 
 	psClient *pubsub.Client
 
@@ -35,6 +36,7 @@ type PubSubConfig struct {
 	ProjectName         string                  `json:"project_name" yaml:"project_name"`
 	ServiceAccountCreds string                  `json:"service_account_creds,omitempty" yaml:"service_account_creds,omitempty"`
 	MaxPSBuffer         int                     `json:"max_ps_buffer,omitempty" yaml:"max_ps_buffer,omitempty"`
+	Filters             []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *PubSubConfig) Validate() error {
@@ -78,10 +80,22 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 		}
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		a.psClient.Close()
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			a.psClient.Close()
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.buildSub = a.psClient.Subscription(a.conf.SubscriptionName)

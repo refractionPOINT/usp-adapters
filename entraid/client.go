@@ -25,7 +25,7 @@ var URL = map[string]string{
 
 type EntraIDAdapter struct {
 	conf       EntraIDConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 
 	endpoint string
@@ -42,6 +42,7 @@ type EntraIDConfig struct {
 	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *EntraIDConfig) Validate() error {
@@ -68,9 +69,20 @@ func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, erro
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

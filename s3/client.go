@@ -60,7 +60,7 @@ const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type S3Adapter struct {
 	conf      S3Config
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 
 	ctx context.Context
 
@@ -84,6 +84,7 @@ type S3Config struct {
 	Prefix        string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
 	Region        string                  `json:"region" yaml:"region"`
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *S3Config) Validate() error {
@@ -171,9 +172,20 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	a.awsS3 = s3.New(a.awsSession)
 	a.awsDownloader = s3manager.NewDownloader(a.awsSession)
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	chStopped := make(chan struct{})

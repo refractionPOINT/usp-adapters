@@ -30,6 +30,7 @@ type TrendMicroConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	APIToken      string                  `json:"api_token" yaml:"api_token"`
 	Region        string                  `json:"region" yaml:"region"` // "us", "eu", "sg", "jp", "in", "au" - defaults to "us"
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *TrendMicroConfig) Validate() error {
@@ -51,7 +52,7 @@ func (c *TrendMicroConfig) Validate() error {
 
 type TrendMicroAdapter struct {
 	conf       TrendMicroConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 	chStopped  chan struct{}
 	wgSenders  sync.WaitGroup
@@ -78,9 +79,20 @@ func NewTrendMicroAdapter(conf TrendMicroConfig) (*TrendMicroAdapter, chan struc
 	// Set regional base URL
 	a.baseURL = regionalDomains[conf.Region]
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

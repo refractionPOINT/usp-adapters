@@ -29,7 +29,7 @@ type opRequest struct {
 
 type ITGlueAdapter struct {
 	conf       ITGlueConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 
 	chStopped chan struct{}
@@ -42,6 +42,7 @@ type ITGlueAdapter struct {
 type ITGlueConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *ITGlueConfig) Validate() error {
@@ -62,9 +63,20 @@ func NewITGlueAdapter(conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) 
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

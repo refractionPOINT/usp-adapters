@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 
 	"github.com/crowdstrike/gofalcon/falcon"
 	"github.com/crowdstrike/gofalcon/falcon/client"
@@ -30,6 +31,7 @@ type FalconCloudConfig struct {
 	IsUsingOffset   bool                    `json:"is_using_offset" yaml:"is_using_offset"`
 	Offset          uint64                  `json:"offset" yaml:"offset"`
 	NotBefore       *time.Time              `json:"not_before,omitempty" yaml:"not_before,omitempty"`
+	Filters         []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *FalconCloudConfig) Validate() error {
@@ -49,7 +51,7 @@ type FalconCloudAdapter struct {
 	conf         FalconCloudConfig
 	isRunning    uint32
 	mRunning     sync.RWMutex
-	uspClient    *uspclient.Client
+	uspClient    utils.Shipper
 	writeTimeout time.Duration
 
 	chStopped chan struct{}
@@ -71,9 +73,20 @@ func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan st
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.ctx, a.cancel = context.WithCancel(context.Background())

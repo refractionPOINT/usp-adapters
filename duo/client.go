@@ -21,7 +21,7 @@ const (
 
 type DuoAdapter struct {
 	conf        DuoConfig
-	uspClient   *uspclient.Client
+	uspClient   utils.Shipper
 	duoClient   *duoapi.DuoApi
 	adminClient *duoadmin.Client
 
@@ -37,6 +37,7 @@ type DuoConfig struct {
 	IntegrationKey string                  `json:"integration_key" yaml:"integration_key"`
 	SecretKey      string                  `json:"secret_key" yaml:"secret_key"`
 	APIHostname    string                  `json:"api_hostname" yaml:"api_hostname"`
+	Filters        []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *DuoConfig) Validate() error {
@@ -63,9 +64,20 @@ func NewDuoAdapter(conf DuoConfig) (*DuoAdapter, chan struct{}, error) {
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.duoClient = duoapi.NewDuoApi(a.conf.IntegrationKey, a.conf.SecretKey, a.conf.APIHostname, "limacharlie", duoapi.SetTimeout(15*time.Second))

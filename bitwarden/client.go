@@ -32,6 +32,7 @@ type BitwardenConfig struct {
 	Region            string                  `json:"region" yaml:"region"`                         // "us" or "eu", defaults to "us"
 	TokenEndpointURL  string                  `json:"token_endpoint_url" yaml:"token_endpoint_url"` // Custom token endpoint URL for self-hosted instances
 	EventsBaseURL     string                  `json:"events_base_url" yaml:"events_base_url"`       // Custom events base URL for self-hosted instances
+	Filters           []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *BitwardenConfig) Validate() error {
@@ -75,7 +76,7 @@ func (c *BitwardenConfig) Validate() error {
 
 type BitwardenAdapter struct {
 	conf          BitwardenConfig
-	uspClient     *uspclient.Client
+	uspClient     utils.Shipper
 	httpClient    *http.Client
 	chStopped     chan struct{}
 	wgSenders     sync.WaitGroup
@@ -114,9 +115,20 @@ func NewBitwardenAdapter(conf BitwardenConfig) (*BitwardenAdapter, chan struct{}
 		a.tokenEndpoint = tokenEndpointUS
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

@@ -23,7 +23,7 @@ const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type GCSAdapter struct {
 	conf      GCSConfig
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 
 	ctx context.Context
 
@@ -41,6 +41,7 @@ type GCSConfig struct {
 	IsOneTimeLoad       bool                    `json:"single_load" yaml:"single_load"`
 	Prefix              string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch       int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
+	Filters             []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *GCSConfig) Validate() error {
@@ -92,9 +93,20 @@ func NewGCSAdapter(conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
 
 	a.bucket = a.client.Bucket(conf.BucketName)
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	chStopped := make(chan struct{})

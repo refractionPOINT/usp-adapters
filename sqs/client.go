@@ -13,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -21,7 +22,7 @@ const (
 
 type SQSAdapter struct {
 	conf      SQSConfig
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 
 	awsConfig  *aws.Config
 	awsSession *session.Session
@@ -37,6 +38,7 @@ type SQSConfig struct {
 	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
 	QueueURL      string                  `json:"queue_url" yaml:"queue_url"`
 	Region        string                  `json:"region" yaml:"region"`
+	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *SQSConfig) Validate() error {
@@ -76,9 +78,20 @@ func NewSQSAdapter(conf SQSConfig) (*SQSAdapter, chan struct{}, error) {
 
 	a.sqsClient = sqs.New(a.awsSession)
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	var subErr error
