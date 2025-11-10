@@ -42,7 +42,7 @@ type ITGlueAdapter struct {
 type ITGlueConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *ITGlueConfig) Validate() error {

@@ -45,7 +45,7 @@ type OktaConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"apikey" yaml:"apikey"`
 	URL           string                  `json:"url" yaml:"url"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *OktaConfig) Validate() error {

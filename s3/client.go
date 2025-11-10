@@ -84,7 +84,7 @@ type S3Config struct {
 	Prefix        string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
 	Region        string                  `json:"region" yaml:"region"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *S3Config) Validate() error {

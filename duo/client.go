@@ -37,7 +37,7 @@ type DuoConfig struct {
 	IntegrationKey string                  `json:"integration_key" yaml:"integration_key"`
 	SecretKey      string                  `json:"secret_key" yaml:"secret_key"`
 	APIHostname    string                  `json:"api_hostname" yaml:"api_hostname"`
-	Filters        []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *DuoConfig) Validate() error {

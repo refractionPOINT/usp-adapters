@@ -65,7 +65,7 @@ type SQSFilesConfig struct {
 	IsDecodeObjectKey bool   `json:"is_decode_object_key,omitempty" yaml:"is_decode_object_key,omitempty"`
 	// Optional: alternative to BucketPath
 	Bucket  string   `json:"bucket,omitempty" yaml:"bucket,omitempty"`
-	Filters []string `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 type fileInfo struct {

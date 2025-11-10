@@ -1,6 +1,7 @@
 package usp_k8s_pods
 
 import (
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/go-uspclient"
 )
 
@@ -10,5 +11,5 @@ type K8sPodsConfig struct {
 	Root            string                  `json:"root" yaml:"root"`
 	IncludePodsRE   string                  `json:"include_pods_re" yaml:"include_pods_re"`
 	ExcludePodsRE   string                  `json:"exclude_pods_re" yaml:"exclude_pods_re"`
-	Filters         []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }

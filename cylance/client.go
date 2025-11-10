@@ -36,7 +36,7 @@ type CylanceConfig struct {
 	AppID          string                  `json:"app_id" yaml:"app_id"`
 	AppSecret      string                  `json:"app_secret" yaml:"app_secret"`
 	LoggingBaseURL string                  `json:"logging_base_url" yaml:"logging_base_url"`
-	Filters        []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 type CylanceAdapter struct {

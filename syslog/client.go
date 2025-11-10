@@ -42,7 +42,7 @@ type SyslogConfig struct {
 	SslKeyPath        string                  `json:"ssl_key" yaml:"ssl_key"`
 	MutualTlsCertPath string                  `json:"mutual_tls_cert,omitempty" yaml:"mutual_tls_cert,omitempty"`
 	WriteTimeoutSec   uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-	Filters           []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *SyslogConfig) Validate() error {

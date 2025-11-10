@@ -87,7 +87,7 @@ type Office365Config struct {
 	StartTime     string                  `json:"start_time" yaml:"start_time"`
 
 	Deduper utils.Deduper `json:"-" yaml:"-"`
-	Filters []string      `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *Office365Config) Validate() error {

@@ -41,7 +41,7 @@ type GCSConfig struct {
 	IsOneTimeLoad       bool                    `json:"single_load" yaml:"single_load"`
 	Prefix              string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch       int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
-	Filters             []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *GCSConfig) Validate() error {

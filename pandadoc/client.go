@@ -44,7 +44,7 @@ type PandaDocAdapter struct {
 type PandaDocConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"api_key" yaml:"api_key"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *PandaDocConfig) Validate() error {

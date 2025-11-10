@@ -38,7 +38,7 @@ type ProofpointTapConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Principal     string                  `json:"principal" yaml:"principal"`
 	Secret        string                  `json:"secret" yaml:"secret"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *ProofpointTapConfig) Validate() error {

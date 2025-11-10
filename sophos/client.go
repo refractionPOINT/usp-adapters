@@ -46,7 +46,7 @@ type SophosConfig struct {
 	ClientSecret  string                  `json:"clientsecret" yaml:"clientsecret"`
 	TenantId      string                  `json:"tenantid" yaml:"tenantid"`
 	URL           string                  `json:"url" yaml:"url"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *SophosConfig) Validate() error {

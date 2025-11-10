@@ -56,7 +56,7 @@ type OnePasswordConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
 	Endpoint      string                  `json:"endpoint" yaml:"endpoint"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *OnePasswordConfig) Validate() error {

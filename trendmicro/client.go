@@ -30,7 +30,7 @@ type TrendMicroConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	APIToken      string                  `json:"api_token" yaml:"api_token"`
 	Region        string                  `json:"region" yaml:"region"` // "us", "eu", "sg", "jp", "in", "au" - defaults to "us"
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *TrendMicroConfig) Validate() error {

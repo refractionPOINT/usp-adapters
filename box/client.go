@@ -28,7 +28,7 @@ type BoxConfig struct {
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
 	SubjectID     string                  `json:"subject_id" yaml:"subject_id"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *BoxConfig) Validate() error {

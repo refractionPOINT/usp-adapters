@@ -52,7 +52,7 @@ type ImapConfig struct {
 	MaxBodySize             int                     `json:"max_body_size" yaml:"max_body_size"`
 	AttachmentIngestKey     string                  `json:"attachment_ingest_key" yaml:"attachment_ingest_key"`
 	AttachmentRetentionDays int                     `json:"attachment_retention_days" yaml:"attachment_retention_days"`
-	Filters                 []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *ImapConfig) Validate() error {

@@ -31,7 +31,7 @@ type EventHubAdapter struct {
 type EventHubConfig struct {
 	ClientOptions    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ConnectionString string                  `json:"connection_string" yaml:"connection_string"`
-	Filters          []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *EventHubConfig) Validate() error {

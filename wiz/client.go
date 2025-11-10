@@ -41,7 +41,7 @@ type WizConfig struct {
 	TimeField     string                  `json:"time_field" yaml:"time_field"` // e.g., "createdAt", "updatedAt"
 	DataPath      []string                `json:"data_path" yaml:"data_path"`   // e.g., ["data", "securityIssues", "issues"]
 	IDField       string                  `json:"id_field" yaml:"id_field"`     // e.g., "id"
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *WizConfig) Validate() error {

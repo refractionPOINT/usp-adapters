@@ -36,7 +36,7 @@ type SimulatorConfig struct {
 	Reader         io.ReadCloser           `json:"-" yaml:"-"`
 	FilePath       string                  `json:"file_path" yaml:"file_path"`
 	IsReplayTiming bool                    `json:"is_replay_timing" yaml:"is_replay_timing"`
-	Filters        []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 type basicLCEvent struct {

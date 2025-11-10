@@ -40,7 +40,7 @@ type SublimeConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"api_key" yaml:"api_key"`
 	BaseURL       string                  `json:"base_url" yaml:"base_url"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *SublimeConfig) Validate() error {

@@ -31,7 +31,7 @@ type FalconCloudConfig struct {
 	IsUsingOffset   bool                    `json:"is_using_offset" yaml:"is_using_offset"`
 	Offset          uint64                  `json:"offset" yaml:"offset"`
 	NotBefore       *time.Time              `json:"not_before,omitempty" yaml:"not_before,omitempty"`
-	Filters         []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *FalconCloudConfig) Validate() error {

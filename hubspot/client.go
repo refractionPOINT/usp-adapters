@@ -44,7 +44,7 @@ type HubSpotAdapter struct {
 type HubSpotConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	AccessToken   string                  `json:"access_token" yaml:"access_token"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *HubSpotConfig) Validate() error {

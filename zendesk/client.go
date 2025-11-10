@@ -47,7 +47,7 @@ type ZendeskConfig struct {
 	ApiToken      string                  `json:"api_token" yaml:"api_token"`
 	ZendeskDomain string                  `json:"zendesk_domain" yaml:"zendesk_domain"`
 	ZendeskEmail  string                  `json:"zendesk_email" yaml:"zendesk_email"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *ZendeskConfig) Validate() error {

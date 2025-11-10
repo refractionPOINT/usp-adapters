@@ -40,7 +40,7 @@ type CatoConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 	ApiKey          string                  `json:"apikey" yaml:"apikey"`
 	AccountId       int                     `json:"accountid" yaml:"accountid"`
-	Filters         []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *CatoConfig) Validate() error {

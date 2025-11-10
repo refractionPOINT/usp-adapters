@@ -37,7 +37,7 @@ type SentinelOneConfig struct {
 	URLs                string                  `json:"urls" yaml:"urls"`
 	StartTime           string                  `json:"start_time" yaml:"start_time"`
 	TimeBetweenRequests time.Duration           `json:"time_between_requests" yaml:"time_between_requests"`
-	Filters             []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *SentinelOneConfig) Validate() error {

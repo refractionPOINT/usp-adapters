@@ -28,7 +28,7 @@ type StdinAdapter struct {
 type StdinConfig struct {
 	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
-	Filters         []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *StdinConfig) Validate() error {

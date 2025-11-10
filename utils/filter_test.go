@@ -2,31 +2,94 @@ package utils
 
 import (
 	"testing"
-	"time"
 
 	"github.com/refractionPOINT/go-uspclient/protocol"
 )
 
-func TestFilterEngine(t *testing.T) {
+// TestFilterPatternValidation tests the FilterPattern Validate method
+func TestFilterPatternValidation(t *testing.T) {
 	tests := []struct {
-		name            string
-		patterns        []string
-		message         *protocol.DataMessage
-		shouldFilter    bool
-		matchedPattern  string
+		name    string
+		pattern FilterPattern
+		wantErr bool
 	}{
 		{
-			name:     "text payload matches",
-			patterns: []string{"health-?check"},
+			name:    "valid regex pattern",
+			pattern: FilterPattern{Type: "regex", Pattern: "test"},
+			wantErr: false,
+		},
+		{
+			name:    "valid gjson pattern",
+			pattern: FilterPattern{Type: "gjson", Path: "level", Pattern: "DEBUG"},
+			wantErr: false,
+		},
+		{
+			name:    "invalid type",
+			pattern: FilterPattern{Type: "invalid", Pattern: "test"},
+			wantErr: true,
+		},
+		{
+			name:    "empty pattern",
+			pattern: FilterPattern{Type: "regex", Pattern: ""},
+			wantErr: true,
+		},
+		{
+			name:    "whitespace-only pattern",
+			pattern: FilterPattern{Type: "regex", Pattern: "   "},
+			wantErr: true,
+		},
+		{
+			name:    "gjson without path",
+			pattern: FilterPattern{Type: "gjson", Pattern: "test"},
+			wantErr: true,
+		},
+		{
+			name:    "gjson with empty path",
+			pattern: FilterPattern{Type: "gjson", Path: "", Pattern: "test"},
+			wantErr: true,
+		},
+		{
+			name:    "invalid regex pattern",
+			pattern: FilterPattern{Type: "regex", Pattern: "[invalid"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.pattern.Validate()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestFilterEngineRegexPatterns tests regex-based filtering
+func TestFilterEngineRegexPatterns(t *testing.T) {
+	tests := []struct {
+		name           string
+		patterns       []FilterPattern
+		message        *protocol.DataMessage
+		shouldFilter   bool
+		matchedPattern string
+	}{
+		{
+			name: "text payload matches",
+			patterns: []FilterPattern{
+				{Type: "regex", Pattern: "health-?check"},
+			},
 			message: &protocol.DataMessage{
 				TextPayload: "GET /health-check HTTP/1.1",
 			},
 			shouldFilter:   true,
-			matchedPattern: "health-?check",
+			matchedPattern: `regex("health-?check")`,
 		},
 		{
-			name:     "text payload no match",
-			patterns: []string{"health-?check"},
+			name: "text payload no match",
+			patterns: []FilterPattern{
+				{Type: "regex", Pattern: "health-?check"},
+			},
 			message: &protocol.DataMessage{
 				TextPayload: "GET /api/users HTTP/1.1",
 			},
@@ -34,8 +97,10 @@ func TestFilterEngine(t *testing.T) {
 			matchedPattern: "",
 		},
 		{
-			name:     "json payload matches",
-			patterns: []string{`"level":"debug"`},
+			name: "json payload marshaled match",
+			patterns: []FilterPattern{
+				{Type: "regex", Pattern: `"level":"debug"`},
+			},
 			message: &protocol.DataMessage{
 				JsonPayload: map[string]interface{}{
 					"level":   "debug",
@@ -43,43 +108,29 @@ func TestFilterEngine(t *testing.T) {
 				},
 			},
 			shouldFilter:   true,
-			matchedPattern: `"level":"debug"`,
+			matchedPattern: `regex("\"level\":\"debug\"")`,
 		},
 		{
-			name:     "case insensitive match",
-			patterns: []string{"(?i)password"},
+			name: "case insensitive match",
+			patterns: []FilterPattern{
+				{Type: "regex", Pattern: "(?i)password"},
+			},
 			message: &protocol.DataMessage{
 				TextPayload: "User entered PASSWORD incorrectly",
 			},
 			shouldFilter:   true,
-			matchedPattern: "(?i)password",
+			matchedPattern: `regex("(?i)password")`,
 		},
 		{
-			name:     "multiple patterns - first matches",
-			patterns: []string{"health-?check", "monitoring", "ping"},
-			message: &protocol.DataMessage{
-				TextPayload: "GET /healthcheck HTTP/1.1",
+			name: "complex regex",
+			patterns: []FilterPattern{
+				{Type: "regex", Pattern: `\b(DEBUG|TRACE)\b`},
 			},
-			shouldFilter:   true,
-			matchedPattern: "health-?check",
-		},
-		{
-			name:     "multiple patterns - second matches",
-			patterns: []string{"health-?check", "(?i)monitoring", "ping"},
-			message: &protocol.DataMessage{
-				TextPayload: "Monitoring probe detected",
-			},
-			shouldFilter:   true,
-			matchedPattern: "(?i)monitoring",
-		},
-		{
-			name:     "complex regex",
-			patterns: []string{`\b(DEBUG|TRACE)\b`},
 			message: &protocol.DataMessage{
 				TextPayload: "[DEBUG] Starting application",
 			},
 			shouldFilter:   true,
-			matchedPattern: `\b(DEBUG|TRACE)\b`,
+			matchedPattern: `regex("\\b(DEBUG|TRACE)\\b")`,
 		},
 	}
 
@@ -105,40 +156,243 @@ func TestFilterEngine(t *testing.T) {
 			if matchedPattern != tt.matchedPattern {
 				t.Errorf("matchedPattern = %q, want %q", matchedPattern, tt.matchedPattern)
 			}
+		})
+	}
+}
 
-			// Check statistics
-			stats := fe.GetStats()
-			if stats.TotalChecked != 1 {
-				t.Errorf("TotalChecked = %d, want 1", stats.TotalChecked)
+// TestFilterEngineGJSONBasic tests basic gjson path filtering
+func TestFilterEngineGJSONBasic(t *testing.T) {
+	tests := []struct {
+		name           string
+		patterns       []FilterPattern
+		message        *protocol.DataMessage
+		shouldFilter   bool
+		matchedPattern string
+	}{
+		{
+			name: "simple field match",
+			patterns: []FilterPattern{
+				{Type: "gjson", Path: "level", Pattern: "DEBUG"},
+			},
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level":   "DEBUG",
+					"message": "test",
+				},
+			},
+			shouldFilter:   true,
+			matchedPattern: `gjson(path="level", pattern="DEBUG")`,
+		},
+		{
+			name: "nested field match",
+			patterns: []FilterPattern{
+				{Type: "gjson", Path: "user.name", Pattern: "admin"},
+			},
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"user": map[string]interface{}{
+						"name": "admin",
+						"id":   123,
+					},
+				},
+			},
+			shouldFilter:   true,
+			matchedPattern: `gjson(path="user.name", pattern="admin")`,
+		},
+		{
+			name: "array index access",
+			patterns: []FilterPattern{
+				{Type: "gjson", Path: "items.0.type", Pattern: "test"},
+			},
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"items": []interface{}{
+						map[string]interface{}{"type": "test", "id": 1},
+						map[string]interface{}{"type": "prod", "id": 2},
+					},
+				},
+			},
+			shouldFilter:   true,
+			matchedPattern: `gjson(path="items.0.type", pattern="test")`,
+		},
+		{
+			name: "field not found - no match",
+			patterns: []FilterPattern{
+				{Type: "gjson", Path: "nonexistent", Pattern: ".*"},
+			},
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level": "INFO",
+				},
+			},
+			shouldFilter:   false,
+			matchedPattern: "",
+		},
+		{
+			name: "regex pattern on gjson value",
+			patterns: []FilterPattern{
+				{Type: "gjson", Path: "level", Pattern: "^(DEBUG|TRACE)$"},
+			},
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level": "DEBUG",
+				},
+			},
+			shouldFilter:   true,
+			matchedPattern: `gjson(path="level", pattern="^(DEBUG|TRACE)$")`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := func(msg string) {
+				t.Logf("Log: %s", msg)
 			}
 
-			expectedFiltered := uint64(0)
-			if tt.shouldFilter {
-				expectedFiltered = 1
+			fe, err := NewFilterEngine(tt.patterns, logger)
+			if err != nil {
+				t.Fatalf("Failed to create filter engine: %v", err)
 			}
-			if stats.TotalFiltered != expectedFiltered {
-				t.Errorf("TotalFiltered = %d, want %d", stats.TotalFiltered, expectedFiltered)
+			defer fe.Close()
+
+			shouldFilter, matchedPattern := fe.ShouldFilter(tt.message)
+
+			if shouldFilter != tt.shouldFilter {
+				t.Errorf("ShouldFilter() = %v, want %v", shouldFilter, tt.shouldFilter)
+			}
+
+			if matchedPattern != tt.matchedPattern {
+				t.Errorf("matchedPattern = %q, want %q", matchedPattern, tt.matchedPattern)
 			}
 		})
 	}
 }
 
-func TestFilterEngineInvalidPattern(t *testing.T) {
-	logger := func(msg string) {}
+// TestFilterEngineGJSONQueries tests gjson query syntax
+func TestFilterEngineGJSONQueries(t *testing.T) {
+	tests := []struct {
+		name         string
+		patterns     []FilterPattern
+		message      *protocol.DataMessage
+		shouldFilter bool
+	}{
+		{
+			name: "array query - single match",
+			patterns: []FilterPattern{
+				{Type: "gjson", Path: `users.#(age>45).name`, Pattern: ".*"},
+			},
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"users": []interface{}{
+						map[string]interface{}{"name": "Alice", "age": 30},
+						map[string]interface{}{"name": "Bob", "age": 50},
+					},
+				},
+			},
+			shouldFilter: true,
+		},
+		{
+			name: "array query - equality",
+			patterns: []FilterPattern{
+				{Type: "gjson", Path: `tags.#(=="internal")`, Pattern: "internal"},
+			},
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"tags": []interface{}{"internal", "test", "debug"},
+				},
+			},
+			shouldFilter: true,
+		},
+	}
 
-	_, err := NewFilterEngine([]string{"[invalid"}, logger)
-	if err == nil {
-		t.Error("Expected error for invalid regex pattern, got nil")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			logger := func(msg string) {
+				t.Logf("Log: %s", msg)
+			}
+
+			fe, err := NewFilterEngine(tt.patterns, logger)
+			if err != nil {
+				t.Fatalf("Failed to create filter engine: %v", err)
+			}
+			defer fe.Close()
+
+			shouldFilter, _ := fe.ShouldFilter(tt.message)
+
+			if shouldFilter != tt.shouldFilter {
+				t.Errorf("ShouldFilter() = %v, want %v", shouldFilter, tt.shouldFilter)
+			}
+		})
 	}
 }
 
-func TestFilterEngineStats(t *testing.T) {
-	var logMessages []string
-	logger := func(msg string) {
-		logMessages = append(logMessages, msg)
+// TestFilterEngineMixedPatterns tests using both regex and gjson patterns together
+func TestFilterEngineMixedPatterns(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: "health-?check"},
+		{Type: "gjson", Path: "level", Pattern: "^(DEBUG|TRACE)$"},
+		{Type: "gjson", Path: "user.role", Pattern: "^test-.*"},
 	}
 
-	fe, err := NewFilterEngine([]string{"pattern1", "pattern2"}, logger)
+	logger := func(msg string) {
+		t.Logf("Log: %s", msg)
+	}
+
+	fe, err := NewFilterEngine(patterns, logger)
+	if err != nil {
+		t.Fatalf("Failed to create filter engine: %v", err)
+	}
+	defer fe.Close()
+
+	// Test gjson match (should match first)
+	msg1 := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"level":   "DEBUG",
+			"message": "test message with health-check",
+		},
+	}
+	shouldFilter, matched := fe.ShouldFilter(msg1)
+	if !shouldFilter {
+		t.Error("Expected gjson pattern to match DEBUG level")
+	}
+	if matched != `gjson(path="level", pattern="^(DEBUG|TRACE)$")` {
+		t.Errorf("Expected gjson match, got %q", matched)
+	}
+
+	// Test regex match (falls back after gjson)
+	msg2 := &protocol.DataMessage{
+		TextPayload: "GET /health-check HTTP/1.1",
+	}
+	shouldFilter, matched = fe.ShouldFilter(msg2)
+	if !shouldFilter {
+		t.Error("Expected regex pattern to match health-check")
+	}
+	if matched != `regex("health-?check")` {
+		t.Errorf("Expected regex match, got %q", matched)
+	}
+
+	// Test no match
+	msg3 := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"level": "INFO",
+		},
+	}
+	shouldFilter, _ = fe.ShouldFilter(msg3)
+	if shouldFilter {
+		t.Error("Expected no match for INFO level")
+	}
+}
+
+// TestFilterEngineStats tests statistics tracking
+func TestFilterEngineStats(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: "pattern1"},
+		{Type: "gjson", Path: "level", Pattern: "DEBUG"},
+	}
+
+	logger := func(msg string) {}
+
+	fe, err := NewFilterEngine(patterns, logger)
 	if err != nil {
 		t.Fatalf("Failed to create filter engine: %v", err)
 	}
@@ -147,10 +401,10 @@ func TestFilterEngineStats(t *testing.T) {
 	// Test multiple messages
 	messages := []*protocol.DataMessage{
 		{TextPayload: "contains pattern1 here"},
-		{TextPayload: "contains pattern2 here"},
+		{JsonPayload: map[string]interface{}{"level": "DEBUG"}},
 		{TextPayload: "contains pattern1 again"},
 		{TextPayload: "no match"},
-		{TextPayload: "another pattern1"},
+		{JsonPayload: map[string]interface{}{"level": "DEBUG"}},
 	}
 
 	for _, msg := range messages {
@@ -172,40 +426,173 @@ func TestFilterEngineStats(t *testing.T) {
 		t.Errorf("len(PerPattern) = %d, want 2", len(stats.PerPattern))
 	}
 
-	if stats.PerPattern[0].Matches != 3 {
-		t.Errorf("Pattern 0 matches = %d, want 3", stats.PerPattern[0].Matches)
+	// Pattern 0 (regex) should have 2 matches
+	if stats.PerPattern[0].Matches != 2 {
+		t.Errorf("Pattern 0 matches = %d, want 2", stats.PerPattern[0].Matches)
 	}
 
-	if stats.PerPattern[1].Matches != 1 {
-		t.Errorf("Pattern 1 matches = %d, want 1", stats.PerPattern[1].Matches)
+	// Pattern 1 (gjson) should have 2 matches
+	if stats.PerPattern[1].Matches != 2 {
+		t.Errorf("Pattern 1 matches = %d, want 2", stats.PerPattern[1].Matches)
 	}
 }
 
-func TestFilterEngineEmptyPayload(t *testing.T) {
+// TestFilterEngineConcurrency tests thread-safety with concurrent access
+func TestFilterEngineConcurrency(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: "pattern1"},
+		{Type: "gjson", Path: "level", Pattern: "DEBUG"},
+	}
+
 	logger := func(msg string) {}
 
-	fe, err := NewFilterEngine([]string{"test"}, logger)
+	fe, err := NewFilterEngine(patterns, logger)
 	if err != nil {
 		t.Fatalf("Failed to create filter engine: %v", err)
 	}
 	defer fe.Close()
 
-	// Test with empty message
-	msg := &protocol.DataMessage{}
-	shouldFilter, _ := fe.ShouldFilter(msg)
+	const numGoroutines = 50
+	const messagesPerGoroutine = 100
 
-	if shouldFilter {
-		t.Error("Empty message should not be filtered")
+	messages := []*protocol.DataMessage{
+		{TextPayload: "contains pattern1"},
+		{JsonPayload: map[string]interface{}{"level": "DEBUG"}},
+		{TextPayload: "no match"},
+		{JsonPayload: map[string]interface{}{"level": "INFO"}},
+	}
+
+	done := make(chan bool, numGoroutines)
+	start := make(chan struct{})
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("Goroutine panicked: %v", r)
+				}
+				done <- true
+			}()
+
+			<-start
+
+			for j := 0; j < messagesPerGoroutine; j++ {
+				msg := messages[j%len(messages)]
+				fe.ShouldFilter(msg)
+
+				if j%10 == 0 {
+					_ = fe.GetStats()
+				}
+			}
+		}()
+	}
+
+	close(start)
+
+	for i := 0; i < numGoroutines; i++ {
+		<-done
+	}
+
+	stats := fe.GetStats()
+	expectedTotal := uint64(numGoroutines * messagesPerGoroutine)
+
+	if stats.TotalChecked != expectedTotal {
+		t.Errorf("TotalChecked = %d, want %d", stats.TotalChecked, expectedTotal)
 	}
 }
 
-func BenchmarkFilterEngine(b *testing.B) {
+// TestFilterEngineDoubleClose tests idempotent Close()
+func TestFilterEngineDoubleClose(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: "test"},
+	}
+
 	logger := func(msg string) {}
 
-	fe, err := NewFilterEngine([]string{"health-?check", "monitoring", "debug"}, logger)
+	fe, err := NewFilterEngine(patterns, logger)
 	if err != nil {
-		b.Fatalf("Failed to create filter engine: %v", err)
+		t.Fatalf("Failed to create filter engine: %v", err)
 	}
+
+	// Close multiple times - should not panic
+	fe.Close()
+	fe.Close()
+	fe.Close()
+
+	t.Log("Multiple Close() calls succeeded without panic")
+}
+
+// TestFilterEngineMarshalFailures tests handling of unmarshalable JSON
+func TestFilterEngineMarshalFailures(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "test", Pattern: ".*"},
+	}
+
+	var logMessages []string
+	logger := func(msg string) {
+		logMessages = append(logMessages, msg)
+	}
+
+	fe, err := NewFilterEngine(patterns, logger)
+	if err != nil {
+		t.Fatalf("Failed to create filter engine: %v", err)
+	}
+	defer fe.Close()
+
+	// Create a message with JsonPayload containing an unmarshalable channel
+	ch := make(chan int)
+	msg := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"channel": ch,
+		},
+	}
+
+	shouldFilter, _ := fe.ShouldFilter(msg)
+
+	if shouldFilter {
+		t.Error("Expected message not to be filtered after marshal failure")
+	}
+
+	// Check that failure was logged
+	foundMarshalError := false
+	for _, logMsg := range logMessages {
+		if len(logMsg) > 6 && (logMsg[:6] == "Failed" || (len(logMsg) > 7 && logMsg[:7] == "Filtered")) {
+			if stringContains(logMsg, "marshal") {
+				foundMarshalError = true
+				break
+			}
+		}
+	}
+
+	if !foundMarshalError {
+		t.Error("Expected marshal failure to be logged")
+	}
+
+	stats := fe.GetStats()
+	if stats.MarshalFailures == 0 {
+		t.Error("Expected MarshalFailures > 0, got 0")
+	}
+}
+
+func stringContains(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}
+
+// Benchmarks
+
+func BenchmarkFilterEngineRegex(b *testing.B) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: "health-?check"},
+	}
+
+	logger := func(msg string) {}
+
+	fe, _ := NewFilterEngine(patterns, logger)
 	defer fe.Close()
 
 	msg := &protocol.DataMessage{
@@ -218,47 +605,149 @@ func BenchmarkFilterEngine(b *testing.B) {
 	}
 }
 
-func TestFilterEngineStatsReporting(t *testing.T) {
-	// This test verifies that stats are reported correctly
-	// We won't test the 5-minute timer, but we'll verify the logging works
-
-	var logMessages []string
-	logger := func(msg string) {
-		logMessages = append(logMessages, msg)
+func BenchmarkFilterEngineGJSON(b *testing.B) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "level", Pattern: "^(DEBUG|TRACE)$"},
 	}
 
-	fe, err := NewFilterEngine([]string{"test"}, logger)
-	if err != nil {
-		t.Fatalf("Failed to create filter engine: %v", err)
+	logger := func(msg string) {}
+
+	fe, _ := NewFilterEngine(patterns, logger)
+	defer fe.Close()
+
+	msg := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"level":   "INFO",
+			"message": "test message",
+		},
 	}
 
-	// Process some messages
-	for i := 0; i < 10; i++ {
-		fe.ShouldFilter(&protocol.DataMessage{TextPayload: "test message"})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fe.ShouldFilter(msg)
+	}
+}
+
+func BenchmarkFilterEngineGJSONMatch(b *testing.B) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "level", Pattern: "^(DEBUG|TRACE)$"},
 	}
 
-	// Manually trigger stats logging
-	fe.logStats(true)
+	logger := func(msg string) {}
 
-	// Check that final stats were logged
-	foundStats := false
-	for _, msg := range logMessages {
-		// Check if message contains "filter stats" or "Final"
-		if len(msg) > 0 {
-			t.Logf("Log message: %s", msg)
-			if len(msg) >= 5 && (msg[:5] == "Final" || msg[:6] == "Filter") {
-				foundStats = true
-				break
-			}
-		}
+	fe, _ := NewFilterEngine(patterns, logger)
+	defer fe.Close()
+
+	msg := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"level":   "DEBUG",
+			"message": "test message",
+		},
 	}
 
-	if !foundStats {
-		t.Errorf("Expected stats logging, but found none. Got %d log messages total", len(logMessages))
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fe.ShouldFilter(msg)
+	}
+}
+
+func BenchmarkFilterEngineMixed(b *testing.B) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: "health-?check"},
+		{Type: "gjson", Path: "level", Pattern: "^(DEBUG|TRACE)$"},
+		{Type: "gjson", Path: "user.role", Pattern: "^test-.*"},
 	}
 
-	fe.Close()
+	logger := func(msg string) {}
 
-	// Give some time for final stats
-	time.Sleep(10 * time.Millisecond)
+	fe, _ := NewFilterEngine(patterns, logger)
+	defer fe.Close()
+
+	msg := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"level":   "INFO",
+			"message": "normal message",
+		},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fe.ShouldFilter(msg)
+	}
+}
+
+// BenchmarkFilterEngineRegexOnJSON benchmarks the old approach: regex matching on full JSON payload
+func BenchmarkFilterEngineRegexOnJSON(b *testing.B) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: `"level"\s*:\s*"(DEBUG|TRACE)"`},
+	}
+
+	logger := func(msg string) {}
+
+	fe, _ := NewFilterEngine(patterns, logger)
+	defer fe.Close()
+
+	// Large JSON payload to simulate real-world scenario
+	msg := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"timestamp": "2024-01-15T10:30:00Z",
+			"level":     "INFO",
+			"message":   "Processing request for user authentication",
+			"request_id": "req-12345-abcde-67890",
+			"user": map[string]interface{}{
+				"id":    "user-9876",
+				"name":  "John Doe",
+				"email": "john.doe@example.com",
+				"roles": []string{"admin", "developer"},
+			},
+			"metadata": map[string]interface{}{
+				"ip":         "192.168.1.100",
+				"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+				"session_id": "sess-xyz-123-abc",
+			},
+		},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fe.ShouldFilter(msg)
+	}
+}
+
+// BenchmarkFilterEngineGJSONOnJSON benchmarks the new approach: gjson path extraction + regex
+func BenchmarkFilterEngineGJSONOnJSON(b *testing.B) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "level", Pattern: "^(DEBUG|TRACE)$"},
+	}
+
+	logger := func(msg string) {}
+
+	fe, _ := NewFilterEngine(patterns, logger)
+	defer fe.Close()
+
+	// Same large JSON payload as regex benchmark
+	msg := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"timestamp": "2024-01-15T10:30:00Z",
+			"level":     "INFO",
+			"message":   "Processing request for user authentication",
+			"request_id": "req-12345-abcde-67890",
+			"user": map[string]interface{}{
+				"id":    "user-9876",
+				"name":  "John Doe",
+				"email": "john.doe@example.com",
+				"roles": []string{"admin", "developer"},
+			},
+			"metadata": map[string]interface{}{
+				"ip":         "192.168.1.100",
+				"user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+				"session_id": "sess-xyz-123-abc",
+			},
+		},
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		fe.ShouldFilter(msg)
+	}
 }

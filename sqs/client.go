@@ -38,7 +38,7 @@ type SQSConfig struct {
 	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
 	QueueURL      string                  `json:"queue_url" yaml:"queue_url"`
 	Region        string                  `json:"region" yaml:"region"`
-	Filters       []string                `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 func (c *SQSConfig) Validate() error {
