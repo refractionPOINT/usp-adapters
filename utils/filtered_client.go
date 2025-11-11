@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
@@ -84,17 +83,8 @@ func NewFilteredClient(client *uspclient.Client, patterns []FilterPattern, debug
 
 // Ship sends a message through the filter, then to the client if not filtered.
 func (fc *FilteredClient) Ship(msg *protocol.DataMessage, timeout time.Duration) error {
-	shouldFilter, pattern := fc.filterEngine.ShouldFilter(msg)
+	shouldFilter, _ := fc.filterEngine.ShouldFilter(msg)
 	if shouldFilter {
-		// Determine payload type for logging
-		payloadType := "unknown"
-		if msg.TextPayload != "" {
-			payloadType = "TextPayload"
-		} else if msg.JsonPayload != nil {
-			payloadType = "JsonPayload"
-		}
-
-		fc.debugLog(fmt.Sprintf("Filtered: matched pattern %q in %s", pattern, payloadType))
 		return nil // Filtered out, not an error
 	}
 

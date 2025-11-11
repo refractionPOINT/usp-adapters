@@ -553,21 +553,7 @@ func TestFilterEngineMarshalFailures(t *testing.T) {
 		t.Error("Expected message not to be filtered after marshal failure")
 	}
 
-	// Check that failure was logged
-	foundMarshalError := false
-	for _, logMsg := range logMessages {
-		if len(logMsg) > 6 && (logMsg[:6] == "Failed" || (len(logMsg) > 7 && logMsg[:7] == "Filtered")) {
-			if stringContains(logMsg, "marshal") {
-				foundMarshalError = true
-				break
-			}
-		}
-	}
-
-	if !foundMarshalError {
-		t.Error("Expected marshal failure to be logged")
-	}
-
+	// Check that failure was counted in stats
 	stats := fe.GetStats()
 	if stats.MarshalFailures == 0 {
 		t.Error("Expected MarshalFailures > 0, got 0")

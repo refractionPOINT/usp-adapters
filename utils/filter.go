@@ -310,7 +310,6 @@ func (fe *FilterEngine) ShouldFilter(msg *protocol.DataMessage) (bool, string) {
 		jsonBytes, err := json.Marshal(msg.JsonPayload)
 		if err != nil {
 			atomic.AddUint64(&fe.marshalFailures, 1)
-			fe.logger(fmt.Sprintf("Failed to marshal JsonPayload for gjson filtering: %v", err))
 		} else {
 			jsonStr := string(jsonBytes)
 
@@ -324,7 +323,6 @@ func (fe *FilterEngine) ShouldFilter(msg *protocol.DataMessage) (bool, string) {
 						atomic.AddUint64(&fe.totalFiltered, 1)
 						pat := fe.rawPatterns[gm.index]
 						patternDesc := fmt.Sprintf("gjson(path=%q, pattern=%q)", pat.Path, pat.Pattern)
-						fe.logger(fmt.Sprintf("Filtered: matched %s in JsonPayload", patternDesc))
 						return true, patternDesc
 					}
 				}
@@ -344,7 +342,6 @@ func (fe *FilterEngine) ShouldFilter(msg *protocol.DataMessage) (bool, string) {
 			atomic.AddUint64(&fe.totalFiltered, 1)
 			pat := fe.rawPatterns[rm.index]
 			patternDesc := fmt.Sprintf("regex(%q)", pat.Pattern)
-			fe.logger(fmt.Sprintf("Filtered: matched %s", patternDesc))
 			return true, patternDesc
 		}
 	}
@@ -365,7 +362,6 @@ func (fe *FilterEngine) extractPayload(msg *protocol.DataMessage) string {
 		jsonBytes, err := json.Marshal(msg.JsonPayload)
 		if err != nil {
 			atomic.AddUint64(&fe.marshalFailures, 1)
-			fe.logger(fmt.Sprintf("Failed to marshal JsonPayload for filtering: %v", err))
 			return ""
 		}
 		return string(jsonBytes)
