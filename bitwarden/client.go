@@ -26,12 +26,12 @@ const (
 )
 
 type BitwardenConfig struct {
-	ClientOptions     uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientID          string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret      string                  `json:"client_secret" yaml:"client_secret"`
-	Region            string                  `json:"region" yaml:"region"`                         // "us" or "eu", defaults to "us"
-	TokenEndpointURL  string                  `json:"token_endpoint_url" yaml:"token_endpoint_url"` // Custom token endpoint URL for self-hosted instances
-	EventsBaseURL     string                  `json:"events_base_url" yaml:"events_base_url"`       // Custom events base URL for self-hosted instances
+	ClientOptions    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	ClientID         string                  `json:"client_id" yaml:"client_id"`
+	ClientSecret     string                  `json:"client_secret" yaml:"client_secret"`
+	Region           string                  `json:"region" yaml:"region"`                         // "us" or "eu", defaults to "us"
+	TokenEndpointURL string                  `json:"token_endpoint_url" yaml:"token_endpoint_url"` // Custom token endpoint URL for self-hosted instances
+	EventsBaseURL    string                  `json:"events_base_url" yaml:"events_base_url"`       // Custom events base URL for self-hosted instances
 }
 
 func (c *BitwardenConfig) Validate() error {
