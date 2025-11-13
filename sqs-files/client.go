@@ -63,6 +63,7 @@ type SQSFilesConfig struct {
 	BucketPath        string `json:"bucket_path,omitempty" yaml:"bucket_path,omitempty"`
 	FilePath          string `json:"file_path,omitempty" yaml:"file_path,omitempty"`
 	IsDecodeObjectKey bool   `json:"is_decode_object_key,omitempty" yaml:"is_decode_object_key,omitempty"`
+	KeyPrefix         string `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty"`
 	// Optional: alternative to BucketPath
 	Bucket string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
 }
@@ -292,6 +293,10 @@ func (a *SQSFilesAdapter) processFiles() error {
 				a.conf.ClientOptions.OnError(fmt.Errorf("url.QueryUnescape(): %v", err))
 				continue
 			}
+		}
+		// Apply key prefix if configured
+		if a.conf.KeyPrefix != "" {
+			path = a.conf.KeyPrefix + path
 		}
 		startTime := time.Now().UTC()
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s", path))
