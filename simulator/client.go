@@ -1,6 +1,7 @@
 package usp_simulator
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -51,7 +52,7 @@ func (c *SimulatorConfig) Validate() error {
 	return nil
 }
 
-func NewSimulatorAdapter(conf SimulatorConfig) (*SimulatorAdapter, chan struct{}, error) {
+func NewSimulatorAdapter(ctx context.Context, conf SimulatorConfig) (*SimulatorAdapter, chan struct{}, error) {
 	a := &SimulatorAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -70,7 +71,7 @@ func NewSimulatorAdapter(conf SimulatorConfig) (*SimulatorAdapter, chan struct{}
 	}
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

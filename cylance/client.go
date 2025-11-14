@@ -57,7 +57,7 @@ type CylanceAdapter struct {
 	refreshFailLimitMet bool
 }
 
-func NewCylanceAdapter(conf CylanceConfig) (*CylanceAdapter, chan struct{}, error) {
+func NewCylanceAdapter(ctx context.Context, conf CylanceConfig) (*CylanceAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -74,7 +74,7 @@ func NewCylanceAdapter(conf CylanceConfig) (*CylanceAdapter, chan struct{}, erro
 	a.cancel = cancel
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

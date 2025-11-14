@@ -154,3 +154,6 @@ require (
 )
 
 replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6
+
+// Local development: use local go-uspclient to test context changes
+replace github.com/refractionPOINT/go-uspclient => ../go-uspclient

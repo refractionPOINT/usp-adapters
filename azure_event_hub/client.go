@@ -42,7 +42,7 @@ func (c *EventHubConfig) Validate() error {
 	return nil
 }
 
-func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
+func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
 	a := &EventHubAdapter{
 		conf: conf,
 		ctx:  context.Background(),
@@ -60,7 +60,7 @@ func NewEventHubAdapter(conf EventHubConfig) (*EventHubAdapter, chan struct{}, e
 		return nil, nil, err
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		a.hub.Close(a.ctx)
 		return nil, nil, err

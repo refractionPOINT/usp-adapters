@@ -105,7 +105,7 @@ func (c *MimecastConfig) Validate() error {
 	return nil
 }
 
-func NewMimecastAdapter(conf MimecastConfig) (*MimecastAdapter, chan struct{}, error) {
+func NewMimecastAdapter(ctx context.Context, conf MimecastConfig) (*MimecastAdapter, chan struct{}, error) {
 	var err error
 	a := &MimecastAdapter{
 		conf:   conf,
@@ -114,7 +114,7 @@ func NewMimecastAdapter(conf MimecastConfig) (*MimecastAdapter, chan struct{}, e
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
