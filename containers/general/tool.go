@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -184,7 +185,7 @@ func main() {
 		}
 
 		log("starting adapter: %s", method)
-		client, chRunning, err := runAdapter(method, *config, showConfig)
+		client, chRunning, err := runAdapter(context.Background(), method, *config, showConfig)
 		if err != nil {
 			logError("error running adapter: %v", err)
 			os.Exit(1)
@@ -242,7 +243,7 @@ func main() {
 					<-chRunning
 
 					log("starting new adapter")
-					client, chRunning, err = runAdapter(method, newConfig, showConfig)
+					client, chRunning, err = runAdapter(context.Background(), method, newConfig, showConfig)
 				}); err != nil {
 					logError("error watching for conf updates: %v", err)
 				}
@@ -278,7 +279,7 @@ func main() {
 	log("exited")
 }
 
-func runAdapter(method string, configs Configuration, showConfig bool) (USPClient, chan struct{}, error) {
+func runAdapter(ctx context.Context, method string, configs Configuration, showConfig bool) (USPClient, chan struct{}, error) {
 	var client USPClient
 	var chRunning chan struct{}
 	var err error
@@ -289,202 +290,202 @@ func runAdapter(method string, configs Configuration, showConfig bool) (USPClien
 		configs.Syslog.ClientOptions = applyLogging(configs.Syslog.ClientOptions)
 		configs.Syslog.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Syslog
-		client, chRunning, err = usp_syslog.NewSyslogAdapter(configs.Syslog)
+		client, chRunning, err = usp_syslog.NewSyslogAdapter(ctx, configs.Syslog)
 	} else if method == "pubsub" {
 		configs.PubSub.ClientOptions = applyLogging(configs.PubSub.ClientOptions)
 		configs.PubSub.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.PubSub
-		client, chRunning, err = usp_pubsub.NewPubSubAdapter(configs.PubSub)
+		client, chRunning, err = usp_pubsub.NewPubSubAdapter(ctx, configs.PubSub)
 	} else if method == "gcs" {
 		configs.Gcs.ClientOptions = applyLogging(configs.Gcs.ClientOptions)
 		configs.Gcs.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Gcs
-		client, chRunning, err = usp_gcs.NewGCSAdapter(configs.Gcs)
+		client, chRunning, err = usp_gcs.NewGCSAdapter(ctx, configs.Gcs)
 	} else if method == "s3" {
 		configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
 		configs.S3.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.S3
-		client, chRunning, err = usp_s3.NewS3Adapter(configs.S3)
+		client, chRunning, err = usp_s3.NewS3Adapter(ctx, configs.S3)
 	} else if method == "stdin" {
 		configs.Stdin.ClientOptions = applyLogging(configs.Stdin.ClientOptions)
 		configs.Stdin.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Stdin
-		client, chRunning, err = usp_stdin.NewStdinAdapter(configs.Stdin)
+		client, chRunning, err = usp_stdin.NewStdinAdapter(ctx, configs.Stdin)
 	} else if method == "1password" {
 		configs.OnePassword.ClientOptions = applyLogging(configs.OnePassword.ClientOptions)
 		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.OnePassword
-		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(configs.OnePassword)
+		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(ctx, configs.OnePassword)
 	} else if method == "bitwarden" {
 		configs.Bitwarden.ClientOptions = applyLogging(configs.Bitwarden.ClientOptions)
 		configs.Bitwarden.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Bitwarden
-		client, chRunning, err = usp_bitwarden.NewBitwardenAdapter(configs.Bitwarden)
+		client, chRunning, err = usp_bitwarden.NewBitwardenAdapter(ctx, configs.Bitwarden)
 	} else if method == "itglue" {
 		configs.ITGlue.ClientOptions = applyLogging(configs.ITGlue.ClientOptions)
 		configs.ITGlue.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ITGlue
-		client, chRunning, err = usp_itglue.NewITGlueAdapter(configs.ITGlue)
+		client, chRunning, err = usp_itglue.NewITGlueAdapter(ctx, configs.ITGlue)
 	} else if method == "sophos" {
 		configs.Sophos.ClientOptions = applyLogging(configs.Sophos.ClientOptions)
 		configs.Sophos.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Sophos
-		client, chRunning, err = usp_sophos.NewSophosAdapter(configs.Sophos)
+		client, chRunning, err = usp_sophos.NewSophosAdapter(ctx, configs.Sophos)
 	} else if method == "okta" {
 		configs.Okta.ClientOptions = applyLogging(configs.Okta.ClientOptions)
 		configs.Okta.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Okta
-		client, chRunning, err = usp_okta.NewOktaAdapter(configs.Okta)
+		client, chRunning, err = usp_okta.NewOktaAdapter(ctx, configs.Okta)
 	} else if method == "office365" {
 		configs.Office365.ClientOptions = applyLogging(configs.Office365.ClientOptions)
 		configs.Office365.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Office365
-		client, chRunning, err = usp_o365.NewOffice365Adapter(configs.Office365)
+		client, chRunning, err = usp_o365.NewOffice365Adapter(ctx, configs.Office365)
 	} else if method == "wiz" {
 		configs.Wiz.ClientOptions = applyLogging(configs.Wiz.ClientOptions)
 		configs.Wiz.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Wiz
-		client, chRunning, err = usp_wiz.NewWizAdapter(configs.Wiz)
+		client, chRunning, err = usp_wiz.NewWizAdapter(ctx, configs.Wiz)
 	} else if method == "wel" {
 		configs.Wel.ClientOptions = applyLogging(configs.Wel.ClientOptions)
 		configs.Wel.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Wel
-		client, chRunning, err = usp_wel.NewWELAdapter(configs.Wel)
+		client, chRunning, err = usp_wel.NewWELAdapter(ctx, configs.Wel)
 	} else if method == "mac_unified_logging" {
 		configs.MacUnifiedLogging.ClientOptions = applyLogging(configs.MacUnifiedLogging.ClientOptions)
 		configs.MacUnifiedLogging.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.MacUnifiedLogging
-		client, chRunning, err = usp_mac_unified_logging.NewMacUnifiedLoggingAdapter(configs.MacUnifiedLogging)
+		client, chRunning, err = usp_mac_unified_logging.NewMacUnifiedLoggingAdapter(ctx, configs.MacUnifiedLogging)
 	} else if method == "azure_event_hub" {
 		configs.AzureEventHub.ClientOptions = applyLogging(configs.AzureEventHub.ClientOptions)
 		configs.AzureEventHub.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.AzureEventHub
-		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(configs.AzureEventHub)
+		client, chRunning, err = usp_azure_event_hub.NewEventHubAdapter(ctx, configs.AzureEventHub)
 	} else if method == "duo" {
 		configs.Duo.ClientOptions = applyLogging(configs.Duo.ClientOptions)
 		configs.Duo.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Duo
-		client, chRunning, err = usp_duo.NewDuoAdapter(configs.Duo)
+		client, chRunning, err = usp_duo.NewDuoAdapter(ctx, configs.Duo)
 	} else if method == "cato" {
 		configs.Cato.ClientOptions = applyLogging(configs.Cato.ClientOptions)
 		configs.Cato.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Cato
-		client, chRunning, err = usp_cato.NewCatoAdapter(configs.Cato)
+		client, chRunning, err = usp_cato.NewCatoAdapter(ctx, configs.Cato)
 	} else if method == "cylance" {
 		configs.Cylance.ClientOptions = applyLogging(configs.Cylance.ClientOptions)
 		configs.Cylance.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Cylance
-		client, chRunning, err = usp_cylance.NewCylanceAdapter(configs.Cylance)
+		client, chRunning, err = usp_cylance.NewCylanceAdapter(ctx, configs.Cylance)
 	} else if method == "entraid" {
 		configs.EntraID.ClientOptions = applyLogging(configs.EntraID.ClientOptions)
 		configs.EntraID.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.EntraID
-		client, chRunning, err = usp_entraid.NewEntraIDAdapter(configs.EntraID)
+		client, chRunning, err = usp_entraid.NewEntraIDAdapter(ctx, configs.EntraID)
 	} else if method == "defender" {
 		configs.Defender.ClientOptions = applyLogging(configs.Defender.ClientOptions)
 		configs.Defender.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Defender
-		client, chRunning, err = usp_defender.NewDefenderAdapter(configs.Defender)
+		client, chRunning, err = usp_defender.NewDefenderAdapter(ctx, configs.Defender)
 	} else if method == "slack" {
 		configs.Slack.ClientOptions = applyLogging(configs.Slack.ClientOptions)
 		configs.Slack.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Slack
-		client, chRunning, err = usp_slack.NewSlackAdapter(configs.Slack)
+		client, chRunning, err = usp_slack.NewSlackAdapter(ctx, configs.Slack)
 	} else if method == "sqs" {
 		configs.Sqs.ClientOptions = applyLogging(configs.Sqs.ClientOptions)
 		configs.Sqs.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Sqs
-		client, chRunning, err = usp_sqs.NewSQSAdapter(configs.Sqs)
+		client, chRunning, err = usp_sqs.NewSQSAdapter(ctx, configs.Sqs)
 	} else if method == "sqs-files" {
 		configs.SqsFiles.ClientOptions = applyLogging(configs.SqsFiles.ClientOptions)
 		configs.SqsFiles.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.SqsFiles
-		client, chRunning, err = usp_sqs_files.NewSQSFilesAdapter(configs.SqsFiles)
+		client, chRunning, err = usp_sqs_files.NewSQSFilesAdapter(ctx, configs.SqsFiles)
 	} else if method == "simulator" {
 		configs.Simulator.ClientOptions = applyLogging(configs.Simulator.ClientOptions)
 		configs.Simulator.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Simulator
-		client, chRunning, err = usp_simulator.NewSimulatorAdapter(configs.Simulator)
+		client, chRunning, err = usp_simulator.NewSimulatorAdapter(ctx, configs.Simulator)
 	} else if method == "file" {
 		configs.File.ClientOptions = applyLogging(configs.File.ClientOptions)
 		configs.File.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.File
-		client, chRunning, err = usp_file.NewFileAdapter(configs.File)
+		client, chRunning, err = usp_file.NewFileAdapter(ctx, configs.File)
 	} else if method == "evtx" {
 		configs.Evtx.ClientOptions = applyLogging(configs.Evtx.ClientOptions)
 		configs.Evtx.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Evtx
-		client, chRunning, err = usp_evtx.NewEVTXAdapter(configs.Evtx)
+		client, chRunning, err = usp_evtx.NewEVTXAdapter(ctx, configs.Evtx)
 	} else if method == "k8s_pods" {
 		configs.K8sPods.ClientOptions = applyLogging(configs.K8sPods.ClientOptions)
 		configs.K8sPods.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.K8sPods
-		client, chRunning, err = usp_k8s_pods.NewK8sPodsAdapter(configs.K8sPods)
+		client, chRunning, err = usp_k8s_pods.NewK8sPodsAdapter(ctx, configs.K8sPods)
 	} else if method == "bigquery" {
 		configs.BigQuery.ClientOptions = applyLogging(configs.BigQuery.ClientOptions)
 		configs.BigQuery.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.BigQuery
-		client, chRunning, err = usp_bigquery.NewBigQueryAdapter(configs.BigQuery)
+		client, chRunning, err = usp_bigquery.NewBigQueryAdapter(ctx, configs.BigQuery)
 	} else if method == "imap" {
 		configs.Imap.ClientOptions = applyLogging(configs.Imap.ClientOptions)
 		configs.Imap.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Imap
-		client, chRunning, err = usp_imap.NewImapAdapter(configs.Imap)
+		client, chRunning, err = usp_imap.NewImapAdapter(ctx, configs.Imap)
 	} else if method == "hubspot" {
 		configs.HubSpot.ClientOptions = applyLogging(configs.HubSpot.ClientOptions)
 		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.HubSpot
-		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(configs.HubSpot)
+		client, chRunning, err = usp_hubspot.NewHubSpotAdapter(ctx, configs.HubSpot)
 	} else if method == "falconcloud" {
 		configs.FalconCloud.ClientOptions = applyLogging(configs.FalconCloud.ClientOptions)
 		configs.FalconCloud.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.FalconCloud
-		client, chRunning, err = usp_falconcloud.NewFalconCloudAdapter(configs.FalconCloud)
+		client, chRunning, err = usp_falconcloud.NewFalconCloudAdapter(ctx, configs.FalconCloud)
 	} else if method == "mimecast" {
 		configs.Mimecast.ClientOptions = applyLogging(configs.Mimecast.ClientOptions)
 		configs.Mimecast.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Mimecast
-		client, chRunning, err = usp_mimecast.NewMimecastAdapter(configs.Mimecast)
+		client, chRunning, err = usp_mimecast.NewMimecastAdapter(ctx, configs.Mimecast)
 	} else if method == "ms_graph" {
 		configs.MsGraph.ClientOptions = applyLogging(configs.MsGraph.ClientOptions)
 		configs.MsGraph.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.MsGraph
-		client, chRunning, err = usp_ms_graph.NewMsGraphAdapter(configs.MsGraph)
+		client, chRunning, err = usp_ms_graph.NewMsGraphAdapter(ctx, configs.MsGraph)
 	} else if method == "zendesk" {
 		configs.Zendesk.ClientOptions = applyLogging(configs.Zendesk.ClientOptions)
 		configs.Zendesk.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Zendesk
-		client, chRunning, err = usp_zendesk.NewZendeskAdapter(configs.Zendesk)
+		client, chRunning, err = usp_zendesk.NewZendeskAdapter(ctx, configs.Zendesk)
 	} else if method == "pandadoc" {
 		configs.PandaDoc.ClientOptions = applyLogging(configs.PandaDoc.ClientOptions)
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.PandaDoc
-		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(configs.PandaDoc)
+		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(ctx, configs.PandaDoc)
 	} else if method == "proofpoint_tap" {
 		configs.ProofpointTap.ClientOptions = applyLogging(configs.ProofpointTap.ClientOptions)
 		configs.ProofpointTap.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ProofpointTap
-		client, chRunning, err = usp_proofpoint_tap.NewProofpointTapAdapter(configs.ProofpointTap)
+		client, chRunning, err = usp_proofpoint_tap.NewProofpointTapAdapter(ctx, configs.ProofpointTap)
 	} else if method == "box" {
 		configs.Box.ClientOptions = applyLogging(configs.Box.ClientOptions)
 		configs.Box.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Box
-		client, chRunning, err = usp_box.NewBoxAdapter(configs.Box)
+		client, chRunning, err = usp_box.NewBoxAdapter(ctx, configs.Box)
 	} else if method == "sublime" {
 		configs.Sublime.ClientOptions = applyLogging(configs.Sublime.ClientOptions)
 		configs.Sublime.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Sublime
-		client, chRunning, err = usp_sublime.NewSublimeAdapter(configs.Sublime)
+		client, chRunning, err = usp_sublime.NewSublimeAdapter(ctx, configs.Sublime)
 	} else if method == "sentinel_one" {
 		configs.SentinelOne.ClientOptions = applyLogging(configs.SentinelOne.ClientOptions)
 		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.SentinelOne
-		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(configs.SentinelOne)
+		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(ctx, configs.SentinelOne)
 	} else if method == "trendmicro" {
 		configs.TrendMicro.ClientOptions = applyLogging(configs.TrendMicro.ClientOptions)
 		configs.TrendMicro.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.TrendMicro
-		client, chRunning, err = usp_trendmicro.NewTrendMicroAdapter(configs.TrendMicro)
+		client, chRunning, err = usp_trendmicro.NewTrendMicroAdapter(ctx, configs.TrendMicro)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}

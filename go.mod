@@ -5,7 +5,7 @@ go 1.24.0
 require (
 	cloud.google.com/go/bigquery v1.72.0
 	cloud.google.com/go/pubsub v1.50.1
-	cloud.google.com/go/storage v1.57.1
+	cloud.google.com/go/storage v1.57.2
 	github.com/Azure/azure-event-hubs-go/v3 v3.6.2
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/crowdstrike/gofalcon v0.18.0
@@ -19,7 +19,7 @@ require (
 	github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251110144611-385ee44c7cf9
-	github.com/refractionPOINT/go-uspclient v1.5.2
+	github.com/refractionPOINT/go-uspclient v1.6.0
 	github.com/stretchr/testify v1.11.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/net v0.47.0
@@ -136,11 +136,11 @@ require (
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.4 // indirect
 	golang.org/x/crypto v0.44.0 // indirect
-	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
+	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/mod v0.30.0 // indirect
 	golang.org/x/telemetry v0.0.0-20251112162317-03ef243c208a // indirect
 	golang.org/x/time v0.14.0 // indirect
-	golang.org/x/tools v0.38.0 // indirect
+	golang.org/x/tools v0.39.0 // indirect
 	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da // indirect
 	google.golang.org/genproto v0.0.0-20251111163417-95abcf5c77ba // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20251111163417-95abcf5c77ba // indirect
