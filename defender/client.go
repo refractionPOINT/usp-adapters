@@ -9,7 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
-	"strings"
+	"net/url"
 	"sync"
 	"time"
 
@@ -60,7 +60,7 @@ func (c *DefenderConfig) Validate() error {
 	return nil
 }
 
-func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, error) {
+func NewDefenderAdapter(ctx context.Context, conf DefenderConfig) (*DefenderAdapter, chan struct{}, error) {
 	var err error
 	a := &DefenderAdapter{
 		conf:   conf,
@@ -68,7 +68,7 @@ func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, e
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -195,13 +195,19 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 
 	// Retry up to 3 times
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Create query parameters
-		filter := "%24"
-		query := "%20ge%20"
-		date_filter := fmt.Sprintf("?%sfilter=createdDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
+		// Parse the base URL and add query parameters properly
+		parsedURL, err := url.Parse(eventsUrl)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Error parsing URL: %s\n", err))
+			return nil, since, "", err
+		}
 
-		// Create the full request URL with query parameters (don't modify eventsUrl to avoid corruption on retries)
-		requestUrl := eventsUrl + date_filter
+		// Build the OData filter query parameter properly
+		// Use RawQuery to set $filter parameter ($ is valid in query strings)
+		filterValue := fmt.Sprintf("createdDateTime ge %s", since)
+		parsedURL.RawQuery = "$filter=" + url.QueryEscape(filterValue)
+
+		requestUrl := parsedURL.String()
 
 		authToken, err := a.fetchToken()
 		if err != nil {
