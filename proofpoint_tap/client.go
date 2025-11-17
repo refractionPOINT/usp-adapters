@@ -1,6 +1,7 @@
 package usp_proofpoint_tap
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,7 +54,7 @@ func (c *ProofpointTapConfig) Validate() error {
 	return nil
 }
 
-func NewProofpointTapAdapter(conf ProofpointTapConfig) (*ProofpointTapAdapter, chan struct{}, error) {
+func NewProofpointTapAdapter(ctx context.Context, conf ProofpointTapConfig) (*ProofpointTapAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -66,7 +67,7 @@ func NewProofpointTapAdapter(conf ProofpointTapConfig) (*ProofpointTapAdapter, c
 	}
 	var err error
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

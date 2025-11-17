@@ -68,7 +68,7 @@ type CatoAdapter struct {
 	ctx context.Context
 }
 
-func NewCatoAdapter(conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
+func NewCatoAdapter(ctx context.Context, conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
 	a := &CatoAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -80,7 +80,7 @@ func NewCatoAdapter(conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

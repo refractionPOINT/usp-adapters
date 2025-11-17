@@ -89,7 +89,7 @@ type BitwardenAdapter struct {
 	lastStartDate *time.Time
 }
 
-func NewBitwardenAdapter(conf BitwardenConfig) (*BitwardenAdapter, chan struct{}, error) {
+func NewBitwardenAdapter(ctx context.Context, conf BitwardenConfig) (*BitwardenAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -114,7 +114,7 @@ func NewBitwardenAdapter(conf BitwardenConfig) (*BitwardenAdapter, chan struct{}
 		a.tokenEndpoint = tokenEndpointUS
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

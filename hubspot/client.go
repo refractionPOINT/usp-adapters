@@ -56,7 +56,7 @@ func (c *HubSpotConfig) Validate() error {
 	return nil
 }
 
-func NewHubSpotAdapter(conf HubSpotConfig) (*HubSpotAdapter, chan struct{}, error) {
+func NewHubSpotAdapter(ctx context.Context, conf HubSpotConfig) (*HubSpotAdapter, chan struct{}, error) {
 	var err error
 	a := &HubSpotAdapter{
 		conf:   conf,
@@ -65,7 +65,7 @@ func NewHubSpotAdapter(conf HubSpotConfig) (*HubSpotAdapter, chan struct{}, erro
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

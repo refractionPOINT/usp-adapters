@@ -1,6 +1,7 @@
 package usp_syslog
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -54,7 +55,7 @@ func (c *SyslogConfig) Validate() error {
 	return nil
 }
 
-func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
+func NewSyslogAdapter(ctx context.Context, conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
 	a := &SyslogAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -112,7 +113,7 @@ func NewSyslogAdapter(conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) 
 		return nil, nil, err
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		if l != nil {
 			l.Close()

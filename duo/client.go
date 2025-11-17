@@ -55,7 +55,7 @@ func (c *DuoConfig) Validate() error {
 	return nil
 }
 
-func NewDuoAdapter(conf DuoConfig) (*DuoAdapter, chan struct{}, error) {
+func NewDuoAdapter(ctx context.Context, conf DuoConfig) (*DuoAdapter, chan struct{}, error) {
 	var err error
 	a := &DuoAdapter{
 		conf:   conf,
@@ -63,7 +63,7 @@ func NewDuoAdapter(conf DuoConfig) (*DuoAdapter, chan struct{}, error) {
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

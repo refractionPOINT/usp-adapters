@@ -59,7 +59,7 @@ type FalconCloudAdapter struct {
 	cancel context.CancelFunc
 }
 
-func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
+func NewFalconCloudAdapter(ctx context.Context, conf FalconCloudConfig) (*FalconCloudAdapter, chan struct{}, error) {
 	a := &FalconCloudAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -71,7 +71,7 @@ func NewFalconCloudAdapter(conf FalconCloudConfig) (*FalconCloudAdapter, chan st
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

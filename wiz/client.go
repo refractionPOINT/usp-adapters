@@ -71,7 +71,7 @@ func (c *WizConfig) Validate() error {
 	return nil
 }
 
-func NewWizAdapter(conf WizConfig) (*WizAdapter, chan struct{}, error) {
+func NewWizAdapter(ctx context.Context, conf WizConfig) (*WizAdapter, chan struct{}, error) {
 	var err error
 	a := &WizAdapter{
 		conf:   conf,
@@ -79,7 +79,7 @@ func NewWizAdapter(conf WizConfig) (*WizAdapter, chan struct{}, error) {
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

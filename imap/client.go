@@ -69,7 +69,7 @@ func (c *ImapConfig) Validate() error {
 	return nil
 }
 
-func NewImapAdapter(conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
+func NewImapAdapter(ctx context.Context, conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
 	a := &IMAPAdapter{
 		conf: conf,
 		ctx:  context.Background(),
@@ -126,7 +126,7 @@ func NewImapAdapter(conf ImapConfig) (*IMAPAdapter, chan struct{}, error) {
 	}
 
 	// Create the USP client to ship to LC
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		a.imapClient.Logout()
 		a.imapClient.Close()

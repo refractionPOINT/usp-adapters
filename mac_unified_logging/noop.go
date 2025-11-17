@@ -3,7 +3,10 @@
 
 package usp_mac_unified_logging
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // Dummy noop file to build when the platform
 // is _not_ MacOS since unified logging is only
@@ -11,7 +14,7 @@ import "errors"
 
 type MacUnifiedLoggingAdapter struct{}
 
-func NewMacUnifiedLoggingAdapter(conf MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
+func NewMacUnifiedLoggingAdapter(ctx context.Context, conf MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
 	return nil, nil, errors.New("mac (MacOS unified logging) collection not supported outside of MacOS")
 }
 

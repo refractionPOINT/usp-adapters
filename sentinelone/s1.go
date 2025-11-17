@@ -62,17 +62,17 @@ func (c *SentinelOneConfig) Validate() error {
 	return nil
 }
 
-func NewSentinelOneAdapter(conf SentinelOneConfig) (*SentinelOneAdapter, chan struct{}, error) {
+func NewSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig) (*SentinelOneAdapter, chan struct{}, error) {
 	var err error
 
 	a := &SentinelOneAdapter{
 		conf:     conf,
-		ctx:      context.Background(),
+		ctx:      ctx,
 		doStop:   utils.NewEvent(),
 		s1Client: NewSentinelOneClient(conf.Domain, conf.APIKey),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

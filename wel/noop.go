@@ -3,7 +3,10 @@
 
 package usp_wel
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // Dummy noop file to build when the platform
 // is _not_ Windows since the WEL API is only
@@ -11,7 +14,7 @@ import "errors"
 
 type WELAdapter struct{}
 
-func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
+func NewWELAdapter(ctx context.Context, conf WELConfig) (*WELAdapter, chan struct{}, error) {
 	return nil, nil, errors.New("wel (Windows Event Logs) collection not supported outside of Windows")
 }
 

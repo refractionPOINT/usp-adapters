@@ -60,7 +60,7 @@ func (c *OktaConfig) Validate() error {
 	return nil
 }
 
-func NewOktaAdapter(conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
+func NewOktaAdapter(ctx context.Context, conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
 	var err error
 	a := &OktaAdapter{
 		conf:   conf,
@@ -69,7 +69,7 @@ func NewOktaAdapter(conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

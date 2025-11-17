@@ -3,14 +3,17 @@
 
 package usp_file
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // Dummy noop file to build when the platform
 // is _not_ supported.
 
 type FileAdapter struct{}
 
-func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
+func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	return nil, nil, errors.New("file collection not supported on this platform")
 }
 

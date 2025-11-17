@@ -4,6 +4,7 @@
 package usp_k8s_pods
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"regexp"
@@ -45,7 +46,7 @@ func (c *K8sPodsConfig) Validate() error {
 	return nil
 }
 
-func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, error) {
+func NewK8sPodsAdapter(ctx context.Context, conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, error) {
 	a := &K8sPodsAdapter{
 		conf: conf,
 	}
@@ -67,7 +68,7 @@ func NewK8sPodsAdapter(conf K8sPodsConfig) (*K8sPodsAdapter, chan struct{}, erro
 		}
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
