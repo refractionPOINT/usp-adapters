@@ -78,7 +78,7 @@ func (c *FileConfig) Validate() error {
 	return nil
 }
 
-func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
+func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	a := &FileAdapter{
 		conf:       conf,
 		tailFiles:  make(map[string]*tailInfo),
@@ -91,7 +91,7 @@ func NewFileAdapter(conf FileConfig) (*FileAdapter, chan struct{}, error) {
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

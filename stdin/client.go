@@ -1,6 +1,7 @@
 package usp_stdin
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -37,7 +38,7 @@ func (c *StdinConfig) Validate() error {
 	return nil
 }
 
-func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
+func NewStdinAdapter(ctx context.Context, conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
 	a := &StdinAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -49,7 +50,7 @@ func NewStdinAdapter(conf StdinConfig) (*StdinAdapter, chan struct{}, error) {
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

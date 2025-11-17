@@ -54,7 +54,7 @@ type BoxAdapter struct {
 	initialized    bool
 }
 
-func NewBoxAdapter(conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
+func NewBoxAdapter(ctx context.Context, conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
 	var err error
 	a := &BoxAdapter{
 		conf:           conf,
@@ -65,7 +65,7 @@ func NewBoxAdapter(conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
 		initialized:    false,
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -114,13 +114,13 @@ type s3Record struct {
 	Size int64
 }
 
-func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
+func NewS3Adapter(ctx context.Context, conf S3Config) (*S3Adapter, chan struct{}, error) {
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}
 	a := &S3Adapter{
 		conf: conf,
-		ctx:  context.Background(),
+		ctx:  ctx,
 	}
 
 	var err error
@@ -130,6 +130,10 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 		region = conf.Region
 	} else {
 		if region, err = a.getRegion(); err != nil {
+			// Check if context was cancelled/timed out during region detection
+			if ctx.Err() != nil {
+				return nil, nil, fmt.Errorf("s3.GetBucketRegion() context cancelled: %w", ctx.Err())
+			}
 			return nil, nil, fmt.Errorf("s3.GetBucketRegion(): %v", err)
 		}
 	}
@@ -171,7 +175,7 @@ func NewS3Adapter(conf S3Config) (*S3Adapter, chan struct{}, error) {
 	a.awsS3 = s3.New(a.awsSession)
 	a.awsDownloader = s3manager.NewDownloader(a.awsSession)
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

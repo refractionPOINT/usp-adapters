@@ -75,7 +75,7 @@ func (c *OnePasswordConfig) Validate() error {
 	return nil
 }
 
-func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
+func NewOnePasswordpAdapter(ctx context.Context, conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
 	var err error
 	a := &OnePasswordAdapter{
 		conf:   conf,
@@ -91,7 +91,7 @@ func NewOnePasswordpAdapter(conf OnePasswordConfig) (*OnePasswordAdapter, chan s
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

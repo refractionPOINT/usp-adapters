@@ -1,6 +1,7 @@
 package usp_evtx
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,7 +45,7 @@ func (c *EVTXConfig) Validate() error {
 	return nil
 }
 
-func NewEVTXAdapter(conf EVTXConfig) (*EVTXAdapter, chan struct{}, error) {
+func NewEVTXAdapter(ctx context.Context, conf EVTXConfig) (*EVTXAdapter, chan struct{}, error) {
 	a := &EVTXAdapter{
 		conf: conf,
 	}
@@ -65,7 +66,7 @@ func NewEVTXAdapter(conf EVTXConfig) (*EVTXAdapter, chan struct{}, error) {
 		return nil, nil, err
 	}
 
-	a.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -50,7 +50,7 @@ func (bq *BigQueryConfig) Validate() error {
 	return nil
 }
 
-func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
+func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
 	// Create bq cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
 	bq := &BigQueryAdapter{
@@ -81,7 +81,7 @@ func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, e
 	bq.dataset = bq.client.Dataset(bq.conf.DatasetName)
 	bq.table = bq.dataset.Table(bq.conf.TableName)
 
-	bq.uspClient, err = uspclient.NewClient(conf.ClientOptions)
+	bq.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
