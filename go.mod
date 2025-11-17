@@ -18,7 +18,7 @@ require (
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
-	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251110144611-385ee44c7cf9
+	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251116170209-61e4b9651299
 	github.com/refractionPOINT/go-uspclient v1.6.0
 	github.com/stretchr/testify v1.11.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
@@ -74,7 +74,7 @@ require (
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-openapi/analysis v0.24.1 // indirect
 	github.com/go-openapi/errors v0.22.4 // indirect
-	github.com/go-openapi/jsonpointer v0.22.1 // indirect
+	github.com/go-openapi/jsonpointer v0.22.3 // indirect
 	github.com/go-openapi/jsonreference v0.21.3 // indirect
 	github.com/go-openapi/loads v0.23.2 // indirect
 	github.com/go-openapi/runtime v0.29.2 // indirect

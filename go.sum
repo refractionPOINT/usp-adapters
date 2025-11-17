@@ -162,8 +162,8 @@ github.com/go-openapi/analysis v0.24.1 h1:Xp+7Yn/KOnVWYG8d+hPksOYnCYImE3TieBa7rB
 github.com/go-openapi/analysis v0.24.1/go.mod h1:dU+qxX7QGU1rl7IYhBC8bIfmWQdX4Buoea4TGtxXY84=
 github.com/go-openapi/errors v0.22.4 h1:oi2K9mHTOb5DPW2Zjdzs/NIvwi2N3fARKaTJLdNabaM=
 github.com/go-openapi/errors v0.22.4/go.mod h1:z9S8ASTUqx7+CP1Q8dD8ewGH/1JWFFLX/2PmAYNQLgk=
-github.com/go-openapi/jsonpointer v0.22.1 h1:sHYI1He3b9NqJ4wXLoJDKmUmHkWy/L7rtEo92JUxBNk=
-github.com/go-openapi/jsonpointer v0.22.1/go.mod h1:pQT9OsLkfz1yWoMgYFy4x3U5GY5nUlsOn1qSBH5MkCM=
+github.com/go-openapi/jsonpointer v0.22.3 h1:dKMwfV4fmt6Ah90zloTbUKWMD+0he+12XYAsPotrkn8=
+github.com/go-openapi/jsonpointer v0.22.3/go.mod h1:0lBbqeRsQ5lIanv3LHZBrmRGHLHcQoOXQnf88fHlGWo=
 github.com/go-openapi/jsonreference v0.21.3 h1:96Dn+MRPa0nYAR8DR1E03SblB5FJvh7W6krPI0Z7qMc=
 github.com/go-openapi/jsonreference v0.21.3/go.mod h1:RqkUP0MrLf37HqxZxrIAtTWW4ZJIK1VzduhXYBEeGc4=
 github.com/go-openapi/loads v0.23.2 h1:rJXAcP7g1+lWyBHC7iTY+WAF0rprtM+pm8Jxv1uQJp4=
@@ -308,8 +308,8 @@ github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121 h1:8VEMti13FI
 github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121/go.mod h1:ZQQ/GaL5743AyXXzuQgC9rcZzfNA1qKXWQv/4iVdGMo=
 github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d h1:5OLPrBvVR0V/eGezlkJ4fyTaaJS/7pbYNTzMqu0Qur0=
 github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d/go.mod h1:7S4MA6zBzHBCOlHUFK+X+lgQq+pHiR0OZtW0v3VJOkY=
-github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251110144611-385ee44c7cf9 h1:X8aYEHo8N+Esf+o2dWLklfShx00TwWf80fUcj3It8zE=
-github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251110144611-385ee44c7cf9/go.mod h1:M4LyEs/2mJ2OA1JHsDMQYKPdD8/RZmz2+FWLlVIwapM=
+github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251116170209-61e4b9651299 h1:P6rwrNYePV46kMzZEV8LzplZ8I9hUHxIr0tYloj3U/4=
+github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251116170209-61e4b9651299/go.mod h1:M4LyEs/2mJ2OA1JHsDMQYKPdD8/RZmz2+FWLlVIwapM=
 github.com/refractionPOINT/go-uspclient v1.6.0 h1:obGaLRkJlcIvZHxf55JSXmT2pDLqnX3E6IPDUT572pY=
 github.com/refractionPOINT/go-uspclient v1.6.0/go.mod h1:j4tCnHNLMcx80nZ2KHKLGgLFPW2UVvFVxRil6Qd6Wjo=
 github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6 h1:1+7g49ZLqdbxFcqy0ISBs6tXq5dl/D0WV/VQgcvqWhY=
