@@ -23,6 +23,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/cylance"
+	"github.com/refractionPOINT/usp-adapters/cynet"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
@@ -376,6 +377,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.Cylance.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Cylance
 		client, chRunning, err = usp_cylance.NewCylanceAdapter(ctx, configs.Cylance)
+	} else if method == "cynet" {
+		configs.Cynet.ClientOptions = applyLogging(configs.Cynet.ClientOptions)
+		configs.Cynet.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Cynet
+		client, chRunning, err = usp_cynet.NewCynetAdapter(ctx, configs.Cynet)
 	} else if method == "entraid" {
 		configs.EntraID.ClientOptions = applyLogging(configs.EntraID.ClientOptions)
 		configs.EntraID.ClientOptions.Architecture = "usp_adapter"
