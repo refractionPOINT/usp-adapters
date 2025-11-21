@@ -4,6 +4,7 @@ import (
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 
 	"github.com/refractionPOINT/usp-adapters/1password"
+	"github.com/refractionPOINT/usp-adapters/abnormal_security"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
@@ -52,6 +53,7 @@ type GeneralConfigs struct {
 	S3                usp_s3.S3Config                                 `json:"s3" yaml:"s3"`
 	Stdin             usp_stdin.StdinConfig                           `json:"stdin" yaml:"stdin"`
 	OnePassword       usp_1password.OnePasswordConfig                 `json:"1password" yaml:"1password"`
+	AbnormalSecurity usp_abnormal_security.AbnormalSecurityConfig	`json:"abnormal_security" yaml:"abnormal_security"`
 	Bitwarden         usp_bitwarden.BitwardenConfig                   `json:"bitwarden" yaml:"bitwarden"`
 	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
 	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
