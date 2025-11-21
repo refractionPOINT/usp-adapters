@@ -261,8 +261,6 @@ func (a *MimecastAdapter) refreshOAuthToken(ctx context.Context) (map[string]str
 	a.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-60) * time.Second)
 	a.tokenMu.Unlock()
 
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("obtained new OAuth token, expires in %d seconds", tokenResp.ExpiresIn-60))
-
 	return map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", tokenResp.AccessToken),
 		"Accept":        "application/json",
@@ -420,7 +418,6 @@ func (a *MimecastAdapter) RunFetchLoop(apis []*API) {
 						count := 0
 
 						defer func() {
-							a.conf.ClientOptions.DebugLog(fmt.Sprintf("shipped %d events", count))
 							close(shipDone)
 						}()
 
@@ -831,7 +828,6 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 	if querySucceeded {
 		api.mu.Lock()
 		api.since = cycleTime.Add(-overlapPeriod)
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("api.since updated to %s (with %v overlap)", api.since.UTC().Format(time.RFC3339), overlapPeriod))
 		api.mu.Unlock()
 	}
 
@@ -845,10 +841,9 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 			delete(api.dedupe, k)
 		}
 	}
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("After Delete, %s %d", api.key, len(api.dedupe)))
+
 	api.mu.Unlock()
 
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s + %d (success=%v)", api.key, len(allItems), querySucceeded))
 	return allItems, nil
 }
 
