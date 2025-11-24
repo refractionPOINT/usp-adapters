@@ -118,16 +118,6 @@ func (c *MimecastConfig) Validate() error {
 		// UK Specific - Ensures data stays within the UK instance: https://uk-api.services.mimecast.com
 	}
 
-	if c.InitialLookback == 0 {
-		c.InitialLookback = 24 * time.Hour // Default
-	} else {
-		if c.InitialLookback < 1*time.Minute {
-			return fmt.Errorf("initial_lookback must be at least 1 minute, got %s", c.InitialLookback)
-		}
-		if c.InitialLookback > 30*24*time.Hour { // 30 days
-			return fmt.Errorf("initial_lookback must be less than 30 days, got %s", c.InitialLookback)
-		}
-	}
 
 	if c.MaxConcurrentWorkers == 0 {
 		c.MaxConcurrentWorkers = 10 // Default
