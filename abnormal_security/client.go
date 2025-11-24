@@ -86,7 +86,7 @@ func NewAbnormalSecurityAdapter(ctx context.Context, conf AbnormalSecurityConfig
 	a.cancel = cancel
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(rootCtx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
