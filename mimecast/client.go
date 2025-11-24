@@ -415,7 +415,6 @@ func (a *MimecastAdapter) RunFetchLoop(apis []*API) {
 					// shipper routine
 					go func() {
 						var shipperWg sync.WaitGroup
-						var mu sync.Mutex
 
 						defer func() {
 							close(shipDone)
@@ -434,8 +433,6 @@ func (a *MimecastAdapter) RunFetchLoop(apis []*API) {
 									<-shipperSem
 									shipperWg.Done()
 								}()
-								mu.Lock()
-								mu.Unlock()
 								a.submitEvents(events)
 							}(eventsCopy)
 						}
