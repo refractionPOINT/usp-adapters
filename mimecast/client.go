@@ -533,6 +533,7 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 	var allItems []utils.Dict
 	var start string
 	var retryCount int
+	var retryableErrorCount int
 	var querySucceeded bool // Track if we successfully completed the query
 
 	api.mu.Lock()
@@ -738,12 +739,43 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 		// Check for Mimecast-specific errors in the fail array
 		if len(response.Fail) > 0 {
 			var errorMessages []string
+			allRetryable := true
+			
 			for _, failure := range response.Fail {
 				for _, errDetail := range failure.Errors {
-					errorMessages = append(errorMessages, fmt.Sprintf("%s: %s (retryable: %v)", errDetail.Code, errDetail.Message, errDetail.Retryable))
+					errorMessages = append(errorMessages, fmt.Sprintf("%s: %s (retryable: %v)", 
+						errDetail.Code, errDetail.Message, errDetail.Retryable))
+					if !errDetail.Retryable {
+						allRetryable = false
+					}
 				}
 			}
-			a.conf.ClientOptions.OnError(fmt.Errorf("mimecast api returned errors: %v", errorMessages))
+			
+			if allRetryable {
+				retryableErrorCount++
+
+				if retryableErrorCount >= 5 {
+					a.conf.ClientOptions.OnError(fmt.Errorf("max retries exceeded for retryable errors: %v", errorMessages))
+					if len(allItems) > 0 {
+						return allItems, fmt.Errorf("mimecast api errors after %d retries: %v", retryableErrorCount, errorMessages)
+					}
+					return nil, fmt.Errorf("mimecast api errors after %d retries: %v", retryableErrorCount, errorMessages)
+				}
+
+				// Log warning and retry
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("mimecast api returned retryable errors: %v, retrying", errorMessages))
+				
+				if err := sleepContext(a.ctx, 5*time.Second); err != nil {
+					if len(allItems) > 0 {
+						return allItems, err
+					}
+					return nil, err
+				}
+				continue  // Retry the request
+			}
+			
+			// Non-retryable error - fail
+			a.conf.ClientOptions.OnError(fmt.Errorf("mimecast api returned non-retryable errors: %v", errorMessages))
 			return nil, fmt.Errorf("mimecast api errors: %v", errorMessages)
 		}
 
