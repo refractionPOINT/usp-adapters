@@ -91,12 +91,13 @@ type AuditLog struct {
 }
 
 type MimecastConfig struct {
-	ClientOptions        uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientId             string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret         string                  `json:"client_secret" yaml:"client_secret"`
-	BaseURL              string                  `json:"base_url,omitempty" yaml:"base_url,omitempty"`
-	InitialLookback      time.Duration           `json:"initial_lookback,omitempty" yaml:"initial_lookback,omitempty"` // eg, 24h, 30m, 168h, 1h30m
-	MaxConcurrentWorkers int                     `json:"max_concurrent_workers,omitempty" yaml:"max_concurrent_workers,omitempty"`
+	ClientOptions        uspclient.ClientOptions 	`json:"client_options" yaml:"client_options"`
+	ClientId              string                  	`json:"client_id" yaml:"client_id"`
+	ClientSecret          string                  	`json:"client_secret" yaml:"client_secret"`
+	BaseURL               string                  	`json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	InitialLookback       time.Duration           	`json:"initial_lookback,omitempty" yaml:"initial_lookback,omitempty"` // eg, 24h, 30m, 168h, 1h30m
+	MaxConcurrentWorkers  int                     	`json:"max_concurrent_workers,omitempty" yaml:"max_concurrent_workers,omitempty"`
+	MaxConcurrentShippers int 						`json:"max_concurrent_shippers,omitempty" yaml:"max_concurrent_shippers,omitempty"`
 }
 
 func (c *MimecastConfig) Validate() error {
@@ -132,6 +133,12 @@ func (c *MimecastConfig) Validate() error {
 		c.MaxConcurrentWorkers = 10 // Default
 	} else if c.MaxConcurrentWorkers > 100 {
     	return fmt.Errorf("max_concurrent_workers cannot exceed 100, got %d", c.MaxConcurrentWorkers)
+	}
+
+	if c.MaxConcurrentShippers == 0 {
+		c.MaxConcurrentShippers = 2  // Default
+	} else if c.MaxConcurrentShippers > 100 {
+		return fmt.Errorf("max_concurrent_shippers cannot exceed 100, got %d", c.MaxConcurrentShippers)
 	}
 
 	return nil
@@ -372,7 +379,7 @@ func (a *MimecastAdapter) shouldShutdown(apis []*API) bool {
 
 func (a *MimecastAdapter) RunFetchLoop(apis []*API) {
 	cycleSem := make(chan struct{}, 1)
-	shipperSem := make(chan struct{}, 2)
+	shipperSem := make(chan struct{}, a.conf.MaxConcurrentShippers)
 	workerSem := make(chan struct{}, a.conf.MaxConcurrentWorkers)
 	ticker := time.NewTicker(queryInterval * time.Second)
 	defer ticker.Stop()
