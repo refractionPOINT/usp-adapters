@@ -98,7 +98,7 @@ func NewCynetAdapter(ctx context.Context, conf CynetConfig) (*CynetAdapter, chan
 	a.cancel = cancel
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(rootCtx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create USP client: %w", err)
 	}
