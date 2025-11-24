@@ -256,9 +256,12 @@ func (a *MimecastAdapter) refreshOAuthToken(ctx context.Context) (map[string]str
 		return nil, fmt.Errorf("failed to decode token response: %w", err)
 	}
 
-	// Store the token in the ADAPTER with 60-second grace period
+	gracePeriod := 60
+	if tokenResp.ExpiresIn < gracePeriod {
+		gracePeriod = 0  // or tokenResp.ExpiresIn / 2, or some other logic
+	}
 	a.oauthToken = tokenResp.AccessToken
-	a.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-60) * time.Second)
+	a.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-gracePeriod) * time.Second)
 
 	return map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", tokenResp.AccessToken),
