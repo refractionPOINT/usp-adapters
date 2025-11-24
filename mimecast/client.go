@@ -148,7 +148,7 @@ func NewMimecastAdapter(ctx context.Context, conf MimecastConfig) (*MimecastAdap
 		cancel: cancel,
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(ctxChild, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
