@@ -538,7 +538,6 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 	var start string
 	var retryCount int
 	var retryableErrorCount int
-	var querySucceeded bool // Track if we successfully completed the query
 
 	api.mu.Lock()
 	start = api.since.UTC().Format(time.RFC3339)
@@ -862,17 +861,11 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 		}
 	}
 
-	// Mark query as successful - we completed pagination successfully
-	querySucceeded = true
-
 	// Update api.since to the end time of this request window
-	// This ensures we don't miss any events in future requests
-	// ONLY update if query succeeded
-	if querySucceeded {
-		api.mu.Lock()
-		api.since = cycleTime.Add(-overlapPeriod)
-		api.mu.Unlock()
-	}
+	// This ensures we don't miss any events in future requests	
+	api.mu.Lock()
+	api.since = cycleTime.Add(-overlapPeriod)
+	api.mu.Unlock()
 
 	// Cull old dedupe entries - keep entries from the last lookback period
 	// to handle duplicates during the overlap window
