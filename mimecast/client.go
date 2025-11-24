@@ -208,7 +208,8 @@ func (a *MimecastAdapter) getAuthHeaders(ctx context.Context) (map[string]string
 			"Content-Type":  "application/json",
 		}, nil
 	}
-	a.tokenMu.Unlock()
+	
+	defer a.tokenMu.Unlock()
 
 	// Need to get a new token
 	return a.refreshOAuthToken(ctx)
@@ -256,10 +257,8 @@ func (a *MimecastAdapter) refreshOAuthToken(ctx context.Context) (map[string]str
 	}
 
 	// Store the token in the ADAPTER with 60-second grace period
-	a.tokenMu.Lock()
 	a.oauthToken = tokenResp.AccessToken
 	a.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-60) * time.Second)
-	a.tokenMu.Unlock()
 
 	return map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", tokenResp.AccessToken),
