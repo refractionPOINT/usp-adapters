@@ -130,6 +130,8 @@ func (c *MimecastConfig) Validate() error {
 
 	if c.MaxConcurrentWorkers == 0 {
 		c.MaxConcurrentWorkers = 10 // Default
+	} else if c.MaxConcurrentWorkers > 100 {
+    	return fmt.Errorf("max_concurrent_workers cannot exceed 100, got %d", c.MaxConcurrentWorkers)
 	}
 
 	return nil
