@@ -651,6 +651,8 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 					}
 					return nil, err
 				}
+			} else if retryAfterTime.Before(time.Now()) { 
+				continue 
 			} else if !retryAfterTime.IsZero() {
 				retryUntilTime := time.Until(retryAfterTime).Seconds()
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header with time %v, sleeping %vs before retry", retryAfterTime, retryUntilTime))
