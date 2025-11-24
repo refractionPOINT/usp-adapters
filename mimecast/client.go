@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -888,18 +889,22 @@ func (a *MimecastAdapter) processLogItem(api *API, logMap map[string]interface{}
 	return true // Include this item
 }
 
-// New function to generate a hash from log content
 func (a *MimecastAdapter) generateLogHash(logMap map[string]interface{}) string {
-	// Convert the log map to a stable JSON representation
-	jsonBytes, err := json.Marshal(logMap)
-	if err != nil {
-		// Fallback: use timestamp if available
-		return fmt.Sprintf("hash-error-%d", time.Now().UnixNano())
-	}
-
-	// Generate SHA256 hash
-	hash := sha256.Sum256(jsonBytes)
-	return hex.EncodeToString(hash[:])
+    // Extract and sort keys
+    keys := make([]string, 0, len(logMap))
+    for k := range logMap {
+        keys = append(keys, k)
+    }
+    sort.Strings(keys)
+    
+    // Build deterministic string representation
+    var buf bytes.Buffer
+    for _, k := range keys {
+        fmt.Fprintf(&buf, "%s:%v|", k, logMap[k])
+    }
+    
+    hash := sha256.Sum256(buf.Bytes())
+    return hex.EncodeToString(hash[:])
 }
 
 func (a *MimecastAdapter) submitEvents(events []utils.Dict) {
