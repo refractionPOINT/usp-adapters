@@ -63,7 +63,7 @@ func (c *MsGraphConfig) Validate() error {
 	return nil
 }
 
-func NewMsGraphAdapter(conf MsGraphConfig) (*MsGraphAdapter, chan struct{}, error) {
+func NewMsGraphAdapter(ctx context.Context, conf MsGraphConfig) (*MsGraphAdapter, chan struct{}, error) {
 	var err error
 	a := &MsGraphAdapter{
 		conf:   conf,
@@ -71,7 +71,7 @@ func NewMsGraphAdapter(conf MsGraphConfig) (*MsGraphAdapter, chan struct{}, erro
 		doStop: utils.NewEvent(),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

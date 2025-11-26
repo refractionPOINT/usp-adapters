@@ -61,7 +61,7 @@ func (c *DefenderConfig) Validate() error {
 	return nil
 }
 
-func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, error) {
+func NewDefenderAdapter(ctx context.Context, conf DefenderConfig) (*DefenderAdapter, chan struct{}, error) {
 	var err error
 	a := &DefenderAdapter{
 		conf:   conf,
@@ -69,7 +69,7 @@ func NewDefenderAdapter(conf DefenderConfig) (*DefenderAdapter, chan struct{}, e
 		doStop: utils.NewEvent(),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

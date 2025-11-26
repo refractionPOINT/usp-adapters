@@ -61,7 +61,7 @@ func (c *EntraIDConfig) Validate() error {
 	return nil
 }
 
-func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, error) {
+func NewEntraIDAdapter(ctx context.Context, conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, error) {
 	var err error
 	a := &EntraIDAdapter{
 		conf:   conf,
@@ -69,7 +69,7 @@ func NewEntraIDAdapter(conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, erro
 		doStop: utils.NewEvent(),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

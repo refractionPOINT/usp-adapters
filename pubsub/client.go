@@ -55,7 +55,7 @@ func (c *PubSubConfig) Validate() error {
 	return nil
 }
 
-func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) {
+func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) {
 	a := &PubSubAdapter{
 		conf: conf,
 		ctx:  context.Background(),
@@ -80,7 +80,7 @@ func NewPubSubAdapter(conf PubSubConfig) (*PubSubAdapter, chan struct{}, error) 
 		}
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		a.psClient.Close()
 		return nil, nil, err

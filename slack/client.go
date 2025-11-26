@@ -56,7 +56,7 @@ func (c *SlackConfig) Validate() error {
 	return nil
 }
 
-func NewSlackAdapter(conf SlackConfig) (*SlackAdapter, chan struct{}, error) {
+func NewSlackAdapter(ctx context.Context, conf SlackConfig) (*SlackAdapter, chan struct{}, error) {
 	var err error
 	a := &SlackAdapter{
 		conf:   conf,
@@ -64,7 +64,7 @@ func NewSlackAdapter(conf SlackConfig) (*SlackAdapter, chan struct{}, error) {
 		doStop: utils.NewEvent(),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

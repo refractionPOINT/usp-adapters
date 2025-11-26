@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
@@ -152,7 +153,7 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	chRunnings := make(chan struct{})
 	for _, config := range configsToRun {
 		log("starting adapter: %s", method)
-		client, chRunning, err := runAdapter(method, *config, false)
+		client, chRunning, err := runAdapter(context.Background(), method, *config, false)
 		if err != nil {
 			saveErrorOnDisk(logError("runAdapter(): %v", err))
 			return false, 1

@@ -62,7 +62,7 @@ type gcsLocalFile struct {
 	Err          error
 }
 
-func NewGCSAdapter(conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
+func NewGCSAdapter(ctx context.Context, conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}
@@ -93,7 +93,7 @@ func NewGCSAdapter(conf GCSConfig) (*GCSAdapter, chan struct{}, error) {
 
 	a.bucket = a.client.Bucket(conf.BucketName)
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -60,7 +60,7 @@ func (c *SQSConfig) Validate() error {
 	return nil
 }
 
-func NewSQSAdapter(conf SQSConfig) (*SQSAdapter, chan struct{}, error) {
+func NewSQSAdapter(ctx context.Context, conf SQSConfig) (*SQSAdapter, chan struct{}, error) {
 	a := &SQSAdapter{
 		conf: conf,
 		ctx:  context.Background(),
@@ -78,7 +78,7 @@ func NewSQSAdapter(conf SQSConfig) (*SQSAdapter, chan struct{}, error) {
 
 	a.sqsClient = sqs.New(a.awsSession)
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

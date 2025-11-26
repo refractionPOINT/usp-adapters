@@ -67,7 +67,7 @@ func (c *ZendeskConfig) Validate() error {
 	return nil
 }
 
-func NewZendeskAdapter(conf ZendeskConfig) (*ZendeskAdapter, chan struct{}, error) {
+func NewZendeskAdapter(ctx context.Context, conf ZendeskConfig) (*ZendeskAdapter, chan struct{}, error) {
 	var err error
 	a := &ZendeskAdapter{
 		conf:   conf,
@@ -76,7 +76,7 @@ func NewZendeskAdapter(conf ZendeskConfig) (*ZendeskAdapter, chan struct{}, erro
 		dedupe: make(map[string]int64),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

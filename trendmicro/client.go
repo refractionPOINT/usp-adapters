@@ -62,7 +62,7 @@ type TrendMicroAdapter struct {
 	lastFetch  time.Time
 }
 
-func NewTrendMicroAdapter(conf TrendMicroConfig) (*TrendMicroAdapter, chan struct{}, error) {
+func NewTrendMicroAdapter(ctx context.Context, conf TrendMicroConfig) (*TrendMicroAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -79,7 +79,7 @@ func NewTrendMicroAdapter(conf TrendMicroConfig) (*TrendMicroAdapter, chan struc
 	// Set regional base URL
 	a.baseURL = regionalDomains[conf.Region]
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

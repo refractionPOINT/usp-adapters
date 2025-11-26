@@ -92,7 +92,7 @@ func (c *SQSFilesConfig) Validate() error {
 	return nil
 }
 
-func NewSQSFilesAdapter(conf SQSFilesConfig) (*SQSFilesAdapter, chan struct{}, error) {
+func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdapter, chan struct{}, error) {
 	if conf.ParallelFetch <= 0 {
 		conf.ParallelFetch = 1
 	}
@@ -128,7 +128,7 @@ func NewSQSFilesAdapter(conf SQSFilesConfig) (*SQSFilesAdapter, chan struct{}, e
 
 	a.chFiles = make(chan fileInfo)
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

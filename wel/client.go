@@ -4,6 +4,7 @@
 package usp_wel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,7 +31,7 @@ type WELAdapter struct {
 	hSubs []EVT_HANDLE
 }
 
-func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
+func NewWELAdapter(ctx context.Context, conf WELConfig) (*WELAdapter, chan struct{}, error) {
 	a := &WELAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -46,7 +47,7 @@ func NewWELAdapter(conf WELConfig) (*WELAdapter, chan struct{}, error) {
 	}
 
 	var err error
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

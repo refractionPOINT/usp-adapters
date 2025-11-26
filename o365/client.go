@@ -119,7 +119,7 @@ func (c *Office365Config) Validate() error {
 	return nil
 }
 
-func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}, error) {
+func NewOffice365Adapter(ctx context.Context, conf Office365Config) (*Office365Adapter, chan struct{}, error) {
 	var err error
 
 	// If no deduper is provided, use a local one.
@@ -146,7 +146,7 @@ func NewOffice365Adapter(conf Office365Config) (*Office365Adapter, chan struct{}
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

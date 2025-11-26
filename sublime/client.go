@@ -56,7 +56,7 @@ func (c *SublimeConfig) Validate() error {
 	return nil
 }
 
-func NewSublimeAdapter(conf SublimeConfig) (*SublimeAdapter, chan struct{}, error) {
+func NewSublimeAdapter(ctx context.Context, conf SublimeConfig) (*SublimeAdapter, chan struct{}, error) {
 	var err error
 	a := &SublimeAdapter{
 		conf:   conf,
@@ -65,7 +65,7 @@ func NewSublimeAdapter(conf SublimeConfig) (*SublimeAdapter, chan struct{}, erro
 		dedupe: make(map[string]int64),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -58,7 +58,7 @@ func (c *PandaDocConfig) Validate() error {
 	return nil
 }
 
-func NewPandaDocAdapter(conf PandaDocConfig) (*PandaDocAdapter, chan struct{}, error) {
+func NewPandaDocAdapter(ctx context.Context, conf PandaDocConfig) (*PandaDocAdapter, chan struct{}, error) {
 	var err error
 	a := &PandaDocAdapter{
 		conf:   conf,
@@ -67,7 +67,7 @@ func NewPandaDocAdapter(conf PandaDocConfig) (*PandaDocAdapter, chan struct{}, e
 		dedupe: make(map[string]int64),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

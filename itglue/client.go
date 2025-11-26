@@ -55,7 +55,7 @@ func (c *ITGlueConfig) Validate() error {
 	return nil
 }
 
-func NewITGlueAdapter(conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) {
+func NewITGlueAdapter(ctx context.Context, conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) {
 	var err error
 	a := &ITGlueAdapter{
 		conf:   conf,
@@ -63,7 +63,7 @@ func NewITGlueAdapter(conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) 
 		doStop: utils.NewEvent(),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

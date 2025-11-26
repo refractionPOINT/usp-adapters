@@ -68,7 +68,7 @@ func (c *SophosConfig) Validate() error {
 	return nil
 }
 
-func NewSophosAdapter(conf SophosConfig) (*SophosAdapter, chan struct{}, error) {
+func NewSophosAdapter(ctx context.Context, conf SophosConfig) (*SophosAdapter, chan struct{}, error) {
 	var err error
 	a := &SophosAdapter{
 		conf:   conf,
@@ -76,7 +76,7 @@ func NewSophosAdapter(conf SophosConfig) (*SophosAdapter, chan struct{}, error) 
 		doStop: utils.NewEvent(),
 	}
 
-	client, err := uspclient.NewClient(conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}

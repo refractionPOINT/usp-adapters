@@ -1,6 +1,7 @@
 package usp_file
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -123,7 +124,7 @@ func TestPollSerialFiles(t *testing.T) {
 	debugReceived := []string{}
 
 	mockClientOptions := new(MockClientOptions)
-	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
 		TestSinkMode: true,
 	})
 	if err != nil {
@@ -207,7 +208,7 @@ func TestTailActiveFile(t *testing.T) {
 	// Create channels to receive USP messages
 	receivedLines := make(chan string, 100)
 	mockClientOptions := new(MockClientOptions)
-	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
 		TestSinkMode: true,
 	})
 	if err != nil {
@@ -314,7 +315,7 @@ func TestMultiLineJSON(t *testing.T) {
 	// Create channels to receive JSON messages
 	receivedJSON := make(chan string, 100)
 	mockClientOptions := new(MockClientOptions)
-	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
 		TestSinkMode: true,
 	})
 	if err != nil {
@@ -434,7 +435,7 @@ func TestFileRotationDetection(t *testing.T) {
 	receivedLines := make(chan string, 100)
 
 	mockClientOptions := new(MockClientOptions)
-	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
 		TestSinkMode: true,
 	})
 	require.NoError(t, err)
@@ -573,7 +574,7 @@ func TestFileRotationPreservesData(t *testing.T) {
 	logCapture := &LogCapture{}
 	receivedLines := make(chan string, 200)
 
-	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
 		TestSinkMode: true,
 	})
 	require.NoError(t, err)
@@ -683,7 +684,7 @@ func TestMultipleFileRotations(t *testing.T) {
 	logCapture := &LogCapture{}
 	receivedLines := make(chan string, 50)
 
-	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
 		TestSinkMode: true,
 	})
 	require.NoError(t, err)
@@ -788,7 +789,7 @@ func TestConcurrentFileRotations(t *testing.T) {
 	logCapture := &LogCapture{}
 	receivedLines := make(chan string, 50)
 
-	dummyUSPClient, err := uspclient.NewClient(uspclient.ClientOptions{
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
 		TestSinkMode: true,
 	})
 	require.NoError(t, err)

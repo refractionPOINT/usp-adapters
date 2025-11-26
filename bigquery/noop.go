@@ -3,14 +3,17 @@
 
 package usp_bigquery
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 // Dummy noop file to build when the platform
 // is _not_ supported.
 
 type BigQueryAdapter struct{}
 
-func NewBigQueryAdapter(conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
+func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
 	return nil, nil, errors.New("bigquery collection not supported on this platform")
 }
 
