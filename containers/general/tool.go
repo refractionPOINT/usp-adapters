@@ -17,6 +17,7 @@ import (
 
 	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/usp-adapters/1password"
+	"github.com/refractionPOINT/usp-adapters/abnormal_security"
 	"github.com/refractionPOINT/usp-adapters/azure_event_hub"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
@@ -316,6 +317,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.OnePassword.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.OnePassword
 		client, chRunning, err = usp_1password.NewOnePasswordpAdapter(ctx, configs.OnePassword)
+	} else if method == "abnormal_security" {
+		configs.AbnormalSecurity.ClientOptions = applyLogging(configs.AbnormalSecurity.ClientOptions)
+		configs.AbnormalSecurity.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.AbnormalSecurity
+		client, chRunning, err = usp_abnormal_security.NewAbnormalSecurityAdapter(ctx, configs.AbnormalSecurity)
 	} else if method == "bitwarden" {
 		configs.Bitwarden.ClientOptions = applyLogging(configs.Bitwarden.ClientOptions)
 		configs.Bitwarden.ClientOptions.Architecture = "usp_adapter"
