@@ -1,6 +1,7 @@
 package usp_bigquery
 
 import (
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/go-uspclient"
 )
 
@@ -14,4 +15,5 @@ type BigQueryConfig struct {
 	SqlQuery            string                  `json:"sql_query" yaml:"sql_query"`
 	QueryInterval       string                  `json:"query_interval" yaml:"query_interval"`
 	IsOneTimeLoad       bool                    `json:"is_one_time_load" yaml:"is_one_time_load"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }

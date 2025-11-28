@@ -24,7 +24,7 @@ type SimulatorAdapter struct {
 	conf         SimulatorConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
-	uspClient    *uspclient.Client
+	uspClient    utils.Shipper
 	writeTimeout time.Duration
 	dataReader   io.ReadCloser
 
@@ -37,6 +37,7 @@ type SimulatorConfig struct {
 	Reader         io.ReadCloser           `json:"-" yaml:"-"`
 	FilePath       string                  `json:"file_path" yaml:"file_path"`
 	IsReplayTiming bool                    `json:"is_replay_timing" yaml:"is_replay_timing"`
+	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
 }
 
 type basicLCEvent struct {
@@ -71,9 +72,20 @@ func NewSimulatorAdapter(ctx context.Context, conf SimulatorConfig) (*SimulatorA
 	}
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	chStopped := make(chan struct{})

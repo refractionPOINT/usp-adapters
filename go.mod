@@ -21,6 +21,7 @@ require (
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20251126001619-8201a3d5ed8d
 	github.com/refractionPOINT/go-uspclient v1.6.2
 	github.com/stretchr/testify v1.11.1
+	github.com/tidwall/gjson v1.18.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/net v0.47.0
 	golang.org/x/oauth2 v0.33.0
