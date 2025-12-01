@@ -9,7 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
-	"strings"
+	"net/url"
 	"sync"
 	"time"
 
@@ -84,7 +84,7 @@ func NewDefenderAdapter(ctx context.Context, conf DefenderConfig) (*DefenderAdap
 
 	a.chStopped = make(chan struct{})
 
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts"))
+	a.conf.ClientOptions.DebugLog("starting to fetch alerts")
 
 	a.wgSenders.Add(1)
 	go a.fetchEvents(URL["get_alerts"])
@@ -117,35 +117,64 @@ func (a *DefenderAdapter) fetchToken() (string, error) {
 	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.conf.TenantID)
 	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
 
+	// Log the request details (mask sensitive data)
+	maskedPayload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=***REDACTED***", a.conf.ClientID, scope, "client_credentials")
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: POST %s", url))
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: Request payload: %s", maskedPayload))
+
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
 	if err != nil {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: Request headers: Content-Type=application/x-www-form-urlencoded"))
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: Request failed: %s", err))
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 	defer resp.Body.Close()
 
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: Response status: %d %s", resp.StatusCode, resp.Status))
+
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: Failed to read response body: %s", err))
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
+	// Log response body (mask access token if present)
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: Response body (invalid JSON): %s", string(body)))
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
+
+	// Create a copy for logging with masked token
+	logResult := make(map[string]interface{})
+	for k, v := range result {
+		if k == "access_token" {
+			if token, ok := v.(string); ok && len(token) > 20 {
+				logResult[k] = token[:10] + "..." + token[len(token)-10:] + " (masked)"
+			} else {
+				logResult[k] = "***REDACTED***"
+			}
+		} else {
+			logResult[k] = v
+		}
+	}
+	logJSON, _ := json.Marshal(logResult)
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetchToken: Response body: %s", string(logJSON)))
 
 	accessToken, ok := result["access_token"].(string)
 	if !ok {
 		return "", fmt.Errorf("no bearer token returned: %#v", result)
 	}
 
+	a.conf.ClientOptions.DebugLog("fetchToken: successfully obtained access token")
 	return accessToken, nil
 
 }
@@ -195,13 +224,21 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 
 	// Retry up to 3 times
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Create query parameters
-		filter := "%24"
-		query := "%20ge%20"
-		date_filter := fmt.Sprintf("?%sfilter=createdDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
+		// Parse the base URL and add query parameters properly
+		parsedURL, err := url.Parse(eventsUrl)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Error parsing URL: %s\n", err))
+			return nil, since, "", err
+		}
 
-		// Create the full request URL with query parameters (don't modify eventsUrl to avoid corruption on retries)
-		requestUrl := eventsUrl + date_filter
+		// Build the OData filter query parameter properly
+		// Use RawQuery to set $filter parameter ($ is valid in query strings)
+		filterValue := fmt.Sprintf("createdDateTime ge %s", since)
+		parsedURL.RawQuery = "$filter=" + url.QueryEscape(filterValue)
+
+		requestUrl := parsedURL.String()
+
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Attempt %d of 3", attempt))
 
 		authToken, err := a.fetchToken()
 		if err != nil {
@@ -216,6 +253,8 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 			return nil, since, "", fmt.Errorf("error fetching token after 3 attempts: %s", err)
 		}
 
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: GET %s", requestUrl))
+
 		req, err := http.NewRequest("GET", requestUrl, nil)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Error creating request: %s\n", err))
@@ -225,18 +264,39 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
 		req.Header.Set("Content-Type", "application/json")
 
+		// Log request headers (mask the actual token)
+		var maskedToken string
+		if len(authToken) > 20 {
+			maskedToken = authToken[:10] + "..." + authToken[len(authToken)-10:]
+		} else {
+			maskedToken = "***REDACTED***"
+		}
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Request headers: Authorization=Bearer %s, Content-Type=application/json", maskedToken))
+
 		client := &http.Client{}
 		resp, err := client.Do(req)
 		if err != nil {
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Request failed: %s", err))
 			a.conf.ClientOptions.OnError(fmt.Errorf("Error making request: %s\n", err))
 			return nil, since, "", err
 		}
 		defer resp.Body.Close()
 
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Response status: %d %s", resp.StatusCode, resp.Status))
+
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Failed to read response body: %s", err))
 			a.conf.ClientOptions.OnError(fmt.Errorf("Error reading response: %s\n", err))
 			return nil, since, "", err
+		}
+
+		// Log response body length and first 500 chars (if it's too long)
+		bodyStr := string(body)
+		if len(bodyStr) > 500 {
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Response body (%d bytes): %s...[truncated]", len(bodyStr), bodyStr[:500]))
+		} else {
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Response body (%d bytes): %s", len(bodyStr), bodyStr))
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -270,6 +330,7 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 		}
 
 		items := detections
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("makeOneListRequest: Successfully parsed response, found %d alerts", len(items)))
 
 		lastDetectionTime = since
 		for _, detection := range items {
