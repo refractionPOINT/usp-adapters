@@ -226,6 +226,75 @@ func (a *Office365Adapter) Close() error {
 	return err2
 }
 
+func parseNestedDicts(d utils.Dict) utils.Dict {
+	dst := make(utils.Dict, len(d))
+	for k, v := range d {
+		dst[k] = v
+	}
+
+	for k, v := range d {
+		switch v2 := v.(type) {
+
+		// Already a Dict → recurse
+		case utils.Dict:
+			dst[k] = parseNestedDicts(v2)
+
+		// Raw map → cast and recurse
+		case map[string]interface{}:
+			nested := utils.Dict(v2)
+			dst[k] = parseNestedDicts(nested)
+
+		// 3) JSON‐encoded in string/bytes → try to unmarshal
+		case json.RawMessage, []byte, string:
+			var raw []byte
+			switch x := v2.(type) {
+			case json.RawMessage:
+				raw = []byte(x)
+			case []byte:
+				raw = x
+			case string:
+				raw = []byte(x)
+			}
+
+			trimmed := bytes.TrimSpace(raw)
+			if !bytes.HasPrefix(trimmed, []byte("{")) ||
+				!bytes.HasSuffix(trimmed, []byte("}")) {
+				continue
+			}
+
+			var tmp map[string]interface{}
+			if err := json.Unmarshal(trimmed, &tmp); err != nil {
+				continue
+			}
+
+			// convert and recurse
+			nested := utils.Dict(tmp)
+			dst[k] = parseNestedDicts(nested)
+		}
+	}
+
+	return dst
+}
+
+func (a *Office365Adapter) shipWithRetry(msg string) bool {
+	rawMsg := &protocol.DataMessage{
+		TextPayload: msg,
+		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+	}
+	if err := a.uspClient.Ship(rawMsg, 10*time.Second); err != nil {
+		if err == uspclient.ErrorBufferFull {
+			a.conf.ClientOptions.OnWarning("stream falling behind")
+			err = a.uspClient.Ship(rawMsg, 1*time.Hour)
+		}
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			a.doStop.Set()
+			return false
+		}
+	}
+	return true
+}
+
 func (a *Office365Adapter) fetchEvents(url string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog("fetching of events exiting")
@@ -279,22 +348,31 @@ func (a *Office365Adapter) fetchEvents(url string) {
 					}
 
 				}
-				msg := &protocol.DataMessage{
-					TextPayload: event.Raw,
-					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-				}
-				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-					if err == uspclient.ErrorBufferFull {
-						a.conf.ClientOptions.OnWarning("stream falling behind")
-						err = a.uspClient.Ship(msg, 1*time.Hour)
+
+				var d utils.Dict
+				if err := json.Unmarshal([]byte(event.Raw), &d); err != nil {
+					// If the raw event cannot be unmarshaled, ship the raw event
+					if success := a.shipWithRetry(event.Raw); success {
+						nShipped++
 					}
-					if err != nil {
-						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-						a.doStop.Set()
-						return true
-					}
+					return true
 				}
-				nShipped++
+
+				parsed := parseNestedDicts(d)
+
+				marshaled, err := json.Marshal(parsed)
+				if err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("failed to re‑marshal event: %w", err))
+					// If the parsed event cannot be marshaled, ship the raw event
+					if success := a.shipWithRetry(event.Raw); success {
+						nShipped++
+					}
+					return true
+				}
+
+				if success := a.shipWithRetry(string(marshaled)); success {
+					nShipped++
+				}
 				return true
 			})
 		}
