@@ -9,6 +9,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/cylance"
+	"github.com/refractionPOINT/usp-adapters/darktrace"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
@@ -56,6 +57,7 @@ type GeneralConfigs struct {
 	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
 	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
 	EntraID           usp_entraid.EntraIDConfig                       `json:"entraid" yaml:"entraid"`
+	Darktrace         usp_darktrace.DarktraceConfig                   `json:"darktrace" yaml:"darktrace"`
 	Defender          usp_defender.DefenderConfig                     `json:"defender" yaml:"defender"`
 	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
 	Cylance           usp_cylance.CylanceConfig                       `json:"cylance" yaml:"cylance"`
