@@ -30,10 +30,11 @@ const (
 )
 
 type DarktraceConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	Url           string                  `json:"url" yaml:"url"`
-	PublicToken   string                  `json:"public_token" yaml:"public_token"`
-	PrivateToken  string                  `json:"private_token" yaml:"private_token"`
+	ClientOptions 			uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	Url           			string                  `json:"url" yaml:"url"`
+	PublicToken   			string                  `json:"public_token" yaml:"public_token"`
+	PrivateToken  			string                  `json:"private_token" yaml:"private_token"`
+	InitialLookback       	time.Duration           `json:"initial_lookback,omitempty" yaml:"initial_lookback,omitempty"` // eg, 24h, 30m, 168h, 1h30m
 }
 
 type DarkTraceAdapter struct {
@@ -142,9 +143,9 @@ type API struct {
 
 func (a *DarkTraceAdapter) fetchEvents() {
 
-	since := map[string]int64{
-		"aiAnalyst":     time.Now().Add(-24*7*time.Hour).UTC().UnixMilli(),
-		"modelBreaches": time.Now().Add(-24*time.Hour).UTC().UnixMilli(),
+	since := map[string]time.Time{
+		"aiAnalyst":     time.Now().Add(-1*a.conf.InitialLookback).UTC(),
+		"modelBreaches": time.Now().Add(-1*a.conf.InitialLookback).UTC(),
 	}
 
 	APIs := []API{
@@ -175,19 +176,23 @@ func (a *DarkTraceAdapter) fetchEvents() {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.conf.Url))
 			return
 		case <-ticker.C:
+			// Capture current time once for all APIs in this cycle
+			cycleTime := time.Now()
 
 			allItems := []utils.Dict{}
 
 			for _, api := range APIs {
 				pageURL := fmt.Sprintf("%s%s", a.conf.Url, api.Endpoint)
-				items, newSince, err := a.getEvents(pageURL, since[api.Key], api)
+				items, err := a.getEvents(pageURL, since[api.Key], cycleTime, api)
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", api.Key, err))
 					continue
 				}
-				since[api.Key] = newSince
-				a.conf.ClientOptions.DebugLog(fmt.Sprintf("Received: %d", len(items)))
-				allItems = append(allItems, items...)
+				
+				if len(items) > 0 {	
+					since[api.Key] = cycleTime.Add(-queryInterval * time.Second)
+					allItems = append(allItems, items...)
+				}
 			}
 
 			if len(allItems) > 0 {
@@ -197,36 +202,27 @@ func (a *DarkTraceAdapter) fetchEvents() {
 	}
 }
 
-func (a *DarkTraceAdapter) getEvents(pageUrl string, since int64, api API) ([]utils.Dict, int64, error) {
+func (a *DarkTraceAdapter) getEvents(pageUrl string, since time.Time, cycleTime time.Time, api API) ([]utils.Dict, error) {
 	var allItems []utils.Dict
-	lastDetectionTime := since
-
-	defer func() {
-		for k, v := range api.Dedupe {
-			if v < time.UnixMilli(since).Add(-1*time.Minute).UnixMilli() {
-				delete(api.Dedupe, k)
-			}
-		}
-	}()
-
-	urlWithTimes := fmt.Sprintf("%s&starttime=%d&endtime=%d", pageUrl, since, time.Now().UTC().UnixMilli())
-
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("Fetching %s from: %s", api.Key, urlWithTimes))
 	
+	// Cull old dedupe entries - keep entries from the last lookback period
+	// to handle duplicates during the overlap window
+	cutoffTime := cycleTime.Add(-2 * queryInterval * time.Second).Unix()
+	for k, v := range api.Dedupe {
+		if v < cutoffTime {
+			delete(api.Dedupe, k)
+		}
+	}
+
+	// Build URL with time range including overlap
+	sinceMs := since.UTC().UnixMilli()
+	endMs := cycleTime.UTC().UnixMilli()
+
+	urlWithTimes := fmt.Sprintf("%s&starttime=%d&endtime=%d", pageUrl, sinceMs, endMs)
+
 	response, err := a.doWithRetry(urlWithTimes, api)
 	if err != nil {
-		return nil, 0, err
-	}
-	
-	// Debug: Log response structure
-	if response != nil {
-		events := response.GetDict()
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s response: received %d events", api.Key, len(events)))
-		if len(events) > 0 {
-			// Log first event structure for debugging
-			firstEventJSON, _ := json.MarshalIndent(events[0], "", "  ")
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s first event structure:\n%s", api.Key, string(firstEventJSON)))
-		}
+		return nil, err
 	}
 
 	for _, event := range response.GetDict() {
@@ -235,9 +231,12 @@ func (a *DarkTraceAdapter) getEvents(pageUrl string, since int64, api API) ([]ut
 
 		// Get timestamp - handle both string and numeric formats
 		var timeString time.Time
-		var err error
 
-		timeValue := event[api.timeField]
+		timeValue, exists := event[api.timeField]
+		if !exists {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s: event missing time field '%s'", api.Key, api.timeField))
+			continue
+		}
 		switch v := timeValue.(type) {
 		case string:
 			// Parse string timestamp
@@ -265,16 +264,15 @@ func (a *DarkTraceAdapter) getEvents(pageUrl string, since int64, api API) ([]ut
 
 		// Check for duplicates using hash-based ID
 		if _, seen := api.Dedupe[dedupeID]; !seen {
-			if timeString.After(time.UnixMilli(since)) {
-				api.Dedupe[dedupeID] = time.Now().UTC().UnixMilli()
+			if timeString.After(since) || timeString.Equal(since) {
+				// Store the event timestamp for dedupe cleanup
+				api.Dedupe[dedupeID] = timeString.Unix()
 				allItems = append(allItems, event)
-				if timeString.After(time.UnixMilli(lastDetectionTime)) {
-					lastDetectionTime = timeString.UnixMilli()
-				}
 			}
 		}
 	}
-	return allItems, lastDetectionTime, nil
+
+	return allItems, nil
 }
 
 func (a *DarkTraceAdapter) generateLogHash(logMap map[string]interface{}) string {
@@ -308,6 +306,11 @@ func (a *DarkTraceAdapter) generateSignature(timeString string, fullURL string) 
 
 func (a *DarkTraceAdapter) doWithRetry(url string, api API) (DarktraceResponse, error) {
 	for {
+		select {
+		case <-a.ctx.Done():
+			return nil, a.ctx.Err()
+		default:
+		}
 		var respBody []byte
 		var status int
 
@@ -364,21 +367,11 @@ func (a *DarkTraceAdapter) doWithRetry(url string, api API) (DarktraceResponse, 
 			return nil, fmt.Errorf("darktrace %s api non-200: %d\nRESPONSE %s", api.Key, status, string(respBody))
 		}
 
-		// Debug: Log raw response body preview
-		respPreview := string(respBody)
-		if len(respPreview) > 500 {
-			respPreview = respPreview[:500] + "... (truncated)"
-		}
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s raw response preview: %s", api.Key, respPreview))
-
 		err = json.Unmarshal(respBody, &api.ResponseType)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("darktrace %s api invalid json: %v\nResponse body: %s", api.Key, err, string(respBody)))
 			return nil, err
 		}
-
-		// Debug: Log parsed response type and structure
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s parsed response type: %T", api.Key, api.ResponseType))
 
 		return api.ResponseType, nil
 	}
