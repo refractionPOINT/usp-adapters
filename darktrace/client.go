@@ -113,6 +113,7 @@ func (c *DarktraceConfig) Validate() error {
 	if c.PrivateToken == "" {
 		return errors.New("missing private token")
 	}
+	// InitialLookback defaults to zero (current time, no lookback)
 	return nil
 }
 
