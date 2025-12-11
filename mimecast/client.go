@@ -118,6 +118,7 @@ func (c *MimecastConfig) Validate() error {
 		// UK Specific - Ensures data stays within the UK instance: https://uk-api.services.mimecast.com
 	}
 
+	// InitialLookback defaults to zero (current time, no lookback)
 
 	if c.MaxConcurrentWorkers == 0 {
 		c.MaxConcurrentWorkers = 10 // Default
@@ -640,6 +641,7 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 
 		if status == http.StatusTooManyRequests {
 			if retryAfterInt != 0 {
+				// Retry-After header with integer seconds value
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header, sleeping %ds before retry", retryAfterInt))
 				if err := sleepContext(a.ctx, time.Duration(retryAfterInt)*time.Second); err != nil {
 					if len(allItems) > 0 {
@@ -647,25 +649,28 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 					}
 					return nil, err
 				}
-			} else if retryAfterTime.Before(time.Now()) {
-				// Retry-After time already passed, wait a minimum of 1 second to avoid tight loop
-				if err := sleepContext(a.ctx, 1*time.Second); err != nil {
-					if len(allItems) > 0 {
-						return allItems, err
-					}
-					return nil, err
-				}
-				continue
 			} else if !retryAfterTime.IsZero() {
-				retryUntilTime := time.Until(retryAfterTime).Seconds()
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header with time %v, sleeping %vs before retry", retryAfterTime, retryUntilTime))
-				if err := sleepContext(a.ctx, time.Duration(retryUntilTime)*time.Second); err != nil {
-					if len(allItems) > 0 {
-						return allItems, err
+				// Retry-After header with HTTP-date value
+				if retryAfterTime.Before(time.Now()) {
+					// Retry-After time already passed, wait a minimum of 1 second to avoid tight loop
+					if err := sleepContext(a.ctx, 1*time.Second); err != nil {
+						if len(allItems) > 0 {
+							return allItems, err
+						}
+						return nil, err
 					}
-					return nil, err
+				} else {
+					retryUntilTime := time.Until(retryAfterTime).Seconds()
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header with time %v, sleeping %vs before retry", retryAfterTime, retryUntilTime))
+					if err := sleepContext(a.ctx, time.Duration(retryUntilTime)*time.Second); err != nil {
+						if len(allItems) > 0 {
+							return allItems, err
+						}
+						return nil, err
+					}
 				}
 			} else {
+				// No Retry-After header, use default 60s wait
 				a.conf.ClientOptions.OnWarning("makeOneRequest got 429 without 'Retry-After' header, sleeping 60s before retry")
 				if err := sleepContext(a.ctx, 60*time.Second); err != nil {
 					if len(allItems) > 0 {
