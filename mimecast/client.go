@@ -91,13 +91,13 @@ type AuditLog struct {
 }
 
 type MimecastConfig struct {
-	ClientOptions        uspclient.ClientOptions 	`json:"client_options" yaml:"client_options"`
-	ClientId              string                  	`json:"client_id" yaml:"client_id"`
-	ClientSecret          string                  	`json:"client_secret" yaml:"client_secret"`
-	BaseURL               string                  	`json:"base_url,omitempty" yaml:"base_url,omitempty"`
-	InitialLookback       time.Duration           	`json:"initial_lookback,omitempty" yaml:"initial_lookback,omitempty"` // eg, 24h, 30m, 168h, 1h30m
-	MaxConcurrentWorkers  int                     	`json:"max_concurrent_workers,omitempty" yaml:"max_concurrent_workers,omitempty"`
-	MaxConcurrentShippers int 						`json:"max_concurrent_shippers,omitempty" yaml:"max_concurrent_shippers,omitempty"`
+	ClientOptions         uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	ClientId              string                  `json:"client_id" yaml:"client_id"`
+	ClientSecret          string                  `json:"client_secret" yaml:"client_secret"`
+	BaseURL               string                  `json:"base_url,omitempty" yaml:"base_url,omitempty"`
+	InitialLookback       time.Duration           `json:"initial_lookback,omitempty" yaml:"initial_lookback,omitempty"` // eg, 24h, 30m, 168h, 1h30m
+	MaxConcurrentWorkers  int                     `json:"max_concurrent_workers,omitempty" yaml:"max_concurrent_workers,omitempty"`
+	MaxConcurrentShippers int                     `json:"max_concurrent_shippers,omitempty" yaml:"max_concurrent_shippers,omitempty"`
 }
 
 func (c *MimecastConfig) Validate() error {
@@ -208,10 +208,9 @@ func (a *MimecastAdapter) getAuthHeaders(ctx context.Context) (map[string]string
 			"Content-Type":  "application/json",
 		}, nil
 	}
-	
-	defer a.tokenMu.Unlock()
+	a.tokenMu.Unlock()
 
-	// Need to get a new token
+	// Need to get a new token - refreshOAuthToken handles its own locking
 	return a.refreshOAuthToken(ctx)
 }
 
@@ -258,10 +257,13 @@ func (a *MimecastAdapter) refreshOAuthToken(ctx context.Context) (map[string]str
 
 	gracePeriod := 60
 	if tokenResp.ExpiresIn < gracePeriod {
-		gracePeriod = 0  // or tokenResp.ExpiresIn / 2, or some other logic
+		gracePeriod = 0 // or tokenResp.ExpiresIn / 2, or some other logic
 	}
+
+	a.tokenMu.Lock()
 	a.oauthToken = tokenResp.AccessToken
 	a.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-gracePeriod) * time.Second)
+	a.tokenMu.Unlock()
 
 	return map[string]string{
 		"Authorization": fmt.Sprintf("Bearer %s", tokenResp.AccessToken),
@@ -400,7 +402,9 @@ func (a *MimecastAdapter) RunFetchLoop(apis []*API) {
 
 					// If no APIs are active due to forbidden messages, shutdown
 					if a.shouldShutdown(apis) {
-						a.Close()
+						// Signal shutdown via context cancellation instead of calling Close()
+						// to avoid deadlock (Close waits for fetch loop which we're inside)
+						a.cancel()
 						return
 					}
 
@@ -609,6 +613,9 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 			defer resp.Body.Close()
 
 			respBody, err = io.ReadAll(resp.Body)
+			if err != nil {
+				return err
+			}
 
 			status = resp.StatusCode
 			ra := resp.Header.Get("Retry-After")
@@ -616,16 +623,12 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 			if ra == "" {
 				retryAfterInt = 0
 				retryAfterTime = time.Time{}
-			} else if secs, err := strconv.Atoi(ra); err == nil {
+			} else if secs, parseErr := strconv.Atoi(ra); parseErr == nil {
 				retryAfterInt = secs
 				retryAfterTime = time.Time{}
-			} else if t, err := http.ParseTime(ra); err == nil {
+			} else if t, parseErr := http.ParseTime(ra); parseErr == nil {
 				retryAfterInt = 0
 				retryAfterTime = t
-			}
-
-			if err != nil {
-				return err
 			}
 
 			return nil
@@ -644,8 +647,15 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 					}
 					return nil, err
 				}
-			} else if retryAfterTime.Before(time.Now()) { 
-				continue 
+			} else if retryAfterTime.Before(time.Now()) {
+				// Retry-After time already passed, wait a minimum of 1 second to avoid tight loop
+				if err := sleepContext(a.ctx, 1*time.Second); err != nil {
+					if len(allItems) > 0 {
+						return allItems, err
+					}
+					return nil, err
+				}
+				continue
 			} else if !retryAfterTime.IsZero() {
 				retryUntilTime := time.Until(retryAfterTime).Seconds()
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header with time %v, sleeping %vs before retry", retryAfterTime, retryUntilTime))
@@ -702,12 +712,12 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 		if status >= 500 && status < 600 {
 			err := fmt.Errorf("mimecast server error: %d\nRESPONSE: %s", status, string(respBody))
 			a.conf.ClientOptions.OnError(err)
-			// We don't want this to be handled like an error
-			// The hope is these errors are temporary
+			// Return collected items with error so caller knows about the failure
+			// and api.since won't be updated (preventing data loss on retry)
 			if len(allItems) > 0 {
-				return allItems, nil
+				return allItems, err
 			}
-			return nil, nil
+			return nil, err
 		}
 		if status != http.StatusOK {
 			err := fmt.Errorf("mimecast api non-200: %d\nRESPONSE: %s", status, string(respBody))
@@ -910,25 +920,40 @@ func (a *MimecastAdapter) processLogItem(api *API, logMap map[string]interface{}
 }
 
 func (a *MimecastAdapter) generateLogHash(logMap map[string]interface{}) string {
-    // Extract and sort keys
-    keys := make([]string, 0, len(logMap))
-    for k := range logMap {
-        keys = append(keys, k)
-    }
-    sort.Strings(keys)
-    
-    // Build deterministic string representation
-    var buf bytes.Buffer
-    for _, k := range keys {
-        fmt.Fprintf(&buf, "%s:%v|", k, logMap[k])
-    }
-    
-    hash := sha256.Sum256(buf.Bytes())
-    return hex.EncodeToString(hash[:])
+	// Extract and sort keys
+	keys := make([]string, 0, len(logMap))
+	for k := range logMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Build deterministic string representation using JSON for complex values
+	var buf bytes.Buffer
+	for _, k := range keys {
+		v := logMap[k]
+		// Use JSON marshaling for deterministic representation of complex types
+		valueBytes, err := json.Marshal(v)
+		if err != nil {
+			// Fallback to fmt if JSON fails
+			fmt.Fprintf(&buf, "%s:%v|", k, v)
+		} else {
+			fmt.Fprintf(&buf, "%s:%s|", k, valueBytes)
+		}
+	}
+
+	hash := sha256.Sum256(buf.Bytes())
+	return hex.EncodeToString(hash[:])
 }
 
 func (a *MimecastAdapter) submitEvents(events []utils.Dict) {
 	for _, item := range events {
+		// Check if we're shutting down
+		select {
+		case <-a.ctx.Done():
+			return
+		default:
+		}
+
 		msg := &protocol.DataMessage{
 			JsonPayload: item,
 			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
@@ -938,10 +963,15 @@ func (a *MimecastAdapter) submitEvents(events []utils.Dict) {
 				a.conf.ClientOptions.OnWarning("stream falling behind")
 				if err := a.uspClient.Ship(msg, 1*time.Hour); err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-					a.Close()
+					// Signal shutdown via context cancellation instead of calling Close()
+					// to avoid deadlock (Close waits for fetch loop which spawned us)
+					a.cancel()
 					return
 				}
+				continue
 			}
+			// Handle non-ErrorBufferFull errors
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
 	}
 }
