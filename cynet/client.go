@@ -88,7 +88,7 @@ func NewCynetAdapter(ctx context.Context, conf CynetConfig) (*CynetAdapter, chan
 	a := &CynetAdapter{
 		conf:         conf,
 		alertsDedupe: make(map[string]int64),
-		since:        time.Now().Add(-1 * 24 * time.Hour).UTC(), // On start, pull the last day's alerts
+		since:        time.Now().UTC(), // Start from current time, no lookback
 	}
 
 	// Logs don't have IDs, this generates an "ID" by hashing the event.
@@ -518,8 +518,9 @@ func (a *CynetAdapter) processAlerts(resp *AlertsResponse) ([]utils.Dict, time.T
 	// Parse the SyncTimeUtc
 	syncTime, err := time.Parse(time.RFC3339Nano, resp.SyncTimeUtc)
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("failed to parse SyncTimeUtc '%s': %v", resp.SyncTimeUtc, err))
-		syncTime = a.since
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("failed to parse SyncTimeUtc '%s': %v, using current time", resp.SyncTimeUtc, err))
+		// Use current time to ensure progress even when parsing fails
+		syncTime = time.Now().UTC()
 	}
 
 	for _, entity := range resp.Entities {
