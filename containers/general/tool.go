@@ -386,7 +386,7 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.Darktrace.ClientOptions = applyLogging(configs.Darktrace.ClientOptions)
 		configs.Darktrace.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Darktrace
-		client, chRunning, err = usp_darktrace.NewDarkTraceAdapter(ctx, configs.Darktrace)
+		client, chRunning, err = usp_darktrace.NewDarktraceAdapter(ctx, configs.Darktrace)
 	} else if method == "defender" {
 		configs.Defender.ClientOptions = applyLogging(configs.Defender.ClientOptions)
 		configs.Defender.ClientOptions.Architecture = "usp_adapter"

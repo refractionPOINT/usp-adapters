@@ -37,7 +37,7 @@ type DarktraceConfig struct {
 	InitialLookback       	time.Duration           `json:"initial_lookback,omitempty" yaml:"initial_lookback,omitempty"` // eg, 24h, 30m, 168h, 1h30m
 }
 
-type DarkTraceAdapter struct {
+type DarktraceAdapter struct {
 	conf       DarktraceConfig
 	uspClient  *uspclient.Client
 	httpClient *http.Client
@@ -61,11 +61,11 @@ func (r DarktraceEventsResponse) GetDict() []utils.Dict {
 	return []utils.Dict(r)
 }
 
-func NewDarkTraceAdapter(ctx context.Context, conf DarktraceConfig) (*DarkTraceAdapter, chan struct{}, error) {
+func NewDarktraceAdapter(ctx context.Context, conf DarktraceConfig) (*DarktraceAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
-	a := &DarkTraceAdapter{
+	a := &DarktraceAdapter{
 		conf:              conf,
 		aiAnalystDedupe:   make(map[string]int64),
 		modelBreachDedupe: make(map[string]int64),
@@ -76,7 +76,7 @@ func NewDarkTraceAdapter(ctx context.Context, conf DarktraceConfig) (*DarkTraceA
 	a.cancel = cancel
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = uspclient.NewClient(rootCtx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -116,7 +116,7 @@ func (c *DarktraceConfig) Validate() error {
 	return nil
 }
 
-func (a *DarkTraceAdapter) Close() error {
+func (a *DarktraceAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	var err1, err2 error
 	a.once.Do(func() {
@@ -141,7 +141,7 @@ type API struct {
 	timeFormat   string
 }
 
-func (a *DarkTraceAdapter) fetchEvents() {
+func (a *DarktraceAdapter) fetchEvents() {
 
 	since := map[string]time.Time{
 		"aiAnalyst":     time.Now().Add(-1*a.conf.InitialLookback).UTC(),
@@ -189,7 +189,7 @@ func (a *DarkTraceAdapter) fetchEvents() {
 					continue
 				}
 				
-				if len(items) > 0 {	
+				if len(items) > 0 {
 					since[api.Key] = cycleTime.Add(-queryInterval * time.Second)
 					allItems = append(allItems, items...)
 				}
@@ -202,7 +202,7 @@ func (a *DarkTraceAdapter) fetchEvents() {
 	}
 }
 
-func (a *DarkTraceAdapter) getEvents(pageUrl string, since time.Time, cycleTime time.Time, api API) ([]utils.Dict, error) {
+func (a *DarktraceAdapter) getEvents(pageUrl string, since time.Time, cycleTime time.Time, api API) ([]utils.Dict, error) {
 	var allItems []utils.Dict
 	
 	// Cull old dedupe entries - keep entries from the last lookback period
@@ -220,7 +220,7 @@ func (a *DarkTraceAdapter) getEvents(pageUrl string, since time.Time, cycleTime 
 
 	urlWithTimes := fmt.Sprintf("%s&starttime=%d&endtime=%d", pageUrl, sinceMs, endMs)
 
-	response, err := a.doWithRetry(urlWithTimes, api)
+	response, err := a.doRequest(urlWithTimes, api)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +275,7 @@ func (a *DarkTraceAdapter) getEvents(pageUrl string, since time.Time, cycleTime 
 	return allItems, nil
 }
 
-func (a *DarkTraceAdapter) generateLogHash(logMap map[string]interface{}) string {
+func (a *DarktraceAdapter) generateLogHash(logMap map[string]interface{}) string {
 	// Extract and sort keys
 	keys := make([]string, 0, len(logMap))
 	for k := range logMap {
@@ -293,7 +293,7 @@ func (a *DarkTraceAdapter) generateLogHash(logMap map[string]interface{}) string
 	return hex.EncodeToString(hash[:])
 }
 
-func (a *DarkTraceAdapter) generateSignature(timeString string, fullURL string) (string, error) {
+func (a *DarktraceAdapter) generateSignature(timeString string, fullURL string) (string, error) {
 	u, err := url.Parse(fullURL)
 	if err != nil {
 		return "", err
@@ -304,7 +304,7 @@ func (a *DarkTraceAdapter) generateSignature(timeString string, fullURL string) 
 	return hex.EncodeToString(mac.Sum(nil)), nil
 }
 
-func (a *DarkTraceAdapter) doWithRetry(url string, api API) (DarktraceResponse, error) {
+func (a *DarktraceAdapter) doRequest(url string, api API) (DarktraceResponse, error) {
 	for {
 		select {
 		case <-a.ctx.Done():
@@ -363,7 +363,6 @@ func (a *DarkTraceAdapter) doWithRetry(url string, api API) (DarktraceResponse, 
 			continue
 		}
 		if status != http.StatusOK {
-			a.conf.ClientOptions.OnError(fmt.Errorf("darktrace %s api non-200: %d\nRESPONSE %s", api.Key, status, string(respBody)))
 			return nil, fmt.Errorf("darktrace %s api non-200: %d\nRESPONSE %s", api.Key, status, string(respBody))
 		}
 
@@ -377,7 +376,7 @@ func (a *DarkTraceAdapter) doWithRetry(url string, api API) (DarktraceResponse, 
 	}
 }
 
-func (a *DarkTraceAdapter) submitEvents(items []utils.Dict) {
+func (a *DarktraceAdapter) submitEvents(items []utils.Dict) {
 	for _, item := range items {
 		msg := &protocol.DataMessage{
 			JsonPayload: item,
@@ -391,12 +390,14 @@ func (a *DarkTraceAdapter) submitEvents(items []utils.Dict) {
 					a.Close()
 					return
 				}
+			} else {
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 			}
 		}
 	}
 }
 
-func (a *DarkTraceAdapter) sleepContext(d time.Duration) error {
+func (a *DarktraceAdapter) sleepContext(d time.Duration) error {
 	timer := time.NewTimer(d)
 	defer timer.Stop()
 
