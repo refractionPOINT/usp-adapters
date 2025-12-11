@@ -52,7 +52,8 @@ type CynetAdapter struct {
 	cancel      context.CancelFunc
 
 	// Authentication
-	accessToken string
+	accessToken   string
+	accessTokenMu sync.RWMutex
 
 	// Deduplication
 	fnvHasher    hash.Hash64
@@ -253,7 +254,9 @@ func (a *CynetAdapter) authenticate() error {
 		return fmt.Errorf("received empty access token from auth endpoint")
 	}
 
+	a.accessTokenMu.Lock()
 	a.accessToken = authResp.AccessToken
+	a.accessTokenMu.Unlock()
 
 	return nil
 }
@@ -312,15 +315,15 @@ func (a *CynetAdapter) fetchAlerts() ([]utils.Dict, error) {
 	var latestTimestamp time.Time
 	var offset int
 
+	// Clean up old dedupe entries once per fetch cycle
+	a.cleanupDedupe()
+
 	for {
 		select {
 		case <-a.ctx.Done():
 			return nil, a.ctx.Err()
 		default:
 		}
-
-		// Clean up old dedupe entries
-		a.cleanupDedupe()
 
 		// Build URL with pagination
 		u, err := url.Parse(fmt.Sprintf("%s%s", a.conf.URL, alertsEndpoint))
@@ -375,13 +378,10 @@ func (a *CynetAdapter) fetchAlerts() ([]utils.Dict, error) {
 	return allAlerts, nil
 }
 
-func (a *CynetAdapter) makeRequest(url string) (*AlertsResponse, error) {
+func (a *CynetAdapter) makeRequest(reqURL string) (*AlertsResponse, error) {
 	var lastErr error
 	retryCount := 0
 	maxRetries := 3
-
-	ctx, cancel := context.WithTimeout(a.ctx, 180*time.Second)
-	defer cancel()
 
 	for retryCount < maxRetries {
 		select {
@@ -390,17 +390,25 @@ func (a *CynetAdapter) makeRequest(url string) (*AlertsResponse, error) {
 		default:
 		}
 
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		ctx, cancel := context.WithTimeout(a.ctx, 60*time.Second)
+
+		a.accessTokenMu.RLock()
+		token := a.accessToken
+		a.accessTokenMu.RUnlock()
+
+		req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 		if err != nil {
+			cancel()
 			return nil, fmt.Errorf("failed to create request: %w", err)
 		}
 
-		req.Header.Set("access_token", a.accessToken)
+		req.Header.Set("access_token", token)
 		req.Header.Set("client_id", a.conf.SiteID)
 		req.Header.Set("Accept", "application/json")
 
 		resp, err := a.httpClient.Do(req)
 		if err != nil {
+			cancel()
 			// Check if it's a context error
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 				lastErr = err
@@ -419,9 +427,9 @@ func (a *CynetAdapter) makeRequest(url string) (*AlertsResponse, error) {
 			return nil, fmt.Errorf("request failed: %w", err)
 		}
 
-		defer resp.Body.Close()
-
 		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		cancel()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response: %w", err)
 		}
@@ -546,7 +554,7 @@ func (a *CynetAdapter) processAlerts(resp *AlertsResponse) ([]utils.Dict, time.T
 }
 
 func (a *CynetAdapter) cleanupDedupe() {
-	cutoff := a.since.Add(-1 * queryInterval).Unix() // Only keep dedupes that are within one queryInterval of the last known received timestamp
+	cutoff := time.Now().Add(-2 * time.Duration(queryInterval) * time.Second).Unix()
 
 	for id, timestamp := range a.alertsDedupe {
 		if timestamp < cutoff {
