@@ -22,6 +22,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -41,9 +42,10 @@ type MimecastAdapter struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	oauthToken  string
-	tokenExpiry time.Time
-	tokenMu     sync.Mutex
+	oauthToken        string
+	tokenExpiry       time.Time
+	tokenMu           sync.Mutex
+	tokenRefreshGroup singleflight.Group
 }
 
 type AuditRequest struct {
@@ -82,23 +84,13 @@ type Pagination struct {
 	Next     string `json:"next"`
 }
 
-type AuditLog struct {
-	ID        string `json:"id"`
-	AuditType string `json:"auditType"`
-	User      string `json:"user"`
-	EventTime string `json:"eventTime"`
-	EventInfo string `json:"eventInfo"`
-	Category  string `json:"category"`
-}
-
 type MimecastConfig struct {
 	ClientOptions         uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ClientId              string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret          string                  `json:"client_secret" yaml:"client_secret"`
 	BaseURL               string                  `json:"base_url,omitempty" yaml:"base_url,omitempty"`
 	InitialLookback       time.Duration           `json:"initial_lookback,omitempty" yaml:"initial_lookback,omitempty"` // eg, 24h, 30m, 168h, 1h30m
-	MaxConcurrentWorkers  int                     `json:"max_concurrent_workers,omitempty" yaml:"max_concurrent_workers,omitempty"`
-	MaxConcurrentShippers int                     `json:"max_concurrent_shippers,omitempty" yaml:"max_concurrent_shippers,omitempty"`
+	MaxConcurrentWorkers int `json:"max_concurrent_workers,omitempty" yaml:"max_concurrent_workers,omitempty"`
 }
 
 func (c *MimecastConfig) Validate() error {
@@ -124,13 +116,7 @@ func (c *MimecastConfig) Validate() error {
 	if c.MaxConcurrentWorkers == 0 {
 		c.MaxConcurrentWorkers = 10 // Default
 	} else if c.MaxConcurrentWorkers > 100 {
-    	return fmt.Errorf("max_concurrent_workers cannot exceed 100, got %d", c.MaxConcurrentWorkers)
-	}
-
-	if c.MaxConcurrentShippers == 0 {
-		c.MaxConcurrentShippers = 2  // Default
-	} else if c.MaxConcurrentShippers > 100 {
-		return fmt.Errorf("max_concurrent_shippers cannot exceed 100, got %d", c.MaxConcurrentShippers)
+		return fmt.Errorf("max_concurrent_workers cannot exceed 100, got %d", c.MaxConcurrentWorkers)
 	}
 
 	return nil
@@ -216,75 +202,82 @@ func (a *MimecastAdapter) getAuthHeaders(ctx context.Context) (map[string]string
 	return a.refreshOAuthToken(ctx)
 }
 
-// refreshOAuthToken gets a new OAuth 2.0 access token
+// refreshOAuthToken gets a new OAuth 2.0 access token using singleflight to prevent thundering herd
 func (a *MimecastAdapter) refreshOAuthToken(ctx context.Context) (map[string]string, error) {
-	// Double-check: another goroutine may have refreshed while we waited
-	a.tokenMu.Lock()
-	if a.oauthToken != "" && time.Now().Before(a.tokenExpiry) {
-		token := a.oauthToken
+	// singleflight ensures only one token refresh happens at a time
+	result, err, _ := a.tokenRefreshGroup.Do("token", func() (interface{}, error) {
+		// Check if token was refreshed while waiting for singleflight
+		a.tokenMu.Lock()
+		if a.oauthToken != "" && time.Now().Before(a.tokenExpiry) {
+			token := a.oauthToken
+			a.tokenMu.Unlock()
+			return map[string]string{
+				"Authorization": fmt.Sprintf("Bearer %s", token),
+				"Accept":        "application/json",
+				"Content-Type":  "application/json",
+			}, nil
+		}
 		a.tokenMu.Unlock()
+
+		tokenURL := a.conf.BaseURL + "/oauth/token"
+
+		data := url.Values{}
+		data.Set("client_id", a.conf.ClientId)
+		data.Set("client_secret", a.conf.ClientSecret)
+		data.Set("grant_type", "client_credentials")
+
+		loopCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(loopCtx, "POST", tokenURL, strings.NewReader(data.Encode()))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create token request: %w", err)
+		}
+
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		resp, err := a.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to request token: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("oauth token request failed: %d - %s", resp.StatusCode, string(body))
+		}
+
+		var tokenResp struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   int    `json:"expires_in"`
+			TokenType   string `json:"token_type"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+			return nil, fmt.Errorf("failed to decode token response: %w", err)
+		}
+
+		gracePeriod := 60
+		if tokenResp.ExpiresIn < gracePeriod {
+			gracePeriod = 0
+		}
+
+		a.tokenMu.Lock()
+		a.oauthToken = tokenResp.AccessToken
+		a.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-gracePeriod) * time.Second)
+		a.tokenMu.Unlock()
+
 		return map[string]string{
-			"Authorization": fmt.Sprintf("Bearer %s", token),
+			"Authorization": fmt.Sprintf("Bearer %s", tokenResp.AccessToken),
 			"Accept":        "application/json",
 			"Content-Type":  "application/json",
 		}, nil
-	}
-	a.tokenMu.Unlock()
+	})
 
-	tokenURL := a.conf.BaseURL + "/oauth/token"
-
-	// Prepare form data
-	data := url.Values{}
-	data.Set("client_id", a.conf.ClientId)
-	data.Set("client_secret", a.conf.ClientSecret)
-	data.Set("grant_type", "client_credentials")
-
-	loopCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(loopCtx, "POST", tokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create token request: %w", err)
+		return nil, err
 	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to request token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("oauth token request failed: %d - %s", resp.StatusCode, string(body))
-	}
-
-	var tokenResp struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-		TokenType   string `json:"token_type"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, fmt.Errorf("failed to decode token response: %w", err)
-	}
-
-	gracePeriod := 60
-	if tokenResp.ExpiresIn < gracePeriod {
-		gracePeriod = 0 // or tokenResp.ExpiresIn / 2, or some other logic
-	}
-
-	a.tokenMu.Lock()
-	a.oauthToken = tokenResp.AccessToken
-	a.tokenExpiry = time.Now().Add(time.Duration(tokenResp.ExpiresIn-gracePeriod) * time.Second)
-	a.tokenMu.Unlock()
-
-	return map[string]string{
-		"Authorization": fmt.Sprintf("Bearer %s", tokenResp.AccessToken),
-		"Accept":        "application/json",
-		"Content-Type":  "application/json",
-	}, nil
+	return result.(map[string]string), nil
 }
 
 type API struct {
@@ -311,7 +304,6 @@ func (api *API) SetInactive() {
 	defer api.mu.Unlock()
 	api.active = false
 }
-
 
 func (a *MimecastAdapter) fetchEvents() {
 	APIs := []*API{
@@ -455,6 +447,8 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 	var start string
 	var retryCount int
 	var retryableErrorCount int
+	var retryCount5xx int
+	retryDeadline := time.Now().Add(1 * time.Hour)
 
 	api.mu.Lock()
 	start = api.since.UTC().Format(time.RFC3339)
@@ -565,6 +559,14 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 		}
 
 		if status == http.StatusTooManyRequests {
+			// Check if we've exceeded the 1 hour retry deadline
+			if time.Now().After(retryDeadline) {
+				err := fmt.Errorf("mimecast rate limit: exceeded 1 hour retry deadline for API %s", api.key)
+				if len(allItems) > 0 {
+					return allItems, err
+				}
+				return nil, err
+			}
 			if retryAfterInt != 0 {
 				// Retry-After header with integer seconds value
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header, sleeping %ds before retry", retryAfterInt))
@@ -640,14 +642,29 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 			return nil, nil
 		}
 		if status >= 500 && status < 600 {
-			err := fmt.Errorf("mimecast server error: %d\nRESPONSE: %s", status, string(respBody))
-			a.conf.ClientOptions.OnError(err)
-			// Return collected items with error so caller knows about the failure
-			// and api.since won't be updated (preventing data loss on retry)
-			if len(allItems) > 0 {
-				return allItems, err
+			// Check if we've exceeded the 1 hour retry deadline
+			if time.Now().After(retryDeadline) {
+				err := fmt.Errorf("mimecast server error: %d after 1h retries\nRESPONSE: %s", status, string(respBody))
+				a.conf.ClientOptions.OnError(err)
+				if len(allItems) > 0 {
+					return allItems, err
+				}
+				return nil, err
 			}
-			return nil, err
+			// Exponential backoff: 30s, 60s, 90s, ... capped at 5 minutes
+			backoff := time.Duration(retryCount5xx+1) * 30 * time.Second
+			if backoff > 5*time.Minute {
+				backoff = 5 * time.Minute
+			}
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("mimecast server error %d, retrying in %v", status, backoff))
+			if err := sleepContext(a.ctx, backoff); err != nil {
+				if len(allItems) > 0 {
+					return allItems, err
+				}
+				return nil, err
+			}
+			retryCount5xx++
+			continue
 		}
 		if status != http.StatusOK {
 			err := fmt.Errorf("mimecast api non-200: %d\nRESPONSE: %s", status, string(respBody))
@@ -797,7 +814,7 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 	// Cull old dedupe entries - keep entries from the last lookback period
 	// to handle duplicates during the overlap window
 	// We can clean up regardless of query success
-	cutoffTime := cycleTime.Add(-2 * overlapPeriod).Unix()
+	cutoffTime := cycleTime.Add(-1 * time.Hour).Unix()
 	api.mu.Lock()
 	for k, v := range api.dedupe {
 		if v < cutoffTime {
