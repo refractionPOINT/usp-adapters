@@ -167,7 +167,7 @@ func (a *MimecastAdapter) Close() error {
 		a.cancel()
 		select {
 		case <-a.chFetchLoop:
-		case <-time.After(10 * time.Second):
+		case <-time.After(2 * time.Minute):
 			a.conf.ClientOptions.OnWarning("timeout waiting for fetch loop to exit; proceeding with cleanup")
 		}
 		err1 = a.uspClient.Drain(1 * time.Minute)
@@ -796,6 +796,11 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 		}
 
 		allItems = append(allItems, newItems...)
+
+		// Reset retry counters for next page
+		retryCount = 0
+		retryableErrorCount = 0
+		retryCount5xx = 0
 
 		// Check if we need to make another request.
 		if response.Meta.Pagination.Next != "" {
