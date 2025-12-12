@@ -21,6 +21,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -217,6 +218,19 @@ func (a *MimecastAdapter) getAuthHeaders(ctx context.Context) (map[string]string
 
 // refreshOAuthToken gets a new OAuth 2.0 access token
 func (a *MimecastAdapter) refreshOAuthToken(ctx context.Context) (map[string]string, error) {
+	// Double-check: another goroutine may have refreshed while we waited
+	a.tokenMu.Lock()
+	if a.oauthToken != "" && time.Now().Before(a.tokenExpiry) {
+		token := a.oauthToken
+		a.tokenMu.Unlock()
+		return map[string]string{
+			"Authorization": fmt.Sprintf("Bearer %s", token),
+			"Accept":        "application/json",
+			"Content-Type":  "application/json",
+		}, nil
+	}
+	a.tokenMu.Unlock()
+
 	tokenURL := a.conf.BaseURL + "/oauth/token"
 
 	// Prepare form data
@@ -298,12 +312,6 @@ func (api *API) SetInactive() {
 	api.active = false
 }
 
-// Returned results from fetch routines
-type routineResult struct {
-	key   string
-	items []utils.Dict
-	err   error
-}
 
 func (a *MimecastAdapter) fetchEvents() {
 	APIs := []*API{
@@ -362,7 +370,7 @@ func (a *MimecastAdapter) fetchEvents() {
 func (a *MimecastAdapter) shouldShutdown(apis []*API) bool {
 	// If no APIs are active due to 'Forbidden' messages, shutdown
 	for _, api := range apis {
-		if api.active {
+		if api.IsActive() {
 			return false
 		}
 	}
@@ -371,158 +379,75 @@ func (a *MimecastAdapter) shouldShutdown(apis []*API) bool {
 }
 
 func (a *MimecastAdapter) RunFetchLoop(apis []*API) {
-	cycleSem := make(chan struct{}, 1)
-	shipperSem := make(chan struct{}, a.conf.MaxConcurrentShippers)
-	workerSem := make(chan struct{}, a.conf.MaxConcurrentWorkers)
 	ticker := time.NewTicker(queryInterval * time.Second)
 	defer ticker.Stop()
+	defer a.fetchOnce.Do(func() { close(a.chFetchLoop) })
 
 	for {
 		select {
 		case <-a.ctx.Done():
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.conf.BaseURL))
-
-			// Wait for any ongoing cycle to complete with timeout
-			select {
-			case cycleSem <- struct{}{}:
-				// No cycle in progress, safe to exit
-				<-cycleSem
-			case <-time.After(30 * time.Second):
-				a.conf.ClientOptions.OnWarning("timeout waiting for fetch cycle to complete during shutdown")
-			}
-
-			// Fetch loop isn't running, safe to close
-			a.fetchOnce.Do(func() { close(a.chFetchLoop) })
 			return
 		case <-ticker.C:
-			select {
-			case cycleSem <- struct{}{}:
-				go func() {
-					// Hold cycle semaphore until cycle completes
-					defer func() { <-cycleSem }()
-
-					// If no APIs are active due to forbidden messages, shutdown
-					if a.shouldShutdown(apis) {
-						// Signal shutdown via context cancellation instead of calling Close()
-						// to avoid deadlock (Close waits for fetch loop which we're inside)
-						a.cancel()
-						return
-					}
-
-					// Capture current time once for all APIs in this cycle
-					cycleTime := time.Now()
-
-					// Communication channel to send results to shipper routine
-					shipCh := make(chan []utils.Dict)
-					// Used to flag when the shipper routine is done.
-					shipDone := make(chan struct{})
-
-					// shipper routine
-					go func() {
-						var shipperWg sync.WaitGroup
-
-						defer func() {
-							close(shipDone)
-						}()
-
-						// shipper routine will run until shipCh closes
-						for events := range shipCh {
-							eventsCopy := events
-							// Consume a slot when spinning up a shipper routine
-							shipperSem <- struct{}{}
-							shipperWg.Add(1)
-							go func(events []utils.Dict) {
-								// Release a slot when done shipping
-								// Decrement shipperWg
-								defer func() {
-									<-shipperSem
-									shipperWg.Done()
-								}()
-								a.submitEvents(events)
-							}(eventsCopy)
-						}
-						shipperWg.Wait()
-					}()
-
-					// Channel for returning fetch data and checking for errors
-					resultCh := make(chan routineResult)
-
-					var wg sync.WaitGroup
-
-					// fetchApi routines
-					for i := range apis {
-						// Check if signal to close has been sent before starting any fetches
-						select {
-						case <-a.ctx.Done():
-							return
-						default:
-						}
-						// If the current api is disabled due to forbidden message, skip
-						if !apis[i].IsActive() {
-							continue
-						}
-						workerSem <- struct{}{}
-						wg.Add(1)
-						go func(api *API) {
-							defer func() {
-								<-workerSem
-								wg.Done()
-							}()
-							a.fetchApi(api, cycleTime, resultCh)
-						}(apis[i])
-					}
-
-					go func() {
-						wg.Wait()
-						// Wait until all fetch goroutines are done to close the channel
-						close(resultCh)
-					}()
-
-					// Blocking while fetchApi routines collect events
-					// Events are passed off as they come in to the shipper routine
-					for res := range resultCh {
-						if res.err != nil {
-							a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", res.key, res.err))
-							continue
-						}
-						if len(res.items) > 0 {
-							shipCh <- res.items
-						}
-					}
-
-					// resultCh has closed, meaning all events have been pooled for shipping
-					close(shipCh)
-
-					// Wait until shipping is done
-					<-shipDone
-				}()
-			default:
-				a.conf.ClientOptions.OnWarning("previous fetch cycle is still in progress, skipping this cycle")
+			if err := a.runOneCycle(apis); err != nil {
+				if a.ctx.Err() != nil {
+					return // Context cancelled, exit gracefully
+				}
+				// All APIs disabled, shutdown
+				a.cancel()
+				return
 			}
 		}
 	}
 }
 
-func (a *MimecastAdapter) fetchApi(api *API, cycleTime time.Time, resultCh chan<- routineResult) {
-	fetchCtx, cancelFetch := context.WithCancel(a.ctx)
-	defer cancelFetch()
-
-	// Check for a close signal
-	select {
-	case <-fetchCtx.Done():
-		return
-	default:
+func (a *MimecastAdapter) runOneCycle(apis []*API) error {
+	if a.shouldShutdown(apis) {
+		return fmt.Errorf("all APIs disabled")
 	}
 
-	items, err := a.makeOneRequest(api, cycleTime)
-	if err != nil {
-		resultCh <- routineResult{api.key, nil, err}
-		return
+	cycleTime := time.Now()
+	g, ctx := errgroup.WithContext(a.ctx)
+	g.SetLimit(a.conf.MaxConcurrentWorkers)
+
+	// Buffered channel to collect results from workers
+	resultCh := make(chan []utils.Dict, len(apis))
+
+	// Launch fetch workers
+	for _, api := range apis {
+		if !api.IsActive() {
+			continue
+		}
+		api := api // capture for goroutine
+		g.Go(func() error {
+			items, err := a.makeOneRequest(api, cycleTime)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", api.key, err))
+				return nil // Don't fail the whole group for one API error
+			}
+			if len(items) > 0 {
+				select {
+				case resultCh <- items:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		})
 	}
 
-	if len(items) > 0 {
-		resultCh <- routineResult{api.key, items, nil}
+	// Close resultCh when all fetchers are done
+	go func() {
+		g.Wait()
+		close(resultCh)
+	}()
+
+	// Ship results as they arrive
+	for items := range resultCh {
+		a.submitEvents(items)
 	}
+
+	return g.Wait()
 }
 
 func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils.Dict, error) {
@@ -660,9 +585,9 @@ func (a *MimecastAdapter) makeOneRequest(api *API, cycleTime time.Time) ([]utils
 						return nil, err
 					}
 				} else {
-					retryUntilTime := time.Until(retryAfterTime).Seconds()
-					a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header with time %v, sleeping %vs before retry", retryAfterTime, retryUntilTime))
-					if err := sleepContext(a.ctx, time.Duration(retryUntilTime)*time.Second); err != nil {
+					retryDuration := time.Until(retryAfterTime)
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf("makeOneRequest got 429 with 'Retry-After' header with time %v, sleeping %v before retry", retryAfterTime, retryDuration))
+					if err := sleepContext(a.ctx, retryDuration); err != nil {
 						if len(allItems) > 0 {
 							return allItems, err
 						}
