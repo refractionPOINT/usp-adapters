@@ -22,3 +22,6 @@
 
 #binary
 /containers/general/general
+
+# logs
+/build_scripts/code_signing/code_signing.log

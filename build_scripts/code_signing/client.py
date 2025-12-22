@@ -23,11 +23,6 @@ from dataclasses import asdict, dataclass
 from google.api_core.exceptions import NotFound  # type: ignore
 from google.cloud import pubsub_v1  # type: ignore
 from google.oauth2.service_account import Credentials  # type: ignore
-
-script_root = os.path.abspath(os.path.dirname(sys.argv[0]))
-lc_py_root = os.path.abspath(os.path.join(script_root, os.path.pardir))
-sys.path.append(lc_py_root)
-
 from lc_py.lc_config import JSONConfig  # nopep8
 from lc_py.lc_gsifile import LCGSIFile  # nopep8
 from lc_py.lc_py_utils import LcUtil  # nopep8
@@ -159,6 +154,44 @@ class SigningPublisher:
 
             shutil.copy2(signed_output, output)
 
+    def sign_macos(self, input: str, entitlements: str, output: str, timeout: float) -> None:
+
+        with tempfile.TemporaryDirectory(prefix="macos_sign_") as td:
+            input_fn = os.path.basename(input)
+            bin_file = os.path.join(td, f"macos_{input_fn}")
+
+            shutil.copy2(input, bin_file)
+
+            entitlements_dir = os.path.join(td, "entitlements")
+            os.mkdir(entitlements_dir)
+
+            e_file = os.path.join(entitlements_dir, f"macos_{input_fn}.plist")
+            shutil.copy2(entitlements, e_file)
+
+            e_zip = os.path.join(td, "entitlements.zip")
+
+            LcUtil.zip(entitlements_dir, e_zip)
+
+            shutil.rmtree(entitlements_dir)
+
+            with tempfile.TemporaryDirectory(prefix="unsigned") as unsigned:
+
+                sign_package = os.path.join(unsigned, "package.zip")
+
+                LcUtil.zip(td, sign_package, include_root=False)
+
+                # this may take a while
+                self.sign(SignFileType.SENSOR_ARCHIVE,
+                          sign_package,
+                          sign_package,
+                          timeout)
+
+                # unzip and extract the signed file
+                LcUtil.unzip(sign_package, td)
+
+            # return the signed / notarized file
+            shutil.copy2(bin_file, output)
+
 
 def main() -> int:
 
@@ -229,6 +262,11 @@ def main() -> int:
                         choices=["sensor", "package", "hlk"],
                         help="Type of signing")
 
+    parser.add_argument("-e",
+                        "--entitlements-file",
+                        type=str,
+                        help="/path/to/entitlements.plist")
+
     args = parser.parse_args()
 
     try:
@@ -258,6 +296,9 @@ def main() -> int:
         LcUtil.printkv("Bucket Name", args.bucket)
         LcUtil.printkv("Signing timeout", args.timeout)
 
+        if args.entitlements_file is not None:
+            LcUtil.printkv("Entitlements", args.entitlements_file)
+
         with tempfile.TemporaryDirectory(prefix="pub_client_") as td:
 
             if args.key is not None:
@@ -280,7 +321,13 @@ def main() -> int:
                                   args.bucket,
                                   key_file) as pub:
 
-                pub.sign(sign_type, args.input, args.output, args.timeout)
+                if args.entitlements_file is None:
+                    pub.sign(sign_type, args.input, args.output, args.timeout)
+                else:
+                    pub.sign_macos(args.input,
+                                   args.entitlements_file,
+                                   args.output,
+                                   args.timeout)
 
         LcUtil.printkv("Output File", args.output)
         LcUtil.printkv("Output File Size", LcUtil.file_size_fmt(args.output))
