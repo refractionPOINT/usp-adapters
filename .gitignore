@@ -15,5 +15,10 @@
 # vendor/
 
 
-#intellij
+#IDEs
 .idea/
+/.zed
+/.vscode
+
+#binary
+/containers/general/general
