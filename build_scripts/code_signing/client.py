@@ -157,15 +157,15 @@ class SigningPublisher:
     def sign_macos(self, input: str, entitlements: str, output: str, timeout: float) -> None:
 
         with tempfile.TemporaryDirectory(prefix="macos_sign_") as td:
-            input_fn = os.path.basename(input)
-            bin_file = os.path.join(td, f"macos_{input_fn}")
 
+            input_fn = os.path.basename(input)
+            bin_file = os.path.join(td, input_fn)
             shutil.copy2(input, bin_file)
 
             entitlements_dir = os.path.join(td, "entitlements")
             os.mkdir(entitlements_dir)
 
-            e_file = os.path.join(entitlements_dir, f"macos_{input_fn}.plist")
+            e_file = os.path.join(entitlements_dir, f"{input_fn}.plist")
             shutil.copy2(entitlements, e_file)
 
             e_zip = os.path.join(td, "entitlements.zip")
