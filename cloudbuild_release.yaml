@@ -1,4 +1,4 @@
-steps:
+ steps:
     - name: "gcr.io/cloud-builders/gcloud"
       entrypoint: "bash"
       id: get-github-keys
@@ -371,6 +371,40 @@ steps:
           - "GOARCH=amd64"
       waitFor: ["get-github-keys"]
 
+    # Sign macOS binaries
+    - name: "python:3.12-slim"
+      id: sign-macos64
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --base64-key $$CODE_SIGNING_KEY -i /workspace/lc_adapter_macos_64_$TAG_NAME -e ./entitlements/general.plist",
+          ]
+      secretEnv: ["CODE_SIGNING_KEY"]
+      waitFor: ["build-macos64"]
+    - name: "python:3.12-slim"
+      id: sign-macosarm64
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --base64-key $$CODE_SIGNING_KEY -i /workspace/lc_adapter_macos_arm64_$TAG_NAME -e ./entitlements/general.plist",
+          ]
+      secretEnv: ["CODE_SIGNING_KEY"]
+      waitFor: ["build-macosarm64"]
+
+    # Sign Windows binaries
+    - name: "python:3.12-slim"
+      id: sign-win64
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --base64-key $$CODE_SIGNING_KEY -i /workspace/lc_adapter_windows_64_$TAG_NAME.exe",
+          ]
+      secretEnv: ["CODE_SIGNING_KEY"]
+      waitFor: ["build-win64"]
+
     # Stage binaries
     - name: "gcr.io/cloud-builders/gsutil"
       id: copy-binary-adapters
@@ -378,9 +412,9 @@ steps:
       waitFor:
           [
               "build-linux64",
-              "build-win64",
-              "build-macos64",
-              "build-macosarm64",
+              "sign-win64",
+              "sign-macos64",
+              "sign-macosarm64",
               "build-linuxarm",
               "build-linuxarm64",
               "build-solarisamd64",
@@ -456,6 +490,8 @@ availableSecrets:
           env: "USERNAME"
         - versionName: projects/${PROJECT_ID}/secrets/GITHUB-DEPS-ACCESS/versions/latest
           env: "SSH_KEY"
+        - versionName: projects/${PROJECT_ID}/secrets/CODE_SIGNING_KEY/versions/latest
+          env: "CODE_SIGNING_KEY"
 options:
     machineType: "N1_HIGHCPU_32"
-timeout: 30m
+timeout: 45m
