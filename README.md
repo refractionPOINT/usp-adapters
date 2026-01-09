@@ -64,6 +64,14 @@ USP Clients generate LimaCharlie Sensors at runtime. The ID of those sensors (SI
 
 This implies that if want to re-key an IID (perhaps it was leaked), you may replace the IID with a new valid one. As long as you use the same OID and Sensor Seed Key, the generated SIDs will be stable despite the IID change.
 
+## Throughput Limits
+Free tier USP sensors have a maximum throughput limit of **10,240 bytes per second**. If this limit is exceeded, you may encounter an error message such as:
+```
+over throughput of 10240 for free tier, come back later
+```
+
+This limit applies to the rate at which data is sent from the adapter to the LimaCharlie platform. If you need higher throughput, consider upgrading your account tier.
+
 ## Custom Formatting
 Data sent via USP can be formatted in many different ways. Data is processed in a specific order as a pipeline:
 1. Regular Expression with named capture groups parsing a string into a JSON object.
