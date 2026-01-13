@@ -12,10 +12,12 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/aws/aws-sdk-go/service/sqs"
+	"github.com/aws/aws-sdk-go/service/sts"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
@@ -53,10 +55,12 @@ type SQSFilesConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 
 	// SQS specific
-	AccessKey string `json:"access_key" yaml:"access_key"`
-	SecretKey string `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
-	QueueURL  string `json:"queue_url" yaml:"queue_url"`
-	Region    string `json:"region" yaml:"region"`
+	AccessKey  string `json:"access_key" yaml:"access_key"`
+	SecretKey  string `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
+	QueueURL   string `json:"queue_url" yaml:"queue_url"`
+	Region     string `json:"region" yaml:"region"`
+	RoleArn    string `json:"role_arn,omitempty" yaml:"role_arn,omitempty"`
+	ExternalId string `json:"external_id,omitempty" yaml:"external_id,omitempty"`
 
 	// S3 specific
 	ParallelFetch     int    `json:"parallel_fetch" yaml:"parallel_fetch"`
@@ -117,6 +121,18 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 
 	if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {
 		return nil, nil, err
+	}
+
+	// If RoleArn is provided, assume the role
+	if conf.RoleArn != "" {
+		creds, err := a.assumeRole(conf.RoleArn, conf.ExternalId)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to assume role: %v", err)
+		}
+		a.awsConfig.Credentials = creds
+		if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {
+			return nil, nil, err
+		}
 	}
 
 	a.sqsClient = sqs.New(a.awsSession)
@@ -187,13 +203,48 @@ func (a *SQSFilesAdapter) initS3SDKs(bucket string) error {
 		return fmt.Errorf("s3.NewSession(): %v", err)
 	}
 
-	a.awsS3 = s3.New(a.awsSession)
+	// If RoleArn is provided, assume the role for S3 as well
+	if a.conf.RoleArn != "" {
+		creds, err := a.assumeRole(a.conf.RoleArn, a.conf.ExternalId)
+		if err != nil {
+			return fmt.Errorf("failed to assume role for S3: %v", err)
+		}
+		a.awsS3Config.Credentials = creds
+		if a.awsS3Session, err = session.NewSession(a.awsS3Config); err != nil {
+			return fmt.Errorf("s3.NewSession(): %v", err)
+		}
+	}
+
+	a.awsS3 = s3.New(a.awsS3Session)
 	a.awsDownloader = s3manager.NewDownloader(a.awsS3Session)
+	a.isS3Inited = true
 	return nil
 }
 
 func (a *SQSFilesAdapter) getBucketRegion(bucket string) (string, error) {
 	return s3manager.GetBucketRegion(a.ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
+}
+
+func (a *SQSFilesAdapter) assumeRole(roleArn, externalId string) (*credentials.Credentials, error) {
+	// Create STS client with base credentials
+	stsClient := sts.New(a.awsSession)
+
+	// Build assume role input
+	assumeRoleInput := &sts.AssumeRoleInput{
+		RoleArn:         aws.String(roleArn),
+		RoleSessionName: aws.String(fmt.Sprintf("sqs-files-adapter-%d", time.Now().Unix())),
+	}
+
+	// Add external ID if provided (required for cross-account access)
+	if externalId != "" {
+		assumeRoleInput.ExternalId = aws.String(externalId)
+	}
+
+	// Return credentials that will automatically refresh
+	return stscreds.NewCredentialsWithClient(stsClient, roleArn, func(p *stscreds.AssumeRoleProvider) {
+		p.ExternalID = assumeRoleInput.ExternalId
+		p.RoleSessionName = *assumeRoleInput.RoleSessionName
+	}), nil
 }
 
 func (a *SQSFilesAdapter) receiveEvents() error {
