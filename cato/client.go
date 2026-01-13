@@ -39,6 +39,7 @@ type CatoConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 	ApiKey          string                  `json:"apikey" yaml:"apikey"`
 	AccountId       int                     `json:"accountid" yaml:"accountid"`
+	ApiURL          string                  `json:"apiurl" yaml:"apiurl"`
 }
 
 func (c *CatoConfig) Validate() error {
@@ -50,6 +51,9 @@ func (c *CatoConfig) Validate() error {
 	}
 	if c.ApiKey == "" {
 		return errors.New("missing api key")
+	}
+	if c.ApiURL == "" {
+		return errors.New("missing api url")
 	}
 	return nil
 }
@@ -99,7 +103,7 @@ func NewCatoAdapter(ctx context.Context, conf CatoConfig) (*CatoAdapter, chan st
 		}
 	}
 
-	go a.handleEvent(&marker, strconv.Itoa(a.conf.AccountId), a.conf.ApiKey)
+	go a.handleEvent(&marker, strconv.Itoa(a.conf.AccountId), a.conf.ApiKey, a.conf.ApiURL)
 
 	go func() {
 		a.wgSenders.Wait()
@@ -142,7 +146,7 @@ func (a *CatoAdapter) convertStructToMap(obj interface{}) map[string]interface{}
 	return mapRepresentation
 }
 
-func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key string) {
+func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key string, api_url string) {
 
 	start = time.Now()
 
@@ -175,7 +179,7 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 
 		attempts := 0
 		for attempts < 3 {
-			success, resp = a.send(query, account_id, api_key)
+			success, resp = a.send(query, account_id, api_key, api_url)
 			if success {
 				break
 			}
@@ -244,7 +248,7 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 
 }
 
-func (a *CatoAdapter) send(query string, account_id string, api_key string) (bool, map[string]interface{}) {
+func (a *CatoAdapter) send(query string, account_id string, api_key string, api_url string) (bool, map[string]interface{}) {
 	retryCount := 0
 	data := map[string]string{"query": query}
 	headers := map[string]string{
@@ -266,7 +270,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 			continue
 		}
 
-		req, err := http.NewRequest("POST", "https://api.catonetworks.com/api/v1/graphql2", bytes.NewBuffer(jsonData))
+		req, err := http.NewRequest("POST", api_url, bytes.NewBuffer(jsonData))
 		if err != nil {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)
