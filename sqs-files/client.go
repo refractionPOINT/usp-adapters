@@ -358,7 +358,7 @@ func (a *SQSFilesAdapter) processFiles() error {
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v", path, time.Since(startTime)))
 
-		// If CloudTrail record splitting is enabled, try to split the records
+		// If CloudTrail record splitting is enabled, attempt to try to split the records
 		if a.conf.SplitCloudTrailRecords {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("CloudTrail splitting enabled for %s", path))
 			records, err := a.splitCloudTrailRecords(writerAt.Bytes())
