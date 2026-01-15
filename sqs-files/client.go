@@ -201,25 +201,15 @@ func (a *SQSFilesAdapter) initS3SDKs(bucket string) error {
 	if err != nil {
 		return fmt.Errorf("s3.Region: %v", err)
 	}
+	
+	// Use the same credentials as SQS (which may already be assumed role credentials)
 	a.awsS3Config = &aws.Config{
 		Region:      aws.String(region),
-		Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+		Credentials: a.awsConfig.Credentials,
 	}
 
 	if a.awsS3Session, err = session.NewSession(a.awsS3Config); err != nil {
 		return fmt.Errorf("s3.NewSession(): %v", err)
-	}
-
-	// If RoleArn is provided, assume the role for S3 as well
-	if a.conf.RoleArn != "" {
-		creds, err := a.assumeRole(a.conf.RoleArn, a.conf.ExternalId)
-		if err != nil {
-			return fmt.Errorf("failed to assume role for S3: %v", err)
-		}
-		a.awsS3Config.Credentials = creds
-		if a.awsS3Session, err = session.NewSession(a.awsS3Config); err != nil {
-			return fmt.Errorf("s3.NewSession(): %v", err)
-		}
 	}
 
 	a.awsS3 = s3.New(a.awsS3Session)
