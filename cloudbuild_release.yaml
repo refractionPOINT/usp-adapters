@@ -378,7 +378,7 @@ steps:
       args:
           [
               "-c",
-              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_macos_64_$TAG_NAME -e ./entitlements/general.plist",
+              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --timeout 120 --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_macos_64_$TAG_NAME -e ./entitlements/general.plist",
           ]
       waitFor: ["build-macos64"]
     - name: "python:3.12-slim"
@@ -387,9 +387,9 @@ steps:
       args:
           [
               "-c",
-              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_macos_arm64_$TAG_NAME -e ./entitlements/general.plist",
+              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --timeout 120 --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_macos_arm64_$TAG_NAME -e ./entitlements/general.plist",
           ]
-      waitFor: ["build-macosarm64"]
+      waitFor: ["build-macosarm64"]f
 
     # Sign Windows binaries
     - name: "python:3.12-slim"
@@ -398,7 +398,7 @@ steps:
       args:
           [
               "-c",
-              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_windows_64_$TAG_NAME.exe",
+              "pip install uv && cd ./build_scripts/code_signing && uv run client.py --timeout 120 --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_windows_64_$TAG_NAME.exe",
           ]
       waitFor: ["build-win64"]
 
