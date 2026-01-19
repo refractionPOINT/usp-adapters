@@ -1,227 +1,492 @@
 steps:
-- name: 'gcr.io/cloud-builders/gcloud'
-  entrypoint: 'bash'
-  id: get-github-keys
-  args: ['-c', 'echo $$SSH_KEY > /workspace/id_rsa']
-  secretEnv: ['SSH_KEY']
-- name: 'gcr.io/cloud-builders/docker'
-  id: build-docker-general
-  entrypoint: 'bash'
-  args: ['-c', 'docker build -f ./containers/general/Dockerfile -t refractionpoint/lc-adapter:$TAG_NAME -t gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME -t refractionpoint/lc-adapter:latest .']
-  waitFor: ['get-github-keys']
-- name: 'gcr.io/cloud-builders/docker'
-  id: build-docker-zeek
-  entrypoint: 'bash'
-  args: ['-c', 'cd ./containers/zeek/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek:$TAG_NAME -t refractionpoint/lc-adapter-zeek:latest .']
-  waitFor: ['get-github-keys']
-- name: 'gcr.io/cloud-builders/docker'
-  id: build-docker-zeek-extract
-  entrypoint: 'bash'
-  args: ['-c', 'cd ./containers/zeek_extract/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek-extract:$TAG_NAME -t refractionpoint/lc-adapter-zeek-extract:latest .']
-  waitFor: ['get-github-keys']
-- name: 'gcr.io/cloud-builders/docker'
-  id: build-docker-k8s-pods
-  entrypoint: 'bash'
-  args: ['-c', 'cd ./containers/k8s_pods/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-k8s-pods:$TAG_NAME -t refractionpoint/lc-adapter-k8s-pods:latest .']
-  waitFor: ['get-github-keys']
+    - name: "gcr.io/cloud-builders/gcloud"
+      entrypoint: "bash"
+      id: get-github-keys
+      args: ["-c", "echo $$SSH_KEY > /workspace/id_rsa"]
+      secretEnv: ["SSH_KEY"]
+    - name: "gcr.io/cloud-builders/docker"
+      id: build-docker-general
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "docker build -f ./containers/general/Dockerfile -t refractionpoint/lc-adapter:$TAG_NAME -t gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME -t refractionpoint/lc-adapter:latest .",
+          ]
+      waitFor: ["get-github-keys"]
+    - name: "gcr.io/cloud-builders/docker"
+      id: build-docker-zeek
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "cd ./containers/zeek/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek:$TAG_NAME -t refractionpoint/lc-adapter-zeek:latest .",
+          ]
+      waitFor: ["get-github-keys"]
+    - name: "gcr.io/cloud-builders/docker"
+      id: build-docker-zeek-extract
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "cd ./containers/zeek_extract/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-zeek-extract:$TAG_NAME -t refractionpoint/lc-adapter-zeek-extract:latest .",
+          ]
+      waitFor: ["get-github-keys"]
+    - name: "gcr.io/cloud-builders/docker"
+      id: build-docker-k8s-pods
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "cd ./containers/k8s_pods/ && docker build -f ./Dockerfile -t refractionpoint/lc-adapter-k8s-pods:$TAG_NAME -t refractionpoint/lc-adapter-k8s-pods:latest .",
+          ]
+      waitFor: ["get-github-keys"]
 
-# Adapters
-- name: 'golang:1.24-bullseye'
-  id: build-linux64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64_$TAG_NAME', './containers/general']
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-win64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64_$TAG_NAME.exe', './containers/general']
-  env:
-    - 'GOOS=windows'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-macos64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=darwin'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-macosarm64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=darwin'
-    - 'GOARCH=arm64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-linuxarm
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=linux'
-    - 'GOARCH=arm'
-    - 'GOARM=5'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-linuxarm64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=linux'
-    - 'GOARCH=arm64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-solarisamd64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_solaris_amd64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=solaris'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-aixppc64
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_aix_ppc64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=aix'
-    - 'GOARCH=ppc64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: 'build-freebsdamd64'
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=freebsd'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: 'build-netbsdamd64'
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=netbsd'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: 'build-openbsdamd64'
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_64_$TAG_NAME', './containers/general']
-  env:
-    - 'GOOS=openbsd'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
+    # Adapters
+    - name: "golang:1.24-bullseye"
+      id: build-linux64
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_linux_64_$TAG_NAME",
+              "./containers/general",
+          ]
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-win64
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_windows_64_$TAG_NAME.exe",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=windows"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-macos64
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_macos_64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=darwin"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-macosarm64
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_macos_arm64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=darwin"
+          - "GOARCH=arm64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-linuxarm
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_linux_arm_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=linux"
+          - "GOARCH=arm"
+          - "GOARM=5"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-linuxarm64
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_linux_arm64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=linux"
+          - "GOARCH=arm64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-solarisamd64
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_solaris_amd64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=solaris"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-aixppc64
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_aix_ppc64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=aix"
+          - "GOARCH=ppc64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: "build-freebsdamd64"
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_freebsd_64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=freebsd"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: "build-netbsdamd64"
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_netbsd_64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=netbsd"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: "build-openbsdamd64"
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_adapter_openbsd_64_$TAG_NAME",
+              "./containers/general",
+          ]
+      env:
+          - "GOOS=openbsd"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
 
-# Connectivity Tester
-- name: 'golang:1.24-bullseye'
-  id: build-linux64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_64_$TAG_NAME', './containers/connectivity']
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-win64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_windows_64_$TAG_NAME.exe', './containers/connectivity']
-  env:
-    - 'GOOS=windows'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-macos64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=darwin'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-macosarm64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_arm64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=darwin'
-    - 'GOARCH=arm64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-linuxarm-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=linux'
-    - 'GOARCH=arm'
-    - 'GOARM=5'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-linuxarm64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=linux'
-    - 'GOARCH=arm64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-solarisamd64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_solaris_amd64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=solaris'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-aixppc64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_aix_ppc64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=aix'
-    - 'GOARCH=ppc64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-freebsdamd64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_freebsd_64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=freebsd'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-netbsdamd64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_netbsd_64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=netbsd'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
-- name: 'golang:1.24-bullseye'
-  id: build-openbsdamd64-connectivity
-  args: ['go', 'build', '-v', '-o', 'lc_connectivity_openbsd_64_$TAG_NAME', './containers/connectivity']
-  env:
-    - 'GOOS=openbsd'
-    - 'GOARCH=amd64'
-  waitFor: ['get-github-keys']
+    # Connectivity Tester
+    - name: "golang:1.24-bullseye"
+      id: build-linux64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_linux_64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-win64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_windows_64_$TAG_NAME.exe",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=windows"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-macos64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_macos_64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=darwin"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-macosarm64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_macos_arm64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=darwin"
+          - "GOARCH=arm64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-linuxarm-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_linux_arm_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=linux"
+          - "GOARCH=arm"
+          - "GOARM=5"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-linuxarm64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_linux_arm64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=linux"
+          - "GOARCH=arm64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-solarisamd64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_solaris_amd64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=solaris"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-aixppc64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_aix_ppc64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=aix"
+          - "GOARCH=ppc64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-freebsdamd64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_freebsd_64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=freebsd"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-netbsdamd64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_netbsd_64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=netbsd"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
+    - name: "golang:1.24-bullseye"
+      id: build-openbsdamd64-connectivity
+      args:
+          [
+              "go",
+              "build",
+              "-v",
+              "-o",
+              "lc_connectivity_openbsd_64_$TAG_NAME",
+              "./containers/connectivity",
+          ]
+      env:
+          - "GOOS=openbsd"
+          - "GOARCH=amd64"
+      waitFor: ["get-github-keys"]
 
-# Stage binaries
-- name: 'gcr.io/cloud-builders/gsutil'
-  id: copy-binary-adapters
-  args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64']
-- name: 'gcr.io/cloud-builders/gsutil'
-  id: copy-binary-connectivity
-  args: ['cp', './lc_connectivity_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64-connectivity', 'build-win64-connectivity', 'build-macos64-connectivity', 'build-macosarm64-connectivity', 'build-linuxarm-connectivity', 'build-linuxarm64-connectivity', 'build-solarisamd64-connectivity', 'build-aixppc64-connectivity', 'build-freebsdamd64-connectivity', 'build-netbsdamd64-connectivity', 'build-openbsdamd64-connectivity']
-- name: 'gcr.io/cloud-builders/docker'
-  id: copy-docker-adapter-general
-  entrypoint: 'bash'
-  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter:$TAG_NAME && docker push refractionpoint/lc-adapter:latest']
-  secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-general']
-- name: 'gcr.io/cloud-builders/docker'
-  id: copy-docker-adapter-zeek
-  entrypoint: 'bash'
-  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek:latest']
-  secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-zeek']
-- name: 'gcr.io/cloud-builders/docker'
-  id: copy-docker-adapter-zeek-extract
-  entrypoint: 'bash'
-  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek-extract:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek-extract:latest']
-  secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-zeek-extract']
-- name: 'gcr.io/cloud-builders/docker'
-  id: copy-docker-adapter-k8s-pods
-  entrypoint: 'bash'
-  args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-k8s-pods:$TAG_NAME && docker push refractionpoint/lc-adapter-k8s-pods:latest']
-  secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-k8s-pods']
+    # Sign macOS binaries
+    - name: "python:3.12-slim"
+      id: sign-macos64
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "pip install -r ./build_scripts/code_signing/requirements.txt && python ./build_scripts/code_signing/client.py --timeout 120 --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_macos_64_$TAG_NAME -e ./entitlements/general.plist",
+          ]
+      waitFor: ["build-macos64"]
+    - name: "python:3.12-slim"
+      id: sign-macosarm64
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "pip install -r ./build_scripts/code_signing/requirements.txt && python ./build_scripts/code_signing/client.py --timeout 120 --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_macos_arm64_$TAG_NAME -e ./entitlements/general.plist",
+          ]
+      waitFor: ["build-macosarm64"]
+
+    # Sign Windows binaries
+    - name: "python:3.12-slim"
+      id: sign-win64
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "pip install -r ./build_scripts/code_signing/requirements.txt && python ./build_scripts/code_signing/client.py --timeout 120 --base64-key ${_CODE_SIGNING_KEY} -i /workspace/lc_adapter_windows_64_$TAG_NAME.exe",
+          ]
+      waitFor: ["build-win64"]
+
+    # Stage binaries
+    - name: "gcr.io/cloud-builders/gsutil"
+      id: copy-binary-adapters
+      args: ["cp", "./lc_adapter_*", "gs://limacharlie-io/installers/"]
+      waitFor:
+          [
+              "build-linux64",
+              "sign-win64",
+              "sign-macos64",
+              "sign-macosarm64",
+              "build-linuxarm",
+              "build-linuxarm64",
+              "build-solarisamd64",
+              "build-aixppc64",
+              "build-freebsdamd64",
+              "build-netbsdamd64",
+              "build-openbsdamd64",
+          ]
+    - name: "gcr.io/cloud-builders/gsutil"
+      id: copy-binary-connectivity
+      args: ["cp", "./lc_connectivity_*", "gs://limacharlie-io/installers/"]
+      waitFor:
+          [
+              "build-linux64-connectivity",
+              "build-win64-connectivity",
+              "build-macos64-connectivity",
+              "build-macosarm64-connectivity",
+              "build-linuxarm-connectivity",
+              "build-linuxarm64-connectivity",
+              "build-solarisamd64-connectivity",
+              "build-aixppc64-connectivity",
+              "build-freebsdamd64-connectivity",
+              "build-netbsdamd64-connectivity",
+              "build-openbsdamd64-connectivity",
+          ]
+    - name: "gcr.io/cloud-builders/docker"
+      id: copy-docker-adapter-general
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter:$TAG_NAME && docker push refractionpoint/lc-adapter:latest",
+          ]
+      secretEnv: ["USERNAME", "PASSWORD"]
+      waitFor: ["build-docker-general"]
+    - name: "gcr.io/cloud-builders/docker"
+      id: copy-docker-adapter-zeek
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek:latest",
+          ]
+      secretEnv: ["USERNAME", "PASSWORD"]
+      waitFor: ["build-docker-zeek"]
+    - name: "gcr.io/cloud-builders/docker"
+      id: copy-docker-adapter-zeek-extract
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek-extract:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek-extract:latest",
+          ]
+      secretEnv: ["USERNAME", "PASSWORD"]
+      waitFor: ["build-docker-zeek-extract"]
+    - name: "gcr.io/cloud-builders/docker"
+      id: copy-docker-adapter-k8s-pods
+      entrypoint: "bash"
+      args:
+          [
+              "-c",
+              "docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-k8s-pods:$TAG_NAME && docker push refractionpoint/lc-adapter-k8s-pods:latest",
+          ]
+      secretEnv: ["USERNAME", "PASSWORD"]
+      waitFor: ["build-docker-k8s-pods"]
 images:
-  - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME
+    - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME
 availableSecrets:
-  secretManager:
-  - versionName: projects/${PROJECT_ID}/secrets/DOCKERHUB/versions/latest
-    env: 'PASSWORD'
-  - versionName: projects/${PROJECT_ID}/secrets/DOCKERHUB_USERNAME/versions/latest
-    env: 'USERNAME'
-  - versionName: projects/${PROJECT_ID}/secrets/GITHUB-DEPS-ACCESS/versions/latest
-    env: 'SSH_KEY'
+    secretManager:
+        - versionName: projects/${PROJECT_ID}/secrets/DOCKERHUB/versions/latest
+          env: "PASSWORD"
+        - versionName: projects/${PROJECT_ID}/secrets/DOCKERHUB_USERNAME/versions/latest
+          env: "USERNAME"
+        - versionName: projects/${PROJECT_ID}/secrets/GITHUB-DEPS-ACCESS/versions/latest
+          env: "SSH_KEY"
 options:
-  machineType: 'N1_HIGHCPU_32'
-timeout: 30m
+    machineType: "N1_HIGHCPU_32"
+timeout: 45m

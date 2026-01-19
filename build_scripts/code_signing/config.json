@@ -1,0 +1,7 @@
+{
+    "project": "lc-developers",
+    "pub": {
+        "topic": "lc-sensor-signing",
+        "bucket": "lc-sensor-unsigned"
+    }
+}
