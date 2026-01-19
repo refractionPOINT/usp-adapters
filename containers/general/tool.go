@@ -22,6 +22,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	usp_cortex_xdr "github.com/refractionPOINT/usp-adapters/corex_xdr"
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -366,6 +367,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.Duo.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Duo
 		client, chRunning, err = usp_duo.NewDuoAdapter(ctx, configs.Duo)
+	} else if method == "cortex_xdr" {
+		configs.CortexXDR.ClientOptions = applyLogging(configs.CortexXDR.ClientOptions)
+		configs.CortexXDR.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.CortexXDR
+		client, chRunning, err = usp_cortex_xdr.NewCortexXDRAdapter(ctx, configs.CortexXDR)
 	} else if method == "cato" {
 		configs.Cato.ClientOptions = applyLogging(configs.Cato.ClientOptions)
 		configs.Cato.ClientOptions.Architecture = "usp_adapter"
