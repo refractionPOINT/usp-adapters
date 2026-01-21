@@ -278,6 +278,22 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		return nil, since, "", fmt.Errorf("error parsing response: %v", err)
 	}
 
+	// Check for GraphQL errors in the response
+	if errors, ok := result["errors"].([]interface{}); ok && len(errors) > 0 {
+		errMsg := ""
+		if len(errors) > 0 {
+			if errMap, ok := errors[0].(map[string]interface{}); ok {
+				if msg, ok := errMap["message"].(string); ok {
+					errMsg = msg
+				}
+			}
+		}
+		if errMsg == "" {
+			errMsg = fmt.Sprintf("%v", errors)
+		}
+		return nil, since, "", fmt.Errorf("GraphQL error: %s", errMsg)
+	}
+
 	// Navigate through the data path to find the items
 	current := result
 	for i, path := range a.conf.DataPath {
@@ -287,6 +303,10 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 			// Last path element should be an array
 			items, ok := current[path].([]interface{})
 			if !ok {
+				if current[path] == nil {
+					// No data available, return empty result
+					return nil, since, lastEventId, nil
+				}
 				return nil, since, "", fmt.Errorf("expected array at path %s, got %T", path, current[path])
 			}
 
@@ -331,7 +351,11 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		// Not the last path element, should be an object
 		next, ok := current[path].(map[string]interface{})
 		if !ok {
-			return nil, since, "", fmt.Errorf("expected object at path %s, got %T", path, current[path])
+			if current[path] == nil {
+				// No data available at this path, return empty result
+				return nil, since, lastEventId, nil
+			}
+			return nil, since, "", fmt.Errorf("expected object at path %s, got %T (value: %v)", path, current[path], current[path])
 		}
 		current = next
 	}
