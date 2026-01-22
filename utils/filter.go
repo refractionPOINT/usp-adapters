@@ -363,14 +363,18 @@ func (fe *FilterEngine) ShouldFilter(msg *protocol.DataMessage) (bool, string) {
 // Returns (true, patternDesc) if matched, (false, "") otherwise.
 // This function increments per-pattern stats but NOT totalFiltered.
 func (fe *FilterEngine) matchesAnyPattern(msg *protocol.DataMessage) (bool, string) {
+	var jsonStr string
+	var jsonMarshalFailed bool
+
 	// Fast path: Check gjson patterns first (no full marshaling needed)
 	if msg.JsonPayload != nil && len(fe.gjsonMatchers) > 0 {
 		// Marshal JSON once for all gjson queries
 		jsonBytes, err := json.Marshal(msg.JsonPayload)
 		if err != nil {
 			atomic.AddUint64(&fe.marshalFailures, 1)
+			jsonMarshalFailed = true
 		} else {
-			jsonStr := string(jsonBytes)
+			jsonStr = string(jsonBytes)
 
 			// Check all gjson patterns
 			for _, gm := range fe.gjsonMatchers {
@@ -389,7 +393,7 @@ func (fe *FilterEngine) matchesAnyPattern(msg *protocol.DataMessage) (bool, stri
 	}
 
 	// Slow path: Check regex patterns (requires full payload)
-	payload := fe.extractPayload(msg)
+	payload := fe.extractPayloadWithCache(msg, jsonStr, jsonMarshalFailed)
 	if payload == "" {
 		return false, ""
 	}
@@ -406,15 +410,24 @@ func (fe *FilterEngine) matchesAnyPattern(msg *protocol.DataMessage) (bool, stri
 	return false, ""
 }
 
-// extractPayload extracts the payload from a DataMessage as a string.
-func (fe *FilterEngine) extractPayload(msg *protocol.DataMessage) string {
+// extractPayloadWithCache extracts the payload from a DataMessage as a string.
+// If jsonStr is provided (non-empty), it reuses that instead of re-marshaling.
+// If jsonMarshalFailed is true, it won't attempt to marshal JsonPayload again.
+func (fe *FilterEngine) extractPayloadWithCache(msg *protocol.DataMessage, jsonStr string, jsonMarshalFailed bool) string {
 	// Check TextPayload first
 	if msg.TextPayload != "" {
 		return msg.TextPayload
 	}
 
-	// Check JsonPayload
+	// Check JsonPayload - use cached value if available
 	if msg.JsonPayload != nil {
+		if jsonStr != "" {
+			return jsonStr
+		}
+		// Don't try to marshal again if we already failed
+		if jsonMarshalFailed {
+			return ""
+		}
 		// Marshal to JSON string
 		jsonBytes, err := json.Marshal(msg.JsonPayload)
 		if err != nil {

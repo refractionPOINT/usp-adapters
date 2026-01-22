@@ -560,6 +560,39 @@ func TestFilterEngineMarshalFailures(t *testing.T) {
 	}
 }
 
+// TestFilterEngineMarshalFailuresNoDoubleCount tests that marshal failures are not double-counted
+// when both gjson and regex patterns are configured
+func TestFilterEngineMarshalFailuresNoDoubleCount(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "test", Pattern: ".*"},
+		{Type: "regex", Pattern: "anything"},
+	}
+
+	logger := func(msg string) {}
+
+	fe, err := NewFilterEngine(patterns, FilterModeExclude, logger)
+	if err != nil {
+		t.Fatalf("Failed to create filter engine: %v", err)
+	}
+	defer fe.Close()
+
+	// Create a message with JsonPayload containing an unmarshalable channel
+	ch := make(chan int)
+	msg := &protocol.DataMessage{
+		JsonPayload: map[string]interface{}{
+			"channel": ch,
+		},
+	}
+
+	fe.ShouldFilter(msg)
+
+	stats := fe.GetStats()
+	// Should be exactly 1, not 2 (no double-counting)
+	if stats.MarshalFailures != 1 {
+		t.Errorf("MarshalFailures = %d, want 1 (no double-counting)", stats.MarshalFailures)
+	}
+}
+
 // TestFilterModeValidation tests filter mode validation
 func TestFilterModeValidation(t *testing.T) {
 	patterns := []FilterPattern{
