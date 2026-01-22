@@ -62,7 +62,7 @@ var ResourceScope = map[string]string{
 
 type Office365Adapter struct {
 	conf       Office365Config
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 
 	endpoint     string
@@ -87,6 +87,8 @@ type Office365Config struct {
 	StartTime     string                  `json:"start_time" yaml:"start_time"`
 
 	Deduper utils.Deduper `json:"-" yaml:"-"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *Office365Config) Validate() error {
@@ -145,9 +147,20 @@ func NewOffice365Adapter(ctx context.Context, conf Office365Config) (*Office365A
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

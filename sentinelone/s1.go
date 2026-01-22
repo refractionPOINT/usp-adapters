@@ -18,7 +18,7 @@ import (
 
 type SentinelOneAdapter struct {
 	conf       SentinelOneConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 	s1Client   *SentinelOneClient
 	urls       []string
@@ -37,6 +37,8 @@ type SentinelOneConfig struct {
 	URLs                string                  `json:"urls" yaml:"urls"`
 	StartTime           string                  `json:"start_time" yaml:"start_time"`
 	TimeBetweenRequests time.Duration           `json:"time_between_requests" yaml:"time_between_requests"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *SentinelOneConfig) Validate() error {
@@ -72,9 +74,20 @@ func NewSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig) (*Sentin
 		s1Client: NewSentinelOneClient(conf.Domain, conf.APIKey),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

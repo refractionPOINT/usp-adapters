@@ -26,12 +26,14 @@ const (
 )
 
 type BitwardenConfig struct {
-	ClientOptions    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	ClientID         string                  `json:"client_id" yaml:"client_id"`
-	ClientSecret     string                  `json:"client_secret" yaml:"client_secret"`
-	Region           string                  `json:"region" yaml:"region"`                         // "us" or "eu", defaults to "us"
-	TokenEndpointURL string                  `json:"token_endpoint_url" yaml:"token_endpoint_url"` // Custom token endpoint URL for self-hosted instances
-	EventsBaseURL    string                  `json:"events_base_url" yaml:"events_base_url"`       // Custom events base URL for self-hosted instances
+	ClientOptions     uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
+	ClientID          string                  `json:"client_id" yaml:"client_id"`
+	ClientSecret      string                  `json:"client_secret" yaml:"client_secret"`
+	Region            string                  `json:"region" yaml:"region"`                         // "us" or "eu", defaults to "us"
+	TokenEndpointURL  string                  `json:"token_endpoint_url" yaml:"token_endpoint_url"` // Custom token endpoint URL for self-hosted instances
+	EventsBaseURL     string                  `json:"events_base_url" yaml:"events_base_url"`       // Custom events base URL for self-hosted instances
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *BitwardenConfig) Validate() error {
@@ -75,7 +77,7 @@ func (c *BitwardenConfig) Validate() error {
 
 type BitwardenAdapter struct {
 	conf          BitwardenConfig
-	uspClient     *uspclient.Client
+	uspClient     utils.Shipper
 	httpClient    *http.Client
 	chStopped     chan struct{}
 	wgSenders     sync.WaitGroup
@@ -114,9 +116,20 @@ func NewBitwardenAdapter(ctx context.Context, conf BitwardenConfig) (*BitwardenA
 		a.tokenEndpoint = tokenEndpointUS
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

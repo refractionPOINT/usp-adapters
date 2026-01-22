@@ -19,7 +19,7 @@ import (
 
 type WizAdapter struct {
 	conf       WizConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 
 	chStopped chan struct{}
@@ -41,6 +41,8 @@ type WizConfig struct {
 	TimeField     string                  `json:"time_field" yaml:"time_field"` // e.g., "createdAt", "updatedAt"
 	DataPath      []string                `json:"data_path" yaml:"data_path"`   // e.g., ["data", "securityIssues", "issues"]
 	IDField       string                  `json:"id_field" yaml:"id_field"`     // e.g., "id"
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *WizConfig) Validate() error {
@@ -79,9 +81,20 @@ func NewWizAdapter(ctx context.Context, conf WizConfig) (*WizAdapter, chan struc
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

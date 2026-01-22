@@ -18,6 +18,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"golang.org/x/net/context/ctxhttp"
 )
 
@@ -39,6 +40,8 @@ type CatoConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 	ApiKey          string                  `json:"apikey" yaml:"apikey"`
 	AccountId       int                     `json:"accountid" yaml:"accountid"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *CatoConfig) Validate() error {
@@ -59,7 +62,7 @@ type CatoAdapter struct {
 	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
-	uspClient    *uspclient.Client
+	uspClient    utils.Shipper
 	writeTimeout time.Duration
 
 	chStopped chan struct{}
@@ -80,9 +83,20 @@ func NewCatoAdapter(ctx context.Context, conf CatoConfig) (*CatoAdapter, chan st
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.chStopped = make(chan struct{})

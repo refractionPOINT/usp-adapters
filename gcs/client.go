@@ -23,7 +23,7 @@ const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type GCSAdapter struct {
 	conf      GCSConfig
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 
 	ctx context.Context
 
@@ -41,6 +41,8 @@ type GCSConfig struct {
 	IsOneTimeLoad       bool                    `json:"single_load" yaml:"single_load"`
 	Prefix              string                  `json:"prefix" yaml:"prefix"`
 	ParallelFetch       int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *GCSConfig) Validate() error {
@@ -92,9 +94,20 @@ func NewGCSAdapter(ctx context.Context, conf GCSConfig) (*GCSAdapter, chan struc
 
 	a.bucket = a.client.Bucket(conf.BucketName)
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	chStopped := make(chan struct{})

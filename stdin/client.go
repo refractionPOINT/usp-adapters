@@ -22,13 +22,15 @@ type StdinAdapter struct {
 	conf         StdinConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
-	uspClient    *uspclient.Client
+	uspClient    utils.Shipper
 	writeTimeout time.Duration
 }
 
 type StdinConfig struct {
 	ClientOptions   uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *StdinConfig) Validate() error {
@@ -50,9 +52,20 @@ func NewStdinAdapter(ctx context.Context, conf StdinConfig) (*StdinAdapter, chan
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
 	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	chStopped := make(chan struct{})

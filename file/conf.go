@@ -1,6 +1,7 @@
 package usp_file
 
 import (
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/refractionPOINT/go-uspclient"
 )
 
@@ -15,4 +16,6 @@ type FileConfig struct {
 	SerializeFiles        bool                    `json:"serialize_files" yaml:"serialize_files"`
 	Poll                  bool                    `json:"poll" yaml:"poll"`
 	MultiLineJSON         bool                    `json:"multi_line_json" yaml:"multi_line_json"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }

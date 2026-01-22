@@ -30,7 +30,7 @@ type SyslogAdapter struct {
 	connMutex    sync.Mutex
 	wg           sync.WaitGroup
 	isRunning    uint32
-	uspClient    *uspclient.Client
+	uspClient    utils.Shipper
 	writeTimeout time.Duration
 }
 
@@ -43,6 +43,8 @@ type SyslogConfig struct {
 	SslKeyPath        string                  `json:"ssl_key" yaml:"ssl_key"`
 	MutualTlsCertPath string                  `json:"mutual_tls_cert,omitempty" yaml:"mutual_tls_cert,omitempty"`
 	WriteTimeoutSec   uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *SyslogConfig) Validate() error {
@@ -113,7 +115,7 @@ func NewSyslogAdapter(ctx context.Context, conf SyslogConfig) (*SyslogAdapter, c
 		return nil, nil, err
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		if l != nil {
 			l.Close()
@@ -121,6 +123,22 @@ func NewSyslogAdapter(ctx context.Context, conf SyslogConfig) (*SyslogAdapter, c
 			ul.Close()
 		}
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			if l != nil {
+				l.Close()
+			} else {
+				ul.Close()
+			}
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.listener = l

@@ -30,7 +30,7 @@ type opRequest struct {
 
 type SophosAdapter struct {
 	conf       SophosConfig
-	uspClient  *uspclient.Client
+	uspClient  utils.Shipper
 	httpClient *http.Client
 
 	chStopped chan struct{}
@@ -46,6 +46,8 @@ type SophosConfig struct {
 	ClientSecret  string                  `json:"clientsecret" yaml:"clientsecret"`
 	TenantId      string                  `json:"tenantid" yaml:"tenantid"`
 	URL           string                  `json:"url" yaml:"url"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *SophosConfig) Validate() error {
@@ -75,9 +77,20 @@ func NewSophosAdapter(ctx context.Context, conf SophosConfig) (*SophosAdapter, c
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.httpClient = &http.Client{

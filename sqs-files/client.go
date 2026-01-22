@@ -28,7 +28,7 @@ const (
 
 type SQSFilesAdapter struct {
 	conf      SQSFilesConfig
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 
 	chFiles chan fileInfo
 
@@ -64,7 +64,9 @@ type SQSFilesConfig struct {
 	FilePath          string `json:"file_path,omitempty" yaml:"file_path,omitempty"`
 	IsDecodeObjectKey bool   `json:"is_decode_object_key,omitempty" yaml:"is_decode_object_key,omitempty"`
 	// Optional: alternative to BucketPath
-	Bucket string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
+	Bucket  string   `json:"bucket,omitempty" yaml:"bucket,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 type fileInfo struct {
@@ -127,9 +129,20 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 
 	a.chFiles = make(chan fileInfo)
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	// Start the processors.

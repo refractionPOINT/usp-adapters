@@ -7,11 +7,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/refractionPOINT/go-uspclient"
-	"github.com/refractionPOINT/go-uspclient/protocol"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 
 	"cloud.google.com/go/bigquery"
 	"google.golang.org/api/iterator"
@@ -25,7 +27,7 @@ type BigQueryAdapter struct {
 	table     *bigquery.Table
 	isStop    uint32
 	wg        sync.WaitGroup
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
@@ -81,9 +83,20 @@ func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdap
 	bq.dataset = bq.client.Dataset(bq.conf.DatasetName)
 	bq.table = bq.dataset.Table(bq.conf.TableName)
 
-	bq.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		bq.uspClient = filtered
+	} else {
+		bq.uspClient = client
 	}
 
 	// Parse the query interval

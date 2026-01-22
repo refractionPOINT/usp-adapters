@@ -10,6 +10,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -18,7 +19,7 @@ const (
 
 type EventHubAdapter struct {
 	conf      EventHubConfig
-	uspClient *uspclient.Client
+	uspClient utils.Shipper
 
 	hub       *eventhub.Hub
 	listeners []*eventhub.ListenerHandle
@@ -30,6 +31,8 @@ type EventHubAdapter struct {
 type EventHubConfig struct {
 	ClientOptions    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ConnectionString string                  `json:"connection_string" yaml:"connection_string"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *EventHubConfig) Validate() error {
@@ -60,10 +63,22 @@ func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdap
 		return nil, nil, err
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	client, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		a.hub.Close(a.ctx)
 		return nil, nil, err
+	}
+
+	// Wrap with filtering if configured
+	if len(conf.Filters) > 0 {
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
+		if err != nil {
+			a.hub.Close(a.ctx)
+			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
+		}
+		a.uspClient = filtered
+	} else {
+		a.uspClient = client
 	}
 
 	a.chStopped = make(chan struct{})
