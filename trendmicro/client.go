@@ -30,7 +30,8 @@ type TrendMicroConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	APIToken      string                  `json:"api_token" yaml:"api_token"`
 	Region        string                  `json:"region" yaml:"region"` // "us", "eu", "sg", "jp", "in", "au" - defaults to "us"
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *TrendMicroConfig) Validate() error {
@@ -86,7 +87,7 @@ func NewTrendMicroAdapter(ctx context.Context, conf TrendMicroConfig) (*TrendMic
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
 		}

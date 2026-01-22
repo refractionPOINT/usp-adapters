@@ -42,7 +42,8 @@ type ITGlueAdapter struct {
 type ITGlueConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *ITGlueConfig) Validate() error {
@@ -70,7 +71,7 @@ func NewITGlueAdapter(ctx context.Context, conf ITGlueConfig) (*ITGlueAdapter, c
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
 		}

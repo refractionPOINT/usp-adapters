@@ -38,7 +38,8 @@ type SQSConfig struct {
 	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
 	QueueURL      string                  `json:"queue_url" yaml:"queue_url"`
 	Region        string                  `json:"region" yaml:"region"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *SQSConfig) Validate() error {
@@ -85,7 +86,7 @@ func NewSQSAdapter(ctx context.Context, conf SQSConfig) (*SQSAdapter, chan struc
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
 		}

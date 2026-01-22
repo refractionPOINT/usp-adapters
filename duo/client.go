@@ -37,7 +37,8 @@ type DuoConfig struct {
 	IntegrationKey string                  `json:"integration_key" yaml:"integration_key"`
 	SecretKey      string                  `json:"secret_key" yaml:"secret_key"`
 	APIHostname    string                  `json:"api_hostname" yaml:"api_hostname"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *DuoConfig) Validate() error {
@@ -71,7 +72,7 @@ func NewDuoAdapter(ctx context.Context, conf DuoConfig) (*DuoAdapter, chan struc
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
 		}

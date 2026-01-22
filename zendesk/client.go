@@ -47,7 +47,8 @@ type ZendeskConfig struct {
 	ApiToken      string                  `json:"api_token" yaml:"api_token"`
 	ZendeskDomain string                  `json:"zendesk_domain" yaml:"zendesk_domain"`
 	ZendeskEmail  string                  `json:"zendesk_email" yaml:"zendesk_email"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *ZendeskConfig) Validate() error {
@@ -83,7 +84,7 @@ func NewZendeskAdapter(ctx context.Context, conf ZendeskConfig) (*ZendeskAdapter
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
 		}

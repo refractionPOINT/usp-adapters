@@ -37,7 +37,8 @@ type SimulatorConfig struct {
 	Reader         io.ReadCloser           `json:"-" yaml:"-"`
 	FilePath       string                  `json:"file_path" yaml:"file_path"`
 	IsReplayTiming bool                    `json:"is_replay_timing" yaml:"is_replay_timing"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 type basicLCEvent struct {
@@ -79,7 +80,7 @@ func NewSimulatorAdapter(ctx context.Context, conf SimulatorConfig) (*SimulatorA
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to create filter: %w", err)
 		}

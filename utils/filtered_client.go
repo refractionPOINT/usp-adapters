@@ -64,12 +64,17 @@ type FilteredClient struct {
 }
 
 // NewFilteredClient creates a new filtered client wrapper.
-func NewFilteredClient(client *uspclient.Client, patterns []FilterPattern, debugLog LogFunc) (*FilteredClient, error) {
+// The mode parameter determines how patterns are applied:
+//   - FilterModeExclude (default): messages matching any pattern are filtered out
+//   - FilterModeInclude: only messages matching at least one pattern are allowed through
+//
+// If mode is empty, it defaults to FilterModeExclude for backward compatibility.
+func NewFilteredClient(client *uspclient.Client, patterns []FilterPattern, mode FilterMode, debugLog LogFunc) (*FilteredClient, error) {
 	if debugLog == nil {
 		debugLog = func(string) {} // No-op logger
 	}
 
-	filterEngine, err := NewFilterEngine(patterns, debugLog)
+	filterEngine, err := NewFilterEngine(patterns, mode, debugLog)
 	if err != nil {
 		return nil, err
 	}

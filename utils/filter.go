@@ -16,6 +16,19 @@ import (
 // LogFunc is a function that logs a message.
 type LogFunc func(string)
 
+// FilterMode determines how filter patterns are applied.
+type FilterMode string
+
+const (
+	// FilterModeExclude (default) filters out messages that match any pattern.
+	// Messages that don't match any pattern are allowed through.
+	FilterModeExclude FilterMode = "exclude"
+
+	// FilterModeInclude only allows messages that match at least one pattern.
+	// Messages that don't match any pattern are filtered out.
+	FilterModeInclude FilterMode = "include"
+)
+
 // FilterPattern defines a filter rule for matching and filtering messages.
 //
 // Two pattern types are supported:
@@ -129,6 +142,9 @@ type FilterEngine struct {
 	// Raw patterns for stats reporting
 	rawPatterns []FilterPattern
 
+	// Filter mode (exclude or include)
+	mode FilterMode
+
 	// Statistics (one entry per pattern)
 	stats           []uint64 // Per-pattern match counts (atomic)
 	totalChecked    uint64   // Atomic counter
@@ -144,7 +160,12 @@ type FilterEngine struct {
 }
 
 // NewFilterEngine creates a new filter engine with the given patterns.
-func NewFilterEngine(patterns []FilterPattern, logger LogFunc) (*FilterEngine, error) {
+// The mode parameter determines how patterns are applied:
+//   - FilterModeExclude (default): messages matching any pattern are filtered out
+//   - FilterModeInclude: only messages matching at least one pattern are allowed through
+//
+// If mode is empty, it defaults to FilterModeExclude for backward compatibility.
+func NewFilterEngine(patterns []FilterPattern, mode FilterMode, logger LogFunc) (*FilterEngine, error) {
 	if len(patterns) == 0 {
 		return nil, fmt.Errorf("no patterns provided")
 	}
@@ -153,13 +174,24 @@ func NewFilterEngine(patterns []FilterPattern, logger LogFunc) (*FilterEngine, e
 		logger = func(string) {} // No-op logger
 	}
 
+	// Default to exclude mode for backward compatibility
+	if mode == "" {
+		mode = FilterModeExclude
+	}
+
+	// Validate mode
+	if mode != FilterModeExclude && mode != FilterModeInclude {
+		return nil, fmt.Errorf("invalid filter mode %q, must be 'exclude' or 'include'", mode)
+	}
+
 	fe := &FilterEngine{
-		rawPatterns:   patterns,
-		regexMatchers: make([]*regexMatcher, 0),
-		gjsonMatchers: make([]*gjsonMatcher, 0),
-		stats:         make([]uint64, len(patterns)),
-		logger:        logger,
-		stopReporting: make(chan struct{}),
+		rawPatterns:    patterns,
+		mode:           mode,
+		regexMatchers:  make([]*regexMatcher, 0),
+		gjsonMatchers:  make([]*gjsonMatcher, 0),
+		stats:          make([]uint64, len(patterns)),
+		logger:         logger,
+		stopReporting:  make(chan struct{}),
 		lastReportTime: time.Now(),
 	}
 
@@ -197,8 +229,8 @@ func NewFilterEngine(patterns []FilterPattern, logger LogFunc) (*FilterEngine, e
 	// Start background stats reporter
 	fe.startStatsReporter()
 
-	logger(fmt.Sprintf("Filter engine initialized with %d patterns (%d regex, %d gjson)",
-		len(patterns), len(fe.regexMatchers), len(fe.gjsonMatchers)))
+	logger(fmt.Sprintf("Filter engine initialized with %d patterns (%d regex, %d gjson) in %s mode",
+		len(patterns), len(fe.regexMatchers), len(fe.gjsonMatchers), mode))
 
 	return fe, nil
 }
@@ -301,9 +333,36 @@ func (fe *FilterEngine) GetStats() FilterStats {
 
 // ShouldFilter checks if a message should be filtered out.
 // Returns (true, pattern) if the message should be filtered, (false, "") otherwise.
+//
+// The behavior depends on the filter mode:
+//   - FilterModeExclude: returns true if the message matches any pattern (filter it out)
+//   - FilterModeInclude: returns true if the message does NOT match any pattern (filter it out)
 func (fe *FilterEngine) ShouldFilter(msg *protocol.DataMessage) (bool, string) {
 	atomic.AddUint64(&fe.totalChecked, 1)
 
+	matched, patternDesc := fe.matchesAnyPattern(msg)
+
+	if fe.mode == FilterModeInclude {
+		// Include mode: filter out messages that DON'T match any pattern
+		if !matched {
+			atomic.AddUint64(&fe.totalFiltered, 1)
+			return true, "no pattern matched (include mode)"
+		}
+		return false, ""
+	}
+
+	// Exclude mode (default): filter out messages that DO match a pattern
+	if matched {
+		atomic.AddUint64(&fe.totalFiltered, 1)
+		return true, patternDesc
+	}
+	return false, ""
+}
+
+// matchesAnyPattern checks if a message matches any configured pattern.
+// Returns (true, patternDesc) if matched, (false, "") otherwise.
+// This function increments per-pattern stats but NOT totalFiltered.
+func (fe *FilterEngine) matchesAnyPattern(msg *protocol.DataMessage) (bool, string) {
 	// Fast path: Check gjson patterns first (no full marshaling needed)
 	if msg.JsonPayload != nil && len(fe.gjsonMatchers) > 0 {
 		// Marshal JSON once for all gjson queries
@@ -320,7 +379,6 @@ func (fe *FilterEngine) ShouldFilter(msg *protocol.DataMessage) (bool, string) {
 					value := result.String()
 					if gm.pattern.MatchString(value) {
 						atomic.AddUint64(&fe.stats[gm.index], 1)
-						atomic.AddUint64(&fe.totalFiltered, 1)
 						pat := fe.rawPatterns[gm.index]
 						patternDesc := fmt.Sprintf("gjson(path=%q, pattern=%q)", pat.Path, pat.Pattern)
 						return true, patternDesc
@@ -339,7 +397,6 @@ func (fe *FilterEngine) ShouldFilter(msg *protocol.DataMessage) (bool, string) {
 	for _, rm := range fe.regexMatchers {
 		if rm.pattern.MatchString(payload) {
 			atomic.AddUint64(&fe.stats[rm.index], 1)
-			atomic.AddUint64(&fe.totalFiltered, 1)
 			pat := fe.rawPatterns[rm.index]
 			patternDesc := fmt.Sprintf("regex(%q)", pat.Pattern)
 			return true, patternDesc

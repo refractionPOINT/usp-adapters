@@ -31,7 +31,8 @@ type EventHubAdapter struct {
 type EventHubConfig struct {
 	ClientOptions    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ConnectionString string                  `json:"connection_string" yaml:"connection_string"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *EventHubConfig) Validate() error {
@@ -70,7 +71,7 @@ func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdap
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			a.hub.Close(a.ctx)
 			return nil, nil, fmt.Errorf("failed to create filter: %w", err)

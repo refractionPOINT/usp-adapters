@@ -11,5 +11,6 @@ type K8sPodsConfig struct {
 	Root            string                  `json:"root" yaml:"root"`
 	IncludePodsRE   string                  `json:"include_pods_re" yaml:"include_pods_re"`
 	ExcludePodsRE   string                  `json:"exclude_pods_re" yaml:"exclude_pods_re"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }

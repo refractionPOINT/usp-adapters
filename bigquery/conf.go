@@ -15,5 +15,6 @@ type BigQueryConfig struct {
 	SqlQuery            string                  `json:"sql_query" yaml:"sql_query"`
 	QueryInterval       string                  `json:"query_interval" yaml:"query_interval"`
 	IsOneTimeLoad       bool                    `json:"is_one_time_load" yaml:"is_one_time_load"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }

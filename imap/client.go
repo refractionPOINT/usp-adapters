@@ -52,7 +52,8 @@ type ImapConfig struct {
 	MaxBodySize             int                     `json:"max_body_size" yaml:"max_body_size"`
 	AttachmentIngestKey     string                  `json:"attachment_ingest_key" yaml:"attachment_ingest_key"`
 	AttachmentRetentionDays int                     `json:"attachment_retention_days" yaml:"attachment_retention_days"`
-	Filters []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	Filters    []utils.FilterPattern `json:"filters,omitempty" yaml:"filters,omitempty"`
+	FilterMode utils.FilterMode       `json:"filter_mode,omitempty" yaml:"filter_mode,omitempty"`
 }
 
 func (c *ImapConfig) Validate() error {
@@ -137,7 +138,7 @@ func NewImapAdapter(ctx context.Context, conf ImapConfig) (*IMAPAdapter, chan st
 
 	// Wrap with filtering if configured
 	if len(conf.Filters) > 0 {
-		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.ClientOptions.DebugLog)
+		filtered, err := utils.NewFilteredClient(client, conf.Filters, conf.FilterMode, conf.ClientOptions.DebugLog)
 		if err != nil {
 			a.imapClient.Logout()
 			a.imapClient.Close()

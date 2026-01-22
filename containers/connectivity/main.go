@@ -35,7 +35,7 @@ func main() {
 		panic(err)
 	}
 
-	for urlName, url := range connInfo.URLs {
+	for urlName, url := range connInfo.URLs.ToMap() {
 		// Resolve the relevant DNS.
 		recs, err := net.LookupIP(url)
 		if err != nil {

@@ -141,7 +141,7 @@ func TestFilterEngineRegexPatterns(t *testing.T) {
 				logMessages = append(logMessages, msg)
 			}
 
-			fe, err := NewFilterEngine(tt.patterns, logger)
+			fe, err := NewFilterEngine(tt.patterns, FilterModeExclude, logger)
 			if err != nil {
 				t.Fatalf("Failed to create filter engine: %v", err)
 			}
@@ -249,7 +249,7 @@ func TestFilterEngineGJSONBasic(t *testing.T) {
 				t.Logf("Log: %s", msg)
 			}
 
-			fe, err := NewFilterEngine(tt.patterns, logger)
+			fe, err := NewFilterEngine(tt.patterns, FilterModeExclude, logger)
 			if err != nil {
 				t.Fatalf("Failed to create filter engine: %v", err)
 			}
@@ -311,7 +311,7 @@ func TestFilterEngineGJSONQueries(t *testing.T) {
 				t.Logf("Log: %s", msg)
 			}
 
-			fe, err := NewFilterEngine(tt.patterns, logger)
+			fe, err := NewFilterEngine(tt.patterns, FilterModeExclude, logger)
 			if err != nil {
 				t.Fatalf("Failed to create filter engine: %v", err)
 			}
@@ -338,7 +338,7 @@ func TestFilterEngineMixedPatterns(t *testing.T) {
 		t.Logf("Log: %s", msg)
 	}
 
-	fe, err := NewFilterEngine(patterns, logger)
+	fe, err := NewFilterEngine(patterns, FilterModeExclude, logger)
 	if err != nil {
 		t.Fatalf("Failed to create filter engine: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestFilterEngineStats(t *testing.T) {
 
 	logger := func(msg string) {}
 
-	fe, err := NewFilterEngine(patterns, logger)
+	fe, err := NewFilterEngine(patterns, FilterModeExclude, logger)
 	if err != nil {
 		t.Fatalf("Failed to create filter engine: %v", err)
 	}
@@ -446,7 +446,7 @@ func TestFilterEngineConcurrency(t *testing.T) {
 
 	logger := func(msg string) {}
 
-	fe, err := NewFilterEngine(patterns, logger)
+	fe, err := NewFilterEngine(patterns, FilterModeExclude, logger)
 	if err != nil {
 		t.Fatalf("Failed to create filter engine: %v", err)
 	}
@@ -509,7 +509,7 @@ func TestFilterEngineDoubleClose(t *testing.T) {
 
 	logger := func(msg string) {}
 
-	fe, err := NewFilterEngine(patterns, logger)
+	fe, err := NewFilterEngine(patterns, FilterModeExclude, logger)
 	if err != nil {
 		t.Fatalf("Failed to create filter engine: %v", err)
 	}
@@ -533,7 +533,7 @@ func TestFilterEngineMarshalFailures(t *testing.T) {
 		logMessages = append(logMessages, msg)
 	}
 
-	fe, err := NewFilterEngine(patterns, logger)
+	fe, err := NewFilterEngine(patterns, FilterModeExclude, logger)
 	if err != nil {
 		t.Fatalf("Failed to create filter engine: %v", err)
 	}
@@ -560,13 +560,210 @@ func TestFilterEngineMarshalFailures(t *testing.T) {
 	}
 }
 
-func stringContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+// TestFilterModeValidation tests filter mode validation
+func TestFilterModeValidation(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "regex", Pattern: "test"},
 	}
-	return false
+	logger := func(msg string) {}
+
+	// Test valid modes
+	_, err := NewFilterEngine(patterns, FilterModeExclude, logger)
+	if err != nil {
+		t.Errorf("FilterModeExclude should be valid: %v", err)
+	}
+
+	_, err = NewFilterEngine(patterns, FilterModeInclude, logger)
+	if err != nil {
+		t.Errorf("FilterModeInclude should be valid: %v", err)
+	}
+
+	// Test empty mode defaults to exclude
+	fe, err := NewFilterEngine(patterns, "", logger)
+	if err != nil {
+		t.Errorf("Empty mode should default to exclude: %v", err)
+	}
+	if fe != nil {
+		fe.Close()
+	}
+
+	// Test invalid mode
+	_, err = NewFilterEngine(patterns, "invalid", logger)
+	if err == nil {
+		t.Error("Invalid mode should return error")
+	}
+}
+
+// TestFilterModeInclude tests include mode filtering
+func TestFilterModeInclude(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "level", Pattern: "^(INFO|ERROR|WARN)$"},
+	}
+
+	logger := func(msg string) {
+		t.Logf("Log: %s", msg)
+	}
+
+	fe, err := NewFilterEngine(patterns, FilterModeInclude, logger)
+	if err != nil {
+		t.Fatalf("Failed to create filter engine: %v", err)
+	}
+	defer fe.Close()
+
+	tests := []struct {
+		name         string
+		message      *protocol.DataMessage
+		shouldFilter bool // true = filtered out, false = allowed through
+	}{
+		{
+			name: "matching pattern - allowed through",
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level":   "INFO",
+					"message": "test",
+				},
+			},
+			shouldFilter: false, // matches, so NOT filtered in include mode
+		},
+		{
+			name: "non-matching pattern - filtered out",
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level":   "DEBUG",
+					"message": "test",
+				},
+			},
+			shouldFilter: true, // doesn't match, so filtered in include mode
+		},
+		{
+			name: "another matching pattern - allowed through",
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level":   "ERROR",
+					"message": "error occurred",
+				},
+			},
+			shouldFilter: false, // matches, so NOT filtered in include mode
+		},
+		{
+			name: "text payload no match - filtered out",
+			message: &protocol.DataMessage{
+				TextPayload: "some random text",
+			},
+			shouldFilter: true, // doesn't match, so filtered in include mode
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shouldFilter, _ := fe.ShouldFilter(tt.message)
+			if shouldFilter != tt.shouldFilter {
+				t.Errorf("ShouldFilter() = %v, want %v", shouldFilter, tt.shouldFilter)
+			}
+		})
+	}
+}
+
+// TestFilterModeExclude tests exclude mode filtering (default behavior)
+func TestFilterModeExclude(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "level", Pattern: "^(DEBUG|TRACE)$"},
+	}
+
+	logger := func(msg string) {
+		t.Logf("Log: %s", msg)
+	}
+
+	fe, err := NewFilterEngine(patterns, FilterModeExclude, logger)
+	if err != nil {
+		t.Fatalf("Failed to create filter engine: %v", err)
+	}
+	defer fe.Close()
+
+	tests := []struct {
+		name         string
+		message      *protocol.DataMessage
+		shouldFilter bool // true = filtered out, false = allowed through
+	}{
+		{
+			name: "matching pattern - filtered out",
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level":   "DEBUG",
+					"message": "test",
+				},
+			},
+			shouldFilter: true, // matches, so filtered in exclude mode
+		},
+		{
+			name: "non-matching pattern - allowed through",
+			message: &protocol.DataMessage{
+				JsonPayload: map[string]interface{}{
+					"level":   "INFO",
+					"message": "test",
+				},
+			},
+			shouldFilter: false, // doesn't match, so NOT filtered in exclude mode
+		},
+		{
+			name: "text payload no match - allowed through",
+			message: &protocol.DataMessage{
+				TextPayload: "some random text",
+			},
+			shouldFilter: false, // doesn't match, so NOT filtered in exclude mode
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shouldFilter, _ := fe.ShouldFilter(tt.message)
+			if shouldFilter != tt.shouldFilter {
+				t.Errorf("ShouldFilter() = %v, want %v", shouldFilter, tt.shouldFilter)
+			}
+		})
+	}
+}
+
+// TestFilterModeIncludeStats tests statistics in include mode
+func TestFilterModeIncludeStats(t *testing.T) {
+	patterns := []FilterPattern{
+		{Type: "gjson", Path: "level", Pattern: "^(INFO|ERROR)$"},
+	}
+
+	logger := func(msg string) {}
+
+	fe, err := NewFilterEngine(patterns, FilterModeInclude, logger)
+	if err != nil {
+		t.Fatalf("Failed to create filter engine: %v", err)
+	}
+	defer fe.Close()
+
+	messages := []*protocol.DataMessage{
+		{JsonPayload: map[string]interface{}{"level": "INFO"}},  // matches - not filtered
+		{JsonPayload: map[string]interface{}{"level": "DEBUG"}}, // no match - filtered
+		{JsonPayload: map[string]interface{}{"level": "ERROR"}}, // matches - not filtered
+		{JsonPayload: map[string]interface{}{"level": "TRACE"}}, // no match - filtered
+		{JsonPayload: map[string]interface{}{"level": "INFO"}},  // matches - not filtered
+	}
+
+	for _, msg := range messages {
+		fe.ShouldFilter(msg)
+	}
+
+	stats := fe.GetStats()
+
+	if stats.TotalChecked != 5 {
+		t.Errorf("TotalChecked = %d, want 5", stats.TotalChecked)
+	}
+
+	if stats.TotalFiltered != 2 {
+		t.Errorf("TotalFiltered = %d, want 2 (DEBUG and TRACE filtered in include mode)", stats.TotalFiltered)
+	}
+
+	// Pattern should have 3 matches (INFO, ERROR, INFO)
+	if stats.PerPattern[0].Matches != 3 {
+		t.Errorf("Pattern matches = %d, want 3", stats.PerPattern[0].Matches)
+	}
 }
 
 // Benchmarks
@@ -578,7 +775,7 @@ func BenchmarkFilterEngineRegex(b *testing.B) {
 
 	logger := func(msg string) {}
 
-	fe, _ := NewFilterEngine(patterns, logger)
+	fe, _ := NewFilterEngine(patterns, FilterModeExclude, logger)
 	defer fe.Close()
 
 	msg := &protocol.DataMessage{
@@ -598,7 +795,7 @@ func BenchmarkFilterEngineGJSON(b *testing.B) {
 
 	logger := func(msg string) {}
 
-	fe, _ := NewFilterEngine(patterns, logger)
+	fe, _ := NewFilterEngine(patterns, FilterModeExclude, logger)
 	defer fe.Close()
 
 	msg := &protocol.DataMessage{
@@ -621,7 +818,7 @@ func BenchmarkFilterEngineGJSONMatch(b *testing.B) {
 
 	logger := func(msg string) {}
 
-	fe, _ := NewFilterEngine(patterns, logger)
+	fe, _ := NewFilterEngine(patterns, FilterModeExclude, logger)
 	defer fe.Close()
 
 	msg := &protocol.DataMessage{
@@ -646,7 +843,7 @@ func BenchmarkFilterEngineMixed(b *testing.B) {
 
 	logger := func(msg string) {}
 
-	fe, _ := NewFilterEngine(patterns, logger)
+	fe, _ := NewFilterEngine(patterns, FilterModeExclude, logger)
 	defer fe.Close()
 
 	msg := &protocol.DataMessage{
@@ -670,7 +867,7 @@ func BenchmarkFilterEngineRegexOnJSON(b *testing.B) {
 
 	logger := func(msg string) {}
 
-	fe, _ := NewFilterEngine(patterns, logger)
+	fe, _ := NewFilterEngine(patterns, FilterModeExclude, logger)
 	defer fe.Close()
 
 	// Large JSON payload to simulate real-world scenario
@@ -708,7 +905,7 @@ func BenchmarkFilterEngineGJSONOnJSON(b *testing.B) {
 
 	logger := func(msg string) {}
 
-	fe, _ := NewFilterEngine(patterns, logger)
+	fe, _ := NewFilterEngine(patterns, FilterModeExclude, logger)
 	defer fe.Close()
 
 	// Same large JSON payload as regex benchmark
