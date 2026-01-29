@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -39,8 +40,7 @@ func isTransientError(err error) bool {
 
 	// Check for HTTP status codes in the error message
 	if matches := statusCodeRegex.FindStringSubmatch(errStr); len(matches) > 1 {
-		var statusCode int
-		if _, scanErr := fmt.Sscanf(matches[1], "%d", &statusCode); scanErr == nil {
+		if statusCode, parseErr := strconv.Atoi(matches[1]); parseErr == nil {
 			// 5xx errors are transient server errors
 			if statusCode >= 500 && statusCode <= 599 {
 				return true
@@ -123,7 +123,13 @@ func (c *SentinelOneConfig) Validate() error {
 }
 
 func NewSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig) (*SentinelOneAdapter, chan struct{}, error) {
-	var err error
+	// Ensure retry defaults are set (these may not be set if Validate() wasn't called)
+	if conf.RetryBaseDelay == 0 {
+		conf.RetryBaseDelay = baseRetryDelay
+	}
+	if conf.MaxRetryAttempts == 0 {
+		conf.MaxRetryAttempts = maxRetryAttempts
+	}
 
 	a := &SentinelOneAdapter{
 		conf:     conf,
@@ -132,6 +138,7 @@ func NewSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig) (*Sentin
 		s1Client: NewSentinelOneClient(conf.Domain, conf.APIKey),
 	}
 
+	var err error
 	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
@@ -264,16 +271,23 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 				// Check if this is a transient error worth retrying
 				if !isTransientError(err) {
 					// Permanent error (auth failure, bad request, etc.) - stop the adapter
-					a.conf.ClientOptions.OnError(fmt.Errorf("GetFromAPI(): %v", err))
+					if a.conf.ClientOptions.OnError != nil {
+						a.conf.ClientOptions.OnError(fmt.Errorf("GetFromAPI(): %v", err))
+					}
 					a.doStop.Set()
 					return
 				}
 
 				// Transient error - log and retry with backoff
+				// Only retry if we haven't exhausted all attempts
+				if attempt+1 >= a.conf.MaxRetryAttempts {
+					break // Exit retry loop, will be handled below
+				}
+
 				retryDelay := a.conf.RetryBaseDelay * time.Duration(attempt+1)
 				if a.conf.ClientOptions.OnWarning != nil {
 					a.conf.ClientOptions.OnWarning(fmt.Sprintf(
-						"transient error (attempt %d/%d), retrying in %v: %v",
+						"transient error (attempt %d/%d), waiting %v before retry: %v",
 						attempt+1, a.conf.MaxRetryAttempts, retryDelay, err))
 				}
 
@@ -286,8 +300,10 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 			// If we exhausted all retries, report the error but continue
 			// (don't stop the entire adapter for persistent transient errors)
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf(
-					"GetFromAPI(): failed after %d attempts: %v", a.conf.MaxRetryAttempts, err))
+				if a.conf.ClientOptions.OnError != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf(
+						"GetFromAPI(): failed after %d attempts: %v", a.conf.MaxRetryAttempts, err))
+				}
 				// Break out of pagination loop to try again after TimeBetweenRequests
 				break
 			}

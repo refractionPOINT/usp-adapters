@@ -339,11 +339,12 @@ func TestEndpointsContinueIndependently(t *testing.T) {
 	t.Logf("Request counts - activities: %d, alerts: %d, threats: %d", activities, alerts, threats)
 
 	// Key insight: alerts/threats should make MORE requests than activities because:
-	// - Activities spends time in retry delays (50ms + 100ms + 150ms = 300ms per cycle)
+	// - Activities spends time in retry delays (50ms after attempt 1, 100ms after attempt 2)
+	// - Total retry delay per cycle: 150ms (no delay after final attempt)
 	// - Alerts/threats complete immediately and only wait TimeBetweenRequests (50ms)
 	//
 	// Expected in 1 second:
-	// - Activities: ~9 requests (3 retries × ~3 cycles, with 300ms delay per cycle)
+	// - Activities: ~9 requests (3 attempts × ~3 cycles, with ~200ms per cycle including delays)
 	// - Alerts/Threats: ~20 requests (1000ms / 50ms between requests)
 	//
 	// If retry delays weren't working, activities would make as many requests as alerts.
@@ -478,8 +479,8 @@ func TestRetryExhaustion(t *testing.T) {
 	t.Logf("Request counts - failing: %d, success: %d", failing, success)
 
 	// Failing endpoint should have made multiple retry attempts
-	// Each cycle: 3 attempts + delays (50+100+150=300ms) + TimeBetweenRequests (50ms) ≈ 350ms
-	// In 1 second: ~3 cycles × 3 attempts = ~9 requests
+	// Each cycle: 3 attempts + delays (50+100=150ms, no delay after final attempt) + TimeBetweenRequests (50ms) ≈ 200ms
+	// In 1 second: ~5 cycles × 3 attempts = ~15 requests
 	assert.GreaterOrEqual(t, failing, int32(3),
 		"Should have made at least one full retry cycle (3 attempts)")
 
