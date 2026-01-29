@@ -25,6 +25,7 @@ const (
 	queryInterval     = 60
 	incidentsEndpoint = "/public_api/v1/incidents/get_incidents/"
 	alertsEndpoint    = "/public_api/v1/alerts/get_alerts_multi_events/"
+	dedupeWindow      = 30 * time.Minute
 )
 
 type CortexXDRConfig struct {
@@ -248,7 +249,8 @@ func (a *CortexXDRAdapter) fetchEvents() {
 func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api API) ([]utils.Dict, error) {
 	var allItems []utils.Dict
 
-	cutoffTime := cycleTime.Add(-2 * queryInterval * time.Second).Unix()
+	// Clean up old dedupe entries (30 minute window)
+	cutoffTime := cycleTime.Add(-dedupeWindow).Unix()
 	for k, v := range api.Dedupe {
 		if v < cutoffTime {
 			delete(api.Dedupe, k)
