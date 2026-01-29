@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,57 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
+
+const (
+	maxRetryAttempts = 3
+	baseRetryDelay   = 5 * time.Second
+)
+
+// statusCodeRegex matches "unexpected status code XXX" in error messages
+var statusCodeRegex = regexp.MustCompile(`unexpected status code (\d+)`)
+
+// isTransientError determines if an error is transient and should be retried.
+// Transient errors include:
+// - HTTP 5xx server errors (500, 502, 503, 504)
+// - HTTP 429 Too Many Requests (rate limiting)
+// - Network errors (timeouts, connection refused, etc.)
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	errStr := err.Error()
+
+	// Check for HTTP status codes in the error message
+	if matches := statusCodeRegex.FindStringSubmatch(errStr); len(matches) > 1 {
+		var statusCode int
+		if _, scanErr := fmt.Sscanf(matches[1], "%d", &statusCode); scanErr == nil {
+			// 5xx errors are transient server errors
+			if statusCode >= 500 && statusCode <= 599 {
+				return true
+			}
+			// 429 is rate limiting - transient
+			if statusCode == http.StatusTooManyRequests {
+				return true
+			}
+			// 4xx errors (except 429) are permanent - bad request, auth failure, etc.
+			return false
+		}
+	}
+
+	// Network-related errors are typically transient
+	if strings.Contains(errStr, "failed to execute request") {
+		// This could be timeout, connection refused, DNS failure, etc.
+		return true
+	}
+
+	// Context cancellation is not transient (intentional shutdown)
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	return false
+}
 
 type SentinelOneAdapter struct {
 	conf       SentinelOneConfig
@@ -37,6 +89,8 @@ type SentinelOneConfig struct {
 	URLs                string                  `json:"urls" yaml:"urls"`
 	StartTime           string                  `json:"start_time" yaml:"start_time"`
 	TimeBetweenRequests time.Duration           `json:"time_between_requests" yaml:"time_between_requests"`
+	RetryBaseDelay      time.Duration           `json:"retry_base_delay" yaml:"retry_base_delay"`
+	MaxRetryAttempts    int                     `json:"max_retry_attempts" yaml:"max_retry_attempts"`
 }
 
 func (c *SentinelOneConfig) Validate() error {
@@ -58,6 +112,12 @@ func (c *SentinelOneConfig) Validate() error {
 	}
 	if c.TimeBetweenRequests == 0 {
 		c.TimeBetweenRequests = 1 * time.Minute
+	}
+	if c.RetryBaseDelay == 0 {
+		c.RetryBaseDelay = baseRetryDelay
+	}
+	if c.MaxRetryAttempts == 0 {
+		c.MaxRetryAttempts = maxRetryAttempts
 	}
 	return nil
 }
@@ -187,11 +247,49 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 			}
 
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching from %s?%s", endpoint, qValues.Encode()))
-			resp, err := a.s1Client.GetFromAPI(a.ctx, endpoint, qValues)
+
+			// Retry loop for transient errors
+			var resp *SentinelOnePagedData
+			var err error
+			for attempt := 0; attempt < a.conf.MaxRetryAttempts; attempt++ {
+				if a.doStop.IsSet() {
+					return
+				}
+
+				resp, err = a.s1Client.GetFromAPI(a.ctx, endpoint, qValues)
+				if err == nil {
+					break // Success
+				}
+
+				// Check if this is a transient error worth retrying
+				if !isTransientError(err) {
+					// Permanent error (auth failure, bad request, etc.) - stop the adapter
+					a.conf.ClientOptions.OnError(fmt.Errorf("GetFromAPI(): %v", err))
+					a.doStop.Set()
+					return
+				}
+
+				// Transient error - log and retry with backoff
+				retryDelay := a.conf.RetryBaseDelay * time.Duration(attempt+1)
+				if a.conf.ClientOptions.OnWarning != nil {
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+						"transient error (attempt %d/%d), retrying in %v: %v",
+						attempt+1, a.conf.MaxRetryAttempts, retryDelay, err))
+				}
+
+				// Wait before retry, but respect doStop
+				if a.doStop.WaitFor(retryDelay) {
+					return
+				}
+			}
+
+			// If we exhausted all retries, report the error but continue
+			// (don't stop the entire adapter for persistent transient errors)
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("GetFromAPI(): %v", err))
-				a.doStop.Set()
-				return
+				a.conf.ClientOptions.OnError(fmt.Errorf(
+					"GetFromAPI(): failed after %d attempts: %v", a.conf.MaxRetryAttempts, err))
+				// Break out of pagination loop to try again after TimeBetweenRequests
+				break
 			}
 			if resp.NextCursor != nil {
 				nextPage = *resp.NextCursor

@@ -3,6 +3,7 @@ package usp_sentinelone
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -15,100 +16,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestAdapterStopsPermanentlyOnTransientError demonstrates the bug described in
-// GitHub issue #3990: The SentinelOne adapter terminates permanently when it
-// encounters transient API errors (e.g., 500 status codes from the server).
-//
-// This test verifies the CURRENT (buggy) behavior where a single 500 error
-// causes the entire adapter to stop. Once the fix is implemented, this test
-// should be updated to verify that the adapter retries on transient errors.
-func TestAdapterStopsPermanentlyOnTransientError(t *testing.T) {
-	var requestCount atomic.Int32
-	var mu sync.Mutex
-	var receivedErrors []error
-
-	// Create a mock SentinelOne API server that returns 500 on the first request,
-	// then would return success on subsequent requests (if there were any)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		count := requestCount.Add(1)
-		if count == 1 {
-			// First request: simulate transient server error (like SentinelOne error 5000010)
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte(`{"errors":[{"code":5000010,"message":"Server could not process the request"}]}`))
-			return
-		}
-		// Subsequent requests would succeed - but due to the bug, we never get here
-		w.WriteHeader(http.StatusOK)
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"data":       []map[string]interface{}{},
-			"nextCursor": nil,
-		})
-	}))
-	defer server.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	conf := SentinelOneConfig{
-		Domain:              server.URL,
-		APIKey:              "test-api-key",
-		URLs:                "/web/api/v2.1/activities", // Single endpoint for simpler testing
-		TimeBetweenRequests: 100 * time.Millisecond,
-		ClientOptions: uspclient.ClientOptions{
-			TestSinkMode: true, // Use test sink to avoid needing real USP connection
-			OnError: func(err error) {
-				mu.Lock()
-				receivedErrors = append(receivedErrors, err)
-				mu.Unlock()
-			},
-			DebugLog: func(msg string) {
-				t.Logf("DEBUG: %s", msg)
-			},
-		},
-	}
-
-	adapter, chStopped, err := NewSentinelOneAdapter(ctx, conf)
-	require.NoError(t, err, "Failed to create adapter")
-	require.NotNil(t, adapter, "Adapter should not be nil")
-
-	// Wait for the adapter to stop (due to the bug, it should stop after the first 500 error)
-	select {
-	case <-chStopped:
-		// Adapter stopped - this is the buggy behavior we're testing
-		t.Log("Adapter stopped after encountering error")
-	case <-time.After(5 * time.Second):
-		t.Fatal("Timeout waiting for adapter to stop - unexpected behavior")
-	}
-
-	// Verify that only one request was made (bug: adapter didn't retry)
-	finalRequestCount := requestCount.Load()
-	assert.Equal(t, int32(1), finalRequestCount,
-		"BUG CONFIRMED: Adapter made only %d request(s) and stopped permanently on transient 500 error. "+
-			"Expected behavior would be to retry.", finalRequestCount)
-
-	// Verify that doStop was set (bug: adapter terminated permanently)
-	assert.True(t, adapter.doStop.IsSet(),
-		"BUG CONFIRMED: doStop flag is set, meaning the adapter terminated permanently")
-
-	// Verify an error was received
-	mu.Lock()
-	errorCount := len(receivedErrors)
-	mu.Unlock()
-	assert.Greater(t, errorCount, 0, "Should have received at least one error callback")
-
-	// Clean up
-	adapter.Close()
-}
-
-// TestAdapterShouldRetryOnTransientErrors is the test that SHOULD pass once
-// the bug is fixed. Currently, this test will FAIL because the adapter
-// doesn't implement retry logic.
-//
-// The fix should implement exponential backoff retry for transient errors:
-// - 500, 502, 503, 504 status codes
-// - Network timeouts
-// - Connection refused (temporary)
-func TestAdapterShouldRetryOnTransientErrors(t *testing.T) {
+// TestAdapterRetriesOnTransientErrors verifies that the adapter retries
+// when it encounters transient API errors (500, 502, 503, etc.) instead of
+// terminating permanently.
+// This test verifies the fix for GitHub issue #3990.
+func TestAdapterRetriesOnTransientErrors(t *testing.T) {
 	var requestCount atomic.Int32
 
 	// Mock server that fails twice with 500, then succeeds
@@ -137,10 +49,15 @@ func TestAdapterShouldRetryOnTransientErrors(t *testing.T) {
 		APIKey:              "test-api-key",
 		URLs:                "/web/api/v2.1/activities",
 		TimeBetweenRequests: 100 * time.Millisecond,
+		RetryBaseDelay:      50 * time.Millisecond, // Short delay for testing
+		MaxRetryAttempts:    3,
 		ClientOptions: uspclient.ClientOptions{
 			TestSinkMode: true,
 			OnError: func(err error) {
 				t.Logf("ERROR: %v", err)
+			},
+			OnWarning: func(msg string) {
+				t.Logf("WARNING: %s", msg)
 			},
 			DebugLog: func(msg string) {
 				t.Logf("DEBUG: %s", msg)
@@ -151,17 +68,15 @@ func TestAdapterShouldRetryOnTransientErrors(t *testing.T) {
 	adapter, chStopped, err := NewSentinelOneAdapter(ctx, conf)
 	require.NoError(t, err, "Failed to create adapter")
 
-	// Give the adapter time to make requests and potentially retry
-	time.Sleep(3 * time.Second)
+	// Give the adapter time to make requests and retry
+	time.Sleep(500 * time.Millisecond)
 
-	// Check if adapter is still running (expected behavior after fix)
+	// Check if adapter is still running (expected after fix)
 	select {
 	case <-chStopped:
-		finalCount := requestCount.Load()
-		t.Fatalf("FAILED: Adapter stopped prematurely after %d request(s). "+
-			"With retry logic, it should have retried and succeeded on the 3rd attempt.", finalCount)
+		t.Fatal("Adapter stopped unexpectedly - it should retry on transient errors")
 	default:
-		// Adapter is still running - this is the expected behavior after the fix
+		// Adapter is still running - correct behavior
 	}
 
 	finalRequestCount := requestCount.Load()
@@ -177,25 +92,16 @@ func TestAdapterShouldRetryOnTransientErrors(t *testing.T) {
 	adapter.Close()
 }
 
-// TestTransientVsPermanentErrors documents which HTTP status codes should be
-// considered transient (retry-worthy) vs. permanent errors.
-// This test verifies current behavior and documents expected behavior after fix.
-func TestTransientVsPermanentErrors(t *testing.T) {
+// TestAdapterStopsOnPermanentErrors verifies that the adapter stops
+// when it encounters permanent errors (401, 403, 404).
+func TestAdapterStopsOnPermanentErrors(t *testing.T) {
 	testCases := []struct {
-		name            string
-		statusCode      int
-		isTransient     bool // true = should retry (after fix), false = permanent error
+		name       string
+		statusCode int
 	}{
-		// Transient errors - should retry after fix
-		{"500_InternalServerError", 500, true},
-		{"502_BadGateway", 502, true},
-		{"503_ServiceUnavailable", 503, true},
-		{"504_GatewayTimeout", 504, true},
-		{"429_TooManyRequests", 429, true},
-		// Permanent errors - should stop adapter (correct behavior)
-		{"401_Unauthorized", 401, false},
-		{"403_Forbidden", 403, false},
-		{"404_NotFound", 404, false},
+		{"401_Unauthorized", 401},
+		{"403_Forbidden", 403},
+		{"404_NotFound", 404},
 	}
 
 	for _, tc := range testCases {
@@ -203,18 +109,9 @@ func TestTransientVsPermanentErrors(t *testing.T) {
 			var requestCount atomic.Int32
 
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				count := requestCount.Add(1)
-				if count == 1 {
-					w.WriteHeader(tc.statusCode)
-					w.Write([]byte(`{"error": "test error"}`))
-					return
-				}
-				// Subsequent requests succeed
-				w.WriteHeader(http.StatusOK)
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"data":       []map[string]interface{}{},
-					"nextCursor": nil,
-				})
+				requestCount.Add(1)
+				w.WriteHeader(tc.statusCode)
+				w.Write([]byte(`{"error": "permanent error"}`))
 			}))
 			defer server.Close()
 
@@ -225,7 +122,9 @@ func TestTransientVsPermanentErrors(t *testing.T) {
 				Domain:              server.URL,
 				APIKey:              "test-api-key",
 				URLs:                "/web/api/v2.1/activities",
-				TimeBetweenRequests: 50 * time.Millisecond,
+				TimeBetweenRequests: 100 * time.Millisecond,
+				RetryBaseDelay:      50 * time.Millisecond,
+				MaxRetryAttempts:    3,
 				ClientOptions: uspclient.ClientOptions{
 					TestSinkMode: true,
 					OnError:      func(err error) {},
@@ -236,48 +135,141 @@ func TestTransientVsPermanentErrors(t *testing.T) {
 			adapter, chStopped, err := NewSentinelOneAdapter(ctx, conf)
 			require.NoError(t, err)
 
-			// Wait to see if adapter retries or stops
-			time.Sleep(500 * time.Millisecond)
-
-			var adapterStopped bool
+			// Wait for adapter to stop
 			select {
 			case <-chStopped:
-				adapterStopped = true
-			default:
-				adapterStopped = false
+				// Adapter stopped - correct behavior for permanent errors
+			case <-time.After(2 * time.Second):
+				t.Fatalf("Adapter should have stopped on permanent error %d", tc.statusCode)
 			}
 
-			finalCount := requestCount.Load()
+			// Should have made exactly 1 request (no retries for permanent errors)
+			assert.Equal(t, int32(1), requestCount.Load(),
+				"Should make exactly 1 request for permanent error %d (no retries)", tc.statusCode)
 
-			// Current behavior: ALL errors stop the adapter (bug for transient errors)
-			assert.True(t, adapterStopped,
-				"Current behavior: adapter stops on status %d", tc.statusCode)
-			assert.Equal(t, int32(1), finalCount,
-				"Current behavior: only 1 request made before stopping on status %d", tc.statusCode)
-
-			// Document what SHOULD happen after the fix:
-			if tc.isTransient {
-				t.Logf("BUG: Status %d is transient and SHOULD be retried, but adapter stopped after %d request(s)",
-					tc.statusCode, finalCount)
-			} else {
-				t.Logf("CORRECT: Status %d is permanent error, adapter correctly stopped after %d request(s)",
-					tc.statusCode, finalCount)
-			}
+			// doStop should be set
+			assert.True(t, adapter.doStop.IsSet(),
+				"doStop should be set for permanent error %d", tc.statusCode)
 
 			adapter.Close()
 		})
 	}
 }
 
-// TestAllEndpointsStopOnSingleError verifies the bug where one endpoint's
-// error stops ALL endpoints (they share the same doStop event).
-func TestAllEndpointsStopOnSingleError(t *testing.T) {
+// TestTransientErrorsAreRetried verifies that all transient HTTP status codes
+// trigger retry behavior with proper delays.
+func TestTransientErrorsAreRetried(t *testing.T) {
+	testCases := []struct {
+		name       string
+		statusCode int
+	}{
+		{"500_InternalServerError", 500},
+		{"502_BadGateway", 502},
+		{"503_ServiceUnavailable", 503},
+		{"504_GatewayTimeout", 504},
+		{"429_TooManyRequests", 429},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Use two endpoints: one that fails with transient error, one that always succeeds
+			// Compare their request counts to verify retry delays are being applied
+			var failingEndpointRequests atomic.Int32
+			var successEndpointRequests atomic.Int32
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/web/api/v2.1/activities":
+					// This endpoint fails once with transient error, then succeeds
+					count := failingEndpointRequests.Add(1)
+					if count == 1 {
+						w.WriteHeader(tc.statusCode)
+						w.Write([]byte(`{"error": "transient error"}`))
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"data":       []map[string]interface{}{},
+						"nextCursor": nil,
+					})
+				case "/web/api/v2.1/threats":
+					// Reference endpoint - always succeeds immediately
+					successEndpointRequests.Add(1)
+					w.WriteHeader(http.StatusOK)
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"data":       []map[string]interface{}{},
+						"nextCursor": nil,
+					})
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			conf := SentinelOneConfig{
+				Domain:              server.URL,
+				APIKey:              "test-api-key",
+				URLs:                "/web/api/v2.1/activities,/web/api/v2.1/threats",
+				TimeBetweenRequests: 50 * time.Millisecond,
+				RetryBaseDelay:      100 * time.Millisecond, // Significant delay to show difference
+				MaxRetryAttempts:    3,
+				ClientOptions: uspclient.ClientOptions{
+					TestSinkMode: true,
+					OnError:      func(err error) {},
+					OnWarning:    func(msg string) {},
+					DebugLog:     func(msg string) {},
+				},
+			}
+
+			adapter, chStopped, err := NewSentinelOneAdapter(ctx, conf)
+			require.NoError(t, err)
+
+			// Let adapter run - enough time for retry + several successful cycles
+			time.Sleep(500 * time.Millisecond)
+
+			// Adapter should still be running
+			select {
+			case <-chStopped:
+				t.Fatalf("Adapter stopped on transient error %d - should have retried", tc.statusCode)
+			default:
+				// Still running - correct
+			}
+
+			failing := failingEndpointRequests.Load()
+			success := successEndpointRequests.Load()
+
+			t.Logf("Status %d: failing endpoint=%d, success endpoint=%d requests", tc.statusCode, failing, success)
+
+			// The failing endpoint should have made at least 2 requests (1 fail + 1 success after retry)
+			assert.GreaterOrEqual(t, failing, int32(2),
+				"Failing endpoint should have retried on %d error", tc.statusCode)
+
+			// Key ratio assertion: success endpoint should have more requests than failing endpoint
+			// because the failing endpoint spent time in retry delay (100ms) on first request
+			// In 500ms with 50ms between requests:
+			// - Success: ~10 requests (500ms / 50ms)
+			// - Failing: fewer because first cycle had 100ms retry delay
+			assert.Greater(t, success, failing,
+				"Success endpoint should have more requests than failing endpoint (retry delay effect)")
+
+			// doStop should NOT be set
+			assert.False(t, adapter.doStop.IsSet(),
+				"doStop should NOT be set after transient error %d", tc.statusCode)
+
+			adapter.Close()
+		})
+	}
+}
+
+// TestEndpointsContinueIndependently verifies that one endpoint's transient
+// error doesn't stop other endpoints (fix for shared doStop issue).
+func TestEndpointsContinueIndependently(t *testing.T) {
 	var activitiesRequests atomic.Int32
 	var alertsRequests atomic.Int32
 	var threatsRequests atomic.Int32
-
-	// Use a channel to ensure activities endpoint fails first
-	activitiesFailed := make(chan struct{})
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
@@ -285,22 +277,10 @@ func TestAllEndpointsStopOnSingleError(t *testing.T) {
 		switch path {
 		case "/web/api/v2.1/activities":
 			activitiesRequests.Add(1)
-			// This endpoint returns 500 - it will kill ALL other endpoints due to shared doStop
+			// This endpoint always returns 500
 			w.WriteHeader(http.StatusInternalServerError)
 			w.Write([]byte(`{"error": "transient error"}`))
-			// Signal that activities has failed
-			select {
-			case <-activitiesFailed:
-				// Already closed
-			default:
-				close(activitiesFailed)
-			}
 		case "/web/api/v2.1/cloud-detection/alerts":
-			// Wait briefly to let activities fail first (reduces race condition)
-			select {
-			case <-activitiesFailed:
-			case <-time.After(100 * time.Millisecond):
-			}
 			alertsRequests.Add(1)
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -308,11 +288,6 @@ func TestAllEndpointsStopOnSingleError(t *testing.T) {
 				"nextCursor": nil,
 			})
 		case "/web/api/v2.1/threats":
-			// Wait briefly to let activities fail first (reduces race condition)
-			select {
-			case <-activitiesFailed:
-			case <-time.After(100 * time.Millisecond):
-			}
 			threatsRequests.Add(1)
 			w.WriteHeader(http.StatusOK)
 			json.NewEncoder(w).Encode(map[string]interface{}{
@@ -332,46 +307,203 @@ func TestAllEndpointsStopOnSingleError(t *testing.T) {
 		Domain:              server.URL,
 		APIKey:              "test-api-key",
 		URLs:                "", // Empty means default: activities, alerts, threats
-		TimeBetweenRequests: 100 * time.Millisecond,
+		TimeBetweenRequests: 50 * time.Millisecond,
+		RetryBaseDelay:      50 * time.Millisecond,
+		MaxRetryAttempts:    3,
 		ClientOptions: uspclient.ClientOptions{
 			TestSinkMode: true,
 			OnError:      func(err error) { t.Logf("ERROR: %v", err) },
-			DebugLog:     func(msg string) { t.Logf("DEBUG: %s", msg) },
+			OnWarning:    func(msg string) { t.Logf("WARNING: %s", msg) },
+			DebugLog:     func(msg string) {},
 		},
 	}
 
 	adapter, chStopped, err := NewSentinelOneAdapter(ctx, conf)
 	require.NoError(t, err)
 
-	// Wait for adapter to stop (due to the bug, it should stop quickly after activities fails)
+	// Let the adapter run for a bit
+	time.Sleep(1 * time.Second)
+
+	// Adapter should still be running
 	select {
 	case <-chStopped:
-		t.Log("Adapter stopped")
-	case <-time.After(5 * time.Second):
-		t.Log("Adapter still running after 5 seconds")
+		t.Fatal("Adapter stopped - other endpoints should continue despite activities endpoint failures")
+	default:
+		// Still running - correct
 	}
 
-	// Check request counts
 	activities := activitiesRequests.Load()
 	alerts := alertsRequests.Load()
 	threats := threatsRequests.Load()
 
 	t.Logf("Request counts - activities: %d, alerts: %d, threats: %d", activities, alerts, threats)
 
-	// BUG VERIFICATION: One endpoint's error stops all endpoints
-	assert.True(t, adapter.doStop.IsSet(),
-		"BUG CONFIRMED: doStop is set, stopping ALL endpoints due to ONE endpoint's transient error")
+	// Key insight: alerts/threats should make MORE requests than activities because:
+	// - Activities spends time in retry delays (50ms + 100ms + 150ms = 300ms per cycle)
+	// - Alerts/threats complete immediately and only wait TimeBetweenRequests (50ms)
+	//
+	// Expected in 1 second:
+	// - Activities: ~9 requests (3 retries × ~3 cycles, with 300ms delay per cycle)
+	// - Alerts/Threats: ~20 requests (1000ms / 50ms between requests)
+	//
+	// If retry delays weren't working, activities would make as many requests as alerts.
 
-	// The activities endpoint should have made exactly 1 request before failing
-	assert.Equal(t, int32(1), activities,
-		"Activities endpoint should have made exactly 1 request before failing")
+	// Activities should have made at least 3 requests (one full retry cycle)
+	assert.GreaterOrEqual(t, activities, int32(3),
+		"Activities endpoint should have made at least one full retry cycle (3 attempts)")
 
-	// Due to the bug, other endpoints are stopped. They may have made 0 or 1 requests
-	// depending on timing, but they should NOT continue making multiple requests.
-	assert.LessOrEqual(t, alerts, int32(1),
-		"BUG: Alerts endpoint stopped after at most 1 request due to shared doStop")
-	assert.LessOrEqual(t, threats, int32(1),
-		"BUG: Threats endpoint stopped after at most 1 request due to shared doStop")
+	// Critical assertion: alerts/threats must make MORE requests than activities
+	// This proves that activities is spending time in retry delays
+	assert.Greater(t, alerts, activities,
+		"Alerts should make more requests than activities (activities is delayed by retries)")
+	assert.Greater(t, threats, activities,
+		"Threats should make more requests than activities (activities is delayed by retries)")
+
+	// doStop should NOT be set (transient errors don't stop the adapter)
+	assert.False(t, adapter.doStop.IsSet(),
+		"doStop should NOT be set - transient errors should not stop the adapter")
+
+	adapter.Close()
+}
+
+// TestIsTransientError verifies the error classification logic.
+func TestIsTransientError(t *testing.T) {
+	testCases := []struct {
+		name        string
+		errMsg      string
+		isTransient bool
+	}{
+		// Transient errors
+		{"500 error", `unexpected status code 500 for "http://test": error`, true},
+		{"502 error", `unexpected status code 502 for "http://test": error`, true},
+		{"503 error", `unexpected status code 503 for "http://test": error`, true},
+		{"504 error", `unexpected status code 504 for "http://test": error`, true},
+		{"429 error", `unexpected status code 429 for "http://test": error`, true},
+		{"network error", `failed to execute request "http://test": connection refused`, true},
+
+		// Permanent errors
+		{"401 error", `unexpected status code 401 for "http://test": unauthorized`, false},
+		{"403 error", `unexpected status code 403 for "http://test": forbidden`, false},
+		{"404 error", `unexpected status code 404 for "http://test": not found`, false},
+		{"400 error", `unexpected status code 400 for "http://test": bad request`, false},
+
+		// Edge cases
+		{"nil error", "", false},
+		{"unknown error", "some random error", false},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			var err error
+			if tc.errMsg != "" {
+				err = errors.New(tc.errMsg)
+			}
+			result := isTransientError(err)
+			assert.Equal(t, tc.isTransient, result,
+				"isTransientError(%q) = %v, want %v", tc.errMsg, result, tc.isTransient)
+		})
+	}
+}
+
+// TestRetryExhaustion verifies that after exhausting all retries, the adapter
+// continues (doesn't stop) but reports the error, with proper retry delays.
+func TestRetryExhaustion(t *testing.T) {
+	// Use two endpoints: one that always fails (exhausts retries), one that always succeeds
+	// Compare request counts to verify retry delays are being applied
+	var failingEndpointRequests atomic.Int32
+	var successEndpointRequests atomic.Int32
+	var mu sync.Mutex
+	var capturedErrors []error
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/web/api/v2.1/activities":
+			// Always fails - will exhaust retries
+			failingEndpointRequests.Add(1)
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(`{"error": "always failing"}`))
+		case "/web/api/v2.1/threats":
+			// Reference endpoint - always succeeds
+			successEndpointRequests.Add(1)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data":       []map[string]interface{}{},
+				"nextCursor": nil,
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conf := SentinelOneConfig{
+		Domain:              server.URL,
+		APIKey:              "test-api-key",
+		URLs:                "/web/api/v2.1/activities,/web/api/v2.1/threats",
+		TimeBetweenRequests: 50 * time.Millisecond,
+		RetryBaseDelay:      50 * time.Millisecond,
+		MaxRetryAttempts:    3,
+		ClientOptions: uspclient.ClientOptions{
+			TestSinkMode: true,
+			OnError: func(err error) {
+				mu.Lock()
+				capturedErrors = append(capturedErrors, err)
+				mu.Unlock()
+			},
+			OnWarning: func(msg string) {},
+			DebugLog:  func(msg string) {},
+		},
+	}
+
+	adapter, chStopped, err := NewSentinelOneAdapter(ctx, conf)
+	require.NoError(t, err)
+
+	// Let adapter run for enough time to exhaust retries multiple times
+	time.Sleep(1 * time.Second)
+
+	// Adapter should still be running (not stopped by exhausted retries)
+	select {
+	case <-chStopped:
+		t.Fatal("Adapter stopped after exhausting retries - should continue and try again later")
+	default:
+		// Still running - correct
+	}
+
+	failing := failingEndpointRequests.Load()
+	success := successEndpointRequests.Load()
+
+	t.Logf("Request counts - failing: %d, success: %d", failing, success)
+
+	// Failing endpoint should have made multiple retry attempts
+	// Each cycle: 3 attempts + delays (50+100+150=300ms) + TimeBetweenRequests (50ms) ≈ 350ms
+	// In 1 second: ~3 cycles × 3 attempts = ~9 requests
+	assert.GreaterOrEqual(t, failing, int32(3),
+		"Should have made at least one full retry cycle (3 attempts)")
+
+	// Key ratio assertion: success endpoint should make MORE requests than failing endpoint
+	// Success: ~20 requests (1000ms / 50ms between requests)
+	// Failing: ~9 requests (delayed by retries)
+	assert.Greater(t, success, failing,
+		"Success endpoint should have more requests than failing endpoint (retry delays slow down failing endpoint)")
+
+	// Should have received error callbacks about exhausted retries
+	mu.Lock()
+	hasExhaustionError := false
+	for _, e := range capturedErrors {
+		if e != nil && len(e.Error()) > 0 {
+			hasExhaustionError = true
+			break
+		}
+	}
+	mu.Unlock()
+	assert.True(t, hasExhaustionError, "Should have received error callback after exhausting retries")
+
+	// doStop should NOT be set - adapter continues after exhausting retries
+	assert.False(t, adapter.doStop.IsSet(),
+		"doStop should NOT be set after exhausting retries - adapter should continue")
 
 	adapter.Close()
 }
