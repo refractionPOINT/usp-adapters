@@ -210,8 +210,11 @@ func (a *CortexXDRAdapter) fetchEvents() {
 			items, err := a.getEvents(since[api.Key], cycleTime, api)
 			if err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", api.Key, err))
+				// Don't update since time on failure to avoid data loss
+				continue
 			}
 
+			// Only update since time on successful fetch
 			since[api.Key] = cycleTime.Add(-queryInterval * time.Second)
 
 			if len(items) > 0 {
