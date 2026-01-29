@@ -26,6 +26,8 @@ const (
 	incidentsEndpoint = "/public_api/v1/incidents/get_incidents/"
 	alertsEndpoint    = "/public_api/v1/alerts/get_alerts_multi_events/"
 	dedupeWindow      = 30 * time.Minute
+	maxRetries        = 3
+	initialRetryDelay = 5 * time.Second
 )
 
 type CortexXDRConfig struct {
@@ -371,14 +373,19 @@ func (a *CortexXDRAdapter) generateLogHash(logMap map[string]interface{}) string
 }
 
 func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]interface{}, api API) (CortexXDRResponse, error) {
+	retryDelay := initialRetryDelay
+	retries := 0
+
 	for {
 		select {
 		case <-a.ctx.Done():
 			return nil, a.ctx.Err()
 		default:
 		}
+
 		var respBody []byte
 		var status int
+		var isTransientError bool
 
 		err := func() error {
 			loopCtx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
@@ -403,6 +410,7 @@ func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]int
 
 			resp, err := a.httpClient.Do(req)
 			if err != nil {
+				isTransientError = true
 				a.conf.ClientOptions.OnError(fmt.Errorf("cortex xdr %s api do error: %v", api.Key, err))
 				return err
 			}
@@ -411,16 +419,31 @@ func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]int
 
 			respBody, err = io.ReadAll(resp.Body)
 			if err != nil {
+				isTransientError = true
 				a.conf.ClientOptions.OnError(fmt.Errorf("cortex xdr %s api read error: %v", api.Key, err))
 				return err
 			}
 			status = resp.StatusCode
 			return nil
 		}()
-		if err != nil {
+
+		// Handle transient network errors with retry
+		if err != nil && isTransientError {
+			retries++
+			if retries > maxRetries {
+				return nil, fmt.Errorf("cortex xdr %s api failed after %d retries: %w", api.Key, maxRetries, err)
+			}
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("cortex xdr %s api transient error, retry %d/%d in %v", api.Key, retries, maxRetries, retryDelay))
+			if err := a.sleepContext(retryDelay); err != nil {
+				return nil, err
+			}
+			retryDelay *= 2 // Exponential backoff
+			continue
+		} else if err != nil {
 			return nil, err
 		}
 
+		// Handle rate limiting
 		if status == http.StatusTooManyRequests {
 			a.conf.ClientOptions.OnWarning("getEventsRequest got 429, sleeping 60s before retry")
 			if err := a.sleepContext(60 * time.Second); err != nil {
@@ -428,6 +451,21 @@ func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]int
 			}
 			continue
 		}
+
+		// Handle server errors (5xx) with retry
+		if status >= 500 && status < 600 {
+			retries++
+			if retries > maxRetries {
+				return nil, fmt.Errorf("cortex xdr %s api server error %d after %d retries\nRESPONSE: %s", api.Key, status, maxRetries, string(respBody))
+			}
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("cortex xdr %s api server error %d, retry %d/%d in %v", api.Key, status, retries, maxRetries, retryDelay))
+			if err := a.sleepContext(retryDelay); err != nil {
+				return nil, err
+			}
+			retryDelay *= 2 // Exponential backoff
+			continue
+		}
+
 		if status != http.StatusOK {
 			return nil, fmt.Errorf("cortex xdr %s api non-200: %d\nRESPONSE %s", api.Key, status, string(respBody))
 		}
