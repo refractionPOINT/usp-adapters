@@ -195,11 +195,38 @@ func (a *CortexXDRAdapter) fetchEvents() {
 			Endpoint:     alertsEndpoint,
 			Key:          "alerts",
 			ResponseType: &CortexXDRAlertsResponse{},
-			timeField:    "server_creation_time",  // CRITICAL: Use server_creation_time, not detection_timestamp!
+			timeField:    "server_creation_time",
 			idField:      "alert_id",
 			Dedupe:       a.alertsDedupe,
 		},
 	}
+
+	// Helper function to fetch and process events for all APIs
+	fetchAllAPIs := func() {
+		cycleTime := time.Now()
+		allItems := []utils.Dict{}
+
+		for _, api := range APIs {
+			items, err := a.getEvents(since[api.Key], cycleTime, api)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", api.Key, err))
+			}
+
+			since[api.Key] = cycleTime.Add(-queryInterval * time.Second)
+
+			if len(items) > 0 {
+				allItems = append(allItems, items...)
+			}
+		}
+
+		if len(allItems) > 0 {
+			a.submitEvents(allItems)
+		}
+	}
+
+	// Execute immediately on startup
+	a.conf.ClientOptions.DebugLog("performing initial fetch")
+	fetchAllAPIs()
 
 	ticker := time.NewTicker(queryInterval * time.Second)
 	defer ticker.Stop()
@@ -210,27 +237,7 @@ func (a *CortexXDRAdapter) fetchEvents() {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.conf.FQDN))
 			return
 		case <-ticker.C:
-			// Capture current time once for all APIs in this cycle
-			cycleTime := time.Now()
-
-			allItems := []utils.Dict{}
-
-			for _, api := range APIs {
-				items, err := a.getEvents(since[api.Key], cycleTime, api)
-				if err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("%s fetch failed: %w", api.Key, err))
-				}
-
-				since[api.Key] = cycleTime.Add(-queryInterval * time.Second)
-
-				if len(items) > 0 {
-					allItems = append(allItems, items...)
-				}
-			}
-
-			if len(allItems) > 0 {
-				a.submitEvents(allItems)
-			}
+			fetchAllAPIs()
 		}
 	}
 }
@@ -249,7 +256,7 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 
 	searchFrom := 0
 	pageSize := 100
-	
+
 	for {
 		requestBody := map[string]interface{}{
 			"request_data": map[string]interface{}{
@@ -276,8 +283,8 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 
 		resultCount := response.GetResultCount()
 		totalCount := response.GetTotalCount()
-		
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s: fetched %d results (total: %d, from: %d)", 
+
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s: fetched %d results (total: %d, from: %d)",
 			api.Key, resultCount, totalCount, searchFrom))
 
 		for _, event := range response.GetData() {
