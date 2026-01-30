@@ -5,7 +5,6 @@ package usp_file
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -66,16 +65,6 @@ type FileAdapter struct {
 	mu           sync.Mutex
 	serialFeed   *semaphore.Weighted
 	lineCb       func(line string) // callback for each line for testing
-}
-
-func (c *FileConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.FilePath == "" {
-		return errors.New("file_path missing")
-	}
-	return nil
 }
 
 func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan struct{}, error) {
