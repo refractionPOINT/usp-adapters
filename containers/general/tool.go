@@ -463,7 +463,7 @@ func testParsing(method string, configs *Configuration, sampleFile string) error
 		return fmt.Errorf("API call failed: %v", err)
 	}
 
-	// Check for errors
+	// Check for errors from the API
 	if len(result.Errors) > 0 {
 		log("PARSING FAILED")
 		log("")
@@ -472,6 +472,24 @@ func testParsing(method string, configs *Configuration, sampleFile string) error
 			log("  - %s", e)
 		}
 		return errors.New("parsing validation failed")
+	}
+
+	// Check for empty results - this likely indicates a misconfigured parsing rule or platform
+	if len(result.Results) == 0 {
+		log("PARSING FAILED")
+		log("")
+		log("WARNING: No events were parsed from the sample data.")
+		log("")
+		log("This usually indicates one of the following issues:")
+		log("  - The parsing_re regex does not match the input format")
+		log("  - The platform type does not match the data format")
+		log("  - The sample data is empty or contains only whitespace")
+		log("")
+		log("Suggestions:")
+		log("  - Verify your parsing_re regex matches the sample data")
+		log("  - Check that the platform matches your data format (text, json, cef, etc.)")
+		log("  - Ensure the sample file contains valid log data")
+		return errors.New("no events parsed from sample data")
 	}
 
 	// Display results
