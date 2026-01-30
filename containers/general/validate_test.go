@@ -1,8 +1,10 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
+	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/go-uspclient"
 	usp_bigquery "github.com/refractionPOINT/usp-adapters/bigquery"
 	usp_file "github.com/refractionPOINT/usp-adapters/file"
@@ -300,5 +302,107 @@ func TestConfigValidatorInterface(t *testing.T) {
 
 	t.Run("BigQueryConfigImplementsInterface", func(t *testing.T) {
 		var _ ConfigValidator = &usp_bigquery.BigQueryConfig{}
+	})
+}
+
+// TestCheckParsingResults tests the checkParsingResults function which validates
+// the response from the LimaCharlie USP parsing API.
+func TestCheckParsingResults(t *testing.T) {
+	t.Run("SuccessfulParsingWithResults", func(t *testing.T) {
+		// Successful parsing returns at least one event
+		result := &limacharlie.USPMappingValidationResponse{
+			Results: []limacharlie.Dict{
+				{"event_type": "INFO", "message": "test event 1"},
+				{"event_type": "WARN", "message": "test event 2"},
+			},
+			Errors: []string{},
+		}
+
+		err := checkParsingResults(result)
+		if err != nil {
+			t.Errorf("expected successful parsing to return nil, got error: %v", err)
+		}
+	})
+
+	t.Run("ParsingWithAPIErrors", func(t *testing.T) {
+		// API returns errors indicating parsing failure
+		result := &limacharlie.USPMappingValidationResponse{
+			Results: []limacharlie.Dict{},
+			Errors:  []string{"regex pattern did not match", "invalid mapping configuration"},
+		}
+
+		err := checkParsingResults(result)
+		if err == nil {
+			t.Error("expected parsing with API errors to return error")
+		}
+		if !strings.Contains(err.Error(), "parsing validation failed") {
+			t.Errorf("expected error message to contain 'parsing validation failed', got: %v", err)
+		}
+	})
+
+	t.Run("EmptyResultsNoErrors", func(t *testing.T) {
+		// Empty results with no API errors - indicates regex doesn't match
+		// or wrong platform type
+		result := &limacharlie.USPMappingValidationResponse{
+			Results: []limacharlie.Dict{},
+			Errors:  []string{},
+		}
+
+		err := checkParsingResults(result)
+		if err == nil {
+			t.Error("expected empty results to return error")
+		}
+		if !strings.Contains(err.Error(), "no events parsed") {
+			t.Errorf("expected error message to contain 'no events parsed', got: %v", err)
+		}
+	})
+
+	t.Run("NilResults", func(t *testing.T) {
+		// Nil results should be treated as empty results
+		result := &limacharlie.USPMappingValidationResponse{
+			Results: nil,
+			Errors:  nil,
+		}
+
+		err := checkParsingResults(result)
+		if err == nil {
+			t.Error("expected nil results to return error")
+		}
+		if !strings.Contains(err.Error(), "no events parsed") {
+			t.Errorf("expected error message to contain 'no events parsed', got: %v", err)
+		}
+	})
+
+	t.Run("PartialParsingWithErrors", func(t *testing.T) {
+		// Some results but also some errors - errors take precedence
+		result := &limacharlie.USPMappingValidationResponse{
+			Results: []limacharlie.Dict{
+				{"event_type": "INFO", "message": "partial event"},
+			},
+			Errors: []string{"some lines failed to parse"},
+		}
+
+		err := checkParsingResults(result)
+		if err == nil {
+			t.Error("expected partial parsing with errors to return error")
+		}
+		if !strings.Contains(err.Error(), "parsing validation failed") {
+			t.Errorf("expected error message to contain 'parsing validation failed', got: %v", err)
+		}
+	})
+
+	t.Run("SingleEventSuccess", func(t *testing.T) {
+		// Single event is still a success
+		result := &limacharlie.USPMappingValidationResponse{
+			Results: []limacharlie.Dict{
+				{"event_type": "INFO"},
+			},
+			Errors: []string{},
+		}
+
+		err := checkParsingResults(result)
+		if err != nil {
+			t.Errorf("expected single event parsing to return nil, got error: %v", err)
+		}
 	})
 }

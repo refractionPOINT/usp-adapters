@@ -463,6 +463,21 @@ func testParsing(method string, configs *Configuration, sampleFile string) error
 		return fmt.Errorf("API call failed: %v", err)
 	}
 
+	// Check and display results
+	return checkParsingResults(result)
+}
+
+// checkParsingResults validates the parsing results and returns an error if validation failed.
+// It checks for API errors and empty results (which likely indicate misconfigured parsing rules).
+//
+// Parameters:
+//
+//	result - The parsing validation result from the API.
+//
+// Returns:
+//
+//	error - Returns nil if validation passed with at least one event, or an error describing the failure.
+func checkParsingResults(result *limacharlie.USPMappingValidationResponse) error {
 	// Check for errors from the API
 	if len(result.Errors) > 0 {
 		log("PARSING FAILED")
