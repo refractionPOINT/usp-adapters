@@ -69,6 +69,11 @@ type USPClient interface {
 	Close() error
 }
 
+// ConfigValidator is implemented by adapter configs that support validation.
+type ConfigValidator interface {
+	Validate() error
+}
+
 type AdapterStats struct {
 	m                sync.Mutex
 	lastAck          time.Time
@@ -127,7 +132,12 @@ func printStruct(prefix string, s interface{}, isTop bool) {
 }
 
 func printUsage() {
-	logError("Usage: ./adapter adapter_type [config_file.yaml | <param>...]")
+	logError("Usage: ./adapter [--validate] [--test-parsing <sample_file>] adapter_type [config_file.yaml | <param>...]")
+	logError("")
+	logError("Flags:")
+	logError("  --validate                   Validate configuration without running the adapter")
+	logError("  --test-parsing <sample_file> Test parsing with sample data file (requires OID and API key)")
+	logError("")
 	logError("Available configs:\n")
 	printStruct("", Configuration{}, true)
 }
@@ -140,15 +150,36 @@ func printConfig(method string, c interface{}) {
 func main() {
 	log("starting")
 
-	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-") {
-		if err := serviceMode(os.Args[0], os.Args[1], os.Args[2:]); err != nil {
+	// Check for --validate and --test-parsing flags before other processing
+	validateOnly := false
+	testParsingFile := ""
+	args := os.Args[1:]
+
+	for len(args) > 0 {
+		if args[0] == "--validate" {
+			validateOnly = true
+			args = args[1:]
+		} else if args[0] == "--test-parsing" {
+			if len(args) < 2 {
+				logError("--test-parsing requires a sample file path")
+				os.Exit(1)
+			}
+			testParsingFile = args[1]
+			args = args[2:]
+		} else {
+			break
+		}
+	}
+
+	if len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		if err := serviceMode(os.Args[0], args[0], args[1:]); err != nil {
 			logError("service: %v", err)
 			os.Exit(1)
 		}
 		return
 	}
 
-	method, configsToRun, err := parseConfigs(os.Args[1:])
+	method, configsToRun, err := parseConfigs(args)
 	if err != nil {
 		printUsage()
 		logError("\nerror: %s", err)
@@ -159,6 +190,40 @@ func main() {
 		os.Exit(1)
 		return
 	}
+
+	// Handle --validate flag: validate config and exit without running the adapter
+	if validateOnly {
+		hasError := false
+		for i, config := range configsToRun {
+			log("validating config %d for adapter: %s", i+1, method)
+			if err := validateConfig(method, config); err != nil {
+				logError("config %d validation failed: %v", i+1, err)
+				hasError = true
+			} else {
+				log("config %d validation passed", i+1)
+			}
+		}
+		if hasError {
+			os.Exit(1)
+		}
+		log("all configs validated successfully")
+		return
+	}
+
+	// Handle --test-parsing flag: test parsing with sample data via API
+	if testParsingFile != "" {
+		if len(configsToRun) == 0 {
+			logError("no configs to test parsing with")
+			os.Exit(1)
+		}
+		config := configsToRun[0]
+		if err := testParsing(method, config, testParsingFile); err != nil {
+			logError("parsing test failed: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	mCurrentlyRunning := sync.Mutex{}
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
@@ -277,6 +342,333 @@ func main() {
 		}
 	}
 	log("exited")
+}
+
+// testParsing tests the parsing configuration with sample data via the LimaCharlie API.
+// It reads sample data from the specified file and sends it to the validation API
+// to verify that the parsing rules correctly transform the data.
+//
+// Parameters:
+//
+//	method - The adapter type name (e.g., "syslog", "wel", "s3").
+//	configs - The configuration containing parsing/mapping settings.
+//	sampleFile - Path to a file containing sample data to test.
+//
+// Returns:
+//
+//	error - Returns nil if parsing succeeds, or an error describing the failure.
+func testParsing(method string, configs *Configuration, sampleFile string) error {
+	// Read sample data from file
+	sampleData, err := os.ReadFile(sampleFile)
+	if err != nil {
+		return fmt.Errorf("failed to read sample file %s: %v", sampleFile, err)
+	}
+
+	// Get the client options for the adapter to extract OID, API key, platform, and mapping
+	clientOpts, err := getClientOptions(method, configs)
+	if err != nil {
+		return fmt.Errorf("failed to get client options: %v", err)
+	}
+
+	// Validate we have required credentials
+	if clientOpts.Identity.Oid == "" {
+		return errors.New("missing OID in client_options.identity.oid (required for API validation)")
+	}
+	if clientOpts.Identity.InstallationKey == "" {
+		return errors.New("missing API key in client_options.identity.installation_key (required for API validation)")
+	}
+
+	// Create LimaCharlie client and organization for API authentication
+	lcClient, err := limacharlie.NewClient(limacharlie.ClientOptions{
+		OID:    clientOpts.Identity.Oid,
+		APIKey: clientOpts.Identity.InstallationKey,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create LimaCharlie client: %v", err)
+	}
+
+	org, err := limacharlie.NewOrganization(lcClient)
+	if err != nil {
+		return fmt.Errorf("failed to authenticate with LimaCharlie: %v", err)
+	}
+
+	// Exchange API key for JWT (required for API calls)
+	if _, err := lcClient.RefreshJWT(time.Hour); err != nil {
+		return fmt.Errorf("failed to authenticate (check API key): %v", err)
+	}
+
+	// Build the validation request
+	req := limacharlie.USPMappingValidationRequest{
+		Platform:  clientOpts.Platform,
+		TextInput: string(sampleData),
+	}
+
+
+	// Add mapping if configured (convert to Dict format for API)
+	if clientOpts.Mapping.ParsingRE != "" || clientOpts.Mapping.EventTypePath != "" || clientOpts.Mapping.Transform != nil {
+		mappingDict := limacharlie.Dict{}
+
+		if clientOpts.Mapping.ParsingRE != "" {
+			mappingDict["parsing_re"] = clientOpts.Mapping.ParsingRE
+		}
+		if clientOpts.Mapping.EventTypePath != "" {
+			mappingDict["event_type_path"] = clientOpts.Mapping.EventTypePath
+		}
+		if clientOpts.Mapping.EventTimePath != "" {
+			mappingDict["event_time_path"] = clientOpts.Mapping.EventTimePath
+		}
+		if clientOpts.Mapping.SensorHostnamePath != "" {
+			mappingDict["sensor_hostname_path"] = clientOpts.Mapping.SensorHostnamePath
+		}
+		if clientOpts.Mapping.SensorKeyPath != "" {
+			mappingDict["sensor_key_path"] = clientOpts.Mapping.SensorKeyPath
+		}
+		if clientOpts.Mapping.Transform != nil {
+			mappingDict["transform"] = clientOpts.Mapping.Transform
+		}
+		if len(clientOpts.Mapping.Mappings) > 0 {
+			mappingDict["mappings"] = clientOpts.Mapping.Mappings
+		}
+
+		req.Mapping = mappingDict
+	}
+
+	// Add mappings array if configured (for multi-mapping selection)
+	if len(clientOpts.Mappings) > 0 {
+		mappingsArray := make([]limacharlie.Dict, 0, len(clientOpts.Mappings))
+		for _, m := range clientOpts.Mappings {
+			md := limacharlie.Dict{}
+			if m.ParsingRE != "" {
+				md["parsing_re"] = m.ParsingRE
+			}
+			if m.EventTypePath != "" {
+				md["event_type_path"] = m.EventTypePath
+			}
+			if m.EventTimePath != "" {
+				md["event_time_path"] = m.EventTimePath
+			}
+			if m.Transform != nil {
+				md["transform"] = m.Transform
+			}
+			mappingsArray = append(mappingsArray, md)
+		}
+		req.Mappings = mappingsArray
+	}
+
+	log("testing parsing with platform=%s", clientOpts.Platform)
+
+	// Call the validation API via SDK
+	result, err := org.ValidateUSPMapping(req)
+	if err != nil {
+		return fmt.Errorf("API call failed: %v", err)
+	}
+
+	// Check and display results
+	return checkParsingResults(result)
+}
+
+// checkParsingResults validates the parsing results and returns an error if validation failed.
+// It checks for API errors and empty results (which likely indicate misconfigured parsing rules).
+//
+// Parameters:
+//
+//	result - The parsing validation result from the API.
+//
+// Returns:
+//
+//	error - Returns nil if validation passed with at least one event, or an error describing the failure.
+func checkParsingResults(result *limacharlie.USPMappingValidationResponse) error {
+	// Check for errors from the API
+	if len(result.Errors) > 0 {
+		log("PARSING FAILED")
+		log("")
+		log("Errors:")
+		for _, e := range result.Errors {
+			log("  - %s", e)
+		}
+		return errors.New("parsing validation failed")
+	}
+
+	// Check for empty results - this likely indicates a misconfigured parsing rule or platform
+	if len(result.Results) == 0 {
+		log("PARSING FAILED")
+		log("")
+		log("WARNING: No events were parsed from the sample data.")
+		log("")
+		log("This usually indicates one of the following issues:")
+		log("  - The parsing_re regex does not match the input format")
+		log("  - The platform type does not match the data format")
+		log("  - The sample data is empty or contains only whitespace")
+		log("")
+		log("Suggestions:")
+		log("  - Verify your parsing_re regex matches the sample data")
+		log("  - Check that the platform matches your data format (text, json, cef, etc.)")
+		log("  - Ensure the sample file contains valid log data")
+		return errors.New("no events parsed from sample data")
+	}
+
+	// Display results
+	log("PARSING SUCCESSFUL")
+	log("")
+	log("Parsed %d event(s):", len(result.Results))
+	log("")
+
+	for i, event := range result.Results {
+		log("Event %d:", i+1)
+		eventJSON, _ := json.MarshalIndent(event, "  ", "  ")
+		log("  %s", string(eventJSON))
+		log("")
+	}
+
+	return nil
+}
+
+// getClientOptions extracts the ClientOptions from the config based on adapter type.
+// Uses reflection to find the adapter config field by matching the json tag to the method name,
+// then extracts the embedded ClientOptions field.
+//
+// Parameters:
+//
+//	method - The adapter type name (must match the json tag on GeneralConfigs field).
+//	configs - The configuration struct.
+//
+// Returns:
+//
+//	*uspclient.ClientOptions - The client options for the adapter.
+//	error - An error if the adapter type is unknown or doesn't have ClientOptions.
+func getClientOptions(method string, configs *Configuration) (*uspclient.ClientOptions, error) {
+	// Get the embedded GeneralConfigs struct via pointer to make fields addressable
+	v := reflect.ValueOf(&configs.GeneralConfigs).Elem()
+	t := v.Type()
+
+	// Iterate over fields to find the one with matching json tag
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		jsonTag := field.Tag.Get("json")
+
+		// Extract the tag name (before any comma options)
+		tagName := strings.Split(jsonTag, ",")[0]
+		if tagName != method {
+			continue
+		}
+
+		// Found the matching field, now get its ClientOptions
+		fieldValue := v.Field(i)
+
+		// Look for ClientOptions field in the adapter config struct
+		clientOptsField := fieldValue.FieldByName("ClientOptions")
+		if !clientOptsField.IsValid() {
+			return nil, fmt.Errorf("adapter %s config does not have ClientOptions field", method)
+		}
+
+		// Return pointer to the ClientOptions
+		return clientOptsField.Addr().Interface().(*uspclient.ClientOptions), nil
+	}
+
+	return nil, fmt.Errorf("unknown adapter type: %s", method)
+}
+
+// validateConfig validates the configuration for the specified adapter type.
+// It checks that all required fields are present and properly formatted
+// without actually starting the adapter.
+//
+// Parameters:
+//
+//	method - The adapter type name (e.g., "syslog", "wel", "s3").
+//	configs - The configuration to validate.
+//
+// Returns:
+//
+//	error - Returns nil if validation passes, or an error describing the validation failure.
+func validateConfig(method string, configs *Configuration) error {
+	var validator ConfigValidator
+
+	switch method {
+	case "syslog":
+		validator = &configs.Syslog
+	case "pubsub":
+		validator = &configs.PubSub
+	case "gcs":
+		validator = &configs.Gcs
+	case "s3":
+		validator = &configs.S3
+	case "stdin":
+		validator = &configs.Stdin
+	case "1password":
+		validator = &configs.OnePassword
+	case "bitwarden":
+		validator = &configs.Bitwarden
+	case "itglue":
+		validator = &configs.ITGlue
+	case "sophos":
+		validator = &configs.Sophos
+	case "okta":
+		validator = &configs.Okta
+	case "office365":
+		validator = &configs.Office365
+	case "wiz":
+		validator = &configs.Wiz
+	case "wel":
+		validator = &configs.Wel
+	case "mac_unified_logging":
+		validator = &configs.MacUnifiedLogging
+	case "azure_event_hub":
+		validator = &configs.AzureEventHub
+	case "duo":
+		validator = &configs.Duo
+	case "cato":
+		validator = &configs.Cato
+	case "cylance":
+		validator = &configs.Cylance
+	case "entraid":
+		validator = &configs.EntraID
+	case "defender":
+		validator = &configs.Defender
+	case "slack":
+		validator = &configs.Slack
+	case "sqs":
+		validator = &configs.Sqs
+	case "sqs-files":
+		validator = &configs.SqsFiles
+	case "simulator":
+		validator = &configs.Simulator
+	case "file":
+		validator = &configs.File
+	case "evtx":
+		validator = &configs.Evtx
+	case "k8s_pods":
+		validator = &configs.K8sPods
+	case "bigquery":
+		validator = &configs.BigQuery
+	case "imap":
+		validator = &configs.Imap
+	case "hubspot":
+		validator = &configs.HubSpot
+	case "falconcloud":
+		validator = &configs.FalconCloud
+	case "mimecast":
+		validator = &configs.Mimecast
+	case "ms_graph":
+		validator = &configs.MsGraph
+	case "zendesk":
+		validator = &configs.Zendesk
+	case "pandadoc":
+		validator = &configs.PandaDoc
+	case "proofpoint_tap":
+		validator = &configs.ProofpointTap
+	case "box":
+		validator = &configs.Box
+	case "sublime":
+		validator = &configs.Sublime
+	case "sentinel_one":
+		validator = &configs.SentinelOne
+	case "trendmicro":
+		validator = &configs.TrendMicro
+	default:
+		return fmt.Errorf("unknown adapter type: %s", method)
+	}
+
+	return validator.Validate()
 }
 
 func runAdapter(ctx context.Context, method string, configs Configuration, showConfig bool) (USPClient, chan struct{}, error) {
