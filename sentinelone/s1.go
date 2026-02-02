@@ -7,8 +7,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"regexp"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,9 +21,6 @@ const (
 	baseRetryDelay   = 5 * time.Second
 )
 
-// statusCodeRegex matches "unexpected status code XXX" in error messages
-var statusCodeRegex = regexp.MustCompile(`unexpected status code (\d+)`)
-
 // isTransientError determines if an error is transient and should be retried.
 // Transient errors include:
 // - HTTP 5xx server errors (500, 502, 503, 504)
@@ -36,25 +31,23 @@ func isTransientError(err error) bool {
 		return false
 	}
 
-	errStr := err.Error()
-
-	// Check for HTTP status codes in the error message
-	if matches := statusCodeRegex.FindStringSubmatch(errStr); len(matches) > 1 {
-		if statusCode, parseErr := strconv.Atoi(matches[1]); parseErr == nil {
-			// 5xx errors are transient server errors
-			if statusCode >= 500 && statusCode <= 599 {
-				return true
-			}
-			// 429 is rate limiting - transient
-			if statusCode == http.StatusTooManyRequests {
-				return true
-			}
-			// 4xx errors (except 429) are permanent - bad request, auth failure, etc.
-			return false
+	// Check for HTTPError type which contains the status code directly
+	var httpErr *HTTPError
+	if errors.As(err, &httpErr) {
+		// 5xx errors are transient server errors
+		if httpErr.StatusCode >= 500 && httpErr.StatusCode <= 599 {
+			return true
 		}
+		// 429 is rate limiting - transient
+		if httpErr.StatusCode == http.StatusTooManyRequests {
+			return true
+		}
+		// 4xx errors (except 429) are permanent - bad request, auth failure, etc.
+		return false
 	}
 
 	// Network-related errors are typically transient
+	errStr := err.Error()
 	if strings.Contains(errStr, "failed to execute request") {
 		// This could be timeout, connection refused, DNS failure, etc.
 		return true

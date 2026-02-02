@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -371,39 +372,64 @@ func TestEndpointsContinueIndependently(t *testing.T) {
 func TestIsTransientError(t *testing.T) {
 	testCases := []struct {
 		name        string
-		errMsg      string
+		err         error
 		isTransient bool
 	}{
-		// Transient errors
-		{"500 error", `unexpected status code 500 for "http://test": error`, true},
-		{"502 error", `unexpected status code 502 for "http://test": error`, true},
-		{"503 error", `unexpected status code 503 for "http://test": error`, true},
-		{"504 error", `unexpected status code 504 for "http://test": error`, true},
-		{"429 error", `unexpected status code 429 for "http://test": error`, true},
-		{"network error", `failed to execute request "http://test": connection refused`, true},
+		// Transient HTTP errors (using HTTPError type)
+		{"500 error", &HTTPError{StatusCode: 500, URL: "http://test", Body: "error"}, true},
+		{"502 error", &HTTPError{StatusCode: 502, URL: "http://test", Body: "error"}, true},
+		{"503 error", &HTTPError{StatusCode: 503, URL: "http://test", Body: "error"}, true},
+		{"504 error", &HTTPError{StatusCode: 504, URL: "http://test", Body: "error"}, true},
+		{"429 error", &HTTPError{StatusCode: 429, URL: "http://test", Body: "error"}, true},
 
-		// Permanent errors
-		{"401 error", `unexpected status code 401 for "http://test": unauthorized`, false},
-		{"403 error", `unexpected status code 403 for "http://test": forbidden`, false},
-		{"404 error", `unexpected status code 404 for "http://test": not found`, false},
-		{"400 error", `unexpected status code 400 for "http://test": bad request`, false},
+		// Network error (string-based)
+		{"network error", errors.New(`failed to execute request "http://test": connection refused`), true},
+
+		// Permanent HTTP errors (using HTTPError type)
+		{"401 error", &HTTPError{StatusCode: 401, URL: "http://test", Body: "unauthorized"}, false},
+		{"403 error", &HTTPError{StatusCode: 403, URL: "http://test", Body: "forbidden"}, false},
+		{"404 error", &HTTPError{StatusCode: 404, URL: "http://test", Body: "not found"}, false},
+		{"400 error", &HTTPError{StatusCode: 400, URL: "http://test", Body: "bad request"}, false},
 
 		// Edge cases
-		{"nil error", "", false},
-		{"unknown error", "some random error", false},
+		{"nil error", nil, false},
+		{"unknown error", errors.New("some random error"), false},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			var err error
-			if tc.errMsg != "" {
-				err = errors.New(tc.errMsg)
-			}
-			result := isTransientError(err)
+			result := isTransientError(tc.err)
 			assert.Equal(t, tc.isTransient, result,
-				"isTransientError(%q) = %v, want %v", tc.errMsg, result, tc.isTransient)
+				"isTransientError(%v) = %v, want %v", tc.err, result, tc.isTransient)
 		})
 	}
+}
+
+// TestHTTPError verifies the HTTPError type behavior.
+func TestHTTPError(t *testing.T) {
+	t.Run("Error method format", func(t *testing.T) {
+		err := &HTTPError{
+			StatusCode: 500,
+			URL:        "http://example.com/api",
+			Body:       "internal server error",
+		}
+		expected := `unexpected status code 500 for "http://example.com/api": internal server error`
+		assert.Equal(t, expected, err.Error())
+	})
+
+	t.Run("errors.As extraction", func(t *testing.T) {
+		originalErr := &HTTPError{StatusCode: 503, URL: "http://test", Body: "unavailable"}
+		wrappedErr := fmt.Errorf("GetFromAPI(): %w", originalErr)
+
+		var httpErr *HTTPError
+		assert.True(t, errors.As(wrappedErr, &httpErr), "should extract HTTPError from wrapped error")
+		assert.Equal(t, 503, httpErr.StatusCode)
+	})
+
+	t.Run("implements error interface", func(t *testing.T) {
+		var err error = &HTTPError{StatusCode: 404, URL: "http://test", Body: "not found"}
+		assert.Contains(t, err.Error(), "404")
+	})
 }
 
 // TestRetryExhaustion verifies that after exhausting all retries, the adapter
