@@ -249,7 +249,7 @@ func TestTransientErrorsAreRetried(t *testing.T) {
 				"Failing endpoint should have retried on %d error", tc.statusCode)
 
 			// Key ratio assertion: success endpoint should have more requests than failing endpoint
-			// because the failing endpoint spent time in retry delay (100ms) on first request
+			// because the failing endpoint spent time in exponential backoff (100ms*2^0=100ms on first retry)
 			// In 500ms with 50ms between requests:
 			// - Success: ~10 requests (500ms / 50ms)
 			// - Failing: fewer because first cycle had 100ms retry delay
@@ -340,7 +340,7 @@ func TestEndpointsContinueIndependently(t *testing.T) {
 	t.Logf("Request counts - activities: %d, alerts: %d, threats: %d", activities, alerts, threats)
 
 	// Key insight: alerts/threats should make MORE requests than activities because:
-	// - Activities spends time in retry delays (50ms after attempt 1, 100ms after attempt 2)
+	// - Activities spends time in exponential backoff delays (50ms*2^0=50ms, 50ms*2^1=100ms)
 	// - Total retry delay per cycle: 150ms (no delay after final attempt)
 	// - Alerts/threats complete immediately and only wait TimeBetweenRequests (50ms)
 	//
@@ -432,6 +432,76 @@ func TestHTTPError(t *testing.T) {
 	})
 }
 
+// TestExponentialBackoffWithCap verifies exponential backoff with max delay cap.
+func TestExponentialBackoffWithCap(t *testing.T) {
+	var capturedDelays []time.Duration
+	var mu sync.Mutex
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Always return 500 to trigger retries
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(`{"error": "server error"}`))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conf := SentinelOneConfig{
+		Domain:              server.URL,
+		APIKey:              "test-api-key",
+		URLs:                "/web/api/v2.1/activities",
+		TimeBetweenRequests: 2 * time.Second, // Long enough to not interfere
+		RetryBaseDelay:      50 * time.Millisecond,
+		MaxRetryDelay:       150 * time.Millisecond, // Cap at 150ms
+		MaxRetryAttempts:    5,                      // More attempts to test cap
+		ClientOptions: uspclient.ClientOptions{
+			TestSinkMode: true,
+			OnError:      func(err error) {},
+			OnWarning: func(msg string) {
+				// Parse delay from warning message
+				// Message format: "transient error (attempt X/Y), waiting Zms before retry: ..."
+				mu.Lock()
+				defer mu.Unlock()
+				var attempt, maxAttempts int
+				var delayStr string
+				if _, err := fmt.Sscanf(msg, "transient error (attempt %d/%d), waiting %s before retry:", &attempt, &maxAttempts, &delayStr); err == nil {
+					if delay, err := time.ParseDuration(delayStr); err == nil {
+						capturedDelays = append(capturedDelays, delay)
+					}
+				}
+			},
+			DebugLog: func(msg string) {},
+		},
+	}
+
+	adapter, _, err := NewSentinelOneAdapter(ctx, conf)
+	require.NoError(t, err)
+
+	// Wait for one full retry cycle (4 retries with delays)
+	time.Sleep(800 * time.Millisecond)
+
+	mu.Lock()
+	delays := make([]time.Duration, len(capturedDelays))
+	copy(delays, capturedDelays)
+	mu.Unlock()
+
+	// Should have at least 4 delay entries from one retry cycle
+	require.GreaterOrEqual(t, len(delays), 4, "Expected at least 4 retry delays, got %d", len(delays))
+
+	// Verify exponential backoff with cap:
+	// attempt 0: 50ms * 2^0 = 50ms
+	// attempt 1: 50ms * 2^1 = 100ms
+	// attempt 2: 50ms * 2^2 = 200ms -> capped to 150ms
+	// attempt 3: 50ms * 2^3 = 400ms -> capped to 150ms
+	assert.Equal(t, 50*time.Millisecond, delays[0], "First delay should be 50ms")
+	assert.Equal(t, 100*time.Millisecond, delays[1], "Second delay should be 100ms")
+	assert.Equal(t, 150*time.Millisecond, delays[2], "Third delay should be capped at 150ms")
+	assert.Equal(t, 150*time.Millisecond, delays[3], "Fourth delay should be capped at 150ms")
+
+	adapter.Close()
+}
+
 // TestRetryExhaustion verifies that after exhausting all retries, the adapter
 // continues (doesn't stop) but reports the error, with proper retry delays.
 func TestRetryExhaustion(t *testing.T) {
@@ -505,7 +575,7 @@ func TestRetryExhaustion(t *testing.T) {
 	t.Logf("Request counts - failing: %d, success: %d", failing, success)
 
 	// Failing endpoint should have made multiple retry attempts
-	// Each cycle: 3 attempts + delays (50+100=150ms, no delay after final attempt) + TimeBetweenRequests (50ms) ≈ 200ms
+	// Each cycle: 3 attempts + exponential backoff delays (50ms*2^0 + 50ms*2^1 = 150ms) + TimeBetweenRequests (50ms) ≈ 200ms
 	// In 1 second: ~5 cycles × 3 attempts = ~15 requests
 	assert.GreaterOrEqual(t, failing, int32(3),
 		"Should have made at least one full retry cycle (3 attempts)")

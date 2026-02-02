@@ -19,6 +19,7 @@ import (
 const (
 	maxRetryAttempts = 3
 	baseRetryDelay   = 5 * time.Second
+	maxRetryDelay    = 30 * time.Second
 )
 
 // isTransientError determines if an error is transient and should be retried.
@@ -83,6 +84,7 @@ type SentinelOneConfig struct {
 	StartTime           string                  `json:"start_time" yaml:"start_time"`
 	TimeBetweenRequests time.Duration           `json:"time_between_requests" yaml:"time_between_requests"`
 	RetryBaseDelay      time.Duration           `json:"retry_base_delay" yaml:"retry_base_delay"`
+	MaxRetryDelay       time.Duration           `json:"max_retry_delay" yaml:"max_retry_delay"`
 	MaxRetryAttempts    int                     `json:"max_retry_attempts" yaml:"max_retry_attempts"`
 }
 
@@ -109,6 +111,9 @@ func (c *SentinelOneConfig) Validate() error {
 	if c.RetryBaseDelay == 0 {
 		c.RetryBaseDelay = baseRetryDelay
 	}
+	if c.MaxRetryDelay == 0 {
+		c.MaxRetryDelay = maxRetryDelay
+	}
 	if c.MaxRetryAttempts == 0 {
 		c.MaxRetryAttempts = maxRetryAttempts
 	}
@@ -119,6 +124,9 @@ func NewSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig) (*Sentin
 	// Ensure retry defaults are set (these may not be set if Validate() wasn't called)
 	if conf.RetryBaseDelay == 0 {
 		conf.RetryBaseDelay = baseRetryDelay
+	}
+	if conf.MaxRetryDelay == 0 {
+		conf.MaxRetryDelay = maxRetryDelay
 	}
 	if conf.MaxRetryAttempts == 0 {
 		conf.MaxRetryAttempts = maxRetryAttempts
@@ -271,13 +279,17 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 					return
 				}
 
-				// Transient error - log and retry with backoff
+				// Transient error - log and retry with exponential backoff
 				// Only retry if we haven't exhausted all attempts
 				if attempt+1 >= a.conf.MaxRetryAttempts {
 					break // Exit retry loop, will be handled below
 				}
 
-				retryDelay := a.conf.RetryBaseDelay * time.Duration(attempt+1)
+				// Exponential backoff: baseDelay * 2^attempt, capped at MaxRetryDelay
+				retryDelay := a.conf.RetryBaseDelay * time.Duration(1<<attempt)
+				if retryDelay > a.conf.MaxRetryDelay {
+					retryDelay = a.conf.MaxRetryDelay
+				}
 				if a.conf.ClientOptions.OnWarning != nil {
 					a.conf.ClientOptions.OnWarning(fmt.Sprintf(
 						"transient error (attempt %d/%d), waiting %v before retry: %v",
