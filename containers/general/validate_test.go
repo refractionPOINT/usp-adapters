@@ -283,6 +283,192 @@ func TestValidateConfig(t *testing.T) {
 	})
 }
 
+// TestGetClientOptions tests the reflection-based getClientOptions function
+// that extracts ClientOptions from adapter configs based on json tags.
+func TestGetClientOptions(t *testing.T) {
+	t.Run("Syslog", func(t *testing.T) {
+		config := &Configuration{}
+		config.Syslog.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "test-oid-syslog"},
+		}
+
+		opts, err := getClientOptions("syslog", config)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts == nil {
+			t.Fatal("expected non-nil ClientOptions")
+		}
+		if opts.Identity.Oid != "test-oid-syslog" {
+			t.Errorf("expected Oid 'test-oid-syslog', got %q", opts.Identity.Oid)
+		}
+	})
+
+	t.Run("WEL", func(t *testing.T) {
+		config := &Configuration{}
+		config.Wel.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "test-oid-wel"},
+		}
+
+		opts, err := getClientOptions("wel", config)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.Identity.Oid != "test-oid-wel" {
+			t.Errorf("expected Oid 'test-oid-wel', got %q", opts.Identity.Oid)
+		}
+	})
+
+	t.Run("S3", func(t *testing.T) {
+		config := &Configuration{}
+		config.S3.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "test-oid-s3"},
+		}
+
+		opts, err := getClientOptions("s3", config)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.Identity.Oid != "test-oid-s3" {
+			t.Errorf("expected Oid 'test-oid-s3', got %q", opts.Identity.Oid)
+		}
+	})
+
+	t.Run("SqsFiles", func(t *testing.T) {
+		// Test adapter with hyphen in name (sqs-files)
+		config := &Configuration{}
+		config.SqsFiles.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "test-oid-sqs-files"},
+		}
+
+		opts, err := getClientOptions("sqs-files", config)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.Identity.Oid != "test-oid-sqs-files" {
+			t.Errorf("expected Oid 'test-oid-sqs-files', got %q", opts.Identity.Oid)
+		}
+	})
+
+	t.Run("OnePassword", func(t *testing.T) {
+		// Test adapter with numeric prefix (1password)
+		config := &Configuration{}
+		config.OnePassword.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "test-oid-1password"},
+		}
+
+		opts, err := getClientOptions("1password", config)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if opts.Identity.Oid != "test-oid-1password" {
+			t.Errorf("expected Oid 'test-oid-1password', got %q", opts.Identity.Oid)
+		}
+	})
+
+	t.Run("UnknownAdapter", func(t *testing.T) {
+		config := &Configuration{}
+		_, err := getClientOptions("unknown_adapter", config)
+		if err == nil {
+			t.Fatal("expected error for unknown adapter")
+		}
+		if err.Error() != "unknown adapter type: unknown_adapter" {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("ReturnsPointerToActualField", func(t *testing.T) {
+		// Verify that modifying the returned pointer modifies the original config
+		config := &Configuration{}
+		config.Syslog.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "original"},
+		}
+
+		opts, err := getClientOptions("syslog", config)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// Modify via the returned pointer
+		opts.Identity.Oid = "modified"
+
+		// Verify the original config was modified
+		if config.Syslog.ClientOptions.Identity.Oid != "modified" {
+			t.Error("expected modification via returned pointer to affect original config")
+		}
+	})
+
+	t.Run("AllKnownAdapterTypes", func(t *testing.T) {
+		// Comprehensive test that all adapter types work with reflection
+		adapterTypes := []string{
+			"syslog", "pubsub", "gcs", "s3", "stdin", "1password", "bitwarden",
+			"itglue", "sophos", "okta", "office365", "wiz", "wel", "mac_unified_logging",
+			"azure_event_hub", "duo", "cato", "cylance", "entraid", "defender",
+			"slack", "sqs", "sqs-files", "simulator", "file", "evtx", "k8s_pods",
+			"bigquery", "imap", "hubspot", "falconcloud", "mimecast", "ms_graph",
+			"zendesk", "pandadoc", "proofpoint_tap", "box", "sublime",
+			"sentinel_one", "trendmicro",
+		}
+
+		config := &Configuration{}
+		for _, adapterType := range adapterTypes {
+			opts, err := getClientOptions(adapterType, config)
+			if err != nil {
+				t.Errorf("adapter %q: unexpected error: %v", adapterType, err)
+				continue
+			}
+			if opts == nil {
+				t.Errorf("adapter %q: expected non-nil ClientOptions", adapterType)
+			}
+		}
+	})
+
+	t.Run("MatchesJsonTagNotFieldName", func(t *testing.T) {
+		// Verify reflection uses json tag, not Go field name
+		// Field name is "SentinelOne" but json tag is "sentinel_one"
+		config := &Configuration{}
+		config.SentinelOne.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "test-sentinel"},
+		}
+
+		// Should work with json tag name
+		opts, err := getClientOptions("sentinel_one", config)
+		if err != nil {
+			t.Fatalf("expected json tag 'sentinel_one' to work: %v", err)
+		}
+		if opts.Identity.Oid != "test-sentinel" {
+			t.Errorf("expected Oid 'test-sentinel', got %q", opts.Identity.Oid)
+		}
+
+		// Should NOT work with Go field name
+		_, err = getClientOptions("SentinelOne", config)
+		if err == nil {
+			t.Error("expected Go field name 'SentinelOne' to fail (should use json tag)")
+		}
+	})
+
+	t.Run("MultipleConfigsIndependent", func(t *testing.T) {
+		// Verify getting options for one adapter doesn't affect another
+		config := &Configuration{}
+		config.Syslog.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "syslog-oid"},
+		}
+		config.S3.ClientOptions = uspclient.ClientOptions{
+			Identity: uspclient.Identity{Oid: "s3-oid"},
+		}
+
+		syslogOpts, _ := getClientOptions("syslog", config)
+		s3Opts, _ := getClientOptions("s3", config)
+
+		if syslogOpts.Identity.Oid != "syslog-oid" {
+			t.Errorf("syslog Oid changed unexpectedly: %q", syslogOpts.Identity.Oid)
+		}
+		if s3Opts.Identity.Oid != "s3-oid" {
+			t.Errorf("s3 Oid changed unexpectedly: %q", s3Opts.Identity.Oid)
+		}
+	})
+}
+
 func TestConfigValidatorInterface(t *testing.T) {
 	t.Run("SyslogConfigImplementsInterface", func(t *testing.T) {
 		var _ ConfigValidator = &usp_syslog.SyslogConfig{}

@@ -524,101 +524,48 @@ func checkParsingResults(result *limacharlie.USPMappingValidationResponse) error
 }
 
 // getClientOptions extracts the ClientOptions from the config based on adapter type.
+// Uses reflection to find the adapter config field by matching the json tag to the method name,
+// then extracts the embedded ClientOptions field.
 //
 // Parameters:
 //
-//	method - The adapter type name.
+//	method - The adapter type name (must match the json tag on GeneralConfigs field).
 //	configs - The configuration struct.
 //
 // Returns:
 //
 //	*uspclient.ClientOptions - The client options for the adapter.
-//	error - An error if the adapter type is unknown.
+//	error - An error if the adapter type is unknown or doesn't have ClientOptions.
 func getClientOptions(method string, configs *Configuration) (*uspclient.ClientOptions, error) {
-	switch method {
-	case "syslog":
-		return &configs.Syslog.ClientOptions, nil
-	case "pubsub":
-		return &configs.PubSub.ClientOptions, nil
-	case "gcs":
-		return &configs.Gcs.ClientOptions, nil
-	case "s3":
-		return &configs.S3.ClientOptions, nil
-	case "stdin":
-		return &configs.Stdin.ClientOptions, nil
-	case "1password":
-		return &configs.OnePassword.ClientOptions, nil
-	case "bitwarden":
-		return &configs.Bitwarden.ClientOptions, nil
-	case "itglue":
-		return &configs.ITGlue.ClientOptions, nil
-	case "sophos":
-		return &configs.Sophos.ClientOptions, nil
-	case "okta":
-		return &configs.Okta.ClientOptions, nil
-	case "office365":
-		return &configs.Office365.ClientOptions, nil
-	case "wiz":
-		return &configs.Wiz.ClientOptions, nil
-	case "wel":
-		return &configs.Wel.ClientOptions, nil
-	case "mac_unified_logging":
-		return &configs.MacUnifiedLogging.ClientOptions, nil
-	case "azure_event_hub":
-		return &configs.AzureEventHub.ClientOptions, nil
-	case "duo":
-		return &configs.Duo.ClientOptions, nil
-	case "cato":
-		return &configs.Cato.ClientOptions, nil
-	case "cylance":
-		return &configs.Cylance.ClientOptions, nil
-	case "entraid":
-		return &configs.EntraID.ClientOptions, nil
-	case "defender":
-		return &configs.Defender.ClientOptions, nil
-	case "slack":
-		return &configs.Slack.ClientOptions, nil
-	case "sqs":
-		return &configs.Sqs.ClientOptions, nil
-	case "sqs-files":
-		return &configs.SqsFiles.ClientOptions, nil
-	case "simulator":
-		return &configs.Simulator.ClientOptions, nil
-	case "file":
-		return &configs.File.ClientOptions, nil
-	case "evtx":
-		return &configs.Evtx.ClientOptions, nil
-	case "k8s_pods":
-		return &configs.K8sPods.ClientOptions, nil
-	case "bigquery":
-		return &configs.BigQuery.ClientOptions, nil
-	case "imap":
-		return &configs.Imap.ClientOptions, nil
-	case "hubspot":
-		return &configs.HubSpot.ClientOptions, nil
-	case "falconcloud":
-		return &configs.FalconCloud.ClientOptions, nil
-	case "mimecast":
-		return &configs.Mimecast.ClientOptions, nil
-	case "ms_graph":
-		return &configs.MsGraph.ClientOptions, nil
-	case "zendesk":
-		return &configs.Zendesk.ClientOptions, nil
-	case "pandadoc":
-		return &configs.PandaDoc.ClientOptions, nil
-	case "proofpoint_tap":
-		return &configs.ProofpointTap.ClientOptions, nil
-	case "box":
-		return &configs.Box.ClientOptions, nil
-	case "sublime":
-		return &configs.Sublime.ClientOptions, nil
-	case "sentinel_one":
-		return &configs.SentinelOne.ClientOptions, nil
-	case "trendmicro":
-		return &configs.TrendMicro.ClientOptions, nil
-	default:
-		return nil, fmt.Errorf("unknown adapter type: %s", method)
+	// Get the embedded GeneralConfigs struct via pointer to make fields addressable
+	v := reflect.ValueOf(&configs.GeneralConfigs).Elem()
+	t := v.Type()
+
+	// Iterate over fields to find the one with matching json tag
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		jsonTag := field.Tag.Get("json")
+
+		// Extract the tag name (before any comma options)
+		tagName := strings.Split(jsonTag, ",")[0]
+		if tagName != method {
+			continue
+		}
+
+		// Found the matching field, now get its ClientOptions
+		fieldValue := v.Field(i)
+
+		// Look for ClientOptions field in the adapter config struct
+		clientOptsField := fieldValue.FieldByName("ClientOptions")
+		if !clientOptsField.IsValid() {
+			return nil, fmt.Errorf("adapter %s config does not have ClientOptions field", method)
+		}
+
+		// Return pointer to the ClientOptions
+		return clientOptsField.Addr().Interface().(*uspclient.ClientOptions), nil
 	}
+
+	return nil, fmt.Errorf("unknown adapter type: %s", method)
 }
 
 // validateConfig validates the configuration for the specified adapter type.
