@@ -47,6 +47,7 @@ func (c *PubSubConfig) Validate() error {
 	if c.ProjectName == "" {
 		return errors.New("missing project_name")
 	}
+	c.ServiceAccountCreds = strings.TrimSpace(c.ServiceAccountCreds)
 	if c.ServiceAccountCreds == "" {
 		return errors.New("missing service_account_creds")
 	}
