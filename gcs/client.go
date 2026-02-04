@@ -50,6 +50,7 @@ func (c *GCSConfig) Validate() error {
 	if c.BucketName == "" {
 		return errors.New("missing bucket_name")
 	}
+	c.ServiceAccountCreds = strings.TrimSpace(c.ServiceAccountCreds)
 	return nil
 }
 
