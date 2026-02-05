@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+// HTTPError represents an HTTP error with status code for proper error handling.
+// This allows callers to inspect the status code directly without parsing error strings.
+type HTTPError struct {
+	StatusCode int
+	URL        string
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("unexpected status code %d for %q: %s", e.StatusCode, e.URL, e.Body)
+}
+
 // SentinelOneClient represents a SentinelOne API SentinelOneClient
 type SentinelOneClient struct {
 	baseURL               string
@@ -60,7 +72,11 @@ func (c *SentinelOneClient) GetFromAPI(ctx context.Context, endpoint string, opt
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response body %q: %v", req.URL.String(), err)
 		}
-		return nil, fmt.Errorf("unexpected status code %d for %q: %s", resp.StatusCode, req.URL.String(), string(body))
+		return nil, &HTTPError{
+			StatusCode: resp.StatusCode,
+			URL:        req.URL.String(),
+			Body:       string(body),
+		}
 	}
 
 	var result SentinelOnePagedData
