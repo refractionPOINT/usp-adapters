@@ -30,26 +30,6 @@ type BigQueryAdapter struct {
 	cancel    context.CancelFunc
 }
 
-func (bq *BigQueryConfig) Validate() error {
-	if bq.ProjectId == "" {
-		return errors.New("missing project_id")
-	}
-	// this will usually be th same as projectID but could be different if using outside project dataset such as a public data set
-	if bq.BigQueryProject == "" {
-		return errors.New("missing bigquery project name")
-	}
-	if bq.DatasetName == "" {
-		return errors.New("missing dataset_name")
-	}
-	if bq.TableName == "" {
-		return errors.New("missing table_name")
-	}
-	if bq.SqlQuery == "" {
-		return errors.New("missing sql query")
-	}
-	return nil
-}
-
 func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdapter, chan struct{}, error) {
 	// Create bq cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
