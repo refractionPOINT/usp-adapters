@@ -315,9 +315,6 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 		resultCount := response.GetResultCount()
 		totalCount := response.GetTotalCount()
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s: fetched %d results (total: %d, items_in_response: %d, from: %d)",
-			api.Key, resultCount, totalCount, len(data), searchFrom))
-
 		for _, event := range data {
 			var dedupeID string
 			if idValue, exists := event[api.idField]; exists {
@@ -474,7 +471,6 @@ func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]int
 			if rateLimitHits%10 == 0 {
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("cortex xdr %s api has been rate limited %d consecutive times", api.Key, rateLimitHits))
 			}
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("cortex xdr %s api got 429, sleeping 60s before retry (%d consecutive)", api.Key, rateLimitHits))
 			if err := a.sleepContext(60 * time.Second); err != nil {
 				return nil, err
 			}
