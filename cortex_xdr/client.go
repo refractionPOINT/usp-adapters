@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,12 +23,21 @@ import (
 )
 
 const (
+	// queryInterval controls both the polling ticker and the since-cursor overlap.
+	// Each cycle queries [since, cycleTime - queryBuffer] and then sets since back
+	// by queryInterval from cycleTime. This creates an overlap between consecutive
+	// query windows so that events near the boundary are not missed. The dedupe map
+	// prevents duplicate delivery. Changing queryInterval without updating the
+	// ticker (or vice versa) will break the overlap guarantee.
 	queryInterval     = 60
 	incidentsEndpoint = "/public_api/v1/incidents/get_incidents/"
 	alertsEndpoint    = "/public_api/v1/alerts/get_alerts_multi_events/"
 	dedupeWindow      = 30 * time.Minute
 	maxRetries        = 3
 	initialRetryDelay = 5 * time.Second
+	// queryBuffer excludes recent events from queries to avoid race conditions
+	// where the API's total_count includes events not yet fully queryable.
+	queryBuffer = 5 * time.Second
 )
 
 type CortexXDRConfig struct {
@@ -144,6 +154,9 @@ func (c *CortexXDRConfig) Validate() error {
 	if c.FQDN == "" {
 		return errors.New("missing fqdn")
 	}
+	c.FQDN = strings.TrimPrefix(c.FQDN, "https://")
+	c.FQDN = strings.TrimPrefix(c.FQDN, "http://")
+	c.FQDN = strings.TrimRight(c.FQDN, "/")
 	if c.APIKey == "" {
 		return errors.New("missing api_key")
 	}
@@ -171,12 +184,12 @@ func (a *CortexXDRAdapter) Close() error {
 }
 
 type API struct {
-	Endpoint     string
-	Key          string
-	ResponseType CortexXDRResponse
-	Dedupe       map[string]int64
-	timeField    string
-	idField      string
+	Endpoint      string
+	Key           string
+	Dedupe        map[string]int64
+	filterField   string // field name used in API filter/sort requests
+	responseField string // field name in the response data for timestamp
+	idField       string
 }
 
 func (a *CortexXDRAdapter) fetchEvents() {
@@ -187,27 +200,26 @@ func (a *CortexXDRAdapter) fetchEvents() {
 
 	APIs := []API{
 		{
-			Endpoint:     incidentsEndpoint,
-			Key:          "incidents",
-			ResponseType: &CortexXDRIncidentsResponse{},
-			timeField:    "creation_time",
-			idField:      "incident_id",
-			Dedupe:       a.incidentsDedupe,
+			Endpoint:      incidentsEndpoint,
+			Key:           "incidents",
+			filterField:   "creation_time",
+			responseField: "creation_time",
+			idField:       "incident_id",
+			Dedupe:        a.incidentsDedupe,
 		},
 		{
-			Endpoint:     alertsEndpoint,
-			Key:          "alerts",
-			ResponseType: &CortexXDRAlertsResponse{},
-			timeField:    "server_creation_time",
-			idField:      "alert_id",
-			Dedupe:       a.alertsDedupe,
+			Endpoint:      alertsEndpoint,
+			Key:           "alerts",
+			filterField:   "creation_time",
+			responseField: "detection_timestamp",
+			idField:       "alert_id",
+			Dedupe:        a.alertsDedupe,
 		},
 	}
 
 	// Helper function to fetch and process events for all APIs
 	fetchAllAPIs := func() {
 		cycleTime := time.Now()
-		allItems := []utils.Dict{}
 
 		for _, api := range APIs {
 			items, err := a.getEvents(since[api.Key], cycleTime, api)
@@ -217,16 +229,15 @@ func (a *CortexXDRAdapter) fetchEvents() {
 				continue
 			}
 
-			// Only update since time on successful fetch
-			since[api.Key] = cycleTime.Add(-queryInterval * time.Second)
-
 			if len(items) > 0 {
-				allItems = append(allItems, items...)
+				if err := a.submitEvents(items); err != nil {
+					// submitEvents already called Close(), stop processing
+					return
+				}
 			}
-		}
 
-		if len(allItems) > 0 {
-			a.submitEvents(allItems)
+			// Only update since time after successful fetch and ship
+			since[api.Key] = cycleTime.Add(-queryInterval * time.Second)
 		}
 	}
 
@@ -260,24 +271,36 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 	}
 
 	sinceMs := since.UTC().UnixMilli()
+	untilMs := cycleTime.Add(-queryBuffer).UTC().UnixMilli()
 
 	searchFrom := 0
 	pageSize := 100
 
 	for {
+		select {
+		case <-a.ctx.Done():
+			return nil, a.ctx.Err()
+		default:
+		}
+
 		requestBody := map[string]interface{}{
 			"request_data": map[string]interface{}{
 				"filters": []map[string]interface{}{
 					{
-						"field":    api.timeField,
+						"field":    api.filterField,
 						"operator": "gte",
 						"value":    sinceMs,
+					},
+					{
+						"field":    api.filterField,
+						"operator": "lte",
+						"value":    untilMs,
 					},
 				},
 				"search_from": searchFrom,
 				"search_to":   searchFrom + pageSize,
 				"sort": map[string]string{
-					"field":   api.timeField,
+					"field":   api.filterField,
 					"keyword": "asc",
 				},
 			},
@@ -288,13 +311,14 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 			return nil, err
 		}
 
+		data := response.GetData()
 		resultCount := response.GetResultCount()
 		totalCount := response.GetTotalCount()
 
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s: fetched %d results (total: %d, from: %d)",
-			api.Key, resultCount, totalCount, searchFrom))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s: fetched %d results (total: %d, items_in_response: %d, from: %d)",
+			api.Key, resultCount, totalCount, len(data), searchFrom))
 
-		for _, event := range response.GetData() {
+		for _, event := range data {
 			var dedupeID string
 			if idValue, exists := event[api.idField]; exists {
 				dedupeID = fmt.Sprintf("%v", idValue)
@@ -303,13 +327,13 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 			}
 
 			var timeValue time.Time
-			timeField, exists := event[api.timeField]
+			tsValue, exists := event[api.responseField]
 			if !exists {
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s: event missing time field '%s'", api.Key, api.timeField))
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s: event missing time field '%s'", api.Key, api.responseField))
 				continue
 			}
 
-			switch v := timeField.(type) {
+			switch v := tsValue.(type) {
 			case float64:
 				// Handle numeric timestamp (milliseconds)
 				timeValue = time.UnixMilli(int64(v))
@@ -331,7 +355,7 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 					continue
 				}
 			default:
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s: event time field '%s' has unsupported type %T with value: %v", api.Key, api.timeField, timeField, timeField))
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("%s: event time field '%s' has unsupported type %T with value: %v", api.Key, api.responseField, tsValue, tsValue))
 				continue
 			}
 
@@ -348,7 +372,7 @@ func (a *CortexXDRAdapter) getEvents(since time.Time, cycleTime time.Time, api A
 			break
 		}
 
-		searchFrom += pageSize
+		searchFrom += resultCount
 	}
 
 	return allItems, nil
@@ -375,6 +399,7 @@ func (a *CortexXDRAdapter) generateLogHash(logMap map[string]interface{}) string
 func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]interface{}, api API) (CortexXDRResponse, error) {
 	retryDelay := initialRetryDelay
 	retries := 0
+	rateLimitHits := 0
 
 	for {
 		select {
@@ -445,11 +470,23 @@ func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]int
 
 		// Handle rate limiting
 		if status == http.StatusTooManyRequests {
-			a.conf.ClientOptions.OnWarning("getEventsRequest got 429, sleeping 60s before retry")
+			rateLimitHits++
+			if rateLimitHits%10 == 0 {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("cortex xdr %s api has been rate limited %d consecutive times", api.Key, rateLimitHits))
+			}
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("cortex xdr %s api got 429, sleeping 60s before retry (%d consecutive)", api.Key, rateLimitHits))
 			if err := a.sleepContext(60 * time.Second); err != nil {
 				return nil, err
 			}
 			continue
+		}
+
+		// Handle authentication errors as fatal
+		if status == http.StatusUnauthorized || status == http.StatusForbidden {
+			err := fmt.Errorf("cortex xdr %s api authentication failed (%d) - check api_key and api_key_id configuration\nRESPONSE: %s", api.Key, status, string(respBody))
+			a.conf.ClientOptions.OnError(err)
+			a.Close()
+			return nil, err
 		}
 
 		// Handle server errors (5xx) with retry
@@ -470,17 +507,25 @@ func (a *CortexXDRAdapter) doRequest(endpoint string, requestBody map[string]int
 			return nil, fmt.Errorf("cortex xdr %s api non-200: %d\nRESPONSE %s", api.Key, status, string(respBody))
 		}
 
-		err = json.Unmarshal(respBody, &api.ResponseType)
+		var response CortexXDRResponse
+		switch api.Key {
+		case "incidents":
+			response = &CortexXDRIncidentsResponse{}
+		case "alerts":
+			response = &CortexXDRAlertsResponse{}
+		}
+
+		err = json.Unmarshal(respBody, response)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("cortex xdr %s api invalid json: %v\nResponse body: %s", api.Key, err, string(respBody)))
 			return nil, err
 		}
 
-		return api.ResponseType, nil
+		return response, nil
 	}
 }
 
-func (a *CortexXDRAdapter) submitEvents(items []utils.Dict) {
+func (a *CortexXDRAdapter) submitEvents(items []utils.Dict) error {
 	for _, item := range items {
 		msg := &protocol.DataMessage{
 			JsonPayload: item,
@@ -489,16 +534,16 @@ func (a *CortexXDRAdapter) submitEvents(items []utils.Dict) {
 		if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 			if err == uspclient.ErrorBufferFull {
 				a.conf.ClientOptions.OnWarning("stream falling behind")
-				if err := a.uspClient.Ship(msg, 1*time.Hour); err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-					a.Close()
-					return
-				}
-			} else {
+				err = a.uspClient.Ship(msg, 1*time.Hour)
+			}
+			if err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				a.Close()
+				return err
 			}
 		}
 	}
+	return nil
 }
 
 func (a *CortexXDRAdapter) sleepContext(d time.Duration) error {

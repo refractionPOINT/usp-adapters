@@ -11,7 +11,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
-	"github.com/refractionPOINT/usp-adapters/corex_xdr"
+	"github.com/refractionPOINT/usp-adapters/cortex_xdr"
 	"github.com/refractionPOINT/usp-adapters/entraid"
 	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/falconcloud"

@@ -22,7 +22,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
-	usp_cortex_xdr "github.com/refractionPOINT/usp-adapters/corex_xdr"
+	usp_cortex_xdr "github.com/refractionPOINT/usp-adapters/cortex_xdr"
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
