@@ -63,6 +63,7 @@ type SQSFilesConfig struct {
 	BucketPath        string `json:"bucket_path,omitempty" yaml:"bucket_path,omitempty"`
 	FilePath          string `json:"file_path,omitempty" yaml:"file_path,omitempty"`
 	IsDecodeObjectKey bool   `json:"is_decode_object_key,omitempty" yaml:"is_decode_object_key,omitempty"`
+	KeyPrefix         string `json:"key_prefix,omitempty" yaml:"key_prefix,omitempty"`
 	// Optional: alternative to BucketPath
 	Bucket string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
 }
@@ -196,6 +197,16 @@ func (a *SQSFilesAdapter) getBucketRegion(bucket string) (string, error) {
 	return s3manager.GetBucketRegion(a.ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
 }
 
+// getAvailableKeys returns a list of top-level keys from a Dict
+// for use in error messages to help users debug configuration issues
+func getAvailableKeys(d utils.Dict) []string {
+	keys := make([]string, 0, len(d))
+	for k := range d {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 func (a *SQSFilesAdapter) receiveEvents() error {
 	defer close(a.chFiles)
 
@@ -238,10 +249,13 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 			filePaths := d.ExpandableFindString(a.conf.FilePath)
 
 			if bucket == "" {
-				a.conf.ClientOptions.OnError(errors.New("sqsClient.Message: missing bucket"))
+				availableKeys := getAvailableKeys(d)
+				a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.Message: missing bucket - attempted path '%s', available keys in message: %v", a.conf.BucketPath, availableKeys))
 				continue
 			}
 			if len(filePaths) == 0 {
+				availableKeys := getAvailableKeys(d)
+				a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.Message: missing file paths - attempted path '%s', available keys in message: %v", a.conf.FilePath, availableKeys))
 				continue
 			}
 			if err := a.initS3SDKs(bucket); err != nil {
@@ -279,6 +293,10 @@ func (a *SQSFilesAdapter) processFiles() error {
 				a.conf.ClientOptions.OnError(fmt.Errorf("url.QueryUnescape(): %v", err))
 				continue
 			}
+		}
+		// Apply key prefix if configured
+		if a.conf.KeyPrefix != "" {
+			path = a.conf.KeyPrefix + path
 		}
 		startTime := time.Now().UTC()
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s", path))
