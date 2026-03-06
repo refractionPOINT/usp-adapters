@@ -39,6 +39,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/ms_graph"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
+	"github.com/refractionPOINT/usp-adapters/otel"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
 	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
@@ -481,6 +482,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.SentinelOne.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.SentinelOne
 		client, chRunning, err = usp_sentinelone.NewSentinelOneAdapter(ctx, configs.SentinelOne)
+	} else if method == "otel" {
+		configs.OTel.ClientOptions = applyLogging(configs.OTel.ClientOptions)
+		configs.OTel.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.OTel
+		client, chRunning, err = usp_otel.NewOTelAdapter(ctx, configs.OTel)
 	} else if method == "trendmicro" {
 		configs.TrendMicro.ClientOptions = applyLogging(configs.TrendMicro.ClientOptions)
 		configs.TrendMicro.ClientOptions.Architecture = "usp_adapter"
