@@ -2,6 +2,7 @@ package usp_otel
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -169,16 +170,23 @@ func (a *OTelAdapter) Close() error {
 	return err2
 }
 
-func (a *OTelAdapter) shipJSON(eventType string, payload map[string]interface{}, timestampMs uint64) {
-	if timestampMs == 0 {
-		timestampMs = uint64(time.Now().UnixMilli())
+func (a *OTelAdapter) shipProto(eventType string, protoMsg proto.Message) {
+	jsonBytes, err := protojson.Marshal(protoMsg)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("protojson.Marshal(): %v", err))
+		return
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(jsonBytes, &payload); err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("json.Unmarshal(): %v", err))
+		return
 	}
 	msg := &protocol.DataMessage{
 		JsonPayload: payload,
 		EventType:   eventType,
-		TimestampMs: timestampMs,
+		TimestampMs: uint64(time.Now().UnixMilli()),
 	}
-	err := a.uspClient.Ship(msg, a.writeTimeout)
+	err = a.uspClient.Ship(msg, a.writeTimeout)
 	if err == uspclient.ErrorBufferFull {
 		a.conf.ClientOptions.OnWarning("stream falling behind")
 		err = a.uspClient.Ship(msg, 1*time.Hour)
@@ -308,51 +316,16 @@ func marshalOTLPResponse(w http.ResponseWriter, r *http.Request, msg proto.Messa
 	w.Write(respBytes)
 }
 
-// Processing functions
+// Processing functions: pass through the original OTLP request as-is.
 
 func (a *OTelAdapter) processTraces(req *coltracepb.ExportTraceServiceRequest) {
-	for _, rs := range req.ResourceSpans {
-		resource := convertResource(rs.Resource)
-		for _, ss := range rs.ScopeSpans {
-			scope := convertScope(ss.Scope)
-			for _, span := range ss.Spans {
-				record := convertSpan(span)
-				record["resource"] = resource
-				record["scope"] = scope
-				ts := nanoToMs(span.StartTimeUnixNano)
-				a.shipJSON(eventTypeOTelTrace, record, ts)
-			}
-		}
-	}
+	a.shipProto(eventTypeOTelTrace, req)
 }
 
 func (a *OTelAdapter) processMetrics(req *colmetricspb.ExportMetricsServiceRequest) {
-	for _, rm := range req.ResourceMetrics {
-		resource := convertResource(rm.Resource)
-		for _, sm := range rm.ScopeMetrics {
-			scope := convertScope(sm.Scope)
-			for _, metric := range sm.Metrics {
-				record := convertMetric(metric)
-				record["resource"] = resource
-				record["scope"] = scope
-				a.shipJSON(eventTypeOTelMetric, record, 0)
-			}
-		}
-	}
+	a.shipProto(eventTypeOTelMetric, req)
 }
 
 func (a *OTelAdapter) processLogs(req *collogspb.ExportLogsServiceRequest) {
-	for _, rl := range req.ResourceLogs {
-		resource := convertResource(rl.Resource)
-		for _, sl := range rl.ScopeLogs {
-			scope := convertScope(sl.Scope)
-			for _, logRecord := range sl.LogRecords {
-				record := convertLogRecord(logRecord)
-				record["resource"] = resource
-				record["scope"] = scope
-				ts := nanoToMs(logRecord.TimeUnixNano)
-				a.shipJSON(eventTypeOTelLog, record, ts)
-			}
-		}
-	}
+	a.shipProto(eventTypeOTelLog, req)
 }
