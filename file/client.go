@@ -25,13 +25,9 @@ import (
 )
 
 const (
-	defaultWriteTimeout    = 60 * 10
-	defaultPollingInterval = 10 * time.Second
-)
-
-var (
-	inactivityThreshold   = 24 * time.Hour
-	reactivationThreshold = 60 * time.Second
+	defaultWriteTimeout          = 60 * 10
+	defaultPollingInterval       = 10 * time.Second
+	defaultReactivationThreshold = 60 * time.Second
 )
 
 // getFileInode returns the inode number for a given file path.
@@ -57,15 +53,17 @@ type tailInfo struct {
 }
 
 type FileAdapter struct {
-	ctx          context.Context
-	conf         FileConfig
-	wg           sync.WaitGroup
-	uspClient    *uspclient.Client
-	writeTimeout time.Duration
-	tailFiles    map[string]*tailInfo
-	mu           sync.Mutex
-	serialFeed   *semaphore.Weighted
-	lineCb       func(line string) // callback for each line for testing
+	ctx                   context.Context
+	conf                  FileConfig
+	wg                    sync.WaitGroup
+	uspClient             *uspclient.Client
+	writeTimeout          time.Duration
+	tailFiles             map[string]*tailInfo
+	mu                    sync.Mutex
+	serialFeed            *semaphore.Weighted
+	lineCb                func(line string) // callback for each line for testing
+	inactivityThreshold   time.Duration
+	reactivationThreshold time.Duration
 }
 
 func (c *FileConfig) Validate() error {
@@ -112,11 +110,12 @@ func (a *FileAdapter) pollFiles() {
 	a.ctx = ctx
 	defer cancel()
 
-	if a.conf.InactivityThreshold != 0 {
-		inactivityThreshold = time.Duration(a.conf.InactivityThreshold) * time.Second
-	}
+	// Default inactivity threshold is 0 (disabled/never).
+	// Only enable if explicitly set to a positive value in config.
+	a.inactivityThreshold = time.Duration(a.conf.InactivityThreshold) * time.Second
+	a.reactivationThreshold = defaultReactivationThreshold
 	if a.conf.ReactivationThreshold != 0 {
-		reactivationThreshold = time.Duration(a.conf.ReactivationThreshold) * time.Second
+		a.reactivationThreshold = time.Duration(a.conf.ReactivationThreshold) * time.Second
 	}
 
 	isFirstRun := true
@@ -168,7 +167,7 @@ func (a *FileAdapter) pollFiles() {
 				}
 				if info.isInactive {
 					// validate if an inactive file has been modified recently and we need to tail it
-					if now.Sub(modTime) <= reactivationThreshold {
+					if now.Sub(modTime) <= a.reactivationThreshold {
 						a.conf.ClientOptions.OnError(fmt.Errorf("[REACTIVATION] File reactivated: %s | inode=%d | restarting from beginning | mtime=%s",
 							path, currentInode, modTime.Format(time.RFC3339)))
 
@@ -207,9 +206,9 @@ func (a *FileAdapter) pollFiles() {
 					timeSinceModTime := now.Sub(modTime)
 					timeSinceLastData := now.Sub(time.Unix(lastData, 0))
 
-					if timeSinceModTime > inactivityThreshold && timeSinceLastData > inactivityThreshold {
+					if a.inactivityThreshold > 0 && timeSinceModTime > a.inactivityThreshold && timeSinceLastData > a.inactivityThreshold {
 						a.conf.ClientOptions.OnError(fmt.Errorf("[INACTIVITY] File inactive: %s | timeSinceMtime=%s timeSinceData=%s | threshold=%s",
-							path, timeSinceModTime, timeSinceLastData, inactivityThreshold))
+							path, timeSinceModTime, timeSinceLastData, a.inactivityThreshold))
 
 						// Note: We don't call Tell() here to avoid racing with the tail library's internal cleanup
 						// Reactivation will start from offset 0, which is safe even if we miss some data
@@ -256,7 +255,7 @@ func (a *FileAdapter) pollFiles() {
 
 				fileInode := getInodeFromFileInfo(stat)
 
-				if now.Sub(stat.ModTime()) > inactivityThreshold {
+				if a.inactivityThreshold > 0 && now.Sub(stat.ModTime()) > a.inactivityThreshold {
 					a.conf.ClientOptions.OnWarning(fmt.Sprintf("[SKIP] File too old to open: %s | mtime=%s | age=%s",
 						match, stat.ModTime().Format(time.RFC3339), now.Sub(stat.ModTime())))
 					continue
