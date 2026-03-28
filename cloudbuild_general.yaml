@@ -4,65 +4,65 @@ steps:
     id: run-tests
     args: ['go', 'test', './...', '-v']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_linux_64', './containers/general']
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64.exe', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_windows_64.exe', './containers/general']
     env:
       - 'GOOS=windows'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_macos_64', './containers/general']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_macos_arm64', './containers/general']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_linux_arm', './containers/general']
     env:
       - 'GOOS=linux'
       - 'GOARCH=arm'
       - 'GOARM=5'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_linux_arm64', './containers/general']
     env:
       - 'GOOS=linux'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_solaris_amd64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_solaris_amd64', './containers/general']
     env:
       - 'GOOS=solaris'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_aix_ppc64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_aix_ppc64', './containers/general']
     env:
       - 'GOOS=aix'
       - 'GOARCH=ppc64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_freebsd_64', './containers/general']
     env:
       - 'GOOS=freebsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_netbsd_64', './containers/general']
     env:
       - 'GOOS=netbsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_adapter_openbsd_64', './containers/general']
     env:
       - 'GOOS=openbsd'
       - 'GOARCH=amd64'
@@ -71,65 +71,65 @@ steps:
 
 # Connectivity Tester
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_linux_64', './containers/connectivity']
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_windows_64.exe', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_windows_64.exe', './containers/connectivity']
     env:
       - 'GOOS=windows'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_macos_64', './containers/connectivity']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_arm64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_macos_arm64', './containers/connectivity']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_linux_arm', './containers/connectivity']
     env:
       - 'GOOS=linux'
       - 'GOARCH=arm'
       - 'GOARM=5'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_linux_arm64', './containers/connectivity']
     env:
       - 'GOOS=linux'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_solaris_amd64', './containers/general']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_solaris_amd64', './containers/general']
     env:
       - 'GOOS=solaris'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_aix_ppc64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_aix_ppc64', './containers/connectivity']
     env:
       - 'GOOS=aix'
       - 'GOARCH=ppc64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_freebsd_64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_freebsd_64', './containers/connectivity']
     env:
       - 'GOOS=freebsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_netbsd_64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_netbsd_64', './containers/connectivity']
     env:
       - 'GOOS=netbsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
   - name: 'golang:1.24-bullseye'
-    args: ['go', 'build', '-v', '-o', 'lc_connectivity_openbsd_64', './containers/connectivity']
+    args: ['go', 'build', '-v', "-ldflags='-s -w'", '-o', 'lc_connectivity_openbsd_64', './containers/connectivity']
     env:
       - 'GOOS=openbsd'
       - 'GOARCH=amd64'
