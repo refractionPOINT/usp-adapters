@@ -11,6 +11,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
+	"github.com/refractionPOINT/usp-adapters/cortex_xdr"
 	"github.com/refractionPOINT/usp-adapters/entraid"
 	"github.com/refractionPOINT/usp-adapters/evtx"
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
@@ -65,6 +66,7 @@ type GeneralConfigs struct {
 	MacUnifiedLogging usp_mac_unified_logging.MacUnifiedLoggingConfig `json:"mac_unified_logging" yaml:"mac_unified_logging"`
 	AzureEventHub     usp_azure_event_hub.EventHubConfig              `json:"azure_event_hub" yaml:"azure_event_hub"`
 	Duo               usp_duo.DuoConfig                               `json:"duo" yaml:"duo"`
+	CortexXDR		  usp_cortex_xdr.CortexXDRConfig				  `json:"cortex_xdr" yaml:"cortex_xdr"`
 	Gcs               usp_gcs.GCSConfig                               `json:"gcs" yaml:"gcs"`
 	Slack             usp_slack.SlackConfig                           `json:"slack" yaml:"slack"`
 	Sqs               usp_sqs.SQSConfig                               `json:"sqs" yaml:"sqs"`
