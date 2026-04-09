@@ -39,6 +39,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
+	"github.com/refractionPOINT/usp-adapters/unifi_syslog"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
@@ -86,5 +87,6 @@ type GeneralConfigs struct {
 	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
 	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
+	UnifiSyslog       usp_unifi_syslog.UnifiSyslogConfig              `json:"unifi_syslog" yaml:"unifi_syslog"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
 }

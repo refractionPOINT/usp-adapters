@@ -53,6 +53,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
+	"github.com/refractionPOINT/usp-adapters/unifi_syslog"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
@@ -486,6 +487,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.TrendMicro.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.TrendMicro
 		client, chRunning, err = usp_trendmicro.NewTrendMicroAdapter(ctx, configs.TrendMicro)
+	} else if method == "unifi_syslog" {
+		configs.UnifiSyslog.ClientOptions = applyLogging(configs.UnifiSyslog.ClientOptions)
+		configs.UnifiSyslog.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.UnifiSyslog
+		client, chRunning, err = usp_unifi_syslog.NewUnifiSyslogAdapter(ctx, configs.UnifiSyslog)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
