@@ -16,6 +16,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/google_workspace"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
@@ -66,6 +67,7 @@ type GeneralConfigs struct {
 	AzureEventHub     usp_azure_event_hub.EventHubConfig              `json:"azure_event_hub" yaml:"azure_event_hub"`
 	Duo               usp_duo.DuoConfig                               `json:"duo" yaml:"duo"`
 	Gcs               usp_gcs.GCSConfig                               `json:"gcs" yaml:"gcs"`
+	GoogleWorkspace   usp_google_workspace.GoogleWorkspaceConfig      `json:"google_workspace" yaml:"google_workspace"`
 	Slack             usp_slack.SlackConfig                           `json:"slack" yaml:"slack"`
 	Sqs               usp_sqs.SQSConfig                               `json:"sqs" yaml:"sqs"`
 	SqsFiles          usp_sqs_files.SQSFilesConfig                    `json:"sqs-files" yaml:"sqs-files"`

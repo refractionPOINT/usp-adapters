@@ -30,6 +30,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/google_workspace"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
@@ -301,6 +302,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.Gcs.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Gcs
 		client, chRunning, err = usp_gcs.NewGCSAdapter(ctx, configs.Gcs)
+	} else if method == "google_workspace" {
+		configs.GoogleWorkspace.ClientOptions = applyLogging(configs.GoogleWorkspace.ClientOptions)
+		configs.GoogleWorkspace.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.GoogleWorkspace
+		client, chRunning, err = usp_google_workspace.NewGoogleWorkspaceAdapter(ctx, configs.GoogleWorkspace)
 	} else if method == "s3" {
 		configs.S3.ClientOptions = applyLogging(configs.S3.ClientOptions)
 		configs.S3.ClientOptions.Architecture = "usp_adapter"
