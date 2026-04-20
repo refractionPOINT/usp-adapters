@@ -9,6 +9,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
 	"github.com/refractionPOINT/usp-adapters/cylance"
+	"github.com/refractionPOINT/usp-adapters/cynet"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
 	"github.com/refractionPOINT/usp-adapters/entraid"
@@ -59,6 +60,7 @@ type GeneralConfigs struct {
 	Defender          usp_defender.DefenderConfig                     `json:"defender" yaml:"defender"`
 	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
 	Cylance           usp_cylance.CylanceConfig                       `json:"cylance" yaml:"cylance"`
+	Cynet             usp_cynet.CynetConfig                           `json:"cynet" yaml:"cynet"`
 	Okta              usp_okta.OktaConfig                             `json:"okta" yaml:"okta"`
 	Office365         usp_o365.Office365Config                        `json:"office365" yaml:"office365"`
 	Wel               usp_wel.WELConfig                               `json:"wel" yaml:"wel"`
