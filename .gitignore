@@ -15,5 +15,14 @@
 # vendor/
 
 
-#intellij
+#IDEs
 .idea/
+/.zed
+/.vscode
+
+#binary
+/containers/general/general
+
+# logs
+/build_scripts/code_signing/code_signing.log
+venv/
