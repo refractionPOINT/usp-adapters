@@ -337,16 +337,32 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		}
 
 		isCompressed := false
+		rawData := writerAt.Bytes()
 
 		if strings.HasSuffix(item.Key, ".gz") {
 			isCompressed = true
+		} else if utils.IsParquetFile(item.Key, rawData) {
+			// Parquet is binary and columnar, so the proxy's newline
+			// scanner can't process it directly. Convert rows to
+			// newline-delimited JSON here; downstream platforms like
+			// "json" then just work.
+			converted, err := utils.ParquetToJSONLines(rawData)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("parquet decode %s: %v", item.Key, err))
+				return &s3LocalFile{
+					Obj:  item,
+					Data: nil,
+					Err:  err,
+				}
+			}
+			rawData = converted
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", item.Key, time.Since(startTime), item.Size))
 
 		return &s3LocalFile{
 			Obj:          item,
-			Data:         writerAt.Bytes(),
+			Data:         rawData,
 			IsCompressed: isCompressed,
 		}
 	})

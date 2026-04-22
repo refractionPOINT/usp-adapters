@@ -293,14 +293,26 @@ func (a *SQSFilesAdapter) processFiles() error {
 			return err
 		}
 		isCompressed := false
+		rawData := writerAt.Bytes()
 
 		if strings.HasSuffix(path, ".gz") {
 			isCompressed = true
+		} else if utils.IsParquetFile(path, rawData) {
+			// Parquet is binary and columnar, so the proxy's newline
+			// scanner can't process it directly. Convert rows to
+			// newline-delimited JSON here; downstream platforms like
+			// "json" then just work.
+			converted, err := utils.ParquetToJSONLines(rawData)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("parquet decode %s: %v", path, err))
+				continue
+			}
+			rawData = converted
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v", path, time.Since(startTime)))
 
-		a.processEvent(writerAt.Bytes(), isCompressed)
+		a.processEvent(rawData, isCompressed)
 	}
 	return nil
 }
