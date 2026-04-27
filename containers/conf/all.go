@@ -8,6 +8,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	"github.com/refractionPOINT/usp-adapters/cortex_xdr"
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -58,6 +59,7 @@ type GeneralConfigs struct {
 	EntraID           usp_entraid.EntraIDConfig                       `json:"entraid" yaml:"entraid"`
 	Defender          usp_defender.DefenderConfig                     `json:"defender" yaml:"defender"`
 	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
+	CortexXdr         usp_cortex_xdr.CortexXdrConfig                  `json:"cortex_xdr" yaml:"cortex_xdr"`
 	Cylance           usp_cylance.CylanceConfig                       `json:"cylance" yaml:"cylance"`
 	Okta              usp_okta.OktaConfig                             `json:"okta" yaml:"okta"`
 	Office365         usp_o365.Office365Config                        `json:"office365" yaml:"office365"`
