@@ -4,6 +4,7 @@
 package usp_file
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 
 	"github.com/nxadm/tail"
 
@@ -50,6 +52,11 @@ type tailInfo struct {
 	inode      uint64       // Track which inode is being tailed to detect rotation
 	linesRead  atomic.Int64 // Counter for health monitoring
 	bytesRead  atomic.Int64 // Counter for health monitoring
+	// processedAsParquet marks entries created by the Parquet decode path.
+	// These have no tail goroutine — the file was read once, decoded, and
+	// emitted as JSON lines — so the poll loop must skip tail/inactivity
+	// logic for them and only watch for inode-level rotation.
+	processedAsParquet bool
 }
 
 type FileAdapter struct {
@@ -143,6 +150,18 @@ func (a *FileAdapter) pollFiles() {
 				currentInode := getInodeFromFileInfo(stat)
 				lastData := atomic.LoadInt64(&info.lastData)
 
+				// Parquet files are decoded once and have no live tail.
+				// Skip the tail/inactivity logic, but still detect rotation
+				// (inode change) so a replaced file gets re-decoded.
+				if info.processedAsParquet {
+					if currentInode != 0 && info.inode != 0 && currentInode != info.inode {
+						a.conf.ClientOptions.OnError(fmt.Errorf("[ROTATION DETECTED] Parquet file rotated: %s | old_inode=%d new_inode=%d | will reprocess",
+							path, info.inode, currentInode))
+						delete(a.tailFiles, path)
+					}
+					continue
+				}
+
 				// Log detailed file state for debugging
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("[POLL#%d] Checking file: %s | inode: tailed=%d current=%d | size=%d | mtime=%s | lastData=%s | inactive=%v",
 					pollCycle, path, info.inode, currentInode, stat.Size(), modTime.Format(time.RFC3339),
@@ -230,6 +249,14 @@ func (a *FileAdapter) pollFiles() {
 					}
 				}
 			} else {
+				// Parquet entries have no live tail to stop; just drop them.
+				if info.processedAsParquet {
+					a.conf.ClientOptions.DebugLog(fmt.Sprintf("[REMOVAL] Parquet file removed from disk: %s | inode=%d | lines=%d",
+						path, info.inode, info.linesRead.Load()))
+					delete(a.tailFiles, path)
+					continue
+				}
+
 				// file no longer exists on disk, close and remove all the tail resources
 				a.conf.ClientOptions.OnError(fmt.Errorf("[REMOVAL] File removed from disk: %s | inode=%d | lines=%d bytes=%d",
 					path, info.inode, info.linesRead.Load(), info.bytesRead.Load()))
@@ -258,6 +285,29 @@ func (a *FileAdapter) pollFiles() {
 				if a.inactivityThreshold > 0 && now.Sub(stat.ModTime()) > a.inactivityThreshold {
 					a.conf.ClientOptions.OnWarning(fmt.Sprintf("[SKIP] File too old to open: %s | mtime=%s | age=%s",
 						match, stat.ModTime().Format(time.RFC3339), now.Sub(stat.ModTime())))
+					continue
+				}
+
+				// Parquet is binary and columnar — tailing it byte-for-byte
+				// just ships unparseable garbage to the proxy. Detect it
+				// here, decode the whole file once into newline-delimited
+				// JSON, and feed each row through handleLine.
+				isParquet, detectErr := detectParquetFile(match, stat.Size())
+				if detectErr != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("parquet detect %s: %v", match, detectErr))
+				}
+				if isParquet {
+					info := &tailInfo{
+						lastActive:         time.Now(),
+						inode:              fileInode,
+						processedAsParquet: true,
+					}
+					a.tailFiles[match] = info
+					a.wg.Add(1)
+					go func(path string, info *tailInfo) {
+						defer a.wg.Done()
+						a.processParquetFile(path, info)
+					}(match, info)
 					continue
 				}
 
@@ -451,7 +501,9 @@ func (a *FileAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	a.mu.Lock()
 	for _, info := range a.tailFiles {
-		info.tail.Stop()
+		if info.tail != nil {
+			info.tail.Stop()
+		}
 	}
 	a.mu.Unlock()
 	err1 := a.uspClient.Drain(1 * time.Minute)
@@ -462,4 +514,71 @@ func (a *FileAdapter) Close() error {
 	}
 
 	return err2
+}
+
+// parquetMagic is the 4-byte signature at the start and end of a
+// well-formed Parquet file.
+var parquetMagic = []byte{'P', 'A', 'R', '1'}
+
+// detectParquetFile returns true when the path is a Parquet file, either
+// by .parquet extension or by PAR1 magic at both the header and trailer.
+// Magic detection only needs 8 bytes off disk (4 from each end), so cheap
+// enough to run once per newly-discovered file. The size argument lets the
+// caller skip the open() entirely for files too short to carry valid magic.
+func detectParquetFile(path string, size int64) (bool, error) {
+	if strings.HasSuffix(strings.ToLower(path), ".parquet") {
+		return true, nil
+	}
+	if size < 8 {
+		return false, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	buf := make([]byte, 4)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		return false, err
+	}
+	if !bytes.Equal(buf, parquetMagic) {
+		return false, nil
+	}
+	if _, err := f.ReadAt(buf, size-4); err != nil {
+		return false, err
+	}
+	return bytes.Equal(buf, parquetMagic), nil
+}
+
+// processParquetFile reads a Parquet file in full, decodes it into
+// newline-delimited JSON, and feeds each row through handleLine. The
+// sentinel tailInfo is added to the map by the caller before this runs,
+// which prevents the next poll cycle from re-discovering the file while
+// decoding is still in progress.
+func (a *FileAdapter) processParquetFile(path string, info *tailInfo) {
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("[NEW PARQUET] Decoding: %s | inode=%d", path, info.inode))
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("read parquet %s: %v", path, err))
+		return
+	}
+	converted, err := utils.ParquetToJSONLines(data)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("parquet decode %s: %v", path, err))
+		return
+	}
+
+	var lineCount int64
+	for line := range strings.SplitSeq(string(converted), "\n") {
+		if line == "" {
+			continue
+		}
+		a.handleLine(line)
+		lineCount++
+	}
+	info.linesRead.Store(lineCount)
+	info.bytesRead.Store(int64(len(converted)))
+	atomic.StoreInt64(&info.lastData, time.Now().Unix())
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("[PARQUET DONE] %s | rows=%d bytes=%d", path, lineCount, len(converted)))
 }

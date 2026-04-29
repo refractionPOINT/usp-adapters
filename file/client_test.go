@@ -1,7 +1,9 @@
 package usp_file
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +12,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/array"
+	"github.com/apache/arrow/go/v15/arrow/memory"
+	"github.com/apache/arrow/go/v15/parquet"
+	"github.com/apache/arrow/go/v15/parquet/pqarrow"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
@@ -979,4 +986,156 @@ func waitForNewFile(t *testing.T, logCapture *LogCapture, path string, timeout t
 		time.Sleep(100 * time.Millisecond)
 	}
 	return false
+}
+
+// buildTestParquet synthesises a small Parquet file for testing the
+// adapter's decode path. Mirrors the helper in the utils package but is
+// kept here so the file_test stays self-contained.
+func buildTestParquet(t *testing.T, n int) []byte {
+	t.Helper()
+
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "event_type", Type: arrow.BinaryTypes.String},
+		{Name: "session_id", Type: arrow.BinaryTypes.String},
+		{Name: "user", Type: arrow.BinaryTypes.String},
+	}, nil)
+
+	mem := memory.DefaultAllocator
+	rb := array.NewRecordBuilder(mem, schema)
+	defer rb.Release()
+
+	for i := 0; i < n; i++ {
+		rb.Field(0).(*array.StringBuilder).Append("login.success")
+		rb.Field(1).(*array.StringBuilder).Append(fmt.Sprintf("sess-%04d", i))
+		rb.Field(2).(*array.StringBuilder).Append("alice")
+	}
+
+	rec := rb.NewRecord()
+	defer rec.Release()
+	tbl := array.NewTableFromRecords(schema, []arrow.Record{rec})
+	defer tbl.Release()
+
+	var buf bytes.Buffer
+	if err := pqarrow.WriteTable(tbl, &buf, int64(n), parquet.NewWriterProperties(), pqarrow.DefaultWriterProps()); err != nil {
+		t.Fatalf("pqarrow.WriteTable: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func TestDetectParquetFile(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-detect")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	parquetData := buildTestParquet(t, 1)
+
+	// Extension-only: a file named .parquet is parquet even when we
+	// don't peek inside.
+	extPath := filepath.Join(tmpDir, "events.parquet")
+	require.NoError(t, os.WriteFile(extPath, parquetData, 0644))
+
+	got, err := detectParquetFile(extPath, int64(len(parquetData)))
+	require.NoError(t, err)
+	assert.True(t, got)
+
+	// Magic-only: extension is missing but the PAR1 header and trailer
+	// give it away.
+	magicPath := filepath.Join(tmpDir, "events.bin")
+	require.NoError(t, os.WriteFile(magicPath, parquetData, 0644))
+
+	got, err = detectParquetFile(magicPath, int64(len(parquetData)))
+	require.NoError(t, err)
+	assert.True(t, got)
+
+	// Plain text must not match.
+	textPath := filepath.Join(tmpDir, "events.log")
+	require.NoError(t, os.WriteFile(textPath, []byte("hello world\n"), 0644))
+
+	got, err = detectParquetFile(textPath, 12)
+	require.NoError(t, err)
+	assert.False(t, got)
+
+	// Files smaller than the magic window must short-circuit to false.
+	tinyPath := filepath.Join(tmpDir, "tiny.bin")
+	require.NoError(t, os.WriteFile(tinyPath, []byte("PAR1"), 0644))
+
+	got, err = detectParquetFile(tinyPath, 4)
+	require.NoError(t, err)
+	assert.False(t, got)
+}
+
+// TestParquetFileIngest covers the path the customer hit: pointing the
+// file adapter at a directory of Parquet files and expecting one JSON
+// event per row, not raw binary garbage. Reproduces the bug behind
+// "invalid character 's' looking for beginning of value" before the fix.
+func TestParquetFileIngest(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-ingest")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	const rows = 5
+	parquetPath := filepath.Join(tmpDir, "events.parquet")
+	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, rows), 0644))
+
+	receivedLines := make(chan string, 100)
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	require.NoError(t, err)
+
+	mockClientOptions := new(MockClientOptions)
+	mockClientOptions.On("OnError", mock.Anything).Return()
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  mockClientOptions.OnError,
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
+		uspClient:  dummyUSPClient,
+		lineCb: func(line string) {
+			receivedLines <- line
+		},
+	}
+
+	go adapter.pollFiles()
+
+	var collected []string
+	timeout := time.After(5 * time.Second)
+collect:
+	for len(collected) < rows {
+		select {
+		case line := <-receivedLines:
+			collected = append(collected, line)
+		case <-timeout:
+			break collect
+		}
+	}
+
+	require.Len(t, collected, rows, "expected %d rows decoded from parquet, got %d", rows, len(collected))
+
+	// Each emitted line must be valid JSON with the columns from the
+	// parquet schema — that's the contract the proxy depends on.
+	for i, line := range collected {
+		var row map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &row), "row %d not valid JSON: %q", i, line)
+		assert.Equal(t, "login.success", row["event_type"], "row %d event_type", i)
+		assert.Equal(t, "alice", row["user"], "row %d user", i)
+		assert.NotEmpty(t, row["session_id"], "row %d session_id", i)
+	}
+
+	// Sentinel must be in the map and flagged as parquet so subsequent
+	// poll cycles don't re-decode the file.
+	adapter.mu.Lock()
+	info, exists := adapter.tailFiles[parquetPath]
+	require.True(t, exists)
+	assert.True(t, info.processedAsParquet)
+	assert.Nil(t, info.tail, "parquet sentinel must not own a tail")
+	adapter.mu.Unlock()
 }
