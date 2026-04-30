@@ -2,6 +2,7 @@ package usp_file
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1034,7 +1036,7 @@ func TestDetectParquetFile(t *testing.T) {
 	extPath := filepath.Join(tmpDir, "events.parquet")
 	require.NoError(t, os.WriteFile(extPath, parquetData, 0644))
 
-	got, err := detectParquetFile(extPath, int64(len(parquetData)))
+	got, err := detectParquetFile(extPath)
 	require.NoError(t, err)
 	assert.True(t, got)
 
@@ -1043,7 +1045,7 @@ func TestDetectParquetFile(t *testing.T) {
 	magicPath := filepath.Join(tmpDir, "events.bin")
 	require.NoError(t, os.WriteFile(magicPath, parquetData, 0644))
 
-	got, err = detectParquetFile(magicPath, int64(len(parquetData)))
+	got, err = detectParquetFile(magicPath)
 	require.NoError(t, err)
 	assert.True(t, got)
 
@@ -1051,7 +1053,7 @@ func TestDetectParquetFile(t *testing.T) {
 	textPath := filepath.Join(tmpDir, "events.log")
 	require.NoError(t, os.WriteFile(textPath, []byte("hello world\n"), 0644))
 
-	got, err = detectParquetFile(textPath, 12)
+	got, err = detectParquetFile(textPath)
 	require.NoError(t, err)
 	assert.False(t, got)
 
@@ -1059,9 +1061,359 @@ func TestDetectParquetFile(t *testing.T) {
 	tinyPath := filepath.Join(tmpDir, "tiny.bin")
 	require.NoError(t, os.WriteFile(tinyPath, []byte("PAR1"), 0644))
 
-	got, err = detectParquetFile(tinyPath, 4)
+	got, err = detectParquetFile(tinyPath)
 	require.NoError(t, err)
 	assert.False(t, got)
+
+	// .parquet.gz is the Athena UNLOAD / Firehose-to-Parquet pattern;
+	// extension alone is enough — the gzip wrapping hides the magic.
+	gzPath := filepath.Join(tmpDir, "events.parquet.gz")
+	require.NoError(t, os.WriteFile(gzPath, gzipBytes(t, parquetData), 0644))
+
+	got, err = detectParquetFile(gzPath)
+	require.NoError(t, err)
+	assert.True(t, got)
+}
+
+// gzipBytes wraps `data` in a gzip stream — used to build parquet.gz
+// fixtures without committing binary blobs.
+func gzipBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write(data); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestParquetFileIngestGzipped covers the *.parquet.gz path — the
+// adapter must gunzip in-process before the parquet decoder sees the
+// bytes, otherwise the proxy gets gzipped binary garbage the same way
+// the original customer bug surfaced.
+func TestParquetFileIngestGzipped(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-gz")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	const rows = 4
+	gzPath := filepath.Join(tmpDir, "events.parquet.gz")
+	require.NoError(t, os.WriteFile(gzPath, gzipBytes(t, buildTestParquet(t, rows)), 0644))
+
+	receivedLines := make(chan string, 100)
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	require.NoError(t, err)
+	mockClientOptions := new(MockClientOptions)
+	mockClientOptions.On("OnError", mock.Anything).Return()
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  mockClientOptions.OnError,
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
+		uspClient:  dummyUSPClient,
+		lineCb: func(line string) {
+			receivedLines <- line
+		},
+	}
+
+	go adapter.pollFiles()
+
+	var collected []string
+	timeout := time.After(5 * time.Second)
+collect:
+	for len(collected) < rows {
+		select {
+		case line := <-receivedLines:
+			collected = append(collected, line)
+		case <-timeout:
+			break collect
+		}
+	}
+	require.Len(t, collected, rows)
+	for i, line := range collected {
+		var row map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &row), "row %d not valid JSON: %q", i, line)
+		assert.Equal(t, "login.success", row["event_type"])
+	}
+}
+
+// TestParquetFileMalformed verifies that a file that *looks* like
+// parquet (ends in .parquet) but fails to decode cleans up its sentinel
+// so subsequent poll cycles can retry. Without this fix, a corrupt drop
+// silently blocks the path forever.
+func TestParquetFileMalformed(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-bad")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	// .parquet extension forces the decode path; the bytes are nonsense.
+	badPath := filepath.Join(tmpDir, "bad.parquet")
+	require.NoError(t, os.WriteFile(badPath, []byte("PAR1\x00\x00\x00\x00not-a-real-parquet-fileXXXXXXXXXXXXPAR1"), 0644))
+
+	logs := &LogCapture{}
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	require.NoError(t, err)
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  func(err error) { logs.Add(err.Error()) },
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
+		uspClient:  dummyUSPClient,
+	}
+
+	go adapter.pollFiles()
+
+	// Wait long enough for the decode goroutine to run and clean up.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		adapter.mu.Lock()
+		_, exists := adapter.tailFiles[badPath]
+		adapter.mu.Unlock()
+		if !exists && logs.Contains("parquet decode "+badPath) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	assert.True(t, logs.Contains("parquet decode "+badPath), "expected decode error to be logged")
+
+	// Sentinel must be gone so the next poll cycle can retry; without
+	// this the customer would have to restart or rotate the file.
+	adapter.mu.Lock()
+	_, exists := adapter.tailFiles[badPath]
+	adapter.mu.Unlock()
+	assert.False(t, exists, "decode failure should remove the sentinel")
+}
+
+// TestParquetFileRotation verifies that replacing a parquet file (new
+// inode, same path) causes the adapter to re-decode the new content.
+// Models log-rotation patterns common in the file adapter's other tests.
+func TestParquetFileRotation(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-rot")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	parquetPath := filepath.Join(tmpDir, "events.parquet")
+	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, 2), 0644))
+
+	receivedLines := make(chan string, 100)
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	require.NoError(t, err)
+	mockClientOptions := new(MockClientOptions)
+	mockClientOptions.On("OnError", mock.Anything).Return()
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  mockClientOptions.OnError,
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
+		uspClient:  dummyUSPClient,
+		lineCb: func(line string) {
+			receivedLines <- line
+		},
+	}
+
+	go adapter.pollFiles()
+
+	// Drain the first decode (2 rows).
+	for i := 0; i < 2; i++ {
+		select {
+		case <-receivedLines:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout on initial decode (got %d/%d)", i, 2)
+		}
+	}
+
+	// Rotate: rename + write a fresh file with 3 rows. New inode.
+	require.NoError(t, os.Rename(parquetPath, parquetPath+".old"))
+	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, 3), 0644))
+
+	// poll cycle is 10s; allow up to two cycles for rotation detection
+	// + re-decode pickup.
+	deadline := time.Now().Add(25 * time.Second)
+	got := 0
+	for time.Now().Before(deadline) && got < 3 {
+		select {
+		case <-receivedLines:
+			got++
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	assert.Equal(t, 3, got, "rotation should trigger re-decode of new file")
+}
+
+// TestParquetFileAlongsideTail makes sure adding parquet handling didn't
+// break the basic mixed-dir case: a tailed log file and a parquet file
+// in the same glob both work.
+func TestParquetFileAlongsideTail(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-mixed")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	logPath := filepath.Join(tmpDir, "events.log")
+	require.NoError(t, os.WriteFile(logPath, []byte("text-line-1\ntext-line-2\n"), 0644))
+
+	parquetPath := filepath.Join(tmpDir, "events.parquet")
+	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, 2), 0644))
+
+	receivedLines := make(chan string, 100)
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	require.NoError(t, err)
+	mockClientOptions := new(MockClientOptions)
+	mockClientOptions.On("OnError", mock.Anything).Return()
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  mockClientOptions.OnError,
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
+		uspClient:  dummyUSPClient,
+		lineCb: func(line string) {
+			receivedLines <- line
+		},
+	}
+
+	go adapter.pollFiles()
+
+	// Expect 2 text + 2 parquet rows = 4 total.
+	const want = 4
+	collected := map[string]int{"text": 0, "json": 0}
+	timeout := time.After(5 * time.Second)
+	for collected["text"]+collected["json"] < want {
+		select {
+		case line := <-receivedLines:
+			if strings.HasPrefix(line, "{") {
+				collected["json"]++
+			} else {
+				collected["text"]++
+			}
+		case <-timeout:
+			t.Fatalf("timeout: got %v", collected)
+		}
+	}
+	assert.Equal(t, 2, collected["text"], "tailed log lines")
+	assert.Equal(t, 2, collected["json"], "decoded parquet rows")
+}
+
+// TestParquetCloseWaitsForDecode locks down the Close()→Drain ordering
+// fix: a parquet decode in flight must finish shipping before the
+// uspClient is closed, otherwise the rows hit a closed Ship channel and
+// disappear.
+func TestParquetCloseWaitsForDecode(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-close")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	const rows = 50
+	parquetPath := filepath.Join(tmpDir, "events.parquet")
+	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, rows), 0644))
+
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	require.NoError(t, err)
+	mockClientOptions := new(MockClientOptions)
+	mockClientOptions.On("OnError", mock.Anything).Return()
+
+	var lineCount atomic.Int64
+	// Block the line callback long enough to make Close() race the
+	// decode goroutine. If Close() returns before the decode finishes
+	// the second-half lines never get counted.
+	releaseSlowLines := make(chan struct{})
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  mockClientOptions.OnError,
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
+		uspClient:  dummyUSPClient,
+		lineCb: func(line string) {
+			n := lineCount.Add(1)
+			// Hold the goroutine partway through the decode so that
+			// Close() must wait on parquetWg.
+			if n == 5 {
+				<-releaseSlowLines
+			}
+		},
+	}
+
+	go adapter.pollFiles()
+
+	// Wait for the decode to start and reach the blocking line.
+	require.Eventually(t, func() bool { return lineCount.Load() >= 5 }, 5*time.Second, 20*time.Millisecond,
+		"decode goroutine should have started")
+
+	closed := make(chan error, 1)
+	go func() {
+		closed <- adapter.Close()
+	}()
+
+	// If Close() didn't wait, it would return immediately. It should
+	// be blocked on parquetWg until we release the line callback.
+	select {
+	case <-closed:
+		t.Fatal("Close() returned before parquet decode goroutine finished")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(releaseSlowLines)
+
+	select {
+	case err := <-closed:
+		assert.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close() did not return after decode goroutine was unblocked")
+	}
+
+	// All rows must have been counted before Close returned.
+	assert.Equal(t, int64(rows), lineCount.Load(), "every parquet row should be flushed before Close returns")
 }
 
 // TestParquetFileIngest covers the path the customer hit: pointing the

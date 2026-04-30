@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -292,22 +291,13 @@ func (a *SQSFilesAdapter) processFiles() error {
 			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
 			return err
 		}
-		isCompressed := false
-		rawData := writerAt.Bytes()
-
-		if strings.HasSuffix(path, ".gz") {
-			isCompressed = true
-		} else if utils.IsParquetFile(path, rawData) {
-			// Parquet is binary and columnar, so the proxy's newline
-			// scanner can't process it directly. Convert rows to
-			// newline-delimited JSON here; downstream platforms like
-			// "json" then just work.
-			converted, err := utils.ParquetToJSONLines(rawData)
-			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("parquet decode %s: %v", path, err))
-				continue
-			}
-			rawData = converted
+		// PrepareBundleData routes through the parquet decoder when
+		// needed (including gzipped parquet) and otherwise returns the
+		// bytes untouched.
+		rawData, isCompressed, err := utils.PrepareBundleData(path, writerAt.Bytes())
+		if err != nil {
+			a.conf.ClientOptions.OnError(err)
+			continue
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v", path, time.Since(startTime)))

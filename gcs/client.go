@@ -207,25 +207,17 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 			}
 		}
 
-		isCompressed := false
-
-		if strings.HasSuffix(attrs.Name, ".gz") {
-			isCompressed = true
-		} else if utils.IsParquetFile(attrs.Name, objData) {
-			// Parquet is binary and columnar, so the proxy's newline
-			// scanner can't process it directly. Convert rows to
-			// newline-delimited JSON here; downstream platforms like
-			// "json" then just work.
-			converted, err := utils.ParquetToJSONLines(objData)
-			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("parquet decode %s: %v", attrs.Name, err))
-				return &gcsLocalFile{
-					Obj:  obj,
-					Data: nil,
-					Err:  err,
-				}
+		// PrepareBundleData routes through the parquet decoder when
+		// needed (including gzipped parquet) and otherwise returns the
+		// bytes untouched.
+		objData, isCompressed, err := utils.PrepareBundleData(attrs.Name, objData)
+		if err != nil {
+			a.conf.ClientOptions.OnError(err)
+			return &gcsLocalFile{
+				Obj:  obj,
+				Data: nil,
+				Err:  err,
 			}
-			objData = converted
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", attrs.Name, time.Since(startTime), attrs.Size))

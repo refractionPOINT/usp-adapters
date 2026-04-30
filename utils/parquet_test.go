@@ -4,6 +4,7 @@ package utils
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -105,6 +106,99 @@ func TestParquetToJSONLines_SingleRow(t *testing.T) {
 func TestParquetToJSONLines_NotParquet(t *testing.T) {
 	if _, err := ParquetToJSONLines([]byte("this is not parquet at all")); err == nil {
 		t.Fatal("expected error for non-parquet input, got nil")
+	}
+}
+
+func TestParquetToJSONLines_Empty(t *testing.T) {
+	if _, err := ParquetToJSONLines(nil); err == nil {
+		t.Fatal("expected error for nil input, got nil")
+	}
+	if _, err := ParquetToJSONLines([]byte{}); err == nil {
+		t.Fatal("expected error for empty input, got nil")
+	}
+}
+
+func TestPrepareBundleData_PlainParquet(t *testing.T) {
+	data, isCompressed, err := PrepareBundleData("events.parquet", buildTestParquet(t, 2))
+	if err != nil {
+		t.Fatalf("PrepareBundleData: %v", err)
+	}
+	if isCompressed {
+		t.Fatal("plain parquet should not flag isCompressed")
+	}
+	rows := decodeJSONLines(t, data)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+}
+
+func TestPrepareBundleData_GzippedParquet(t *testing.T) {
+	pq := buildTestParquet(t, 3)
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	if _, err := gw.Write(pq); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	data, isCompressed, err := PrepareBundleData("events.parquet.gz", gzBuf.Bytes())
+	if err != nil {
+		t.Fatalf("PrepareBundleData: %v", err)
+	}
+	if isCompressed {
+		t.Fatal("gzipped parquet must be returned uncompressed: adapter peels both layers")
+	}
+	rows := decodeJSONLines(t, data)
+	if len(rows) != 3 {
+		t.Fatalf("expected 3 rows, got %d", len(rows))
+	}
+}
+
+func TestPrepareBundleData_PlainGzipPassthrough(t *testing.T) {
+	// Non-parquet *.gz must keep the existing behaviour: pass through
+	// untouched with isCompressed=true so the proxy gunzips.
+	payload := []byte("just a gzipped log line\n")
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	gw.Write(payload)
+	gw.Close()
+	gzBytes := gzBuf.Bytes()
+
+	data, isCompressed, err := PrepareBundleData("events.log.gz", gzBytes)
+	if err != nil {
+		t.Fatalf("PrepareBundleData: %v", err)
+	}
+	if !isCompressed {
+		t.Fatal("plain *.gz should flag isCompressed=true for proxy-side decompression")
+	}
+	if !bytes.Equal(data, gzBytes) {
+		t.Fatal("plain *.gz must be returned untouched")
+	}
+}
+
+func TestPrepareBundleData_PlainText(t *testing.T) {
+	in := []byte("plain log content\n")
+	data, isCompressed, err := PrepareBundleData("events.log", in)
+	if err != nil {
+		t.Fatalf("PrepareBundleData: %v", err)
+	}
+	if isCompressed {
+		t.Fatal("plain text should not flag isCompressed")
+	}
+	if !bytes.Equal(data, in) {
+		t.Fatal("plain text must be returned untouched")
+	}
+}
+
+func TestPrepareBundleData_GzippedParquet_BadGzip(t *testing.T) {
+	// Name says .parquet.gz but the bytes are not valid gzip — must
+	// surface as an error so the adapter skips the object instead of
+	// shipping garbage.
+	_, _, err := PrepareBundleData("events.parquet.gz", []byte("not gzip"))
+	if err == nil {
+		t.Fatal("expected gunzip error, got nil")
 	}
 }
 
