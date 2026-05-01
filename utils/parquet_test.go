@@ -202,6 +202,118 @@ func TestPrepareBundleData_GzippedParquet_BadGzip(t *testing.T) {
 	}
 }
 
+// TestGunzipBomb verifies that gunzip refuses to decompress past the
+// caller-provided limit. Without this cap, a small malicious .gz of
+// repeated zeros (every adapter consuming user-controlled gz files is
+// exposed) would OOM the host before parquet decoding even started.
+func TestGunzipBomb(t *testing.T) {
+	// 10 MB of zeros gzips down to ~10 KB but expands back to 10 MB.
+	plain := make([]byte, 10*1024*1024)
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	if _, err := gw.Write(plain); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	// Limit is way below the decompressed size — must fail.
+	if _, err := gunzip(gzBuf.Bytes(), 1024); err == nil {
+		t.Fatal("expected limit-exceeded error from gunzip, got nil")
+	}
+
+	// Above the decompressed size — must succeed.
+	out, err := gunzip(gzBuf.Bytes(), int64(len(plain)+1))
+	if err != nil {
+		t.Fatalf("gunzip within limit: %v", err)
+	}
+	if len(out) != len(plain) {
+		t.Fatalf("gunzip output size = %d, want %d", len(out), len(plain))
+	}
+}
+
+// TestParquetToJSONLines_NullValues verifies that null cells survive
+// the parquet→JSON round-trip and surface as JSON null. Without explicit
+// handling, Apache Arrow's GetOneForMarshal can return Go nil which
+// json.Marshal renders correctly — this test pins that contract.
+func TestParquetToJSONLines_NullValues(t *testing.T) {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "a", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "b", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+	}, nil)
+	mem := memory.DefaultAllocator
+	rb := array.NewRecordBuilder(mem, schema)
+	defer rb.Release()
+
+	// Two rows: one fully populated, one fully null.
+	rb.Field(0).(*array.StringBuilder).Append("hello")
+	rb.Field(1).(*array.Int64Builder).Append(42)
+	rb.Field(0).(*array.StringBuilder).AppendNull()
+	rb.Field(1).(*array.Int64Builder).AppendNull()
+
+	rec := rb.NewRecord()
+	defer rec.Release()
+	tbl := array.NewTableFromRecords(schema, []arrow.Record{rec})
+	defer tbl.Release()
+
+	var buf bytes.Buffer
+	if err := pqarrow.WriteTable(tbl, &buf, 2, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps()); err != nil {
+		t.Fatalf("pqarrow.WriteTable: %v", err)
+	}
+
+	out, err := ParquetToJSONLines(buf.Bytes())
+	if err != nil {
+		t.Fatalf("ParquetToJSONLines: %v", err)
+	}
+	rows := decodeJSONLines(t, out)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	if rows[0]["a"] != "hello" {
+		t.Fatalf("row 0 a=%v, want hello", rows[0]["a"])
+	}
+	if got := rows[0]["b"]; got != float64(42) {
+		t.Fatalf("row 0 b=%v (%T), want 42", got, got)
+	}
+	if rows[1]["a"] != nil {
+		t.Fatalf("row 1 a=%v, want JSON null", rows[1]["a"])
+	}
+	if rows[1]["b"] != nil {
+		t.Fatalf("row 1 b=%v, want JSON null", rows[1]["b"])
+	}
+}
+
+// TestParquetToJSONLines_ZeroRows verifies that a valid parquet file
+// with a schema but no row groups produces no output without erroring.
+// Arrow's RecordReader returns false from Next() immediately; we want
+// this surfaced as an empty (rather than nil) byte slice.
+func TestParquetToJSONLines_ZeroRows(t *testing.T) {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "x", Type: arrow.BinaryTypes.String},
+	}, nil)
+	mem := memory.DefaultAllocator
+	rb := array.NewRecordBuilder(mem, schema)
+	defer rb.Release()
+	rec := rb.NewRecord()
+	defer rec.Release()
+	tbl := array.NewTableFromRecords(schema, []arrow.Record{rec})
+	defer tbl.Release()
+
+	var buf bytes.Buffer
+	if err := pqarrow.WriteTable(tbl, &buf, 1, parquet.NewWriterProperties(), pqarrow.DefaultWriterProps()); err != nil {
+		t.Fatalf("pqarrow.WriteTable: %v", err)
+	}
+
+	out, err := ParquetToJSONLines(buf.Bytes())
+	if err != nil {
+		t.Fatalf("ParquetToJSONLines: %v", err)
+	}
+	if len(out) != 0 {
+		t.Fatalf("zero-row parquet should produce empty output, got %d bytes: %q", len(out), out)
+	}
+}
+
 // buildTestParquet synthesises a Parquet file that matches the schema
 // shape we want to exercise: six REQUIRED columns including a
 // timestamp-millis and a JSON-string payload column. Fully synthetic

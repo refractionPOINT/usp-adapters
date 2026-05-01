@@ -1340,12 +1340,22 @@ func TestParquetFileAlongsideTail(t *testing.T) {
 // fix: a parquet decode in flight must finish shipping before the
 // uspClient is closed, otherwise the rows hit a closed Ship channel and
 // disappear.
+//
+// The test is structured so it actively fails when parquetWg.Wait() is
+// removed: each line sleeps a small amount AFTER the goroutine is
+// unblocked, and the post-Close lineCount assertion runs *immediately*
+// (no Eventually). Without the wait, Close returns the moment ctx is
+// cancelled and lineCount is still mid-loop. With the wait, Close
+// blocks until the goroutine drains every row.
 func TestParquetCloseWaitsForDecode(t *testing.T) {
 	tmpDir, err := os.MkdirTemp("", "test-parquet-close")
 	require.NoError(t, err)
 	defer os.RemoveAll(tmpDir)
 
-	const rows = 50
+	const (
+		rows         = 50
+		perLineSleep = 5 * time.Millisecond // 50 rows ≈ 250ms total post-release
+	)
 	parquetPath := filepath.Join(tmpDir, "events.parquet")
 	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, rows), 0644))
 
@@ -1357,9 +1367,6 @@ func TestParquetCloseWaitsForDecode(t *testing.T) {
 	mockClientOptions.On("OnError", mock.Anything).Return()
 
 	var lineCount atomic.Int64
-	// Block the line callback long enough to make Close() race the
-	// decode goroutine. If Close() returns before the decode finishes
-	// the second-half lines never get counted.
 	releaseSlowLines := make(chan struct{})
 	adapter := &FileAdapter{
 		conf: FileConfig{
@@ -1376,44 +1383,48 @@ func TestParquetCloseWaitsForDecode(t *testing.T) {
 		uspClient:  dummyUSPClient,
 		lineCb: func(line string) {
 			n := lineCount.Add(1)
-			// Hold the goroutine partway through the decode so that
-			// Close() must wait on parquetWg.
 			if n == 5 {
-				<-releaseSlowLines
+				<-releaseSlowLines // park here so Close() races a stuck goroutine
+			} else if n > 5 {
+				time.Sleep(perLineSleep) // post-release: make remaining rows take real time
 			}
 		},
 	}
 
 	go adapter.pollFiles()
 
-	// Wait for the decode to start and reach the blocking line.
 	require.Eventually(t, func() bool { return lineCount.Load() >= 5 }, 5*time.Second, 20*time.Millisecond,
-		"decode goroutine should have started")
+		"decode goroutine should have started and parked at row 5")
 
 	closed := make(chan error, 1)
-	go func() {
-		closed <- adapter.Close()
-	}()
+	go func() { closed <- adapter.Close() }()
 
-	// If Close() didn't wait, it would return immediately. It should
-	// be blocked on parquetWg until we release the line callback.
+	// If Close() didn't wait, it would return immediately. While the
+	// decode is parked waiting for releaseSlowLines, Close must block.
 	select {
 	case <-closed:
-		t.Fatal("Close() returned before parquet decode goroutine finished")
+		t.Fatal("Close() returned before parquet decode goroutine finished (parquetWg.Wait missing?)")
 	case <-time.After(200 * time.Millisecond):
 	}
+	require.Equal(t, int64(5), lineCount.Load(), "decode should still be parked at row 5")
 
+	// Release. Without parquetWg.Wait, Close returns the moment ctx
+	// cancellation propagates — well before the remaining 45 rows
+	// (each sleeping perLineSleep) are processed.
 	close(releaseSlowLines)
 
+	var closeErr error
 	select {
-	case err := <-closed:
-		assert.NoError(t, err)
+	case closeErr = <-closed:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close() did not return after decode goroutine was unblocked")
 	}
+	require.NoError(t, closeErr)
 
-	// All rows must have been counted before Close returned.
-	assert.Equal(t, int64(rows), lineCount.Load(), "every parquet row should be flushed before Close returns")
+	// LOAD-BEARING: this runs in the same goroutine as Close return,
+	// no Eventually polling. Without the wait, lineCount would still
+	// be increasing in the background and this would fail.
+	assert.Equal(t, int64(rows), lineCount.Load(), "every parquet row must ship before Close returns")
 }
 
 // TestParquetFileIngest covers the path the customer hit: pointing the
@@ -1490,4 +1501,126 @@ collect:
 	assert.True(t, info.processedAsParquet)
 	assert.Nil(t, info.tail, "parquet sentinel must not own a tail")
 	adapter.mu.Unlock()
+}
+
+// TestParquetSizeCap verifies that a parquet file larger than the
+// configured cap is rejected without OOMing the adapter, and that the
+// failed-decode sentinel is removed so the next poll can retry once
+// the producer fixes the file size.
+func TestParquetSizeCap(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-cap")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	parquetPath := filepath.Join(tmpDir, "events.parquet")
+	parquetData := buildTestParquet(t, 5)
+	require.NoError(t, os.WriteFile(parquetPath, parquetData, 0644))
+
+	logs := &LogCapture{}
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{TestSinkMode: true})
+	require.NoError(t, err)
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  func(err error) { logs.Add(err.Error()) },
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:      make(map[string]*tailInfo),
+		serialFeed:     semaphore.NewWeighted(1),
+		uspClient:      dummyUSPClient,
+		parquetMaxSize: 16, // tiny on purpose: real fixture is several KB
+	}
+
+	go adapter.pollFiles()
+
+	// Wait for the cap error to surface and the sentinel to be removed.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		adapter.mu.Lock()
+		_, exists := adapter.tailFiles[parquetPath]
+		adapter.mu.Unlock()
+		if !exists && logs.Contains("read parquet "+parquetPath) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	assert.True(t, logs.Contains("exceeds parquet cap"), "expected cap-violation error in logs")
+	adapter.mu.Lock()
+	_, exists := adapter.tailFiles[parquetPath]
+	adapter.mu.Unlock()
+	assert.False(t, exists, "cap violation should remove the sentinel so next poll can retry")
+}
+
+// TestParquetInPlaceRewrite verifies that overwriting a parquet file in
+// place (same inode, new bytes) triggers a re-decode. Without size/mtime
+// tracking the poll loop only watches inode and would silently keep
+// shipping the original content.
+func TestParquetInPlaceRewrite(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "test-parquet-rewrite")
+	require.NoError(t, err)
+	defer os.RemoveAll(tmpDir)
+
+	parquetPath := filepath.Join(tmpDir, "events.parquet")
+	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, 2), 0644))
+	originalInode := getFileInode(parquetPath)
+
+	receivedLines := make(chan string, 100)
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{TestSinkMode: true})
+	require.NoError(t, err)
+	mockClientOptions := new(MockClientOptions)
+	mockClientOptions.On("OnError", mock.Anything).Return()
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath:            filepath.Join(tmpDir, "*"),
+			InactivityThreshold: 60,
+			Backfill:            true,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  mockClientOptions.OnError,
+				DebugLog: func(msg string) {},
+			},
+		},
+		tailFiles:  make(map[string]*tailInfo),
+		serialFeed: semaphore.NewWeighted(1),
+		uspClient:  dummyUSPClient,
+		lineCb: func(line string) { receivedLines <- line },
+	}
+
+	go adapter.pollFiles()
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-receivedLines:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout on initial decode (got %d/2)", i)
+		}
+	}
+
+	// Overwrite in place: os.WriteFile truncates rather than unlinking,
+	// so the inode is preserved on Linux. We assert that to be sure
+	// we're really exercising the rewrite path, not a rotation.
+	require.NoError(t, os.WriteFile(parquetPath, buildTestParquet(t, 4), 0644))
+	// Bump mtime explicitly in case the filesystem mtime granularity
+	// is too coarse to record the back-to-back writes.
+	require.NoError(t, os.Chtimes(parquetPath, time.Now().Add(time.Second), time.Now().Add(time.Second)))
+	require.Equal(t, originalInode, getFileInode(parquetPath), "expected in-place rewrite (same inode); test is invalid otherwise")
+
+	// poll cycle is 10s; allow up to two cycles for rewrite detection
+	// + re-decode.
+	deadline := time.Now().Add(25 * time.Second)
+	got := 0
+	for time.Now().Before(deadline) && got < 4 {
+		select {
+		case <-receivedLines:
+			got++
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	assert.Equal(t, 4, got, "in-place rewrite should trigger re-decode of new content")
 }

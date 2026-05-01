@@ -35,18 +35,32 @@ func IsParquetFile(name string, data []byte) bool {
 	return true
 }
 
-// gunzip decompresses gzip-encoded bytes. Used by PrepareBundleData to
-// peel the gzip layer off compressed-parquet objects (e.g. Athena
-// UNLOAD, Firehose-to-Parquet) before the parquet decoder sees them.
-func gunzip(data []byte) ([]byte, error) {
+// MaxDecompressedParquetSize bounds how many bytes the in-process
+// gunzip path will accept from a compressed-parquet object before it
+// errors out. A modest gzip bomb (50 MB of zeros) decompresses to many
+// GB and would OOM the adapter without this cap. 1 GiB is generous for
+// real workloads while still safe on small EDR hosts.
+const MaxDecompressedParquetSize = 1 << 30
+
+// gunzip decompresses gzip-encoded bytes with an upper bound on the
+// output size, returning an error if the limit is exceeded. Used by
+// PrepareBundleData to peel the gzip layer off compressed-parquet
+// objects (e.g. Athena UNLOAD, Firehose-to-Parquet) before the parquet
+// decoder sees them. The limit defends against gzip bombs.
+func gunzip(data []byte, limit int64) ([]byte, error) {
 	r, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, err
 	}
 	defer r.Close()
-	out, err := io.ReadAll(r)
+	// Read one byte past the limit so we can distinguish "fits exactly"
+	// from "would have spilled past the cap".
+	out, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, err
+	}
+	if int64(len(out)) > limit {
+		return nil, fmt.Errorf("decompressed size exceeds %d bytes", limit)
 	}
 	return out, nil
 }
@@ -76,7 +90,7 @@ func PrepareBundleData(name string, rawData []byte) (data []byte, isCompressed b
 		// it. Plain gzipped text files keep the existing pass-through
 		// path: the proxy gunzips and routes through its line scanner.
 		if strings.HasSuffix(base, ".parquet") {
-			decompressed, gzErr := gunzip(rawData)
+			decompressed, gzErr := gunzip(rawData, MaxDecompressedParquetSize)
 			if gzErr != nil {
 				return nil, false, fmt.Errorf("gunzip %s: %w", name, gzErr)
 			}
