@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -292,15 +291,18 @@ func (a *SQSFilesAdapter) processFiles() error {
 			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
 			return err
 		}
-		isCompressed := false
-
-		if strings.HasSuffix(path, ".gz") {
-			isCompressed = true
+		// PrepareBundleData routes through the parquet decoder when
+		// needed (including gzipped parquet) and otherwise returns the
+		// bytes untouched.
+		rawData, isCompressed, err := utils.PrepareBundleData(path, writerAt.Bytes())
+		if err != nil {
+			a.conf.ClientOptions.OnError(err)
+			continue
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v", path, time.Since(startTime)))
 
-		a.processEvent(writerAt.Bytes(), isCompressed)
+		a.processEvent(rawData, isCompressed)
 	}
 	return nil
 }

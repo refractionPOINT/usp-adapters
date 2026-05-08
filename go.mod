@@ -7,6 +7,7 @@ require (
 	cloud.google.com/go/pubsub v1.50.1
 	cloud.google.com/go/storage v1.59.2
 	github.com/Azure/azure-event-hubs-go/v3 v3.6.2
+	github.com/apache/arrow/go/v15 v15.0.2
 	github.com/aws/aws-sdk-go v1.55.8
 	github.com/crowdstrike/gofalcon v0.19.0
 	github.com/duosecurity/duo_api_golang v0.0.0-20250430191550-ac36954387e7
@@ -46,6 +47,7 @@ require (
 	github.com/Azure/go-autorest v14.2.0+incompatible // indirect
 	github.com/Azure/go-autorest/autorest v0.11.30 // indirect
 	github.com/Azure/go-autorest/autorest/adal v0.9.24 // indirect
+	github.com/Azure/go-autorest/autorest/azure/auth v0.5.9 // indirect
 	github.com/Azure/go-autorest/autorest/date v0.3.1 // indirect
 	github.com/Azure/go-autorest/autorest/to v0.4.1 // indirect
 	github.com/Azure/go-autorest/autorest/validation v0.3.2 // indirect
@@ -54,11 +56,13 @@ require (
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/detectors/gcp v1.31.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/exporter/metric v0.55.0 // indirect
 	github.com/GoogleCloudPlatform/opentelemetry-operations-go/internal/resourcemapping v0.55.0 // indirect
+	github.com/JohnCGriffin/overflow v0.0.0-20211019200055-46fa312c352c // indirect
 	github.com/Velocidex/json v0.0.0-20220224052537-92f3c0326e5a // indirect
 	github.com/Velocidex/ordereddict v0.0.0-20250821063524-02dc06e46238 // indirect
 	github.com/Velocidex/pkcs7 v0.0.0-20230220112103-d4ed02e1862a // indirect
 	github.com/Velocidex/yaml/v2 v2.2.8 // indirect
-	github.com/apache/arrow/go/v15 v15.0.2 // indirect
+	github.com/andybalholm/brotli v1.0.5 // indirect
+	github.com/apache/thrift v0.17.0 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
@@ -96,6 +100,7 @@ require (
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-json v0.10.5 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
+	github.com/golang/snappy v0.0.4 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.11 // indirect
@@ -104,11 +109,14 @@ require (
 	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/jpillora/backoff v1.0.0 // indirect
+	github.com/klauspost/asmfmt v1.3.2 // indirect
 	github.com/klauspost/compress v1.18.3 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/magefile/mage v1.15.0 // indirect
 	github.com/mattn/go-colorable v0.1.14 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
+	github.com/minio/asm2plan9s v0.0.0-20200509001527-cdd76441f9d8 // indirect
+	github.com/minio/c2goasm v0.0.0-20190812172519-36a3d3bbc4f3 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/oklog/ulid v1.3.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
