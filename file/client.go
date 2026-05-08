@@ -4,6 +4,8 @@
 package usp_file
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 
 	"github.com/nxadm/tail"
 
@@ -28,6 +31,13 @@ const (
 	defaultWriteTimeout          = 60 * 10
 	defaultPollingInterval       = 10 * time.Second
 	defaultReactivationThreshold = 60 * time.Second
+	// maxParquetFileSize caps how large a single Parquet file we will
+	// load into memory before decoding. Decoding happens in-process
+	// against a full byte slice (the Apache Arrow Go reader needs
+	// random access to the footer), so an unbounded read would let a
+	// stray multi-GB drop OOM the adapter. 1 GiB is generous for
+	// typical analytics drops and still safe on small EDR hosts.
+	maxParquetFileSize = 1 << 30
 )
 
 // getFileInode returns the inode number for a given file path.
@@ -50,12 +60,31 @@ type tailInfo struct {
 	inode      uint64       // Track which inode is being tailed to detect rotation
 	linesRead  atomic.Int64 // Counter for health monitoring
 	bytesRead  atomic.Int64 // Counter for health monitoring
+	// processedAsParquet marks entries created by the Parquet decode path.
+	// These have no tail goroutine — the file was read once, decoded, and
+	// emitted as JSON lines — so the poll loop must skip tail/inactivity
+	// logic for them and only watch for inode-level rotation.
+	processedAsParquet bool
+	// parquetDecoding is true while the parquet decode goroutine is
+	// running. The poll loop checks this before reacting to a rotated
+	// inode so it doesn't race the in-flight decode (which would leave
+	// two decode goroutines shipping the same file's rows).
+	parquetDecoding atomic.Bool
+	// parquetSize and parquetModTime record the file stat at the moment
+	// the decode goroutine read the bytes. The poll loop compares the
+	// current stat against these on later cycles so an in-place rewrite
+	// (no inode change) still triggers a re-decode. Only meaningful
+	// when processedAsParquet is true.
+	parquetSize    int64
+	parquetModTime time.Time
 }
 
 type FileAdapter struct {
 	ctx                   context.Context
+	cancel                context.CancelFunc // cancels ctx on Close so pollFiles exits and stops spawning new tail/parquet goroutines
 	conf                  FileConfig
 	wg                    sync.WaitGroup
+	parquetWg             sync.WaitGroup // separate from wg so Close() can wait for parquet decodes without deadlocking on pollFiles' forever-loop
 	uspClient             *uspclient.Client
 	writeTimeout          time.Duration
 	tailFiles             map[string]*tailInfo
@@ -64,6 +93,11 @@ type FileAdapter struct {
 	lineCb                func(line string) // callback for each line for testing
 	inactivityThreshold   time.Duration
 	reactivationThreshold time.Duration
+	// parquetMaxSize overrides the default maxParquetFileSize cap used
+	// when reading and decompressing parquet files. Zero means "use the
+	// default const". Tests set this to a small value to exercise the
+	// cap without writing 1 GiB of data to disk.
+	parquetMaxSize int64
 }
 
 func (c *FileConfig) Validate() error {
@@ -77,7 +111,13 @@ func (c *FileConfig) Validate() error {
 }
 
 func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan struct{}, error) {
+	// pollCtx is detached from the caller's ctx so the adapter has a
+	// stable lifecycle gated only by Close(); the caller's ctx is still
+	// used below for uspClient construction (existing behaviour).
+	pollCtx, cancel := context.WithCancel(context.Background())
 	a := &FileAdapter{
+		ctx:        pollCtx,
+		cancel:     cancel,
 		conf:       conf,
 		tailFiles:  make(map[string]*tailInfo),
 		serialFeed: semaphore.NewWeighted(1),
@@ -91,6 +131,7 @@ func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan st
 	var err error
 	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
+		cancel()
 		return nil, nil, err
 	}
 
@@ -106,9 +147,16 @@ func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan st
 }
 
 func (a *FileAdapter) pollFiles() {
-	ctx, cancel := context.WithCancel(context.Background())
-	a.ctx = ctx
-	defer cancel()
+	// Tests construct FileAdapter directly without going through
+	// NewFileAdapter, so ctx may be nil here. Provide a fallback that
+	// preserves the original lifecycle for those tests; production
+	// code paths get their ctx wired up by NewFileAdapter.
+	if a.ctx == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		a.ctx = ctx
+		a.cancel = cancel
+		defer cancel()
+	}
 
 	// Default inactivity threshold is 0 (disabled/never).
 	// Only enable if explicitly set to a positive value in config.
@@ -122,6 +170,15 @@ func (a *FileAdapter) pollFiles() {
 	pollCycle := 0
 
 	for {
+		// Honour Close(): exit before doing any more work or spawning
+		// new goroutines. The Sleep at the bottom of the loop also
+		// uses ctx so a cancelled adapter shuts down promptly instead
+		// of after a full poll interval.
+		if a.ctx.Err() != nil {
+			a.conf.ClientOptions.DebugLog("[POLL] context cancelled, exiting poll loop")
+			return
+		}
+
 		pollCycle++
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("[POLL#%d] Starting poll cycle for pattern: %s", pollCycle, a.conf.FilePath))
 
@@ -142,6 +199,33 @@ func (a *FileAdapter) pollFiles() {
 				modTime := stat.ModTime()
 				currentInode := getInodeFromFileInfo(stat)
 				lastData := atomic.LoadInt64(&info.lastData)
+
+				// Parquet files are decoded once and have no live tail.
+				// Skip the tail/inactivity logic, but still detect a
+				// re-write so the new content gets shipped:
+				//   - inode change: classic rotation (rename + create)
+				//   - same inode, different size or mtime: in-place
+				//     rewrite (truncate + write or `>` redirect)
+				// Only act once the in-flight decode (if any) has
+				// finished — otherwise we'd spawn a second decode for
+				// the same path while the first is still shipping rows.
+				if info.processedAsParquet {
+					if info.parquetDecoding.Load() {
+						continue
+					}
+					rotated := currentInode != 0 && info.inode != 0 && currentInode != info.inode
+					rewrittenInPlace := !rotated && (stat.Size() != info.parquetSize || !modTime.Equal(info.parquetModTime))
+					if rotated {
+						a.conf.ClientOptions.OnError(fmt.Errorf("[ROTATION DETECTED] Parquet file rotated: %s | old_inode=%d new_inode=%d | will reprocess",
+							path, info.inode, currentInode))
+						delete(a.tailFiles, path)
+					} else if rewrittenInPlace {
+						a.conf.ClientOptions.OnError(fmt.Errorf("[REWRITE DETECTED] Parquet file rewritten in place: %s | old_size=%d new_size=%d old_mtime=%s new_mtime=%s | will reprocess",
+							path, info.parquetSize, stat.Size(), info.parquetModTime.Format(time.RFC3339), modTime.Format(time.RFC3339)))
+						delete(a.tailFiles, path)
+					}
+					continue
+				}
 
 				// Log detailed file state for debugging
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("[POLL#%d] Checking file: %s | inode: tailed=%d current=%d | size=%d | mtime=%s | lastData=%s | inactive=%v",
@@ -230,6 +314,14 @@ func (a *FileAdapter) pollFiles() {
 					}
 				}
 			} else {
+				// Parquet entries have no live tail to stop; just drop them.
+				if info.processedAsParquet {
+					a.conf.ClientOptions.DebugLog(fmt.Sprintf("[REMOVAL] Parquet file removed from disk: %s | inode=%d | lines=%d",
+						path, info.inode, info.linesRead.Load()))
+					delete(a.tailFiles, path)
+					continue
+				}
+
 				// file no longer exists on disk, close and remove all the tail resources
 				a.conf.ClientOptions.OnError(fmt.Errorf("[REMOVAL] File removed from disk: %s | inode=%d | lines=%d bytes=%d",
 					path, info.inode, info.linesRead.Load(), info.bytesRead.Load()))
@@ -246,6 +338,13 @@ func (a *FileAdapter) pollFiles() {
 		}
 
 		for _, match := range matches {
+			// Don't spawn new tail/parquet goroutines once Close() has
+			// signalled shutdown. parquetWg.Wait() in Close relies on
+			// no new Add(1) happening after cancel; we synchronise on
+			// a.mu (held throughout this loop) to make that safe.
+			if a.ctx.Err() != nil {
+				break
+			}
 			if _, ok := a.tailFiles[match]; !ok {
 				stat, err := os.Stat(match)
 				if err != nil {
@@ -254,6 +353,32 @@ func (a *FileAdapter) pollFiles() {
 				}
 
 				fileInode := getInodeFromFileInfo(stat)
+
+				// Parquet detection runs *before* the inactivity-skip
+				// check below: parquet drops are typically one-shot
+				// daily/hourly files that may be older than the tail
+				// inactivity threshold but still need decoding. Tailing
+				// them byte-for-byte ships unparseable binary garbage,
+				// so we always read+decode them in full when found.
+				isParquet, detectErr := detectParquetFile(match)
+				if detectErr != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("parquet detect %s: %v", match, detectErr))
+				}
+				if isParquet {
+					info := &tailInfo{
+						lastActive:         time.Now(),
+						inode:              fileInode,
+						processedAsParquet: true,
+					}
+					info.parquetDecoding.Store(true)
+					a.tailFiles[match] = info
+					a.parquetWg.Add(1)
+					go func(path string, info *tailInfo) {
+						defer a.parquetWg.Done()
+						a.processParquetFile(path, info)
+					}(match, info)
+					continue
+				}
 
 				if a.inactivityThreshold > 0 && now.Sub(stat.ModTime()) > a.inactivityThreshold {
 					a.conf.ClientOptions.OnWarning(fmt.Sprintf("[SKIP] File too old to open: %s | mtime=%s | age=%s",
@@ -306,7 +431,13 @@ func (a *FileAdapter) pollFiles() {
 		a.mu.Unlock()
 
 		isFirstRun = false
-		time.Sleep(defaultPollingInterval)
+		// select-on-Done so Close() doesn't have to wait a full poll
+		// interval for the loop to wake up and notice the cancellation.
+		select {
+		case <-time.After(defaultPollingInterval):
+		case <-a.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -449,11 +580,36 @@ func (a *FileAdapter) handleLine(line string) {
 
 func (a *FileAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
+
+	// Cancel ctx first so pollFiles stops spawning new tail/parquet
+	// goroutines on its next iteration; without this, Close() races
+	// the poll loop and rows can ship to a closed uspClient.
+	if a.cancel != nil {
+		a.cancel()
+	}
+
+	// Acquire a.mu briefly: if pollFiles is mid-cycle, this blocks
+	// until it releases the lock — at which point any goroutines it
+	// was spawning have already incremented parquetWg, so the Wait
+	// below sees them.
 	a.mu.Lock()
 	for _, info := range a.tailFiles {
-		info.tail.Stop()
+		if info.tail != nil {
+			info.tail.Stop()
+		}
 	}
 	a.mu.Unlock()
+
+	// Wait for any in-flight parquet decode goroutines to finish their
+	// per-row Ship calls before draining and closing the uspClient.
+	// `parquetWg` is separate from `a.wg` because `a.wg` tracks the
+	// pollFiles forever-loop too; if Close cancels ctx that loop will
+	// exit, so we then wait on `a.wg` for tail handlers and the poll
+	// loop to drain. This mirrors the parquet path: tail goroutines
+	// can also be mid-`handleLine→Ship` when Close is called.
+	a.parquetWg.Wait()
+	a.wg.Wait()
+
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := a.uspClient.Close()
 
@@ -462,4 +618,178 @@ func (a *FileAdapter) Close() error {
 	}
 
 	return err2
+}
+
+// detectParquetFile returns true when the path is a Parquet file, either
+// by .parquet extension (with optional .gz suffix) or by PAR1 magic at
+// both the header and trailer. Magic detection re-stats the file inside
+// the function so a concurrent writer can't shrink the file between the
+// caller's stat and our ReadAt and have us read past EOF — partial-write
+// errors are reported as "not parquet, retry next poll" rather than
+// short-circuiting the file into the tail-as-text path with the wrong
+// content.
+func detectParquetFile(path string) (bool, error) {
+	lower := strings.ToLower(path)
+	if strings.HasSuffix(lower, ".parquet") {
+		return true, nil
+	}
+	if base, isGz := strings.CutSuffix(lower, ".gz"); isGz && strings.HasSuffix(base, ".parquet") {
+		return true, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	size := stat.Size()
+	if size < 8 {
+		return false, nil
+	}
+	buf := make([]byte, 4)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		// A short read here means the file changed under us; treat it
+		// as "not parquet, retry next poll" rather than surfacing the
+		// error and falling through to tail-as-text.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !bytes.Equal(buf, utils.ParquetMagic) {
+		return false, nil
+	}
+	if _, err := f.ReadAt(buf, size-4); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return false, nil
+		}
+		return false, err
+	}
+	return bytes.Equal(buf, utils.ParquetMagic), nil
+}
+
+// readParquetBytes loads the whole Parquet file into memory, peeling a
+// gzip layer first when the path looks like *.parquet.gz (Athena UNLOAD
+// and Firehose-to-Parquet both produce this). The sizeCap bounds both
+// the raw file read and the post-gunzip plain-text size so a multi-GB
+// drop or a gzip bomb can't OOM the adapter. Returns the file's size
+// and mtime alongside the bytes so callers can detect later in-place
+// rewrites without re-stat'ing.
+func readParquetBytes(path string, sizeCap int64) (data []byte, size int64, modTime time.Time, err error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, time.Time{}, err
+	}
+	defer f.Close()
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, 0, time.Time{}, err
+	}
+	size = stat.Size()
+	modTime = stat.ModTime()
+
+	if size > sizeCap {
+		return nil, size, modTime, fmt.Errorf("file size %d exceeds parquet cap %d", size, sizeCap)
+	}
+
+	// Bound the read end-to-end so we never allocate more than
+	// sizeCap+1 bytes, regardless of TOCTOU between stat and read or
+	// of the decompressed size when the path is gzipped. The cap is
+	// applied at whichever stage produces the bytes the parquet
+	// decoder will see — either the raw file, or the gunzipped stream
+	// for *.parquet.gz objects.
+	var src io.Reader
+	if base, isGz := strings.CutSuffix(strings.ToLower(path), ".gz"); isGz && strings.HasSuffix(base, ".parquet") {
+		gz, gzErr := gzip.NewReader(f)
+		if gzErr != nil {
+			return nil, size, modTime, fmt.Errorf("gunzip: %w", gzErr)
+		}
+		defer gz.Close()
+		src = io.LimitReader(gz, sizeCap+1)
+	} else {
+		src = io.LimitReader(f, sizeCap+1)
+	}
+
+	data, err = io.ReadAll(src)
+	if err != nil {
+		return nil, size, modTime, err
+	}
+	if int64(len(data)) > sizeCap {
+		return nil, size, modTime, fmt.Errorf("payload exceeds parquet cap %d", sizeCap)
+	}
+	return data, size, modTime, nil
+}
+
+// parquetSizeCap returns the size cap to apply when reading parquet
+// files. Tests can override it via the parquetMaxSize field; production
+// code paths (NewFileAdapter) leave the field zero and pick up the
+// const default.
+func (a *FileAdapter) parquetSizeCap() int64 {
+	if a.parquetMaxSize > 0 {
+		return a.parquetMaxSize
+	}
+	return maxParquetFileSize
+}
+
+// processParquetFile reads a Parquet file in full, decodes it into
+// newline-delimited JSON, and feeds each row through handleLine. The
+// sentinel tailInfo is added to the map (with parquetDecoding=true) by
+// the caller before this runs, which prevents the next poll cycle from
+// reacting to mid-decode rotation. On any failure the sentinel is
+// removed (only if the slot still points at *this* info) so the next
+// poll cycle can retry rather than silently blocking the file forever.
+func (a *FileAdapter) processParquetFile(path string, info *tailInfo) {
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("[NEW PARQUET] Decoding: %s | inode=%d", path, info.inode))
+	defer info.parquetDecoding.Store(false)
+
+	data, size, modTime, err := readParquetBytes(path, a.parquetSizeCap())
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("read parquet %s: %v", path, err))
+		a.dropTailEntryIfMatch(path, info)
+		return
+	}
+	// Record what we actually read so the poll loop can detect a later
+	// in-place rewrite (no inode change but size/mtime moved).
+	info.parquetSize = size
+	info.parquetModTime = modTime
+
+	converted, err := utils.ParquetToJSONLines(data)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("parquet decode %s: %v", path, err))
+		a.dropTailEntryIfMatch(path, info)
+		return
+	}
+
+	// Increment linesRead per row so health logs that hit mid-decode
+	// (e.g. [ROTATION] / [REMOVAL]) report a meaningful count instead
+	// of zero. bytes.SplitSeq avoids the string(converted) copy that
+	// strings.SplitSeq would require, halving peak memory.
+	for line := range bytes.SplitSeq(converted, []byte{'\n'}) {
+		if len(line) == 0 {
+			continue
+		}
+		a.handleLine(string(line))
+		info.linesRead.Add(1)
+	}
+	info.bytesRead.Store(int64(len(converted)))
+	atomic.StoreInt64(&info.lastData, time.Now().Unix())
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("[PARQUET DONE] %s | rows=%d bytes=%d", path, info.linesRead.Load(), len(converted)))
+}
+
+// dropTailEntryIfMatch removes a tailFiles entry under the adapter
+// mutex, but only if the slot still points at the tailInfo we expect.
+// This prevents a failed parquet decode goroutine from clobbering a
+// freshly-registered entry that was put in place after the original
+// file was removed and recreated. Without the identity check, the
+// poll loop would silently spawn a third decode for the same path on
+// the next cycle (sentinel gone → looks "new" again).
+func (a *FileAdapter) dropTailEntryIfMatch(path string, info *tailInfo) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.tailFiles[path] == info {
+		delete(a.tailFiles, path)
+	}
 }
