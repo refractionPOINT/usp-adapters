@@ -30,6 +30,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/harmony"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
@@ -441,6 +442,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.FalconCloud.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.FalconCloud
 		client, chRunning, err = usp_falconcloud.NewFalconCloudAdapter(ctx, configs.FalconCloud)
+	} else if method == "harmony" {
+		configs.Harmony.ClientOptions = applyLogging(configs.Harmony.ClientOptions)
+		configs.Harmony.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Harmony
+		client, chRunning, err = usp_harmony.NewHarmonyAdapter(ctx, configs.Harmony)
 	} else if method == "mimecast" {
 		configs.Mimecast.ClientOptions = applyLogging(configs.Mimecast.ClientOptions)
 		configs.Mimecast.ClientOptions.Architecture = "usp_adapter"
