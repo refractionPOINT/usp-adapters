@@ -74,9 +74,11 @@ type EventsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 
 	// CloudServices to pull events for. Each is queried independently.
-	// Examples: "Harmony Endpoint", "Harmony Email and Collaboration",
-	// "Harmony Mobile", "Harmony Connect", "Harmony Browse". Empty enables
-	// the full Harmony suite.
+	// Names must match the gateway exactly — the Email service is
+	// "Harmony Email & Collaboration" (ampersand, not the word "and"); the
+	// gateway rejects the "and" spelling. Empty enables the full Harmony
+	// suite ("Harmony Endpoint", "Harmony Email & Collaboration",
+	// "Harmony Mobile", "Harmony Connect", "Harmony Browse").
 	CloudServices []string `json:"cloud_services" yaml:"cloud_services"`
 
 	// Optional Infinity Events query filter applied to every cloud service.
@@ -101,6 +103,14 @@ type RestoreRequestsConfig struct {
 	// How far back to search for restore-requested emails. Defaults to 30 days
 	// (typical quarantine retention window).
 	Lookback time.Duration `json:"lookback" yaml:"lookback"`
+
+	// IncludeResolved, when true, also issues queries filtered on isRestored
+	// and isRestoreDeclined. The default (false) only queries
+	// isRestoreRequested=true, which assumes that flag stays set after the
+	// admin acts on the request. If your tenant clears the flag on
+	// resolution, enable this to ensure the "restored" / "declined"
+	// transitions are still captured. Dedup eliminates any overlap.
+	IncludeResolved bool `json:"include_resolved" yaml:"include_resolved"`
 }
 
 type HarmonyConfig struct {
@@ -211,12 +221,23 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 		return nil, nil, err
 	}
 
-	if conf.Deduper == nil {
-		d, err := utils.NewLocalDeduper(1*time.Hour, 24*time.Hour)
+	// The deduper is only used by the restore-request source. Size its TTL
+	// to cover the full lookback window so a still-pending request — which
+	// the gateway will keep returning every poll for as long as it remains
+	// in the lookback window — doesn't fall out of dedup and get re-emitted
+	// as if it were new. Floor at 24h for sanity even when Lookback is tiny.
+	ownedDeduper := false
+	if conf.RestoreRequests.Enabled && conf.Deduper == nil {
+		ttl := conf.RestoreRequests.Lookback + 1*time.Hour
+		if ttl < 24*time.Hour {
+			ttl = 24 * time.Hour
+		}
+		d, err := utils.NewLocalDeduper(1*time.Hour, ttl)
 		if err != nil {
 			return nil, nil, err
 		}
 		conf.Deduper = d
+		ownedDeduper = true
 	}
 
 	a := &HarmonyAdapter{
@@ -226,9 +247,19 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 		chStopped: make(chan struct{}),
 	}
 
+	// closeOwnedOnFail releases the deduper goroutine on error paths so the
+	// constructor doesn't leak it. We only close the deduper we created
+	// ourselves — a caller-supplied one is the caller's to manage.
+	closeOwnedOnFail := func() {
+		if ownedDeduper && a.conf.Deduper != nil {
+			a.conf.Deduper.Close()
+		}
+	}
+
 	var err error
 	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
+		closeOwnedOnFail()
 		return nil, nil, err
 	}
 
@@ -452,9 +483,30 @@ func (a *HarmonyAdapter) fetchRestoreRequestsForSaas(saas string) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony restore-requests worker exiting (saas=%q)", saas))
 
+	// Filters to issue per poll. The primary pass catches every pending and
+	// post-decision entity if the gateway keeps isRestoreRequested set after
+	// the admin acts. When IncludeResolved is set we additionally search by
+	// isRestored=true and isRestoreDeclined=true so the transition is still
+	// captured if the tenant clears the original flag on resolution. Dedup
+	// suppresses any overlap.
+	filters := []utils.Dict{
+		{"saasAttrName": "entityPayload.isRestoreRequested", "saasAttrOp": "is", "saasAttrValue": "true"},
+	}
+	if a.conf.RestoreRequests.IncludeResolved {
+		filters = append(filters,
+			utils.Dict{"saasAttrName": "entityPayload.isRestored", "saasAttrOp": "is", "saasAttrValue": "true"},
+			utils.Dict{"saasAttrName": "entityPayload.isRestoreDeclined", "saasAttrOp": "is", "saasAttrValue": "true"},
+		)
+	}
+
 	for {
-		if err := a.runOneRestoreRequestsQuery(saas); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[restore_requests:%s]: %v", saas, err))
+		for _, f := range filters {
+			if a.doStop.IsSet() {
+				return
+			}
+			if err := a.runOneRestoreRequestsQuery(saas, f); err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("harmony[restore_requests:%s:%s]: %v", saas, f["saasAttrName"], err))
+			}
 		}
 		if a.doStop.WaitFor(a.conf.RestoreRequests.PollInterval) {
 			return
@@ -462,13 +514,13 @@ func (a *HarmonyAdapter) fetchRestoreRequestsForSaas(saas string) {
 	}
 }
 
-// runOneRestoreRequestsQuery scrolls through every email entity whose
-// isRestoreRequested flag is true within the configured lookback window and
-// ships each entity once per (entityId, entityUpdated) pair. This naturally
-// emits transitions (pending → restored, pending → declined) as the server
-// bumps entityUpdated on state change, without re-emitting still-pending
-// requests on subsequent polls.
-func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string) error {
+// runOneRestoreRequestsQuery scrolls through every email entity matching the
+// supplied extended filter within the configured lookback window and ships
+// each entity once per (entityId, entityUpdated) pair. The gateway bumps
+// entityUpdated on every state change, which is how we naturally surface
+// transitions (pending → restored, pending → declined) without re-emitting
+// still-pending requests on subsequent polls.
+func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter utils.Dict) error {
 	saasEntity, ok := defaultRestoreSaasEntity[saas]
 	if !ok {
 		return fmt.Errorf("unsupported saas %q", saas)
@@ -490,14 +542,8 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string) error {
 					"startDate":  startDate,
 					"endDate":    endDate,
 				},
-				"entityExtendedFilter": []utils.Dict{
-					{
-						"saasAttrName":  "entityPayload.isRestoreRequested",
-						"saasAttrOp":    "is",
-						"saasAttrValue": "true",
-					},
-				},
-				"scrollId": scrollID,
+				"entityExtendedFilter": []utils.Dict{extendedFilter},
+				"scrollId":             scrollID,
 			},
 		}
 
@@ -733,15 +779,16 @@ func marshalBody(body utils.Dict) ([]byte, error) {
 	return b, nil
 }
 
+// extractRecordTime returns the timestamp embedded in an Infinity Events
+// record, used to advance the per-service cursor. RFC3339Nano accepts both
+// fractional and non-fractional seconds, so a single parse call covers both
+// the docs' "2020-01-01T00:00:00.000Z" form and the bare RFC3339 form.
 func extractRecordTime(rec utils.Dict) time.Time {
 	if rec == nil {
 		return time.Time{}
 	}
 	for _, key := range []string{"time", "eventTime", "timestamp"} {
 		if s, ok := rec.GetString(key); ok && s != "" {
-			if t, err := time.Parse(time.RFC3339, s); err == nil {
-				return t
-			}
 			if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 				return t
 			}
