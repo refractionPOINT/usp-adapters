@@ -563,8 +563,15 @@ func (a *HarmonyAdapter) waitForEventsTask(taskID string) ([]string, error) {
 			details := []string{}
 			if rawErrs, ok := data.GetList("errors"); ok {
 				for _, e := range rawErrs {
+					// Today the gateway emits plain strings here. JSON-marshal
+					// anything else so the warning still carries the detail if
+					// Check Point ever switches to structured error objects.
 					if s, ok := e.(string); ok {
 						details = append(details, s)
+						continue
+					}
+					if b, err := json.Marshal(e); err == nil {
+						details = append(details, string(b))
 					}
 				}
 			}
