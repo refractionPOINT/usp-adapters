@@ -303,6 +303,12 @@ type fakeGateway struct {
 	// Records returned by laas retrieve, optionally split into multiple pages.
 	eventPages [][]utils.Dict
 
+	// When non-nil, every laas status poll returns state "Canceled" with
+	// these strings as the gateway's error detail — used to exercise the
+	// soft-fail path the adapter takes when a service can't be fulfilled
+	// for the tenant (e.g. not-provisioned products).
+	cancelEventsTaskWith []string
+
 	// Records returned by the HEC search; can be swapped at runtime to simulate transitions.
 	hecRecords []utils.Dict
 }
@@ -370,6 +376,14 @@ func (f *fakeGateway) serveEventsStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	atomic.AddInt32(&f.statusCalls, 1)
+	if f.cancelEventsTaskWith != nil {
+		errs := make([]interface{}, len(f.cancelEventsTaskWith))
+		for i, s := range f.cancelEventsTaskWith {
+			errs[i] = s
+		}
+		writeJSON(w, http.StatusOK, utils.Dict{"data": utils.Dict{"state": "Canceled", "errors": errs}})
+		return
+	}
 	tokens := []string{}
 	for i := range f.eventPages {
 		tokens = append(tokens, fmt.Sprintf("page-%d", i))
@@ -496,6 +510,69 @@ func TestEventsReAuthOn401(t *testing.T) {
 	waitUntil(t, 3*time.Second, func() bool {
 		return atomic.LoadInt32(&fake.retrieveCalls) >= 1 && atomic.LoadInt32(&fake.authCalls) >= 2
 	}, "expected re-auth after 401 followed by a successful retrieve")
+}
+
+// TestEventsCanceledIsSoftFailure asserts that a logs_query task ending in
+// state "Canceled" is treated as a per-service soft failure: OnWarning fires
+// with the gateway's error detail, OnError stays silent, and the worker
+// keeps polling instead of either bubbling the error up or wedging.
+//
+// This is the failure mode the gateway returns when a cloud service is
+// listed in cloud_services but isn't actually provisioned for the tenant
+// (e.g. "Harmony Connect" on a tenant that only has Email/Endpoint/Mobile).
+// Bubbling it as OnError would spam the operator's error stream every
+// poll_interval for every non-provisioned product in the default list.
+func TestEventsCanceledIsSoftFailure(t *testing.T) {
+	fake := &fakeGateway{cancelEventsTaskWith: []string{"Couldn't process request"}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var warnings []string
+	var errors []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errors = append(errors, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Connect"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Wait until we've seen at least two cancellations — proves the worker
+	// keeps polling instead of wedging on the first one.
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.statusCalls) >= 2
+	}, "expected the worker to keep polling after a Canceled status")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errors) != 0 {
+		t.Fatalf("Canceled should not surface as OnError; got %d errors: %v", len(errors), errors)
+	}
+	if len(warnings) == 0 {
+		t.Fatalf("expected at least one OnWarning for the Canceled status")
+	}
+	if !strings.Contains(warnings[0], "Harmony Connect") {
+		t.Fatalf("warning should name the offending service; got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "Couldn't process request") {
+		t.Fatalf("warning should include the gateway's error detail; got %q", warnings[0])
+	}
 }
 
 // recordingDeduper wraps an inner deduper and notifies on each admitted key.

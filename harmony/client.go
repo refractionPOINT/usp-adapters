@@ -413,9 +413,22 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 		}
 
 		newCursor, err := a.runOneEventsQuery(service, nextStart, endTime)
-		if err != nil {
+		var canceled *taskCanceledError
+		switch {
+		case errors.As(err, &canceled):
+			// Soft failure: the gateway accepted the query but couldn't
+			// fulfill it for this service (commonly: the service isn't
+			// provisioned for the tenant). Warn once per poll with the
+			// gateway's error detail, advance the cursor so we don't keep
+			// re-querying the same window, and let the next poll try
+			// again — most non-provisioned services stay non-provisioned,
+			// so the operator should remove them from cloud_services if
+			// they want the warnings to stop.
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — skipping window", service, canceled))
+			nextStart = endTime
+		case err != nil:
 			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[events:%s]: %v", service, err))
-		} else if !newCursor.IsZero() {
+		case !newCursor.IsZero():
 			nextStart = newCursor
 		}
 
@@ -433,7 +446,8 @@ func (a *HarmonyAdapter) runOneEventsQuery(service string, startTime, endTime ti
 
 	pageTokens, err := a.waitForEventsTask(taskID)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("waitForEventsTask: %v", err)
+		// Wrap with %w so callers can errors.As to detect taskCanceledError.
+		return time.Time{}, fmt.Errorf("waitForEventsTask: %w", err)
 	}
 	if len(pageTokens) == 0 {
 		return endTime, nil
@@ -502,6 +516,25 @@ func (a *HarmonyAdapter) submitEventsQuery(service string, startTime, endTime ti
 	return taskID, nil
 }
 
+// taskCanceledError is returned when the gateway terminates a logs_query
+// task with state "Canceled". This is the gateway's response when it can't
+// fulfill the query (e.g. a cloud service that's listed in our default set
+// but not provisioned for the tenant), and it surfaces as HTTP 200 with the
+// "Canceled" state field — not as a transport error. We carry the gateway's
+// error details on the type so the worker can emit a meaningful warning,
+// and so callers can errors.As for soft-fail handling.
+type taskCanceledError struct {
+	TaskID  string
+	Details []string
+}
+
+func (e *taskCanceledError) Error() string {
+	if len(e.Details) == 0 {
+		return fmt.Sprintf("task %s canceled by server", e.TaskID)
+	}
+	return fmt.Sprintf("task %s canceled by server: %s", e.TaskID, strings.Join(e.Details, "; "))
+}
+
 func (a *HarmonyAdapter) waitForEventsTask(taskID string) ([]string, error) {
 	deadline := time.Now().Add(defaultEventsStatusPollTotal)
 	for {
@@ -527,7 +560,15 @@ func (a *HarmonyAdapter) waitForEventsTask(taskID string) ([]string, error) {
 		case "Done":
 			return nil, nil
 		case "Canceled":
-			return nil, fmt.Errorf("task %s canceled by server", taskID)
+			details := []string{}
+			if rawErrs, ok := data.GetList("errors"); ok {
+				for _, e := range rawErrs {
+					if s, ok := e.(string); ok {
+						details = append(details, s)
+					}
+				}
+			}
+			return nil, &taskCanceledError{TaskID: taskID, Details: details}
 		}
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("task %s did not reach a terminal state within %s (last state=%q)", taskID, defaultEventsStatusPollTotal, state)
