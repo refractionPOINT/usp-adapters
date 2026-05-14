@@ -582,6 +582,23 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter 
 	}
 }
 
+// dictBoolish reads a field that may be encoded as either a JSON boolean or
+// a string ("true" / "false"). The HEC API documentation (Feb 2026 ed.)
+// shows these fields as strings in its example payloads, but the live
+// gateway returns native JSON booleans. We accept both so the adapter
+// works regardless of which form a given tenant or version emits.
+func dictBoolish(d utils.Dict, key string) (value, found bool) {
+	if v, ok := d[key]; ok {
+		switch t := v.(type) {
+		case bool:
+			return t, true
+		case string:
+			return strings.EqualFold(t, "true"), true
+		}
+	}
+	return false, false
+}
+
 // restoreDedupKey returns a key that changes only when the email's restore
 // state advances. We anchor on entityId + entityUpdated because the gateway
 // bumps entityUpdated on every state change, while a still-pending request
@@ -597,10 +614,10 @@ func restoreDedupKey(rec utils.Dict) string {
 		// Fall back to a fingerprint of the relevant flags so we still
 		// dedup if the gateway ever omits entityUpdated.
 		payload, _ := rec.GetDict("entityPayload")
-		req, _ := payload.GetString("isRestoreRequested")
-		restored, _ := payload.GetString("isRestored")
-		declined, _ := payload.GetString("isRestoreDeclined")
-		updated = fmt.Sprintf("req=%s|restored=%s|declined=%s", req, restored, declined)
+		req, _ := dictBoolish(payload, "isRestoreRequested")
+		restored, _ := dictBoolish(payload, "isRestored")
+		declined, _ := dictBoolish(payload, "isRestoreDeclined")
+		updated = fmt.Sprintf("req=%t|restored=%t|declined=%t", req, restored, declined)
 	}
 	return "restore:" + entityID + "|" + updated
 }
@@ -609,12 +626,12 @@ func restoreDedupKey(rec utils.Dict) string {
 // downstream consumers can filter without re-parsing the flag combination.
 func restoreLifecycleState(rec utils.Dict) string {
 	payload, _ := rec.GetDict("entityPayload")
-	restored, _ := payload.GetString("isRestored")
-	declined, _ := payload.GetString("isRestoreDeclined")
+	restored, _ := dictBoolish(payload, "isRestored")
+	declined, _ := dictBoolish(payload, "isRestoreDeclined")
 	switch {
-	case strings.EqualFold(restored, "true"):
+	case restored:
 		return "restored"
-	case strings.EqualFold(declined, "true"):
+	case declined:
 		return "declined"
 	default:
 		return "pending"

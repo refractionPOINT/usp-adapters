@@ -26,28 +26,33 @@ func TestRestoreLifecycleState(t *testing.T) {
 		expected string
 	}{
 		{
-			name:     "pending when neither flag is set",
+			name:     "pending when neither flag is set (string form)",
 			payload:  utils.Dict{"isRestoreRequested": "true", "isRestored": "false", "isRestoreDeclined": "false"},
 			expected: "pending",
 		},
 		{
-			name:     "restored",
+			name:     "restored (string form, as docs show)",
 			payload:  utils.Dict{"isRestoreRequested": "true", "isRestored": "true", "isRestoreDeclined": "false"},
 			expected: "restored",
 		},
 		{
-			name:     "declined",
-			payload:  utils.Dict{"isRestoreRequested": "true", "isRestored": "false", "isRestoreDeclined": "true"},
+			name:     "restored (bool form, as live gateway emits)",
+			payload:  utils.Dict{"isRestoreRequested": true, "isRestored": true, "isRestoreDeclined": false},
+			expected: "restored",
+		},
+		{
+			name:     "declined (bool form)",
+			payload:  utils.Dict{"isRestoreRequested": true, "isRestored": false, "isRestoreDeclined": true},
 			expected: "declined",
 		},
 		{
-			name:     "case-insensitive match",
+			name:     "case-insensitive match on string form",
 			payload:  utils.Dict{"isRestored": "True"},
 			expected: "restored",
 		},
 		{
 			name:     "restored wins when both decision flags are oddly set",
-			payload:  utils.Dict{"isRestored": "true", "isRestoreDeclined": "true"},
+			payload:  utils.Dict{"isRestored": true, "isRestoreDeclined": true},
 			expected: "restored",
 		},
 		{
@@ -87,13 +92,15 @@ func TestRestoreDedupKey(t *testing.T) {
 	})
 
 	t.Run("falls back to flag fingerprint when entityUpdated is absent", func(t *testing.T) {
+		// Mix string and bool forms — the fingerprint must change between
+		// states regardless of which encoding the gateway returns.
 		pending := utils.Dict{
 			"entityInfo":    utils.Dict{"entityId": "abc"},
-			"entityPayload": utils.Dict{"isRestoreRequested": "true", "isRestored": "false", "isRestoreDeclined": "false"},
+			"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": false, "isRestoreDeclined": false},
 		}
 		restored := utils.Dict{
 			"entityInfo":    utils.Dict{"entityId": "abc"},
-			"entityPayload": utils.Dict{"isRestoreRequested": "true", "isRestored": "true", "isRestoreDeclined": "false"},
+			"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": true, "isRestoreDeclined": false},
 		}
 		if restoreDedupKey(pending) == restoreDedupKey(restored) {
 			t.Fatalf("state transition should change the dedup key even without entityUpdated")
@@ -529,10 +536,14 @@ func (d *recordingDeduper) admittedKeys() []string {
 //     dedup key admits the entity again, capturing the transition.
 func TestRestoreRequestsDedupAndTransition(t *testing.T) {
 	fake := &fakeGateway{}
+	// Use the bool form here because that's what the live gateway returns —
+	// the test would have passed against either form before the bool fix,
+	// but using booleans pins the assertion to the wire shape we'll actually
+	// see in production.
 	fake.hecRecords = []utils.Dict{
 		{
 			"entityInfo":    utils.Dict{"entityId": "e1", "entityUpdated": "2026-05-12T10:00:00Z"},
-			"entityPayload": utils.Dict{"isRestoreRequested": "true", "isRestored": "false", "isRestoreDeclined": "false"},
+			"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": false, "isRestoreDeclined": false},
 		},
 	}
 	srv := httptest.NewServer(fake.handler())
@@ -580,7 +591,7 @@ func TestRestoreRequestsDedupAndTransition(t *testing.T) {
 	fake.mu.Lock()
 	fake.hecRecords[0] = utils.Dict{
 		"entityInfo":    utils.Dict{"entityId": "e1", "entityUpdated": "2026-05-12T11:00:00Z"},
-		"entityPayload": utils.Dict{"isRestoreRequested": "true", "isRestored": "true", "isRestoreDeclined": "false"},
+		"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": true, "isRestoreDeclined": false},
 	}
 	fake.mu.Unlock()
 
