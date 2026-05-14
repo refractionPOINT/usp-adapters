@@ -559,8 +559,8 @@ func TestRestoreRequestsDedupAndTransition(t *testing.T) {
 			Saas:         []string{"office365_emails"},
 			PollInterval: 30 * time.Millisecond,
 			Lookback:     1 * time.Hour,
+			Deduper:      dedup,
 		},
-		Deduper: dedup,
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
@@ -625,8 +625,8 @@ func TestRestoreRequestsIncludeResolvedIssuesExtraQueries(t *testing.T) {
 				PollInterval:    1 * time.Hour, // single poll
 				Lookback:        1 * time.Hour,
 				IncludeResolved: includeResolved,
+				Deduper:         newRecordingDeduper(),
 			},
-			Deduper: newRecordingDeduper(),
 		}
 		adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 		if err != nil {

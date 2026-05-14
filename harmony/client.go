@@ -68,6 +68,38 @@ const (
 	defaultRestoreLookback     = 30 * 24 * time.Hour
 )
 
+// harmonySource is the contract every ingestion source in this adapter
+// implements. Adding a new source is mechanical: implement the four
+// methods, add the source-config struct as a field on HarmonyConfig, and
+// register a pointer to it in HarmonyConfig.sources(). HarmonyConfig.Validate
+// and NewHarmonyAdapter handle the rest.
+type harmonySource interface {
+	// Name identifies the source in error messages and the
+	// "_lc_harmony_source" annotation. Convention: snake_case, matching the
+	// source's JSON/YAML key on HarmonyConfig.
+	Name() string
+
+	// IsEnabled returns true when the source is configured to run. Validate
+	// and Start are only invoked when this returns true.
+	IsEnabled() bool
+
+	// Validate is called by HarmonyConfig.Validate when the source is
+	// enabled. It should both reject bad configurations and fill in
+	// sensible defaults for unset fields.
+	Validate() error
+
+	// Start is called by NewHarmonyAdapter when the source is enabled. The
+	// source spawns its workers by calling a.wgSenders.Add(1) and launching
+	// goroutines that end with `defer a.wgSenders.Done()` and respect
+	// a.doStop. Errors here abort adapter construction.
+	Start(a *HarmonyAdapter) error
+
+	// Close releases any source-owned resources (deduper, file handles,
+	// etc.). It is called from HarmonyAdapter.Close after all workers have
+	// exited, and must be safe to call even when Start was never invoked.
+	Close()
+}
+
 // EventsConfig controls the Infinity Events / Logs-as-a-Service source. When
 // Enabled is false this source is skipped entirely.
 type EventsConfig struct {
@@ -88,6 +120,42 @@ type EventsConfig struct {
 	PageLimit    int           `json:"page_limit" yaml:"page_limit"`
 	Limit        int           `json:"limit" yaml:"limit"`
 }
+
+func (c *EventsConfig) Name() string    { return "events" }
+func (c *EventsConfig) IsEnabled() bool { return c != nil && c.Enabled }
+
+func (c *EventsConfig) Validate() error {
+	if len(c.CloudServices) == 0 {
+		c.CloudServices = append([]string{}, defaultEventsCloudServices...)
+	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = defaultEventsPollInterval
+	}
+	if c.PageLimit <= 0 {
+		c.PageLimit = defaultEventsPageLimit
+	}
+	if c.PageLimit < 10 {
+		// Gateway rejects values below 10 with HTTP 400.
+		c.PageLimit = 10
+	}
+	if c.Limit <= 0 {
+		c.Limit = defaultEventsPerCloudLimit
+	}
+	if c.Limit < 10 {
+		c.Limit = 10
+	}
+	return nil
+}
+
+func (c *EventsConfig) Start(a *HarmonyAdapter) error {
+	for _, svc := range c.CloudServices {
+		a.wgSenders.Add(1)
+		go a.fetchEventsForService(svc)
+	}
+	return nil
+}
+
+func (c *EventsConfig) Close() {}
 
 // RestoreRequestsConfig controls polling of the HEC entity search API to
 // surface emails with pending or recently-decided restore requests.
@@ -111,6 +179,68 @@ type RestoreRequestsConfig struct {
 	// resolution, enable this to ensure the "restored" / "declined"
 	// transitions are still captured. Dedup eliminates any overlap.
 	IncludeResolved bool `json:"include_resolved" yaml:"include_resolved"`
+
+	// Deduper avoids re-emitting the same entity for the same state on
+	// every poll. Transitions are still emitted because the dedup key
+	// includes the entityUpdated timestamp. If nil, Start allocates one
+	// sized to Lookback + 1h (24h floor); a caller-supplied deduper takes
+	// precedence. The source's Close releases the deduper unconditionally,
+	// matching the ownership convention used by the o365 adapter.
+	Deduper utils.Deduper `json:"-" yaml:"-"`
+}
+
+func (c *RestoreRequestsConfig) Name() string    { return "restore_requests" }
+func (c *RestoreRequestsConfig) IsEnabled() bool { return c != nil && c.Enabled }
+
+func (c *RestoreRequestsConfig) Validate() error {
+	if len(c.Saas) == 0 {
+		c.Saas = append([]string{}, defaultRestoreSaas...)
+	}
+	for _, s := range c.Saas {
+		if _, ok := defaultRestoreSaasEntity[s]; !ok {
+			return fmt.Errorf("restore_requests.saas %q is not supported (only %v carry the restore flags)", s, defaultRestoreSaas)
+		}
+	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = defaultRestorePollInterval
+	}
+	if c.Lookback <= 0 {
+		c.Lookback = defaultRestoreLookback
+	}
+	return nil
+}
+
+func (c *RestoreRequestsConfig) Start(a *HarmonyAdapter) error {
+	if c.Deduper == nil {
+		// Size the TTL to the full lookback window so a still-pending
+		// request — which the gateway will keep returning every poll for
+		// as long as it remains in the lookback window — doesn't fall out
+		// of dedup and get re-emitted as if it were new. Floor at 24h.
+		ttl := c.Lookback + 1*time.Hour
+		if ttl < 24*time.Hour {
+			ttl = 24 * time.Hour
+		}
+		d, err := utils.NewLocalDeduper(1*time.Hour, ttl)
+		if err != nil {
+			return err
+		}
+		c.Deduper = d
+	}
+	for _, saas := range c.Saas {
+		a.wgSenders.Add(1)
+		go a.fetchRestoreRequestsForSaas(saas)
+	}
+	return nil
+}
+
+func (c *RestoreRequestsConfig) Close() {
+	if c.Deduper != nil {
+		// Close any deduper attached to this source — both ones we allocated
+		// and caller-supplied ones, matching the convention other adapters
+		// in this repo use (e.g. o365).
+		c.Deduper.Close()
+		c.Deduper = nil
+	}
 }
 
 type HarmonyConfig struct {
@@ -132,11 +262,12 @@ type HarmonyConfig struct {
 
 	Events          EventsConfig          `json:"events" yaml:"events"`
 	RestoreRequests RestoreRequestsConfig `json:"restore_requests" yaml:"restore_requests"`
+}
 
-	// Deduper is used by the restore-request source to avoid re-emitting the
-	// same entity for the same state on every poll. Transitions are still
-	// emitted because the dedup key includes the entityUpdated timestamp.
-	Deduper utils.Deduper `json:"-" yaml:"-"`
+// sources returns the registered ingestion sources in a stable order. Adding
+// a new source is a single line here plus the source-config struct.
+func (c *HarmonyConfig) sources() []harmonySource {
+	return []harmonySource{&c.Events, &c.RestoreRequests}
 }
 
 func (c *HarmonyConfig) Validate() error {
@@ -154,49 +285,21 @@ func (c *HarmonyConfig) Validate() error {
 	}
 	c.URL = strings.TrimRight(c.URL, "/")
 
-	if !c.Events.Enabled && !c.RestoreRequests.Enabled {
-		return errors.New("at least one of events.enabled or restore_requests.enabled must be true")
-	}
-
-	if c.Events.Enabled {
-		if len(c.Events.CloudServices) == 0 {
-			c.Events.CloudServices = append([]string{}, defaultEventsCloudServices...)
+	anyEnabled := false
+	names := make([]string, 0, 4)
+	for _, s := range c.sources() {
+		names = append(names, s.Name())
+		if !s.IsEnabled() {
+			continue
 		}
-		if c.Events.PollInterval <= 0 {
-			c.Events.PollInterval = defaultEventsPollInterval
-		}
-		if c.Events.PageLimit <= 0 {
-			c.Events.PageLimit = defaultEventsPageLimit
-		}
-		if c.Events.PageLimit < 10 {
-			// Gateway rejects values below 10 with HTTP 400.
-			c.Events.PageLimit = 10
-		}
-		if c.Events.Limit <= 0 {
-			c.Events.Limit = defaultEventsPerCloudLimit
-		}
-		if c.Events.Limit < 10 {
-			c.Events.Limit = 10
+		anyEnabled = true
+		if err := s.Validate(); err != nil {
+			return fmt.Errorf("%s: %v", s.Name(), err)
 		}
 	}
-
-	if c.RestoreRequests.Enabled {
-		if len(c.RestoreRequests.Saas) == 0 {
-			c.RestoreRequests.Saas = append([]string{}, defaultRestoreSaas...)
-		}
-		for _, s := range c.RestoreRequests.Saas {
-			if _, ok := defaultRestoreSaasEntity[s]; !ok {
-				return fmt.Errorf("restore_requests.saas %q is not supported (only %v carry the restore flags)", s, defaultRestoreSaas)
-			}
-		}
-		if c.RestoreRequests.PollInterval <= 0 {
-			c.RestoreRequests.PollInterval = defaultRestorePollInterval
-		}
-		if c.RestoreRequests.Lookback <= 0 {
-			c.RestoreRequests.Lookback = defaultRestoreLookback
-		}
+	if !anyEnabled {
+		return fmt.Errorf("at least one source must be enabled (%s)", strings.Join(names, ", "))
 	}
-
 	return nil
 }
 
@@ -221,25 +324,6 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 		return nil, nil, err
 	}
 
-	// The deduper is only used by the restore-request source. Size its TTL
-	// to cover the full lookback window so a still-pending request — which
-	// the gateway will keep returning every poll for as long as it remains
-	// in the lookback window — doesn't fall out of dedup and get re-emitted
-	// as if it were new. Floor at 24h for sanity even when Lookback is tiny.
-	ownedDeduper := false
-	if conf.RestoreRequests.Enabled && conf.Deduper == nil {
-		ttl := conf.RestoreRequests.Lookback + 1*time.Hour
-		if ttl < 24*time.Hour {
-			ttl = 24 * time.Hour
-		}
-		d, err := utils.NewLocalDeduper(1*time.Hour, ttl)
-		if err != nil {
-			return nil, nil, err
-		}
-		conf.Deduper = d
-		ownedDeduper = true
-	}
-
 	a := &HarmonyAdapter{
 		conf:      conf,
 		ctx:       context.Background(),
@@ -247,19 +331,9 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 		chStopped: make(chan struct{}),
 	}
 
-	// closeOwnedOnFail releases the deduper goroutine on error paths so the
-	// constructor doesn't leak it. We only close the deduper we created
-	// ourselves — a caller-supplied one is the caller's to manage.
-	closeOwnedOnFail := func() {
-		if ownedDeduper && a.conf.Deduper != nil {
-			a.conf.Deduper.Close()
-		}
-	}
-
 	var err error
 	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
-		closeOwnedOnFail()
 		return nil, nil, err
 	}
 
@@ -272,17 +346,28 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 		},
 	}
 
-	if a.conf.Events.Enabled {
-		for _, svc := range a.conf.Events.CloudServices {
-			a.wgSenders.Add(1)
-			go a.fetchEventsForService(svc)
+	// Start every enabled source. If one fails after others have already
+	// spawned workers we have to fully tear down — signal doStop, wait for
+	// goroutines to exit, then release each source's resources — before
+	// returning the error to the caller. Otherwise we'd leak running
+	// workers and dedupers.
+	//
+	// We operate on the sources rooted in a.conf (the adapter's copy of
+	// the config) rather than the caller's `conf` parameter so the same
+	// HarmonyAdapter.Close path releases everything later.
+	for _, s := range a.conf.sources() {
+		if !s.IsEnabled() {
+			continue
 		}
-	}
-
-	if a.conf.RestoreRequests.Enabled {
-		for _, saas := range a.conf.RestoreRequests.Saas {
-			a.wgSenders.Add(1)
-			go a.fetchRestoreRequestsForSaas(saas)
+		if err := s.Start(a); err != nil {
+			a.doStop.Set()
+			a.wgSenders.Wait()
+			for _, prev := range a.conf.sources() {
+				prev.Close()
+			}
+			_, _ = a.uspClient.Close()
+			a.httpClient.CloseIdleConnections()
+			return nil, nil, fmt.Errorf("%s.Start: %v", s.Name(), err)
 		}
 	}
 
@@ -301,8 +386,8 @@ func (a *HarmonyAdapter) Close() error {
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := a.uspClient.Close()
 	a.httpClient.CloseIdleConnections()
-	if d := a.conf.Deduper; d != nil {
-		d.Close()
+	for _, s := range a.conf.sources() {
+		s.Close()
 	}
 	if err1 != nil {
 		return err1
@@ -564,7 +649,7 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter 
 			if key == "" {
 				continue
 			}
-			if a.conf.Deduper.CheckAndAdd(key) {
+			if a.conf.RestoreRequests.Deduper.CheckAndAdd(key) {
 				continue
 			}
 			rec["_lc_harmony_source"] = "restore_requests"
