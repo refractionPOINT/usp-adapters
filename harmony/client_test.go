@@ -303,6 +303,19 @@ type fakeGateway struct {
 	// Records returned by laas retrieve, optionally split into multiple pages.
 	eventPages [][]utils.Dict
 
+	// cancelEventsErrors is the errors[] payload returned alongside a
+	// Canceled status. The gateway emits strings today; cancelEventsErrorsAny
+	// lets a test stick non-string values in there to exercise the JSON
+	// marshal fallback path.
+	cancelEventsErrors    []string
+	cancelEventsErrorsAny []interface{}
+
+	// cancelEventsTimes controls how many status polls return Canceled
+	// before the gateway reverts to normal Ready/Done behavior. Negative
+	// values mean "always cancel" (used to model a not-provisioned cloud
+	// service that never recovers).
+	cancelEventsTimes int
+
 	// Records returned by the HEC search; can be swapped at runtime to simulate transitions.
 	hecRecords []utils.Dict
 }
@@ -370,6 +383,26 @@ func (f *fakeGateway) serveEventsStatus(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	atomic.AddInt32(&f.statusCalls, 1)
+
+	f.mu.Lock()
+	shouldCancel := f.cancelEventsTimes != 0
+	if f.cancelEventsTimes > 0 {
+		f.cancelEventsTimes--
+	}
+	stringErrs := append([]string(nil), f.cancelEventsErrors...)
+	anyErrs := append([]interface{}(nil), f.cancelEventsErrorsAny...)
+	f.mu.Unlock()
+
+	if shouldCancel {
+		errs := make([]interface{}, 0, len(stringErrs)+len(anyErrs))
+		for _, s := range stringErrs {
+			errs = append(errs, s)
+		}
+		errs = append(errs, anyErrs...)
+		writeJSON(w, http.StatusOK, utils.Dict{"data": utils.Dict{"state": "Canceled", "errors": errs}})
+		return
+	}
+
 	tokens := []string{}
 	for i := range f.eventPages {
 		tokens = append(tokens, fmt.Sprintf("page-%d", i))
@@ -496,6 +529,179 @@ func TestEventsReAuthOn401(t *testing.T) {
 	waitUntil(t, 3*time.Second, func() bool {
 		return atomic.LoadInt32(&fake.retrieveCalls) >= 1 && atomic.LoadInt32(&fake.authCalls) >= 2
 	}, "expected re-auth after 401 followed by a successful retrieve")
+}
+
+// TestEventsCanceledIsSoftFailure asserts that a logs_query task ending in
+// state "Canceled" is treated as a per-service soft failure: OnWarning fires
+// with the gateway's error detail, OnError stays silent, and the worker
+// keeps polling instead of either bubbling the error up or wedging.
+//
+// This is the failure mode the gateway returns when a cloud service is
+// listed in cloud_services but isn't actually provisioned for the tenant
+// (e.g. "Harmony Connect" on a tenant that only has Email/Endpoint/Mobile).
+// Bubbling it as OnError would spam the operator's error stream every
+// poll_interval for every non-provisioned product in the default list.
+func TestEventsCanceledIsSoftFailure(t *testing.T) {
+	fake := &fakeGateway{
+		cancelEventsErrors: []string{"Couldn't process request"},
+		cancelEventsTimes:  -1, // persistently canceled, never recovers
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var warnings []string
+	var errors []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errors = append(errors, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Connect"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Wait until we've seen at least two cancellations — proves the worker
+	// keeps polling instead of wedging on the first one.
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.statusCalls) >= 2
+	}, "expected the worker to keep polling after a Canceled status")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errors) != 0 {
+		t.Fatalf("Canceled should not surface as OnError; got %d errors: %v", len(errors), errors)
+	}
+	if len(warnings) == 0 {
+		t.Fatalf("expected at least one OnWarning for the Canceled status")
+	}
+	if !strings.Contains(warnings[0], "Harmony Connect") {
+		t.Fatalf("warning should name the offending service; got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "Couldn't process request") {
+		t.Fatalf("warning should include the gateway's error detail; got %q", warnings[0])
+	}
+}
+
+// TestEventsCanceledTransientRecovery covers the recovery case: the gateway
+// cancels exactly one task and then resumes normal Ready/Done responses. The
+// worker must surface a single OnWarning, no OnError, and eventually issue a
+// retrieve once the gateway recovers — proving the cursor wasn't wedged and
+// that the soft-fail path lets normal traffic resume on the next poll.
+func TestEventsCanceledTransientRecovery(t *testing.T) {
+	fake := &fakeGateway{
+		cancelEventsErrors: []string{"Transient gateway hiccup"},
+		cancelEventsTimes:  1, // cancel exactly once, then recover
+		eventPages: [][]utils.Dict{
+			{{"id": "post-recovery", "time": "2026-05-14T22:00:00Z"}},
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var warnings, errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// A successful retrieve only happens after the gateway recovers, so this
+	// is the cleanest proof of "post-cancellation traffic flows again".
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
+	}, "expected a retrieve to succeed after the transient cancel")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("transient Canceled should not surface as OnError; got %d errors: %v", len(errs), errs)
+	}
+	if len(warnings) == 0 {
+		t.Fatalf("expected exactly one OnWarning for the transient cancel")
+	}
+}
+
+// TestEventsCanceledMarshalsStructuredErrorDetail pins the JSON-marshal
+// fallback for non-string errors[] entries. Today Check Point returns
+// strings; if it ever switches to objects we want the warning to still
+// carry the detail rather than silently dropping it.
+func TestEventsCanceledMarshalsStructuredErrorDetail(t *testing.T) {
+	fake := &fakeGateway{
+		cancelEventsErrorsAny: []interface{}{
+			map[string]interface{}{"code": 5042, "message": "Service not provisioned"},
+		},
+		cancelEventsTimes: -1,
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var warnings []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
+	opts.OnError = func(error) {}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(warnings) >= 1
+	}, "expected a warning for the canceled task")
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Both fields from the object should appear somewhere in the warning,
+	// proving the marshal fallback ran and kept the detail.
+	if !strings.Contains(warnings[0], "5042") || !strings.Contains(warnings[0], "Service not provisioned") {
+		t.Fatalf("warning should carry the structured error detail via JSON marshal; got %q", warnings[0])
+	}
 }
 
 // recordingDeduper wraps an inner deduper and notifies on each admitted key.
