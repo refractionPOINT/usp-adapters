@@ -269,6 +269,11 @@ type fakeGateway struct {
 	// adapter must absorb via bounded retry. Negative = always 503.
 	retrieve503Times int
 
+	// auth503Times controls how many /auth/external calls return a
+	// transient 503 before succeeding — models the same gateway slowness
+	// hitting the auth endpoint specifically. Negative = always 503.
+	auth503Times int
+
 	// Records returned by the HEC search; can be swapped at runtime to simulate transitions.
 	hecRecords []utils.Dict
 }
@@ -294,6 +299,19 @@ func (f *fakeGateway) handler() http.HandlerFunc {
 
 func (f *fakeGateway) serveAuth(w http.ResponseWriter, r *http.Request) {
 	n := atomic.AddInt32(&f.authCalls, 1)
+
+	f.mu.Lock()
+	transient := f.auth503Times != 0
+	if f.auth503Times > 0 {
+		f.auth503Times--
+	}
+	f.mu.Unlock()
+	if transient {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"success":false,"message":"temporarily unavailable"}`))
+		return
+	}
+
 	f.mu.Lock()
 	f.currentToken = fmt.Sprintf("test-token-%d", n)
 	token := f.currentToken
@@ -952,6 +970,54 @@ func TestEventsRetrieveTransientExhaustionSurfacesError(t *testing.T) {
 	// Each failed window makes maxRequestAttempts retrieve calls.
 	if got := atomic.LoadInt32(&fake.retrieveCalls); got < int32(maxRequestAttempts) {
 		t.Fatalf("expected >= %d retrieve attempts before giving up, got %d", maxRequestAttempts, got)
+	}
+}
+
+// TestAuthTransientRetryRecovers pins the gap-fix: a transient blip on
+// /auth/external (the call every data request depends on) must be absorbed
+// by the same bounded retry, not surface as OnError + a re-run window.
+func TestAuthTransientRetryRecovers(t *testing.T) {
+	withFastBackoff(t)
+	fake := &fakeGateway{
+		eventPages:   [][]utils.Dict{{{"id": "e1", "time": "2026-05-15T10:00:00Z"}}},
+		auth503Times: 2, // auth fails twice, succeeds on the 3rd attempt
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// A successful retrieve can only happen after auth recovered and a
+	// token was issued — proves the auth blip was retried, not surfaced.
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
+	}, "expected auth to recover after transient 503s and data to flow")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("transient auth 503s must not surface as OnError; got: %v", errs)
+	}
+	if got := atomic.LoadInt32(&fake.authCalls); got < 3 {
+		t.Fatalf("expected auth to be retried past the 2 transient 503s, got %d calls", got)
 	}
 }
 

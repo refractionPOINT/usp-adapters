@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -793,9 +794,73 @@ func (a *HarmonyAdapter) shipRecord(rec utils.Dict) error {
 	return nil
 }
 
+// retryBackoff returns the wait before the given attempt (attempt is
+// 1-indexed: the wait before the 2nd attempt is requestRetryBackoff[0]).
+// A ±20% jitter is applied so the per-service event workers don't all
+// retry in lockstep against an already-struggling gateway.
+func retryBackoff(attempt int) time.Duration {
+	i := attempt - 1
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(requestRetryBackoff) {
+		i = len(requestRetryBackoff) - 1
+	}
+	base := requestRetryBackoff[i]
+	span := int64(base) / 5 // 20%
+	if span <= 0 {
+		return base
+	}
+	return base + time.Duration(rand.Int64N(2*span)-span)
+}
+
+// doHTTPWithRetry executes buildReq()'s request with bounded retry on
+// transient failures (client/context timeouts, dropped connections, and
+// HTTP 502/503/504). buildReq is invoked once per attempt so a request
+// body is a fresh reader each time. It returns the final status+body for
+// any non-transient response (including 4xx — the caller decides what those
+// mean); err is non-nil only for a non-transient transport error or an
+// exhausted retry budget. Backoff is interruptible by doStop.
+func (a *HarmonyAdapter) doHTTPWithRetry(label string, buildReq func() (*http.Request, error)) (int, []byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxRequestAttempts; attempt++ {
+		if attempt > 0 {
+			d := retryBackoff(attempt)
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s: transient failure, retry %d/%d after %s: %v",
+				label, attempt, maxRequestAttempts-1, d, lastErr))
+			if a.doStop.WaitFor(d) {
+				return 0, nil, fmt.Errorf("%s: aborted during retry backoff", label)
+			}
+		}
+
+		req, err := buildReq()
+		if err != nil {
+			return 0, nil, err
+		}
+		resp, err := a.httpClient.Do(req)
+		if err != nil {
+			if !isTransientErr(err) {
+				return 0, nil, err
+			}
+			lastErr = err
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if isTransientStatus(resp.StatusCode) {
+			lastErr = fmt.Errorf("%s: HTTP %d: %s", label, resp.StatusCode, string(respBody))
+			continue
+		}
+		return resp.StatusCode, respBody, nil
+	}
+	return 0, nil, fmt.Errorf("%s: exhausted %d attempts: %v", label, maxRequestAttempts, lastErr)
+}
+
 // doAuthRequest issues an HTTP request with a valid bearer token attached.
 // If body is nil, no request body is sent. Additional headers (e.g.
 // x-av-req-id required by HEC endpoints) can be supplied via extraHeaders.
+// Transient gateway failures are absorbed by doHTTPWithRetry; a 401 triggers
+// a single token refresh + re-issue (itself transient-retried).
 func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extraHeaders map[string]string) (utils.Dict, error) {
 	bodyBytes, err := marshalBody(body)
 	if err != nil {
@@ -807,88 +872,68 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 		return nil, err
 	}
 
-	doOnce := func(tok string) (int, []byte, error) {
-		var reader io.Reader
-		if bodyBytes != nil {
-			reader = bytes.NewReader(bodyBytes)
-		}
-		req, err := http.NewRequestWithContext(a.ctx, method, url, reader)
-		if err != nil {
-			return 0, nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-		if bodyBytes != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		req.Header.Set("Authorization", "Bearer "+tok)
-		for k, v := range extraHeaders {
-			req.Header.Set(k, v)
-		}
-		resp, err := a.httpClient.Do(req)
-		if err != nil {
-			return 0, nil, err
-		}
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, respBody, nil
-	}
-
-	var lastErr error
-	for attempt := 0; attempt < maxRequestAttempts; attempt++ {
-		if attempt > 0 {
-			i := attempt - 1
-			if i >= len(requestRetryBackoff) {
-				i = len(requestRetryBackoff) - 1
+	build := func(tok string) func() (*http.Request, error) {
+		return func() (*http.Request, error) {
+			var reader io.Reader
+			if bodyBytes != nil {
+				reader = bytes.NewReader(bodyBytes)
 			}
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s %s: transient failure, retry %d/%d after %s: %v",
-				method, url, attempt, maxRequestAttempts-1, requestRetryBackoff[i], lastErr))
-			if a.doStop.WaitFor(requestRetryBackoff[i]) {
-				return nil, fmt.Errorf("%s %s: aborted during retry backoff", method, url)
-			}
-		}
-
-		status, respBody, err := doOnce(token)
-
-		// 401: refresh the token and re-issue immediately. This doesn't
-		// consume a transient-retry attempt — it's a distinct, expected
-		// path (token expired mid-flight).
-		if err == nil && status == http.StatusUnauthorized {
-			token, err = a.getToken(true)
+			req, err := http.NewRequestWithContext(a.ctx, method, url, reader)
 			if err != nil {
 				return nil, err
 			}
-			status, respBody, err = doOnce(token)
-		}
-
-		switch {
-		case err != nil:
-			if !isTransientErr(err) {
-				return nil, err
+			req.Header.Set("Accept", "application/json")
+			if bodyBytes != nil {
+				req.Header.Set("Content-Type", "application/json")
 			}
-			lastErr = err
-			continue
-		case isTransientStatus(status):
-			lastErr = fmt.Errorf("%s %s: HTTP %d: %s", method, url, status, string(respBody))
-			continue
-		case status < 200 || status >= 300:
-			return nil, fmt.Errorf("%s %s: HTTP %d: %s", method, url, status, string(respBody))
-		}
-
-		out := utils.Dict{}
-		if len(respBody) > 0 {
-			if err := json.Unmarshal(respBody, &out); err != nil {
-				return nil, fmt.Errorf("decode response: %v (body=%s)", err, string(respBody))
+			req.Header.Set("Authorization", "Bearer "+tok)
+			for k, v := range extraHeaders {
+				req.Header.Set(k, v)
 			}
+			return req, nil
 		}
-		return out, nil
 	}
 
-	return nil, fmt.Errorf("%s %s: exhausted %d attempts: %v", method, url, maxRequestAttempts, lastErr)
+	label := method + " " + url
+	status, respBody, err := a.doHTTPWithRetry(label, build(token))
+	if err != nil {
+		return nil, err
+	}
+
+	// 401: token likely expired mid-flight. Refresh once and re-issue;
+	// the re-issue is itself transient-retried. A persistent 401 (revoked
+	// key / IP allowlist) falls through to the non-2xx return below.
+	if status == http.StatusUnauthorized {
+		token, err = a.getToken(true)
+		if err != nil {
+			return nil, err
+		}
+		status, respBody, err = a.doHTTPWithRetry(label, build(token))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("%s: HTTP %d: %s", label, status, string(respBody))
+	}
+
+	out := utils.Dict{}
+	if len(respBody) > 0 {
+		if err := json.Unmarshal(respBody, &out); err != nil {
+			return nil, fmt.Errorf("decode response: %v (body=%s)", err, string(respBody))
+		}
+	}
+	return out, nil
 }
 
 // isTransientStatus reports whether an HTTP status is a retryable gateway
 // hiccup (bad gateway / unavailable / gateway timeout) as opposed to a
-// client error we shouldn't retry.
+// client error we shouldn't retry. 429 is intentionally excluded: the
+// adapter's poll cadence stays well under the documented Infinity Events
+// limits, so a 429 signals a config problem (too many cloud_services / too
+// short a poll_interval) that should surface loudly rather than be masked
+// by silent retries.
 func isTransientStatus(status int) bool {
 	return status == http.StatusBadGateway ||
 		status == http.StatusServiceUnavailable ||
@@ -942,21 +987,25 @@ func (a *HarmonyAdapter) getToken(force bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(a.ctx, "POST", a.conf.URL+authPath, bytes.NewReader(reqBody))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.httpClient.Do(req)
+	// Route through the shared retry helper so an intermittent gateway
+	// blip on /auth/external is absorbed the same way data calls are —
+	// otherwise an auth-endpoint timeout still produces the OnError +
+	// window-rerun the data-path retry was added to prevent. A 401 here
+	// means bad creds / IP allowlist (not transient) and is returned.
+	status, respBody, err := a.doHTTPWithRetry("POST "+a.conf.URL+authPath, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(a.ctx, "POST", a.conf.URL+authPath, bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("auth request: %v", err)
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("auth HTTP %d: %s", resp.StatusCode, string(respBody))
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("auth HTTP %d: %s", status, string(respBody))
 	}
 	parsed := utils.Dict{}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
