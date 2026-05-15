@@ -72,6 +72,15 @@ const (
 )
 
 // Defaults for the Emails source.
+//
+// The HEC search/query endpoint is a generic entity API keyed by
+// saas + saasEntity — it is not email-only and accepts other Harmony
+// Email & Collaboration entity types (files, Teams, Slack, …). This
+// source deliberately scopes to the email entities: that is the surface
+// verified end-to-end (payload shape, scroll pagination, dedup) against a
+// live tenant. Widening to non-email entity types is a separate, explicitly
+// verified change (and would warrant a generic "entities" source rather
+// than extending one named for email), not an allowlist tweak here.
 var defaultEmailsSaas = []string{"office365_emails", "google_mail"}
 
 var defaultEmailsSaasEntity = map[string]string{
@@ -200,8 +209,10 @@ func (c *EventsConfig) Close() {}
 type EmailsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 
-	// Saas platforms to query. Defaults to office365_emails + google_mail
-	// (the email entities HEC exposes through the entity search API).
+	// Saas platforms to query. Defaults to office365_emails + google_mail.
+	// Validate rejects anything outside defaultEmailsSaasEntity — an
+	// intentional scope to the verified email entities, not an API limit
+	// (the HEC entity API itself is generic over saas/saasEntity).
 	Saas []string `json:"saas" yaml:"saas"`
 
 	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
