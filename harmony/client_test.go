@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -19,62 +20,9 @@ import (
 
 // ----- Pure helpers ------------------------------------------------------------------------
 
-func TestRestoreLifecycleState(t *testing.T) {
-	cases := []struct {
-		name     string
-		payload  utils.Dict
-		expected string
-	}{
-		{
-			name:     "pending when neither flag is set (string form)",
-			payload:  utils.Dict{"isRestoreRequested": "true", "isRestored": "false", "isRestoreDeclined": "false"},
-			expected: "pending",
-		},
-		{
-			name:     "restored (string form, as docs show)",
-			payload:  utils.Dict{"isRestoreRequested": "true", "isRestored": "true", "isRestoreDeclined": "false"},
-			expected: "restored",
-		},
-		{
-			name:     "restored (bool form, as live gateway emits)",
-			payload:  utils.Dict{"isRestoreRequested": true, "isRestored": true, "isRestoreDeclined": false},
-			expected: "restored",
-		},
-		{
-			name:     "declined (bool form)",
-			payload:  utils.Dict{"isRestoreRequested": true, "isRestored": false, "isRestoreDeclined": true},
-			expected: "declined",
-		},
-		{
-			name:     "case-insensitive match on string form",
-			payload:  utils.Dict{"isRestored": "True"},
-			expected: "restored",
-		},
-		{
-			name:     "restored wins when both decision flags are oddly set",
-			payload:  utils.Dict{"isRestored": true, "isRestoreDeclined": true},
-			expected: "restored",
-		},
-		{
-			name:     "missing payload defaults to pending",
-			payload:  nil,
-			expected: "pending",
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			rec := utils.Dict{"entityPayload": c.payload}
-			got := restoreLifecycleState(rec)
-			if got != c.expected {
-				t.Fatalf("expected %q, got %q", c.expected, got)
-			}
-		})
-	}
-}
-
-func TestRestoreDedupKey(t *testing.T) {
+func TestEmailDedupKey(t *testing.T) {
 	t.Run("no entityId returns empty key so caller skips it", func(t *testing.T) {
-		if got := restoreDedupKey(utils.Dict{}); got != "" {
+		if got := emailDedupKey(utils.Dict{}); got != "" {
 			t.Fatalf("expected empty key, got %q", got)
 		}
 	})
@@ -83,27 +31,23 @@ func TestRestoreDedupKey(t *testing.T) {
 		a := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}}
 		b := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}}
 		c := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T11:00:00Z"}}
-		if restoreDedupKey(a) != restoreDedupKey(b) {
+		if emailDedupKey(a) != emailDedupKey(b) {
 			t.Fatalf("same entityUpdated should produce same key")
 		}
-		if restoreDedupKey(a) == restoreDedupKey(c) {
-			t.Fatalf("different entityUpdated should produce different keys (transition)")
+		if emailDedupKey(a) == emailDedupKey(c) {
+			t.Fatalf("different entityUpdated should produce different keys (state change)")
 		}
 	})
 
-	t.Run("falls back to flag fingerprint when entityUpdated is absent", func(t *testing.T) {
-		// Mix string and bool forms — the fingerprint must change between
-		// states regardless of which encoding the gateway returns.
-		pending := utils.Dict{
-			"entityInfo":    utils.Dict{"entityId": "abc"},
-			"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": false, "isRestoreDeclined": false},
+	t.Run("falls back to entityCreated when entityUpdated is absent", func(t *testing.T) {
+		noUpdated := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityCreated": "2026-05-12T09:00:00Z"}}
+		withUpdated := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}}
+		got := emailDedupKey(noUpdated)
+		if got == "" || !strings.Contains(got, "2026-05-12T09:00:00Z") {
+			t.Fatalf("expected key to fall back to entityCreated, got %q", got)
 		}
-		restored := utils.Dict{
-			"entityInfo":    utils.Dict{"entityId": "abc"},
-			"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": true, "isRestoreDeclined": false},
-		}
-		if restoreDedupKey(pending) == restoreDedupKey(restored) {
-			t.Fatalf("state transition should change the dedup key even without entityUpdated")
+		if emailDedupKey(noUpdated) == emailDedupKey(withUpdated) {
+			t.Fatalf("entityCreated fallback must not collide with an entityUpdated key")
 		}
 	})
 }
@@ -256,29 +200,29 @@ func TestValidate(t *testing.T) {
 		c := HarmonyConfig{
 			ClientOptions: validClientOptions(),
 			ClientID:      "x", AccessKey: "y",
-			RestoreRequests: RestoreRequestsConfig{Enabled: true, Saas: []string{"slack"}},
+			Emails: EmailsConfig{Enabled: true, Saas: []string{"slack"}},
 		}
 		if err := c.Validate(); err == nil {
 			t.Fatalf("expected error for unsupported saas")
 		}
 	})
 
-	t.Run("restore_requests defaults fill in", func(t *testing.T) {
+	t.Run("emails defaults fill in", func(t *testing.T) {
 		c := HarmonyConfig{
 			ClientOptions: validClientOptions(),
 			ClientID:      "x", AccessKey: "y",
-			RestoreRequests: RestoreRequestsConfig{Enabled: true},
+			Emails: EmailsConfig{Enabled: true},
 		}
 		if err := c.Validate(); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if c.RestoreRequests.PollInterval != defaultRestorePollInterval {
-			t.Fatalf("expected default poll interval, got %s", c.RestoreRequests.PollInterval)
+		if c.Emails.PollInterval != defaultEmailsPollInterval {
+			t.Fatalf("expected default poll interval, got %s", c.Emails.PollInterval)
 		}
-		if c.RestoreRequests.Lookback != defaultRestoreLookback {
-			t.Fatalf("expected default lookback, got %s", c.RestoreRequests.Lookback)
+		if c.Emails.Lookback != defaultEmailsLookback {
+			t.Fatalf("expected default lookback, got %s", c.Emails.Lookback)
 		}
-		if len(c.RestoreRequests.Saas) != len(defaultRestoreSaas) {
+		if len(c.Emails.Saas) != len(defaultEmailsSaas) {
 			t.Fatalf("expected default saas list")
 		}
 	})
@@ -316,8 +260,31 @@ type fakeGateway struct {
 	// service that never recovers).
 	cancelEventsTimes int
 
+	// retrieve503Times controls how many retrieve calls return a transient
+	// 503 before succeeding — models the intermittent gateway slowness the
+	// adapter must absorb via bounded retry. Negative = always 503.
+	retrieve503Times int
+
+	// auth503Times controls how many /auth/external calls return a
+	// transient 503 before succeeding — models the same gateway slowness
+	// hitting the auth endpoint specifically. Negative = always 503.
+	auth503Times int
+
 	// Records returned by the HEC search; can be swapped at runtime to simulate transitions.
 	hecRecords []utils.Dict
+
+	// Number of entityExtendedFilter entries on the most recent HEC search
+	// request, and whether a search request has been observed. The emails
+	// feed must send zero (unfiltered).
+	lastExtFilterLen int
+	sawSearchRequest bool
+
+	// hecPageSize > 0 makes serveHECSearch model HEC's stable-handle scroll:
+	// records are returned in pages of this size, the scrollId is the same
+	// on every page, and an empty page marks the end. 0 keeps the legacy
+	// single-page behavior. hecScrollOffset is the server-side cursor.
+	hecPageSize     int
+	hecScrollOffset int
 }
 
 func (f *fakeGateway) handler() http.HandlerFunc {
@@ -341,6 +308,19 @@ func (f *fakeGateway) handler() http.HandlerFunc {
 
 func (f *fakeGateway) serveAuth(w http.ResponseWriter, r *http.Request) {
 	n := atomic.AddInt32(&f.authCalls, 1)
+
+	f.mu.Lock()
+	transient := f.auth503Times != 0
+	if f.auth503Times > 0 {
+		f.auth503Times--
+	}
+	f.mu.Unlock()
+	if transient {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"success":false,"message":"temporarily unavailable"}`))
+		return
+	}
+
 	f.mu.Lock()
 	f.currentToken = fmt.Sprintf("test-token-%d", n)
 	token := f.currentToken
@@ -419,6 +399,19 @@ func (f *fakeGateway) serveEventsRetrieve(w http.ResponseWriter, r *http.Request
 		return
 	}
 	atomic.AddInt32(&f.retrieveCalls, 1)
+
+	f.mu.Lock()
+	transient := f.retrieve503Times != 0
+	if f.retrieve503Times > 0 {
+		f.retrieve503Times--
+	}
+	f.mu.Unlock()
+	if transient {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"success":false,"message":"temporarily unavailable"}`))
+		return
+	}
+
 	var body utils.Dict
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	pt, _ := body.GetString("pageToken")
@@ -441,13 +434,63 @@ func (f *fakeGateway) serveHECSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	atomic.AddInt32(&f.searchCalls, 1)
+
+	extLen := 0
+	reqScroll := ""
+	var reqBody utils.Dict
+	if json.NewDecoder(r.Body).Decode(&reqBody) == nil {
+		rd, _ := reqBody.GetDict("requestData")
+		if ef, ok := rd["entityExtendedFilter"].([]interface{}); ok {
+			extLen = len(ef)
+		}
+		reqScroll, _ = rd.GetString("scrollId")
+	}
+
 	f.mu.Lock()
-	records := append([]utils.Dict{}, f.hecRecords...)
+	f.lastExtFilterLen = extLen
+	f.sawSearchRequest = true
+	total := append([]utils.Dict{}, f.hecRecords...)
+
+	if f.hecPageSize <= 0 {
+		// Legacy: whole result set in a single page.
+		f.mu.Unlock()
+		writeJSON(w, http.StatusOK, utils.Dict{
+			"responseEnvelope": utils.Dict{"recordsNumber": len(total), "scrollId": ""},
+			"responseData":     dictListToInterface(total),
+		})
+		return
+	}
+
+	// HEC stable-handle scroll: a fresh request (empty scrollId) starts a
+	// new session; the handle returned is the same on every page; the end
+	// is signalled by an empty page.
+	if reqScroll == "" {
+		f.hecScrollOffset = 0
+	}
+	off := f.hecScrollOffset
+	if off > len(total) {
+		off = len(total)
+	}
+	end := off + f.hecPageSize
+	if end > len(total) {
+		end = len(total)
+	}
+	page := total[off:end]
+	f.hecScrollOffset = end
 	f.mu.Unlock()
+
 	writeJSON(w, http.StatusOK, utils.Dict{
-		"responseEnvelope": utils.Dict{"recordsNumber": len(records), "scrollId": ""},
-		"responseData":     dictListToInterface(records),
+		"responseEnvelope": utils.Dict{"recordsNumber": len(total), "scrollId": "hec-scroll"},
+		"responseData":     dictListToInterface(page),
 	})
+}
+
+// lastSearchExtFilter reports the entityExtendedFilter length on the most
+// recent HEC search request and whether one was seen at all.
+func (f *fakeGateway) lastSearchExtFilter() (length int, seen bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastExtFilterLen, f.sawSearchRequest
 }
 
 func writeJSON(w http.ResponseWriter, status int, body utils.Dict) {
@@ -705,7 +748,7 @@ func TestEventsCanceledMarshalsStructuredErrorDetail(t *testing.T) {
 }
 
 // recordingDeduper wraps an inner deduper and notifies on each admitted key.
-// We use it to observe which restore-request entities the adapter ships.
+// We use it to observe which email entities the adapter ships.
 type recordingDeduper struct {
 	mu       sync.Mutex
 	admitted []string
@@ -735,21 +778,17 @@ func (d *recordingDeduper) admittedKeys() []string {
 	return append([]string(nil), d.admitted...)
 }
 
-// TestRestoreRequestsDedupAndTransition verifies the lifecycle:
-//   - On first poll, a pending request is admitted to dedup (and therefore shipped).
+// TestEmailsDedupAndStateChange verifies the feed semantics:
+//   - On first poll, an email entity is admitted to dedup (and therefore shipped).
 //   - On subsequent polls with no change, the same entity is suppressed.
-//   - When the gateway bumps entityUpdated to reflect an admin decision, a new
-//     dedup key admits the entity again, capturing the transition.
-func TestRestoreRequestsDedupAndTransition(t *testing.T) {
+//   - When the gateway bumps entityUpdated to reflect a state change, a new
+//     dedup key admits the entity again, capturing the change.
+func TestEmailsDedupAndStateChange(t *testing.T) {
 	fake := &fakeGateway{}
-	// Use the bool form here because that's what the live gateway returns —
-	// the test would have passed against either form before the bool fix,
-	// but using booleans pins the assertion to the wire shape we'll actually
-	// see in production.
 	fake.hecRecords = []utils.Dict{
 		{
 			"entityInfo":    utils.Dict{"entityId": "e1", "entityUpdated": "2026-05-12T10:00:00Z"},
-			"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": false, "isRestoreDeclined": false},
+			"entityPayload": utils.Dict{"direction": "incoming"},
 		},
 	}
 	srv := httptest.NewServer(fake.handler())
@@ -760,7 +799,7 @@ func TestRestoreRequestsDedupAndTransition(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: validClientOptions(),
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		RestoreRequests: RestoreRequestsConfig{
+		Emails: EmailsConfig{
 			Enabled:      true,
 			Saas:         []string{"office365_emails"},
 			PollInterval: 30 * time.Millisecond,
@@ -777,11 +816,11 @@ func TestRestoreRequestsDedupAndTransition(t *testing.T) {
 	// Wait until the first admission lands.
 	waitUntil(t, 2*time.Second, func() bool {
 		return len(dedup.admittedKeys()) >= 1
-	}, "expected the first poll to admit the pending entity")
+	}, "expected the first poll to admit the entity")
 
-	pendingKey := dedup.admittedKeys()[0]
-	if !strings.Contains(pendingKey, "e1") || !strings.Contains(pendingKey, "2026-05-12T10:00:00Z") {
-		t.Fatalf("unexpected pending dedup key: %q", pendingKey)
+	firstKey := dedup.admittedKeys()[0]
+	if !strings.Contains(firstKey, "e1") || !strings.Contains(firstKey, "2026-05-12T10:00:00Z") {
+		t.Fatalf("unexpected dedup key: %q", firstKey)
 	}
 
 	// Let a few more polls happen — count must stay at 1 since the record hasn't changed.
@@ -793,62 +832,303 @@ func TestRestoreRequestsDedupAndTransition(t *testing.T) {
 		t.Fatalf("expected multiple search polls; got %d", got)
 	}
 
-	// Now flip the record to "restored" with a fresh entityUpdated.
+	// Now advance the entity's state with a fresh entityUpdated.
 	fake.mu.Lock()
 	fake.hecRecords[0] = utils.Dict{
 		"entityInfo":    utils.Dict{"entityId": "e1", "entityUpdated": "2026-05-12T11:00:00Z"},
-		"entityPayload": utils.Dict{"isRestoreRequested": true, "isRestored": true, "isRestoreDeclined": false},
+		"entityPayload": utils.Dict{"direction": "incoming", "isQuarantined": true},
 	}
 	fake.mu.Unlock()
 
 	waitUntil(t, 2*time.Second, func() bool {
 		return len(dedup.admittedKeys()) >= 2
-	}, "expected the transition to produce a second admission")
+	}, "expected the state change to produce a second admission")
 
 	keys := dedup.admittedKeys()
-	transitionKey := keys[1]
-	if !strings.Contains(transitionKey, "2026-05-12T11:00:00Z") {
-		t.Fatalf("expected transition key to include new entityUpdated, got %q", transitionKey)
+	changeKey := keys[1]
+	if !strings.Contains(changeKey, "2026-05-12T11:00:00Z") {
+		t.Fatalf("expected changed key to include new entityUpdated, got %q", changeKey)
 	}
 }
 
-// TestRestoreRequestsIncludeResolvedIssuesExtraQueries asserts that toggling
-// IncludeResolved makes the adapter run three filtered queries per poll
-// (isRestoreRequested, isRestored, isRestoreDeclined). Without the toggle it
-// should only issue one.
-func TestRestoreRequestsIncludeResolvedIssuesExtraQueries(t *testing.T) {
-	mk := func(includeResolved bool) (queriesPerPoll int) {
-		fake := &fakeGateway{}
-		srv := httptest.NewServer(fake.handler())
-		defer srv.Close()
+// TestEmailsUnfilteredSingleQueryPerPoll asserts the emails source issues
+// exactly one query per poll and sends no server-side filter, so the full
+// email-entity feed comes through and triage happens downstream.
+func TestEmailsUnfilteredSingleQueryPerPoll(t *testing.T) {
+	fake := &fakeGateway{}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
 
-		conf := HarmonyConfig{
-			ClientOptions: validClientOptions(),
-			ClientID:      "c", AccessKey: "s", URL: srv.URL,
-			RestoreRequests: RestoreRequestsConfig{
-				Enabled:         true,
-				Saas:            []string{"office365_emails"},
-				PollInterval:    1 * time.Hour, // single poll
-				Lookback:        1 * time.Hour,
-				IncludeResolved: includeResolved,
-				Deduper:         newRecordingDeduper(),
+	conf := HarmonyConfig{
+		ClientOptions: validClientOptions(),
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Emails: EmailsConfig{
+			Enabled:      true,
+			Saas:         []string{"office365_emails"},
+			PollInterval: 1 * time.Hour, // single poll
+			Lookback:     1 * time.Hour,
+			Deduper:      newRecordingDeduper(),
+		},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	// Allow the initial poll to complete.
+	time.Sleep(300 * time.Millisecond)
+	adapter.Close()
+
+	if got := atomic.LoadInt32(&fake.searchCalls); got != 1 {
+		t.Fatalf("expected exactly 1 search call per poll, got %d", got)
+	}
+	extLen, seen := fake.lastSearchExtFilter()
+	if !seen {
+		t.Fatalf("expected the emails source to issue a search request")
+	}
+	if extLen != 0 {
+		t.Fatalf("emails feed must send no extended filter; got %d filter entries", extLen)
+	}
+}
+
+// TestEmailsScrollDrainsAllPages is the regression test for the HEC
+// stable-handle scroll bug: the endpoint returns the *same* scrollId on
+// every page, so terminating on an unchanged scrollId stops after page 1
+// and silently drops the rest of the window. The adapter must keep
+// re-sending the handle until it gets an empty page. With 7 records paged
+// 2 at a time that is 4 non-empty pages + 1 empty terminator = 5 search
+// calls, and all 7 entities must be shipped.
+func TestEmailsScrollDrainsAllPages(t *testing.T) {
+	fake := &fakeGateway{hecPageSize: 2}
+	for i := 1; i <= 7; i++ {
+		fake.hecRecords = append(fake.hecRecords, utils.Dict{
+			"entityInfo": utils.Dict{
+				"entityId":      fmt.Sprintf("e%d", i),
+				"entityUpdated": fmt.Sprintf("2026-05-15T10:00:%02dZ", i),
 			},
+			"entityPayload": utils.Dict{"direction": "incoming"},
+		})
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	dedup := newRecordingDeduper()
+	conf := HarmonyConfig{
+		ClientOptions: validClientOptions(),
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Emails: EmailsConfig{
+			Enabled:      true,
+			Saas:         []string{"office365_emails"},
+			PollInterval: 1 * time.Hour, // single poll
+			Lookback:     1 * time.Hour,
+			Deduper:      dedup,
+		},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// All 7 must be shipped — the buggy termination would yield only the
+	// first page (2).
+	waitUntil(t, 3*time.Second, func() bool {
+		return len(dedup.admittedKeys()) >= 7
+	}, "expected every page to be drained (all 7 entities shipped)")
+
+	if got := len(dedup.admittedKeys()); got != 7 {
+		t.Fatalf("expected exactly 7 entities shipped, got %d: %v", got, dedup.admittedKeys())
+	}
+	// 4 pages of records (2,2,2,1) + 1 empty terminator page.
+	waitUntil(t, 2*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.searchCalls) >= 5
+	}, "expected the scroll to continue past page 1 until an empty page")
+	if got := atomic.LoadInt32(&fake.searchCalls); got != 5 {
+		t.Fatalf("expected exactly 5 search calls (4 pages + empty terminator), got %d", got)
+	}
+}
+
+func TestTransientClassification(t *testing.T) {
+	if !isTransientStatus(502) || !isTransientStatus(503) || !isTransientStatus(504) {
+		t.Fatalf("502/503/504 must be transient")
+	}
+	for _, s := range []int{200, 400, 401, 403, 404, 429, 500} {
+		if isTransientStatus(s) {
+			t.Fatalf("status %d must not be classified transient", s)
 		}
-		adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
-		if err != nil {
-			t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	transient := []error{
+		context.DeadlineExceeded,
+		fmt.Errorf(`Post "https://x/y": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`),
+		fmt.Errorf("read tcp 1.2.3.4:5->6.7.8.9:443: connection reset by peer"),
+		fmt.Errorf("net/http: TLS handshake timeout"),
+		&net.DNSError{IsTimeout: true},
+	}
+	for _, e := range transient {
+		if !isTransientErr(e) {
+			t.Fatalf("expected transient: %v", e)
 		}
-		// Allow the initial-poll burst to complete.
-		time.Sleep(300 * time.Millisecond)
-		adapter.Close()
-		return int(atomic.LoadInt32(&fake.searchCalls))
+	}
+	notTransient := []error{
+		nil,
+		fmt.Errorf("x509: certificate signed by unknown authority"),
+		fmt.Errorf("malformed URL"),
+	}
+	for _, e := range notTransient {
+		if isTransientErr(e) {
+			t.Fatalf("expected NOT transient: %v", e)
+		}
+	}
+}
+
+// withFastBackoff swaps the package retry backoff for tiny durations so the
+// retry tests don't sleep for seconds, restoring it on cleanup.
+func withFastBackoff(t *testing.T) {
+	t.Helper()
+	orig := requestRetryBackoff
+	requestRetryBackoff = []time.Duration{5 * time.Millisecond}
+	t.Cleanup(func() { requestRetryBackoff = orig })
+}
+
+// TestEventsRetrieveTransientRetryRecovers models the reported failure: the
+// gateway 503s the retrieve a couple of times, then succeeds. The window must
+// complete with records shipped, and nothing should reach OnError — the blip
+// is absorbed inside one query cycle so events aren't re-shipped.
+func TestEventsRetrieveTransientRetryRecovers(t *testing.T) {
+	withFastBackoff(t)
+	fake := &fakeGateway{
+		eventPages:       [][]utils.Dict{{{"id": "e1", "time": "2026-05-15T10:00:00Z"}}},
+		retrieve503Times: 2, // fail twice, succeed on the 3rd attempt
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
 	}
 
-	if got := mk(false); got != 1 {
-		t.Fatalf("expected 1 search call when IncludeResolved=false, got %d", got)
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
 	}
-	if got := mk(true); got != 3 {
-		t.Fatalf("expected 3 search calls when IncludeResolved=true, got %d", got)
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// >=3 retrieve calls proves the 2 transient 503s were retried and the
+	// 3rd succeeded within a single query cycle.
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 3
+	}, "expected retrieve to be retried past the transient 503s")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("transient 503s must not surface as OnError; got: %v", errs)
+	}
+}
+
+// TestEventsRetrieveTransientExhaustionSurfacesError asserts that a gateway
+// that never recovers eventually surfaces a single OnError (the bounded
+// retry gives up rather than spinning forever).
+func TestEventsRetrieveTransientExhaustionSurfacesError(t *testing.T) {
+	withFastBackoff(t)
+	fake := &fakeGateway{
+		eventPages:       [][]utils.Dict{{{"id": "e1", "time": "2026-05-15T10:00:00Z"}}},
+		retrieve503Times: -1, // always 503
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs) >= 1
+	}, "expected exhausted retry budget to surface an OnError")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(errs[0], "exhausted") {
+		t.Fatalf("error should indicate retry exhaustion; got %q", errs[0])
+	}
+	// Each failed window makes maxRequestAttempts retrieve calls.
+	if got := atomic.LoadInt32(&fake.retrieveCalls); got < int32(maxRequestAttempts) {
+		t.Fatalf("expected >= %d retrieve attempts before giving up, got %d", maxRequestAttempts, got)
+	}
+}
+
+// TestAuthTransientRetryRecovers pins the gap-fix: a transient blip on
+// /auth/external (the call every data request depends on) must be absorbed
+// by the same bounded retry, not surface as OnError + a re-run window.
+func TestAuthTransientRetryRecovers(t *testing.T) {
+	withFastBackoff(t)
+	fake := &fakeGateway{
+		eventPages:   [][]utils.Dict{{{"id": "e1", "time": "2026-05-15T10:00:00Z"}}},
+		auth503Times: 2, // auth fails twice, succeeds on the 3rd attempt
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// A successful retrieve can only happen after auth recovered and a
+	// token was issued — proves the auth blip was retried, not surfaced.
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
+	}, "expected auth to recover after transient 503s and data to flow")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("transient auth 503s must not surface as OnError; got: %v", errs)
+	}
+	if got := atomic.LoadInt32(&fake.authCalls); got < 3 {
+		t.Fatalf("expected auth to be retried past the 2 transient 503s, got %d calls", got)
 	}
 }
 

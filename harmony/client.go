@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"strings"
@@ -31,7 +32,22 @@ const (
 	hecSearchEntityPath = "/app/hec-api/v1.0/search/query"
 
 	tokenRefreshSkew = 1 * time.Minute
+
+	// maxRequestAttempts bounds how many times a single gateway call is
+	// attempted before the error is surfaced. The Check Point gateway is
+	// observed to intermittently fail to return response headers within the
+	// client timeout (~a few times/day, across all services and both the
+	// status-poll and retrieve endpoints). Absorbing those blips here keeps
+	// a transient slowdown from re-running a whole query window — which for
+	// the events source would re-ship already-shipped pages, since events
+	// are not deduped.
+	maxRequestAttempts = 4
 )
+
+// requestRetryBackoff is the wait before retry attempt i (1-indexed-ish:
+// element 0 is the wait before the 2nd attempt). The last element is reused
+// if there are more attempts than entries.
+var requestRetryBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}
 
 // Defaults for the Infinity Events source.
 // Names must match the gateway exactly. The Email & Collaboration service uses
@@ -55,17 +71,44 @@ const (
 	defaultEventsPerCloudLimit   = 5000
 )
 
-// Defaults for the Restore Requests source.
-var defaultRestoreSaas = []string{"office365_emails", "google_mail"}
+// Defaults for the Emails source.
+//
+// The HEC search/query endpoint is a generic entity API keyed by
+// saas + saasEntity — it is not email-only and accepts other Harmony
+// Email & Collaboration entity types (files, Teams, Slack, …). This
+// source deliberately scopes to the email entities: that is the surface
+// verified end-to-end (payload shape, scroll pagination, dedup) against a
+// live tenant. Widening to non-email entity types is a separate, explicitly
+// verified change (and would warrant a generic "entities" source rather
+// than extending one named for email), not an allowlist tweak here.
+var defaultEmailsSaas = []string{"office365_emails", "google_mail"}
 
-var defaultRestoreSaasEntity = map[string]string{
+var defaultEmailsSaasEntity = map[string]string{
 	"office365_emails": "office365_emails_email",
 	"google_mail":      "google_mail_email",
 }
 
 const (
-	defaultRestorePollInterval = 5 * time.Minute
-	defaultRestoreLookback     = 30 * 24 * time.Hour
+	defaultEmailsPollInterval = 5 * time.Minute
+
+	// defaultEmailsLookback is intentionally short. The HEC search/query
+	// window filters on entityUpdated, not receipt time: when an email's
+	// state changes (verdict re-evaluated, quarantined, restored, declined)
+	// the gateway bumps entityUpdated, which re-dates the entity into a
+	// recent window. So a short lookback polled frequently — with dedup on
+	// entityId+entityUpdated — still captures late state changes without
+	// needing a long window. The lookback only has to exceed the poll
+	// interval (plus margin for clock skew / processing lag) so no update
+	// slips between polls. A long lookback is unnecessary and risks the
+	// per-query record ceiling the endpoint enforces on large windows.
+	defaultEmailsLookback = 1 * time.Hour
+
+	// maxEmailsPages bounds the HEC scroll loop. HEC pages at ~100 records
+	// each and enforces its own per-query record ceiling, so a legitimate
+	// window never approaches this; the bound only exists so a gateway that
+	// keeps returning a non-empty page can't spin forever. Hitting it is a
+	// real fault and is surfaced as an error rather than silently truncating.
+	maxEmailsPages = 1000
 )
 
 // harmonySource is the contract every ingestion source in this adapter
@@ -157,31 +200,32 @@ func (c *EventsConfig) Start(a *HarmonyAdapter) error {
 
 func (c *EventsConfig) Close() {}
 
-// RestoreRequestsConfig controls polling of the HEC entity search API to
-// surface emails with pending or recently-decided restore requests.
-type RestoreRequestsConfig struct {
+// EmailsConfig controls polling of the HEC entity search API for the full,
+// unfiltered email-entity feed: every email entity Harmony processes (with
+// its security verdicts and quarantine/restore lifecycle flags inline),
+// shipped once per (entityId, entityUpdated) so state changes re-emit while
+// unchanged entities don't. No server-side filtering is applied — triage and
+// alerting are expected to happen downstream.
+type EmailsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 
-	// Saas platforms to query. Defaults to office365_emails + google_mail
-	// (the only two HEC currently supports for the restore-request flags).
+	// Saas platforms to query. Defaults to office365_emails + google_mail.
+	// Validate rejects anything outside defaultEmailsSaasEntity — an
+	// intentional scope to the verified email entities, not an API limit
+	// (the HEC entity API itself is generic over saas/saasEntity).
 	Saas []string `json:"saas" yaml:"saas"`
 
 	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
 
-	// How far back to search for restore-requested emails. Defaults to 30 days
-	// (typical quarantine retention window).
+	// How far back each poll searches. Defaults to 1h. Keep this short: the
+	// feed is unfiltered and high volume, and the HEC search/query endpoint
+	// silently truncates a window that exceeds its per-query record cap. A
+	// short lookback polled frequently (with dedup on entityId+entityUpdated)
+	// keeps the feed complete; a long lookback would drop the oldest events.
 	Lookback time.Duration `json:"lookback" yaml:"lookback"`
 
-	// IncludeResolved, when true, also issues queries filtered on isRestored
-	// and isRestoreDeclined. The default (false) only queries
-	// isRestoreRequested=true, which assumes that flag stays set after the
-	// admin acts on the request. If your tenant clears the flag on
-	// resolution, enable this to ensure the "restored" / "declined"
-	// transitions are still captured. Dedup eliminates any overlap.
-	IncludeResolved bool `json:"include_resolved" yaml:"include_resolved"`
-
 	// Deduper avoids re-emitting the same entity for the same state on
-	// every poll. Transitions are still emitted because the dedup key
+	// every poll. State changes are still emitted because the dedup key
 	// includes the entityUpdated timestamp. If nil, Start allocates one
 	// sized to Lookback + 1h (24h floor); a caller-supplied deduper takes
 	// precedence. The source's Close releases the deduper unconditionally,
@@ -189,33 +233,33 @@ type RestoreRequestsConfig struct {
 	Deduper utils.Deduper `json:"-" yaml:"-"`
 }
 
-func (c *RestoreRequestsConfig) Name() string    { return "restore_requests" }
-func (c *RestoreRequestsConfig) IsEnabled() bool { return c != nil && c.Enabled }
+func (c *EmailsConfig) Name() string    { return "emails" }
+func (c *EmailsConfig) IsEnabled() bool { return c != nil && c.Enabled }
 
-func (c *RestoreRequestsConfig) Validate() error {
+func (c *EmailsConfig) Validate() error {
 	if len(c.Saas) == 0 {
-		c.Saas = append([]string{}, defaultRestoreSaas...)
+		c.Saas = append([]string{}, defaultEmailsSaas...)
 	}
 	for _, s := range c.Saas {
-		if _, ok := defaultRestoreSaasEntity[s]; !ok {
-			return fmt.Errorf("restore_requests.saas %q is not supported (only %v carry the restore flags)", s, defaultRestoreSaas)
+		if _, ok := defaultEmailsSaasEntity[s]; !ok {
+			return fmt.Errorf("emails.saas %q is not supported (supported: %v)", s, defaultEmailsSaas)
 		}
 	}
 	if c.PollInterval <= 0 {
-		c.PollInterval = defaultRestorePollInterval
+		c.PollInterval = defaultEmailsPollInterval
 	}
 	if c.Lookback <= 0 {
-		c.Lookback = defaultRestoreLookback
+		c.Lookback = defaultEmailsLookback
 	}
 	return nil
 }
 
-func (c *RestoreRequestsConfig) Start(a *HarmonyAdapter) error {
+func (c *EmailsConfig) Start(a *HarmonyAdapter) error {
 	if c.Deduper == nil {
-		// Size the TTL to the full lookback window so a still-pending
-		// request — which the gateway will keep returning every poll for
-		// as long as it remains in the lookback window — doesn't fall out
-		// of dedup and get re-emitted as if it were new. Floor at 24h.
+		// Size the TTL to the full lookback window so an entity that keeps
+		// matching every poll for as long as it remains in the lookback
+		// window doesn't fall out of dedup and get re-emitted as if it were
+		// new. Floor at 24h.
 		ttl := c.Lookback + 1*time.Hour
 		if ttl < 24*time.Hour {
 			ttl = 24 * time.Hour
@@ -228,12 +272,12 @@ func (c *RestoreRequestsConfig) Start(a *HarmonyAdapter) error {
 	}
 	for _, saas := range c.Saas {
 		a.wgSenders.Add(1)
-		go a.fetchRestoreRequestsForSaas(saas)
+		go a.fetchEmailsForSaas(saas)
 	}
 	return nil
 }
 
-func (c *RestoreRequestsConfig) Close() {
+func (c *EmailsConfig) Close() {
 	if c.Deduper != nil {
 		// Close any deduper attached to this source — both ones we allocated
 		// and caller-supplied ones, matching the convention other adapters
@@ -248,7 +292,7 @@ type HarmonyConfig struct {
 
 	// Infinity Portal API credentials (Global Settings > API Keys).
 	// For Infinity Events the key must include the "Logs as a Service" service.
-	// For Restore Requests the key must include the Harmony Email & Collaboration service.
+	// For the Emails feed the key must include the Harmony Email & Collaboration service.
 	// One key with both services attached is fine.
 	ClientID  string `json:"client_id" yaml:"client_id"`
 	AccessKey string `json:"access_key" yaml:"access_key"`
@@ -260,14 +304,14 @@ type HarmonyConfig struct {
 	// share the same hostname per region.
 	URL string `json:"url" yaml:"url"`
 
-	Events          EventsConfig          `json:"events" yaml:"events"`
-	RestoreRequests RestoreRequestsConfig `json:"restore_requests" yaml:"restore_requests"`
+	Events EventsConfig `json:"events" yaml:"events"`
+	Emails EmailsConfig `json:"emails" yaml:"emails"`
 }
 
 // sources returns the registered ingestion sources in a stable order. Adding
 // a new source is a single line here plus the source-config struct.
 func (c *HarmonyConfig) sources() []harmonySource {
-	return []harmonySource{&c.Events, &c.RestoreRequests}
+	return []harmonySource{&c.Events, &c.Emails}
 }
 
 func (c *HarmonyConfig) Validate() error {
@@ -610,59 +654,50 @@ func (a *HarmonyAdapter) retrieveEventsPage(taskID, pageToken string) ([]utils.D
 	return records, nextToken, nil
 }
 
-// ----- Source 2: HEC Restore Requests -----------------------------------------------------
+// ----- Source 2: HEC Emails ---------------------------------------------------------------
 
-func (a *HarmonyAdapter) fetchRestoreRequestsForSaas(saas string) {
+func (a *HarmonyAdapter) fetchEmailsForSaas(saas string) {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony restore-requests worker exiting (saas=%q)", saas))
-
-	// Filters to issue per poll. The primary pass catches every pending and
-	// post-decision entity if the gateway keeps isRestoreRequested set after
-	// the admin acts. When IncludeResolved is set we additionally search by
-	// isRestored=true and isRestoreDeclined=true so the transition is still
-	// captured if the tenant clears the original flag on resolution. Dedup
-	// suppresses any overlap.
-	filters := []utils.Dict{
-		{"saasAttrName": "entityPayload.isRestoreRequested", "saasAttrOp": "is", "saasAttrValue": "true"},
-	}
-	if a.conf.RestoreRequests.IncludeResolved {
-		filters = append(filters,
-			utils.Dict{"saasAttrName": "entityPayload.isRestored", "saasAttrOp": "is", "saasAttrValue": "true"},
-			utils.Dict{"saasAttrName": "entityPayload.isRestoreDeclined", "saasAttrOp": "is", "saasAttrValue": "true"},
-		)
-	}
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony emails worker exiting (saas=%q)", saas))
 
 	for {
-		for _, f := range filters {
-			if a.doStop.IsSet() {
-				return
-			}
-			if err := a.runOneRestoreRequestsQuery(saas, f); err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("harmony[restore_requests:%s:%s]: %v", saas, f["saasAttrName"], err))
-			}
+		if a.doStop.IsSet() {
+			return
 		}
-		if a.doStop.WaitFor(a.conf.RestoreRequests.PollInterval) {
+		if err := a.runOneEmailsQuery(saas); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[emails:%s]: %v", saas, err))
+		}
+		if a.doStop.WaitFor(a.conf.Emails.PollInterval) {
 			return
 		}
 	}
 }
 
-// runOneRestoreRequestsQuery scrolls through every email entity matching the
-// supplied extended filter within the configured lookback window and ships
-// each entity once per (entityId, entityUpdated) pair. The gateway bumps
-// entityUpdated on every state change, which is how we naturally surface
-// transitions (pending → restored, pending → declined) without re-emitting
-// still-pending requests on subsequent polls.
-func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter utils.Dict) error {
-	saasEntity, ok := defaultRestoreSaasEntity[saas]
+// runOneEmailsQuery scrolls through every email entity for the saas within
+// the configured lookback window and ships each entity once per
+// (entityId, entityUpdated) pair. No server-side filter is applied: the
+// gateway bumps entityUpdated on every state change (quarantine, restore,
+// decline, …), so deduping on that pair both suppresses unchanged repeats
+// and re-emits an entity each time its state advances — downstream does the
+// triage.
+//
+// HEC scroll uses a *stable* handle: the scrollId is the same on every page
+// and you advance by re-POSTing it (the cursor lives server-side). The end
+// of the result set is signalled by an empty page, not a changed/empty
+// scrollId — so termination is "no records returned", bounded by
+// maxEmailsPages as an anti-spin safety net. (Terminating on an unchanged
+// scrollId, as a generic scroll would, stops after the first page here and
+// silently drops the rest of the window.)
+func (a *HarmonyAdapter) runOneEmailsQuery(saas string) error {
+	saasEntity, ok := defaultEmailsSaasEntity[saas]
 	if !ok {
 		return fmt.Errorf("unsupported saas %q", saas)
 	}
-	startDate := time.Now().UTC().Add(-a.conf.RestoreRequests.Lookback).Format(time.RFC3339)
+	startDate := time.Now().UTC().Add(-a.conf.Emails.Lookback).Format(time.RFC3339)
 	endDate := time.Now().UTC().Format(time.RFC3339)
 
 	scrollID := ""
-	for {
+	for page := 0; page < maxEmailsPages; page++ {
 		if a.doStop.IsSet() {
 			return nil
 		}
@@ -675,7 +710,9 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter 
 					"startDate":  startDate,
 					"endDate":    endDate,
 				},
-				"entityExtendedFilter": []utils.Dict{extendedFilter},
+				// Unfiltered: an empty extended filter returns every email
+				// entity in the window, not just a flagged subset.
+				"entityExtendedFilter": []utils.Dict{},
 				"scrollId":             scrollID,
 			},
 		}
@@ -692,50 +729,44 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter 
 		nextScroll, _ := envelope.GetString("scrollId")
 		records, _ := resp.GetListOfDict("responseData")
 
+		// An empty page marks the end of the scroll (also covers an empty
+		// window on the first request).
+		if len(records) == 0 {
+			return nil
+		}
+
 		for _, rec := range records {
-			key := restoreDedupKey(rec)
+			key := emailDedupKey(rec)
 			if key == "" {
 				continue
 			}
-			if a.conf.RestoreRequests.Deduper.CheckAndAdd(key) {
+			if a.conf.Emails.Deduper.CheckAndAdd(key) {
 				continue
 			}
-			rec["_lc_harmony_source"] = "restore_requests"
+			rec["_lc_harmony_source"] = "emails"
 			rec["_lc_harmony_saas"] = saas
 			if err := a.shipRecord(rec); err != nil {
 				return err
 			}
 		}
 
-		if nextScroll == "" || nextScroll == scrollID || len(records) == 0 {
+		// No handle to continue with means this was a single, complete page.
+		if nextScroll == "" {
 			return nil
 		}
+		// Re-send the same (stable) handle to advance the server-side cursor.
 		scrollID = nextScroll
 	}
+	return fmt.Errorf("emails query exceeded %d pages (saas=%q): gateway did not signal end of scroll", maxEmailsPages, saas)
 }
 
-// dictBoolish reads a field that may be encoded as either a JSON boolean or
-// a string ("true" / "false"). The HEC API documentation (Feb 2026 ed.)
-// shows these fields as strings in its example payloads, but the live
-// gateway returns native JSON booleans. We accept both so the adapter
-// works regardless of which form a given tenant or version emits.
-func dictBoolish(d utils.Dict, key string) (value, found bool) {
-	if v, ok := d[key]; ok {
-		switch t := v.(type) {
-		case bool:
-			return t, true
-		case string:
-			return strings.EqualFold(t, "true"), true
-		}
-	}
-	return false, false
-}
-
-// restoreDedupKey returns a key that changes only when the email's restore
-// state advances. We anchor on entityId + entityUpdated because the gateway
-// bumps entityUpdated on every state change, while a still-pending request
-// keeps the same timestamp poll-over-poll.
-func restoreDedupKey(rec utils.Dict) string {
+// emailDedupKey returns a key that changes only when an email entity's state
+// advances. We anchor on entityId + entityUpdated because the gateway bumps
+// entityUpdated on every state change, while an unchanged entity keeps the
+// same timestamp poll-over-poll. If entityUpdated is absent we fall back to
+// entityCreated; a record with an id never yields an empty key, so a missing
+// timestamp can't silently drop it.
+func emailDedupKey(rec utils.Dict) string {
 	info, _ := rec.GetDict("entityInfo")
 	entityID, _ := info.GetString("entityId")
 	if entityID == "" {
@@ -743,15 +774,9 @@ func restoreDedupKey(rec utils.Dict) string {
 	}
 	updated, _ := info.GetString("entityUpdated")
 	if updated == "" {
-		// Fall back to a fingerprint of the relevant flags so we still
-		// dedup if the gateway ever omits entityUpdated.
-		payload, _ := rec.GetDict("entityPayload")
-		req, _ := dictBoolish(payload, "isRestoreRequested")
-		restored, _ := dictBoolish(payload, "isRestored")
-		declined, _ := dictBoolish(payload, "isRestoreDeclined")
-		updated = fmt.Sprintf("req=%t|restored=%t|declined=%t", req, restored, declined)
+		updated, _ = info.GetString("entityCreated")
 	}
-	return "restore:" + entityID + "|" + updated
+	return "email:" + entityID + "|" + updated
 }
 
 // ----- Shared helpers ---------------------------------------------------------------------
@@ -778,9 +803,73 @@ func (a *HarmonyAdapter) shipRecord(rec utils.Dict) error {
 	return nil
 }
 
+// retryBackoff returns the wait before the given attempt (attempt is
+// 1-indexed: the wait before the 2nd attempt is requestRetryBackoff[0]).
+// A ±20% jitter is applied so the per-service event workers don't all
+// retry in lockstep against an already-struggling gateway.
+func retryBackoff(attempt int) time.Duration {
+	i := attempt - 1
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(requestRetryBackoff) {
+		i = len(requestRetryBackoff) - 1
+	}
+	base := requestRetryBackoff[i]
+	span := int64(base) / 5 // 20%
+	if span <= 0 {
+		return base
+	}
+	return base + time.Duration(rand.Int64N(2*span)-span)
+}
+
+// doHTTPWithRetry executes buildReq()'s request with bounded retry on
+// transient failures (client/context timeouts, dropped connections, and
+// HTTP 502/503/504). buildReq is invoked once per attempt so a request
+// body is a fresh reader each time. It returns the final status+body for
+// any non-transient response (including 4xx — the caller decides what those
+// mean); err is non-nil only for a non-transient transport error or an
+// exhausted retry budget. Backoff is interruptible by doStop.
+func (a *HarmonyAdapter) doHTTPWithRetry(label string, buildReq func() (*http.Request, error)) (int, []byte, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxRequestAttempts; attempt++ {
+		if attempt > 0 {
+			d := retryBackoff(attempt)
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s: transient failure, retry %d/%d after %s: %v",
+				label, attempt, maxRequestAttempts-1, d, lastErr))
+			if a.doStop.WaitFor(d) {
+				return 0, nil, fmt.Errorf("%s: aborted during retry backoff", label)
+			}
+		}
+
+		req, err := buildReq()
+		if err != nil {
+			return 0, nil, err
+		}
+		resp, err := a.httpClient.Do(req)
+		if err != nil {
+			if !isTransientErr(err) {
+				return 0, nil, err
+			}
+			lastErr = err
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if isTransientStatus(resp.StatusCode) {
+			lastErr = fmt.Errorf("%s: HTTP %d: %s", label, resp.StatusCode, string(respBody))
+			continue
+		}
+		return resp.StatusCode, respBody, nil
+	}
+	return 0, nil, fmt.Errorf("%s: exhausted %d attempts: %v", label, maxRequestAttempts, lastErr)
+}
+
 // doAuthRequest issues an HTTP request with a valid bearer token attached.
 // If body is nil, no request body is sent. Additional headers (e.g.
 // x-av-req-id required by HEC endpoints) can be supplied via extraHeaders.
+// Transient gateway failures are absorbed by doHTTPWithRetry; a 401 triggers
+// a single token refresh + re-issue (itself transient-retried).
 func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extraHeaders map[string]string) (utils.Dict, error) {
 	bodyBytes, err := marshalBody(body)
 	if err != nil {
@@ -792,49 +881,50 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 		return nil, err
 	}
 
-	doOnce := func(tok string) (int, []byte, error) {
-		var reader io.Reader
-		if bodyBytes != nil {
-			reader = bytes.NewReader(bodyBytes)
+	build := func(tok string) func() (*http.Request, error) {
+		return func() (*http.Request, error) {
+			var reader io.Reader
+			if bodyBytes != nil {
+				reader = bytes.NewReader(bodyBytes)
+			}
+			req, err := http.NewRequestWithContext(a.ctx, method, url, reader)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Accept", "application/json")
+			if bodyBytes != nil {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			req.Header.Set("Authorization", "Bearer "+tok)
+			for k, v := range extraHeaders {
+				req.Header.Set(k, v)
+			}
+			return req, nil
 		}
-		req, err := http.NewRequestWithContext(a.ctx, method, url, reader)
-		if err != nil {
-			return 0, nil, err
-		}
-		req.Header.Set("Accept", "application/json")
-		if bodyBytes != nil {
-			req.Header.Set("Content-Type", "application/json")
-		}
-		req.Header.Set("Authorization", "Bearer "+tok)
-		for k, v := range extraHeaders {
-			req.Header.Set(k, v)
-		}
-		resp, err := a.httpClient.Do(req)
-		if err != nil {
-			return 0, nil, err
-		}
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
-		return resp.StatusCode, respBody, nil
 	}
 
-	status, respBody, err := doOnce(token)
+	label := method + " " + url
+	status, respBody, err := a.doHTTPWithRetry(label, build(token))
 	if err != nil {
 		return nil, err
 	}
+
+	// 401: token likely expired mid-flight. Refresh once and re-issue;
+	// the re-issue is itself transient-retried. A persistent 401 (revoked
+	// key / IP allowlist) falls through to the non-2xx return below.
 	if status == http.StatusUnauthorized {
 		token, err = a.getToken(true)
 		if err != nil {
 			return nil, err
 		}
-		status, respBody, err = doOnce(token)
+		status, respBody, err = a.doHTTPWithRetry(label, build(token))
 		if err != nil {
 			return nil, err
 		}
 	}
 
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("%s %s: HTTP %d: %s", method, url, status, string(respBody))
+		return nil, fmt.Errorf("%s: HTTP %d: %s", label, status, string(respBody))
 	}
 
 	out := utils.Dict{}
@@ -844,6 +934,51 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 		}
 	}
 	return out, nil
+}
+
+// isTransientStatus reports whether an HTTP status is a retryable gateway
+// hiccup (bad gateway / unavailable / gateway timeout) as opposed to a
+// client error we shouldn't retry. 429 is intentionally excluded: the
+// adapter's poll cadence stays well under the documented Infinity Events
+// limits, so a 429 signals a config problem (too many cloud_services / too
+// short a poll_interval) that should surface loudly rather than be masked
+// by silent retries.
+func isTransientStatus(status int) bool {
+	return status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
+}
+
+// isTransientErr reports whether a transport-level error is worth retrying:
+// client/context timeouts and dropped connections. Anything else (bad URL,
+// TLS failure, etc.) is returned to the caller as-is.
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := err.Error()
+	for _, frag := range []string{
+		"context deadline exceeded",
+		"Client.Timeout",
+		"connection reset",
+		"connection refused",
+		"unexpected EOF",
+		"i/o timeout",
+		"TLS handshake timeout",
+		"server closed idle connection",
+	} {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *HarmonyAdapter) getToken(force bool) (string, error) {
@@ -861,21 +996,25 @@ func (a *HarmonyAdapter) getToken(force bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequestWithContext(a.ctx, "POST", a.conf.URL+authPath, bytes.NewReader(reqBody))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := a.httpClient.Do(req)
+	// Route through the shared retry helper so an intermittent gateway
+	// blip on /auth/external is absorbed the same way data calls are —
+	// otherwise an auth-endpoint timeout still produces the OnError +
+	// window-rerun the data-path retry was added to prevent. A 401 here
+	// means bad creds / IP allowlist (not transient) and is returned.
+	status, respBody, err := a.doHTTPWithRetry("POST "+a.conf.URL+authPath, func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(a.ctx, "POST", a.conf.URL+authPath, bytes.NewReader(reqBody))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+		return req, nil
+	})
 	if err != nil {
 		return "", fmt.Errorf("auth request: %v", err)
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("auth HTTP %d: %s", resp.StatusCode, string(respBody))
+	if status < 200 || status >= 300 {
+		return "", fmt.Errorf("auth HTTP %d: %s", status, string(respBody))
 	}
 	parsed := utils.Dict{}
 	if err := json.Unmarshal(respBody, &parsed); err != nil {
