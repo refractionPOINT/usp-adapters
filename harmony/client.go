@@ -31,7 +31,22 @@ const (
 	hecSearchEntityPath = "/app/hec-api/v1.0/search/query"
 
 	tokenRefreshSkew = 1 * time.Minute
+
+	// maxRequestAttempts bounds how many times a single gateway call is
+	// attempted before the error is surfaced. The Check Point gateway is
+	// observed to intermittently fail to return response headers within the
+	// client timeout (~a few times/day, across all services and both the
+	// status-poll and retrieve endpoints). Absorbing those blips here keeps
+	// a transient slowdown from re-running a whole query window — which for
+	// the events source would re-ship already-shipped pages, since events
+	// are not deduped.
+	maxRequestAttempts = 4
 )
+
+// requestRetryBackoff is the wait before retry attempt i (1-indexed-ish:
+// element 0 is the wait before the 2nd attempt). The last element is reused
+// if there are more attempts than entries.
+var requestRetryBackoff = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}
 
 // Defaults for the Infinity Events source.
 // Names must match the gateway exactly. The Email & Collaboration service uses
@@ -818,32 +833,98 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 		return resp.StatusCode, respBody, nil
 	}
 
-	status, respBody, err := doOnce(token)
-	if err != nil {
-		return nil, err
-	}
-	if status == http.StatusUnauthorized {
-		token, err = a.getToken(true)
-		if err != nil {
-			return nil, err
+	var lastErr error
+	for attempt := 0; attempt < maxRequestAttempts; attempt++ {
+		if attempt > 0 {
+			i := attempt - 1
+			if i >= len(requestRetryBackoff) {
+				i = len(requestRetryBackoff) - 1
+			}
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s %s: transient failure, retry %d/%d after %s: %v",
+				method, url, attempt, maxRequestAttempts-1, requestRetryBackoff[i], lastErr))
+			if a.doStop.WaitFor(requestRetryBackoff[i]) {
+				return nil, fmt.Errorf("%s %s: aborted during retry backoff", method, url)
+			}
 		}
-		status, respBody, err = doOnce(token)
-		if err != nil {
-			return nil, err
+
+		status, respBody, err := doOnce(token)
+
+		// 401: refresh the token and re-issue immediately. This doesn't
+		// consume a transient-retry attempt — it's a distinct, expected
+		// path (token expired mid-flight).
+		if err == nil && status == http.StatusUnauthorized {
+			token, err = a.getToken(true)
+			if err != nil {
+				return nil, err
+			}
+			status, respBody, err = doOnce(token)
 		}
+
+		switch {
+		case err != nil:
+			if !isTransientErr(err) {
+				return nil, err
+			}
+			lastErr = err
+			continue
+		case isTransientStatus(status):
+			lastErr = fmt.Errorf("%s %s: HTTP %d: %s", method, url, status, string(respBody))
+			continue
+		case status < 200 || status >= 300:
+			return nil, fmt.Errorf("%s %s: HTTP %d: %s", method, url, status, string(respBody))
+		}
+
+		out := utils.Dict{}
+		if len(respBody) > 0 {
+			if err := json.Unmarshal(respBody, &out); err != nil {
+				return nil, fmt.Errorf("decode response: %v (body=%s)", err, string(respBody))
+			}
+		}
+		return out, nil
 	}
 
-	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("%s %s: HTTP %d: %s", method, url, status, string(respBody))
-	}
+	return nil, fmt.Errorf("%s %s: exhausted %d attempts: %v", method, url, maxRequestAttempts, lastErr)
+}
 
-	out := utils.Dict{}
-	if len(respBody) > 0 {
-		if err := json.Unmarshal(respBody, &out); err != nil {
-			return nil, fmt.Errorf("decode response: %v (body=%s)", err, string(respBody))
+// isTransientStatus reports whether an HTTP status is a retryable gateway
+// hiccup (bad gateway / unavailable / gateway timeout) as opposed to a
+// client error we shouldn't retry.
+func isTransientStatus(status int) bool {
+	return status == http.StatusBadGateway ||
+		status == http.StatusServiceUnavailable ||
+		status == http.StatusGatewayTimeout
+}
+
+// isTransientErr reports whether a transport-level error is worth retrying:
+// client/context timeouts and dropped connections. Anything else (bad URL,
+// TLS failure, etc.) is returned to the caller as-is.
+func isTransientErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := err.Error()
+	for _, frag := range []string{
+		"context deadline exceeded",
+		"Client.Timeout",
+		"connection reset",
+		"connection refused",
+		"unexpected EOF",
+		"i/o timeout",
+		"TLS handshake timeout",
+		"server closed idle connection",
+	} {
+		if strings.Contains(msg, frag) {
+			return true
 		}
 	}
-	return out, nil
+	return false
 }
 
 func (a *HarmonyAdapter) getToken(force bool) (string, error) {

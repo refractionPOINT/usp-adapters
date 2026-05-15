@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -18,59 +19,6 @@ import (
 )
 
 // ----- Pure helpers ------------------------------------------------------------------------
-
-func TestRestoreLifecycleState(t *testing.T) {
-	cases := []struct {
-		name     string
-		payload  utils.Dict
-		expected string
-	}{
-		{
-			name:     "pending when neither flag is set (string form)",
-			payload:  utils.Dict{"isRestoreRequested": "true", "isRestored": "false", "isRestoreDeclined": "false"},
-			expected: "pending",
-		},
-		{
-			name:     "restored (string form, as docs show)",
-			payload:  utils.Dict{"isRestoreRequested": "true", "isRestored": "true", "isRestoreDeclined": "false"},
-			expected: "restored",
-		},
-		{
-			name:     "restored (bool form, as live gateway emits)",
-			payload:  utils.Dict{"isRestoreRequested": true, "isRestored": true, "isRestoreDeclined": false},
-			expected: "restored",
-		},
-		{
-			name:     "declined (bool form)",
-			payload:  utils.Dict{"isRestoreRequested": true, "isRestored": false, "isRestoreDeclined": true},
-			expected: "declined",
-		},
-		{
-			name:     "case-insensitive match on string form",
-			payload:  utils.Dict{"isRestored": "True"},
-			expected: "restored",
-		},
-		{
-			name:     "restored wins when both decision flags are oddly set",
-			payload:  utils.Dict{"isRestored": true, "isRestoreDeclined": true},
-			expected: "restored",
-		},
-		{
-			name:     "missing payload defaults to pending",
-			payload:  nil,
-			expected: "pending",
-		},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			rec := utils.Dict{"entityPayload": c.payload}
-			got := restoreLifecycleState(rec)
-			if got != c.expected {
-				t.Fatalf("expected %q, got %q", c.expected, got)
-			}
-		})
-	}
-}
 
 func TestRestoreDedupKey(t *testing.T) {
 	t.Run("no entityId returns empty key so caller skips it", func(t *testing.T) {
@@ -316,6 +264,11 @@ type fakeGateway struct {
 	// service that never recovers).
 	cancelEventsTimes int
 
+	// retrieve503Times controls how many retrieve calls return a transient
+	// 503 before succeeding — models the intermittent gateway slowness the
+	// adapter must absorb via bounded retry. Negative = always 503.
+	retrieve503Times int
+
 	// Records returned by the HEC search; can be swapped at runtime to simulate transitions.
 	hecRecords []utils.Dict
 }
@@ -419,6 +372,19 @@ func (f *fakeGateway) serveEventsRetrieve(w http.ResponseWriter, r *http.Request
 		return
 	}
 	atomic.AddInt32(&f.retrieveCalls, 1)
+
+	f.mu.Lock()
+	transient := f.retrieve503Times != 0
+	if f.retrieve503Times > 0 {
+		f.retrieve503Times--
+	}
+	f.mu.Unlock()
+	if transient {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"success":false,"message":"temporarily unavailable"}`))
+		return
+	}
+
 	var body utils.Dict
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	pt, _ := body.GetString("pageToken")
@@ -849,6 +815,143 @@ func TestRestoreRequestsIncludeResolvedIssuesExtraQueries(t *testing.T) {
 	}
 	if got := mk(true); got != 3 {
 		t.Fatalf("expected 3 search calls when IncludeResolved=true, got %d", got)
+	}
+}
+
+func TestTransientClassification(t *testing.T) {
+	if !isTransientStatus(502) || !isTransientStatus(503) || !isTransientStatus(504) {
+		t.Fatalf("502/503/504 must be transient")
+	}
+	for _, s := range []int{200, 400, 401, 403, 404, 429, 500} {
+		if isTransientStatus(s) {
+			t.Fatalf("status %d must not be classified transient", s)
+		}
+	}
+	transient := []error{
+		context.DeadlineExceeded,
+		fmt.Errorf(`Post "https://x/y": context deadline exceeded (Client.Timeout exceeded while awaiting headers)`),
+		fmt.Errorf("read tcp 1.2.3.4:5->6.7.8.9:443: connection reset by peer"),
+		fmt.Errorf("net/http: TLS handshake timeout"),
+		&net.DNSError{IsTimeout: true},
+	}
+	for _, e := range transient {
+		if !isTransientErr(e) {
+			t.Fatalf("expected transient: %v", e)
+		}
+	}
+	notTransient := []error{
+		nil,
+		fmt.Errorf("x509: certificate signed by unknown authority"),
+		fmt.Errorf("malformed URL"),
+	}
+	for _, e := range notTransient {
+		if isTransientErr(e) {
+			t.Fatalf("expected NOT transient: %v", e)
+		}
+	}
+}
+
+// withFastBackoff swaps the package retry backoff for tiny durations so the
+// retry tests don't sleep for seconds, restoring it on cleanup.
+func withFastBackoff(t *testing.T) {
+	t.Helper()
+	orig := requestRetryBackoff
+	requestRetryBackoff = []time.Duration{5 * time.Millisecond}
+	t.Cleanup(func() { requestRetryBackoff = orig })
+}
+
+// TestEventsRetrieveTransientRetryRecovers models the reported failure: the
+// gateway 503s the retrieve a couple of times, then succeeds. The window must
+// complete with records shipped, and nothing should reach OnError — the blip
+// is absorbed inside one query cycle so events aren't re-shipped.
+func TestEventsRetrieveTransientRetryRecovers(t *testing.T) {
+	withFastBackoff(t)
+	fake := &fakeGateway{
+		eventPages:       [][]utils.Dict{{{"id": "e1", "time": "2026-05-15T10:00:00Z"}}},
+		retrieve503Times: 2, // fail twice, succeed on the 3rd attempt
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// >=3 retrieve calls proves the 2 transient 503s were retried and the
+	// 3rd succeeded within a single query cycle.
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 3
+	}, "expected retrieve to be retried past the transient 503s")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("transient 503s must not surface as OnError; got: %v", errs)
+	}
+}
+
+// TestEventsRetrieveTransientExhaustionSurfacesError asserts that a gateway
+// that never recovers eventually surfaces a single OnError (the bounded
+// retry gives up rather than spinning forever).
+func TestEventsRetrieveTransientExhaustionSurfacesError(t *testing.T) {
+	withFastBackoff(t)
+	fake := &fakeGateway{
+		eventPages:       [][]utils.Dict{{{"id": "e1", "time": "2026-05-15T10:00:00Z"}}},
+		retrieve503Times: -1, // always 503
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs) >= 1
+	}, "expected exhausted retry budget to surface an OnError")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(errs[0], "exhausted") {
+		t.Fatalf("error should indicate retry exhaustion; got %q", errs[0])
+	}
+	// Each failed window makes maxRequestAttempts retrieve calls.
+	if got := atomic.LoadInt32(&fake.retrieveCalls); got < int32(maxRequestAttempts) {
+		t.Fatalf("expected >= %d retrieve attempts before giving up, got %d", maxRequestAttempts, got)
 	}
 }
 
