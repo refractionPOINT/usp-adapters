@@ -1589,7 +1589,7 @@ func TestParquetInPlaceRewrite(t *testing.T) {
 		tailFiles:  make(map[string]*tailInfo),
 		serialFeed: semaphore.NewWeighted(1),
 		uspClient:  dummyUSPClient,
-		lineCb: func(line string) { receivedLines <- line },
+		lineCb:     func(line string) { receivedLines <- line },
 	}
 
 	go adapter.pollFiles()
