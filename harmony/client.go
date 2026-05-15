@@ -46,13 +46,13 @@ var defaultEventsCloudServices = []string{
 }
 
 const (
-	defaultEventsPollInterval     = 60 * time.Second
-	defaultEventsStatusPollEvery  = 5 * time.Second
-	defaultEventsStatusPollTotal  = 10 * time.Minute
-	defaultEventsInitialLookback  = 1 * time.Hour
-	defaultEventsEndLag           = 1 * time.Minute
-	defaultEventsPageLimit        = 100
-	defaultEventsPerCloudLimit    = 5000
+	defaultEventsPollInterval    = 60 * time.Second
+	defaultEventsStatusPollEvery = 5 * time.Second
+	defaultEventsStatusPollTotal = 10 * time.Minute
+	defaultEventsInitialLookback = 1 * time.Hour
+	defaultEventsEndLag          = 1 * time.Minute
+	defaultEventsPageLimit       = 100
+	defaultEventsPerCloudLimit   = 5000
 )
 
 // Defaults for the Restore Requests source.
@@ -702,7 +702,6 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter 
 			}
 			rec["_lc_harmony_source"] = "restore_requests"
 			rec["_lc_harmony_saas"] = saas
-			rec["_lc_harmony_state"] = restoreLifecycleState(rec)
 			if err := a.shipRecord(rec); err != nil {
 				return err
 			}
@@ -753,22 +752,6 @@ func restoreDedupKey(rec utils.Dict) string {
 		updated = fmt.Sprintf("req=%t|restored=%t|declined=%t", req, restored, declined)
 	}
 	return "restore:" + entityID + "|" + updated
-}
-
-// restoreLifecycleState classifies the current restore lifecycle stage so
-// downstream consumers can filter without re-parsing the flag combination.
-func restoreLifecycleState(rec utils.Dict) string {
-	payload, _ := rec.GetDict("entityPayload")
-	restored, _ := dictBoolish(payload, "isRestored")
-	declined, _ := dictBoolish(payload, "isRestoreDeclined")
-	switch {
-	case restored:
-		return "restored"
-	case declined:
-		return "declined"
-	default:
-		return "pending"
-	}
 }
 
 // ----- Shared helpers ---------------------------------------------------------------------
