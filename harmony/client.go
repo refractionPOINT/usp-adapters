@@ -71,17 +71,35 @@ const (
 	defaultEventsPerCloudLimit   = 5000
 )
 
-// Defaults for the Restore Requests source.
-var defaultRestoreSaas = []string{"office365_emails", "google_mail"}
+// Defaults for the Emails source.
+var defaultEmailsSaas = []string{"office365_emails", "google_mail"}
 
-var defaultRestoreSaasEntity = map[string]string{
+var defaultEmailsSaasEntity = map[string]string{
 	"office365_emails": "office365_emails_email",
 	"google_mail":      "google_mail_email",
 }
 
 const (
-	defaultRestorePollInterval = 5 * time.Minute
-	defaultRestoreLookback     = 30 * 24 * time.Hour
+	defaultEmailsPollInterval = 5 * time.Minute
+
+	// defaultEmailsLookback is intentionally short. The HEC search/query
+	// window filters on entityUpdated, not receipt time: when an email's
+	// state changes (verdict re-evaluated, quarantined, restored, declined)
+	// the gateway bumps entityUpdated, which re-dates the entity into a
+	// recent window. So a short lookback polled frequently — with dedup on
+	// entityId+entityUpdated — still captures late state changes without
+	// needing a long window. The lookback only has to exceed the poll
+	// interval (plus margin for clock skew / processing lag) so no update
+	// slips between polls. A long lookback is unnecessary and risks the
+	// per-query record ceiling the endpoint enforces on large windows.
+	defaultEmailsLookback = 1 * time.Hour
+
+	// maxEmailsPages bounds the HEC scroll loop. HEC pages at ~100 records
+	// each and enforces its own per-query record ceiling, so a legitimate
+	// window never approaches this; the bound only exists so a gateway that
+	// keeps returning a non-empty page can't spin forever. Hitting it is a
+	// real fault and is surfaced as an error rather than silently truncating.
+	maxEmailsPages = 1000
 )
 
 // harmonySource is the contract every ingestion source in this adapter
@@ -173,31 +191,30 @@ func (c *EventsConfig) Start(a *HarmonyAdapter) error {
 
 func (c *EventsConfig) Close() {}
 
-// RestoreRequestsConfig controls polling of the HEC entity search API to
-// surface emails with pending or recently-decided restore requests.
-type RestoreRequestsConfig struct {
+// EmailsConfig controls polling of the HEC entity search API for the full,
+// unfiltered email-entity feed: every email entity Harmony processes (with
+// its security verdicts and quarantine/restore lifecycle flags inline),
+// shipped once per (entityId, entityUpdated) so state changes re-emit while
+// unchanged entities don't. No server-side filtering is applied — triage and
+// alerting are expected to happen downstream.
+type EmailsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 
 	// Saas platforms to query. Defaults to office365_emails + google_mail
-	// (the only two HEC currently supports for the restore-request flags).
+	// (the email entities HEC exposes through the entity search API).
 	Saas []string `json:"saas" yaml:"saas"`
 
 	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
 
-	// How far back to search for restore-requested emails. Defaults to 30 days
-	// (typical quarantine retention window).
+	// How far back each poll searches. Defaults to 1h. Keep this short: the
+	// feed is unfiltered and high volume, and the HEC search/query endpoint
+	// silently truncates a window that exceeds its per-query record cap. A
+	// short lookback polled frequently (with dedup on entityId+entityUpdated)
+	// keeps the feed complete; a long lookback would drop the oldest events.
 	Lookback time.Duration `json:"lookback" yaml:"lookback"`
 
-	// IncludeResolved, when true, also issues queries filtered on isRestored
-	// and isRestoreDeclined. The default (false) only queries
-	// isRestoreRequested=true, which assumes that flag stays set after the
-	// admin acts on the request. If your tenant clears the flag on
-	// resolution, enable this to ensure the "restored" / "declined"
-	// transitions are still captured. Dedup eliminates any overlap.
-	IncludeResolved bool `json:"include_resolved" yaml:"include_resolved"`
-
 	// Deduper avoids re-emitting the same entity for the same state on
-	// every poll. Transitions are still emitted because the dedup key
+	// every poll. State changes are still emitted because the dedup key
 	// includes the entityUpdated timestamp. If nil, Start allocates one
 	// sized to Lookback + 1h (24h floor); a caller-supplied deduper takes
 	// precedence. The source's Close releases the deduper unconditionally,
@@ -205,33 +222,33 @@ type RestoreRequestsConfig struct {
 	Deduper utils.Deduper `json:"-" yaml:"-"`
 }
 
-func (c *RestoreRequestsConfig) Name() string    { return "restore_requests" }
-func (c *RestoreRequestsConfig) IsEnabled() bool { return c != nil && c.Enabled }
+func (c *EmailsConfig) Name() string    { return "emails" }
+func (c *EmailsConfig) IsEnabled() bool { return c != nil && c.Enabled }
 
-func (c *RestoreRequestsConfig) Validate() error {
+func (c *EmailsConfig) Validate() error {
 	if len(c.Saas) == 0 {
-		c.Saas = append([]string{}, defaultRestoreSaas...)
+		c.Saas = append([]string{}, defaultEmailsSaas...)
 	}
 	for _, s := range c.Saas {
-		if _, ok := defaultRestoreSaasEntity[s]; !ok {
-			return fmt.Errorf("restore_requests.saas %q is not supported (only %v carry the restore flags)", s, defaultRestoreSaas)
+		if _, ok := defaultEmailsSaasEntity[s]; !ok {
+			return fmt.Errorf("emails.saas %q is not supported (supported: %v)", s, defaultEmailsSaas)
 		}
 	}
 	if c.PollInterval <= 0 {
-		c.PollInterval = defaultRestorePollInterval
+		c.PollInterval = defaultEmailsPollInterval
 	}
 	if c.Lookback <= 0 {
-		c.Lookback = defaultRestoreLookback
+		c.Lookback = defaultEmailsLookback
 	}
 	return nil
 }
 
-func (c *RestoreRequestsConfig) Start(a *HarmonyAdapter) error {
+func (c *EmailsConfig) Start(a *HarmonyAdapter) error {
 	if c.Deduper == nil {
-		// Size the TTL to the full lookback window so a still-pending
-		// request — which the gateway will keep returning every poll for
-		// as long as it remains in the lookback window — doesn't fall out
-		// of dedup and get re-emitted as if it were new. Floor at 24h.
+		// Size the TTL to the full lookback window so an entity that keeps
+		// matching every poll for as long as it remains in the lookback
+		// window doesn't fall out of dedup and get re-emitted as if it were
+		// new. Floor at 24h.
 		ttl := c.Lookback + 1*time.Hour
 		if ttl < 24*time.Hour {
 			ttl = 24 * time.Hour
@@ -244,12 +261,12 @@ func (c *RestoreRequestsConfig) Start(a *HarmonyAdapter) error {
 	}
 	for _, saas := range c.Saas {
 		a.wgSenders.Add(1)
-		go a.fetchRestoreRequestsForSaas(saas)
+		go a.fetchEmailsForSaas(saas)
 	}
 	return nil
 }
 
-func (c *RestoreRequestsConfig) Close() {
+func (c *EmailsConfig) Close() {
 	if c.Deduper != nil {
 		// Close any deduper attached to this source — both ones we allocated
 		// and caller-supplied ones, matching the convention other adapters
@@ -264,7 +281,7 @@ type HarmonyConfig struct {
 
 	// Infinity Portal API credentials (Global Settings > API Keys).
 	// For Infinity Events the key must include the "Logs as a Service" service.
-	// For Restore Requests the key must include the Harmony Email & Collaboration service.
+	// For the Emails feed the key must include the Harmony Email & Collaboration service.
 	// One key with both services attached is fine.
 	ClientID  string `json:"client_id" yaml:"client_id"`
 	AccessKey string `json:"access_key" yaml:"access_key"`
@@ -276,14 +293,14 @@ type HarmonyConfig struct {
 	// share the same hostname per region.
 	URL string `json:"url" yaml:"url"`
 
-	Events          EventsConfig          `json:"events" yaml:"events"`
-	RestoreRequests RestoreRequestsConfig `json:"restore_requests" yaml:"restore_requests"`
+	Events EventsConfig `json:"events" yaml:"events"`
+	Emails EmailsConfig `json:"emails" yaml:"emails"`
 }
 
 // sources returns the registered ingestion sources in a stable order. Adding
 // a new source is a single line here plus the source-config struct.
 func (c *HarmonyConfig) sources() []harmonySource {
-	return []harmonySource{&c.Events, &c.RestoreRequests}
+	return []harmonySource{&c.Events, &c.Emails}
 }
 
 func (c *HarmonyConfig) Validate() error {
@@ -626,59 +643,50 @@ func (a *HarmonyAdapter) retrieveEventsPage(taskID, pageToken string) ([]utils.D
 	return records, nextToken, nil
 }
 
-// ----- Source 2: HEC Restore Requests -----------------------------------------------------
+// ----- Source 2: HEC Emails ---------------------------------------------------------------
 
-func (a *HarmonyAdapter) fetchRestoreRequestsForSaas(saas string) {
+func (a *HarmonyAdapter) fetchEmailsForSaas(saas string) {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony restore-requests worker exiting (saas=%q)", saas))
-
-	// Filters to issue per poll. The primary pass catches every pending and
-	// post-decision entity if the gateway keeps isRestoreRequested set after
-	// the admin acts. When IncludeResolved is set we additionally search by
-	// isRestored=true and isRestoreDeclined=true so the transition is still
-	// captured if the tenant clears the original flag on resolution. Dedup
-	// suppresses any overlap.
-	filters := []utils.Dict{
-		{"saasAttrName": "entityPayload.isRestoreRequested", "saasAttrOp": "is", "saasAttrValue": "true"},
-	}
-	if a.conf.RestoreRequests.IncludeResolved {
-		filters = append(filters,
-			utils.Dict{"saasAttrName": "entityPayload.isRestored", "saasAttrOp": "is", "saasAttrValue": "true"},
-			utils.Dict{"saasAttrName": "entityPayload.isRestoreDeclined", "saasAttrOp": "is", "saasAttrValue": "true"},
-		)
-	}
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony emails worker exiting (saas=%q)", saas))
 
 	for {
-		for _, f := range filters {
-			if a.doStop.IsSet() {
-				return
-			}
-			if err := a.runOneRestoreRequestsQuery(saas, f); err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("harmony[restore_requests:%s:%s]: %v", saas, f["saasAttrName"], err))
-			}
+		if a.doStop.IsSet() {
+			return
 		}
-		if a.doStop.WaitFor(a.conf.RestoreRequests.PollInterval) {
+		if err := a.runOneEmailsQuery(saas); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[emails:%s]: %v", saas, err))
+		}
+		if a.doStop.WaitFor(a.conf.Emails.PollInterval) {
 			return
 		}
 	}
 }
 
-// runOneRestoreRequestsQuery scrolls through every email entity matching the
-// supplied extended filter within the configured lookback window and ships
-// each entity once per (entityId, entityUpdated) pair. The gateway bumps
-// entityUpdated on every state change, which is how we naturally surface
-// transitions (pending → restored, pending → declined) without re-emitting
-// still-pending requests on subsequent polls.
-func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter utils.Dict) error {
-	saasEntity, ok := defaultRestoreSaasEntity[saas]
+// runOneEmailsQuery scrolls through every email entity for the saas within
+// the configured lookback window and ships each entity once per
+// (entityId, entityUpdated) pair. No server-side filter is applied: the
+// gateway bumps entityUpdated on every state change (quarantine, restore,
+// decline, …), so deduping on that pair both suppresses unchanged repeats
+// and re-emits an entity each time its state advances — downstream does the
+// triage.
+//
+// HEC scroll uses a *stable* handle: the scrollId is the same on every page
+// and you advance by re-POSTing it (the cursor lives server-side). The end
+// of the result set is signalled by an empty page, not a changed/empty
+// scrollId — so termination is "no records returned", bounded by
+// maxEmailsPages as an anti-spin safety net. (Terminating on an unchanged
+// scrollId, as a generic scroll would, stops after the first page here and
+// silently drops the rest of the window.)
+func (a *HarmonyAdapter) runOneEmailsQuery(saas string) error {
+	saasEntity, ok := defaultEmailsSaasEntity[saas]
 	if !ok {
 		return fmt.Errorf("unsupported saas %q", saas)
 	}
-	startDate := time.Now().UTC().Add(-a.conf.RestoreRequests.Lookback).Format(time.RFC3339)
+	startDate := time.Now().UTC().Add(-a.conf.Emails.Lookback).Format(time.RFC3339)
 	endDate := time.Now().UTC().Format(time.RFC3339)
 
 	scrollID := ""
-	for {
+	for page := 0; page < maxEmailsPages; page++ {
 		if a.doStop.IsSet() {
 			return nil
 		}
@@ -691,7 +699,9 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter 
 					"startDate":  startDate,
 					"endDate":    endDate,
 				},
-				"entityExtendedFilter": []utils.Dict{extendedFilter},
+				// Unfiltered: an empty extended filter returns every email
+				// entity in the window, not just a flagged subset.
+				"entityExtendedFilter": []utils.Dict{},
 				"scrollId":             scrollID,
 			},
 		}
@@ -708,50 +718,44 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, extendedFilter 
 		nextScroll, _ := envelope.GetString("scrollId")
 		records, _ := resp.GetListOfDict("responseData")
 
+		// An empty page marks the end of the scroll (also covers an empty
+		// window on the first request).
+		if len(records) == 0 {
+			return nil
+		}
+
 		for _, rec := range records {
-			key := restoreDedupKey(rec)
+			key := emailDedupKey(rec)
 			if key == "" {
 				continue
 			}
-			if a.conf.RestoreRequests.Deduper.CheckAndAdd(key) {
+			if a.conf.Emails.Deduper.CheckAndAdd(key) {
 				continue
 			}
-			rec["_lc_harmony_source"] = "restore_requests"
+			rec["_lc_harmony_source"] = "emails"
 			rec["_lc_harmony_saas"] = saas
 			if err := a.shipRecord(rec); err != nil {
 				return err
 			}
 		}
 
-		if nextScroll == "" || nextScroll == scrollID || len(records) == 0 {
+		// No handle to continue with means this was a single, complete page.
+		if nextScroll == "" {
 			return nil
 		}
+		// Re-send the same (stable) handle to advance the server-side cursor.
 		scrollID = nextScroll
 	}
+	return fmt.Errorf("emails query exceeded %d pages (saas=%q): gateway did not signal end of scroll", maxEmailsPages, saas)
 }
 
-// dictBoolish reads a field that may be encoded as either a JSON boolean or
-// a string ("true" / "false"). The HEC API documentation (Feb 2026 ed.)
-// shows these fields as strings in its example payloads, but the live
-// gateway returns native JSON booleans. We accept both so the adapter
-// works regardless of which form a given tenant or version emits.
-func dictBoolish(d utils.Dict, key string) (value, found bool) {
-	if v, ok := d[key]; ok {
-		switch t := v.(type) {
-		case bool:
-			return t, true
-		case string:
-			return strings.EqualFold(t, "true"), true
-		}
-	}
-	return false, false
-}
-
-// restoreDedupKey returns a key that changes only when the email's restore
-// state advances. We anchor on entityId + entityUpdated because the gateway
-// bumps entityUpdated on every state change, while a still-pending request
-// keeps the same timestamp poll-over-poll.
-func restoreDedupKey(rec utils.Dict) string {
+// emailDedupKey returns a key that changes only when an email entity's state
+// advances. We anchor on entityId + entityUpdated because the gateway bumps
+// entityUpdated on every state change, while an unchanged entity keeps the
+// same timestamp poll-over-poll. If entityUpdated is absent we fall back to
+// entityCreated; a record with an id never yields an empty key, so a missing
+// timestamp can't silently drop it.
+func emailDedupKey(rec utils.Dict) string {
 	info, _ := rec.GetDict("entityInfo")
 	entityID, _ := info.GetString("entityId")
 	if entityID == "" {
@@ -759,15 +763,9 @@ func restoreDedupKey(rec utils.Dict) string {
 	}
 	updated, _ := info.GetString("entityUpdated")
 	if updated == "" {
-		// Fall back to a fingerprint of the relevant flags so we still
-		// dedup if the gateway ever omits entityUpdated.
-		payload, _ := rec.GetDict("entityPayload")
-		req, _ := dictBoolish(payload, "isRestoreRequested")
-		restored, _ := dictBoolish(payload, "isRestored")
-		declined, _ := dictBoolish(payload, "isRestoreDeclined")
-		updated = fmt.Sprintf("req=%t|restored=%t|declined=%t", req, restored, declined)
+		updated, _ = info.GetString("entityCreated")
 	}
-	return "restore:" + entityID + "|" + updated
+	return "email:" + entityID + "|" + updated
 }
 
 // ----- Shared helpers ---------------------------------------------------------------------
