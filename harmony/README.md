@@ -213,9 +213,9 @@ harmony:
 | `filter` | `[]` | List of `{attr, op, value}` predicates passed through as `entityExtendedFilter`. Empty is allowed (then the query is bounded only by the entity window and, in cursor mode, the injected cursor predicate). |
 | `cursor_field` | `""` | Empty → window mode. Set to `entityPayload.<k>` or `entityInfo.<k>` (timestamp-typed) → cursor mode. |
 | `include_splits` | `false` | If true, ship `entityPayload.emailSplit == "split"` master records alongside their child copies (firehose semantics). Default skips them so a single email isn't double-emitted per query. |
-| `lookback` | `1h` (window) / `360h` (cursor) | Floor on `entityFilter.startDate` (received time). |
-| `initial_lookback` | `1h` | Cursor mode only: how far back the cursor starts on the first poll. |
-| `poll_interval` | `5m` | Time between polls. |
+| `lookback` | `1h` (window) / `360h` (cursor) | Floor on `entityFilter.startDate` (received time). Duration string per [`time.ParseDuration`](https://pkg.go.dev/time#ParseDuration) — e.g. `"1h"`, `"360h"`, `"1h30m"`. |
+| `initial_lookback` | `1h` | Cursor mode only: how far back the cursor starts on the first poll. Same `time.ParseDuration` format. |
+| `poll_interval` | `5m` | Time between polls. Same `time.ParseDuration` format. |
 
 ### Operational notes
 

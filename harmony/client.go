@@ -210,9 +210,14 @@ type EventsConfig struct {
 	// Optional Infinity Events query filter applied to every cloud service.
 	Filter string `json:"filter" yaml:"filter"`
 
-	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
-	PageLimit    int           `json:"page_limit" yaml:"page_limit"`
-	Limit        int           `json:"limit" yaml:"limit"`
+	// PollInterval is a time.ParseDuration string ("60s", "5m", "1h30m") —
+	// kept as a string field so YAML and JSON configs are human-readable.
+	// The parsed value is in pollInterval, populated by Validate.
+	PollInterval string `json:"poll_interval" yaml:"poll_interval"`
+	PageLimit    int    `json:"page_limit" yaml:"page_limit"`
+	Limit        int    `json:"limit" yaml:"limit"`
+
+	pollInterval time.Duration
 }
 
 func (c *EventsConfig) Name() string    { return "events" }
@@ -222,9 +227,11 @@ func (c *EventsConfig) Validate() error {
 	if len(c.CloudServices) == 0 {
 		c.CloudServices = append([]string{}, defaultEventsCloudServices...)
 	}
-	if c.PollInterval <= 0 {
-		c.PollInterval = defaultEventsPollInterval
+	pi, err := parseConfigDuration("events.poll_interval", c.PollInterval, defaultEventsPollInterval)
+	if err != nil {
+		return err
 	}
+	c.pollInterval = pi
 	if c.PageLimit <= 0 {
 		c.PageLimit = defaultEventsPageLimit
 	}
@@ -328,15 +335,20 @@ type EntityQuery struct {
 	// semantics: emit every record the gateway returns, including masters.
 	IncludeSplits bool `json:"include_splits" yaml:"include_splits"`
 
-	// Lookback bounds entityFilter.startDate (received time). Defaults:
-	// 1h in window mode, 15d in cursor mode.
-	Lookback time.Duration `json:"lookback" yaml:"lookback"`
+	// Lookback bounds entityFilter.startDate (received time). A
+	// time.ParseDuration string ("1h", "360h", "1h30m"); kept human-readable
+	// in YAML/JSON. Defaults: 1h in window mode, 15d in cursor mode. The
+	// parsed value is in lookback, populated by Validate.
+	Lookback string `json:"lookback" yaml:"lookback"`
 
 	// InitialLookback (cursor mode only) is how far back the cursor starts
-	// on the first poll. Defaults to 1h.
-	InitialLookback time.Duration `json:"initial_lookback" yaml:"initial_lookback"`
+	// on the first poll. A time.ParseDuration string. Defaults to 1h. The
+	// parsed value is in initialLookback, populated by Validate.
+	InitialLookback string `json:"initial_lookback" yaml:"initial_lookback"`
 
-	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
+	// PollInterval is a time.ParseDuration string. The parsed value is in
+	// pollInterval, populated by Validate.
+	PollInterval string `json:"poll_interval" yaml:"poll_interval"`
 
 	// Deduper avoids re-emitting unchanged entities every poll. Key is
 	// query-name + entityId + entityUpdated (+ CursorField value in cursor
@@ -345,6 +357,10 @@ type EntityQuery struct {
 	// Start allocates one; a caller-supplied deduper takes precedence.
 	// Each query has its own deduper; Close releases it.
 	Deduper utils.Deduper `json:"-" yaml:"-"`
+
+	lookback        time.Duration
+	initialLookback time.Duration
+	pollInterval    time.Duration
 }
 
 // EntitiesConfig is the generic HEC entity-query source: a list of named
@@ -394,19 +410,25 @@ func (c *EntitiesConfig) Validate() error {
 			!strings.HasPrefix(q.CursorField, "entityInfo.") {
 			return fmt.Errorf("entities.queries[%q].cursor_field %q must reference entityPayload.* or entityInfo.*", q.Name, q.CursorField)
 		}
-		if q.PollInterval <= 0 {
-			q.PollInterval = defaultEntitiesPollInterval
+		pi, err := parseConfigDuration(fmt.Sprintf("entities.queries[%q].poll_interval", q.Name), q.PollInterval, defaultEntitiesPollInterval)
+		if err != nil {
+			return err
 		}
-		if q.Lookback <= 0 {
-			if q.CursorField != "" {
-				q.Lookback = defaultEntitiesCursorLookback
-			} else {
-				q.Lookback = defaultEntitiesWindowLookback
-			}
+		q.pollInterval = pi
+		lookbackDefault := defaultEntitiesWindowLookback
+		if q.CursorField != "" {
+			lookbackDefault = defaultEntitiesCursorLookback
 		}
-		if q.InitialLookback <= 0 {
-			q.InitialLookback = defaultEntitiesInitialLookback
+		lb, err := parseConfigDuration(fmt.Sprintf("entities.queries[%q].lookback", q.Name), q.Lookback, lookbackDefault)
+		if err != nil {
+			return err
 		}
+		q.lookback = lb
+		il, err := parseConfigDuration(fmt.Sprintf("entities.queries[%q].initial_lookback", q.Name), q.InitialLookback, defaultEntitiesInitialLookback)
+		if err != nil {
+			return err
+		}
+		q.initialLookback = il
 	}
 	return nil
 }
@@ -418,7 +440,7 @@ func (c *EntitiesConfig) Start(a *HarmonyAdapter) error {
 			// TTL covers the received-time window so an entity matching
 			// every poll for as long as it stays in lookback doesn't fall
 			// out of dedup and get re-emitted. Floor at 24h.
-			ttl := q.Lookback + 1*time.Hour
+			ttl := q.lookback + 1*time.Hour
 			if ttl < 24*time.Hour {
 				ttl = 24 * time.Hour
 			}
@@ -617,7 +639,7 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 	for {
 		endTime := time.Now().UTC().Add(-defaultEventsEndLag)
 		if !endTime.After(nextStart) {
-			if a.doStop.WaitFor(a.conf.Events.PollInterval) {
+			if a.doStop.WaitFor(a.conf.Events.pollInterval) {
 				return
 			}
 			continue
@@ -643,7 +665,7 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 			nextStart = newCursor
 		}
 
-		if a.doStop.WaitFor(a.conf.Events.PollInterval) {
+		if a.doStop.WaitFor(a.conf.Events.pollInterval) {
 			return
 		}
 	}
@@ -833,7 +855,7 @@ func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 	// cursor — it relies on the rolling startDate/endDate window + dedup —
 	// but we still initialise the variable so the call signature stays
 	// uniform across modes.
-	cursor := time.Now().UTC().Add(-q.InitialLookback)
+	cursor := time.Now().UTC().Add(-q.initialLookback)
 
 	for {
 		if a.doStop.IsSet() {
@@ -845,7 +867,7 @@ func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 		} else if q.CursorField != "" && newCursor.After(cursor) {
 			cursor = newCursor
 		}
-		if a.doStop.WaitFor(q.PollInterval) {
+		if a.doStop.WaitFor(q.pollInterval) {
 			return
 		}
 	}
@@ -882,7 +904,7 @@ func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since 
 
 	entityFilter := utils.Dict{
 		"saas":      saas,
-		"startDate": now.Add(-q.Lookback).Format(time.RFC3339),
+		"startDate": now.Add(-q.lookback).Format(time.RFC3339),
 	}
 	if !cursorMode {
 		entityFilter["endDate"] = now.Format(time.RFC3339)
@@ -1302,6 +1324,25 @@ func marshalBody(body utils.Dict) ([]byte, error) {
 		return nil, fmt.Errorf("marshal body: %v", err)
 	}
 	return b, nil
+}
+
+// parseConfigDuration parses a time.ParseDuration-style string config value
+// (e.g. "60s", "1h30m"). An empty value falls back to def — same semantics
+// as the prior `if x <= 0 { x = default }` pattern. An explicit "0" / any
+// non-positive parse result also falls back to def. A non-parseable value is
+// surfaced as an error (the caller is Validate, which propagates it).
+func parseConfigDuration(label, raw string, def time.Duration) (time.Duration, error) {
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %v", label, err)
+	}
+	if d <= 0 {
+		return def, nil
+	}
+	return d, nil
 }
 
 // extractRecordTime returns the timestamp embedded in an Infinity Events

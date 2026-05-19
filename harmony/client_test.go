@@ -186,8 +186,8 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("default cloud service %q uses 'and' instead of '&'", svc)
 			}
 		}
-		if c.Events.PollInterval != defaultEventsPollInterval {
-			t.Fatalf("expected default poll interval, got %s", c.Events.PollInterval)
+		if c.Events.pollInterval != defaultEventsPollInterval {
+			t.Fatalf("expected default poll interval, got %s", c.Events.pollInterval)
 		}
 	})
 
@@ -557,7 +557,7 @@ func TestEventsFlowWithMockServer(t *testing.T) {
 		Events: EventsConfig{
 			Enabled:       true,
 			CloudServices: []string{"Harmony Endpoint"},
-			PollInterval:  10 * time.Millisecond,
+			PollInterval:  "10ms",
 		},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
@@ -589,7 +589,7 @@ func TestEventsReAuthOn401(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: validClientOptions(),
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: 10 * time.Millisecond},
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: "10ms"},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
@@ -638,7 +638,7 @@ func TestEventsCanceledIsSoftFailure(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: opts,
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Connect"}, PollInterval: 10 * time.Millisecond},
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Connect"}, PollInterval: "10ms"},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
@@ -701,7 +701,7 @@ func TestEventsCanceledTransientRecovery(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: opts,
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: 10 * time.Millisecond},
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: "10ms"},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
@@ -752,7 +752,7 @@ func TestEventsCanceledMarshalsStructuredErrorDetail(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: opts,
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: 10 * time.Millisecond},
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: "10ms"},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
@@ -822,11 +822,11 @@ func TestEntitiesValidate(t *testing.T) {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		q := c.Entities.Queries[0]
-		if q.PollInterval != defaultEntitiesPollInterval {
-			t.Fatalf("poll interval default; got %s", q.PollInterval)
+		if q.pollInterval != defaultEntitiesPollInterval {
+			t.Fatalf("poll interval default; got %s", q.pollInterval)
 		}
-		if q.Lookback != defaultEntitiesWindowLookback {
-			t.Fatalf("window-mode lookback default; got %s", q.Lookback)
+		if q.lookback != defaultEntitiesWindowLookback {
+			t.Fatalf("window-mode lookback default; got %s", q.lookback)
 		}
 		if len(q.Saas) != len(defaultEntitiesSaas) {
 			t.Fatalf("saas default")
@@ -838,11 +838,11 @@ func TestEntitiesValidate(t *testing.T) {
 		if err := c.Validate(); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if c.Entities.Queries[0].Lookback != defaultEntitiesCursorLookback {
-			t.Fatalf("cursor-mode lookback default (15d); got %s", c.Entities.Queries[0].Lookback)
+		if c.Entities.Queries[0].lookback != defaultEntitiesCursorLookback {
+			t.Fatalf("cursor-mode lookback default (15d); got %s", c.Entities.Queries[0].lookback)
 		}
-		if c.Entities.Queries[0].InitialLookback != defaultEntitiesInitialLookback {
-			t.Fatalf("cursor-mode initial lookback default; got %s", c.Entities.Queries[0].InitialLookback)
+		if c.Entities.Queries[0].initialLookback != defaultEntitiesInitialLookback {
+			t.Fatalf("cursor-mode initial lookback default; got %s", c.Entities.Queries[0].initialLookback)
 		}
 	})
 
@@ -972,9 +972,9 @@ func TestEntitiesCursorModeRestorePreset(t *testing.T) {
 					{Attr: "entityPayload.isRestoreRequested", Op: "is", Value: "true"},
 				},
 				CursorField:     "entityPayload.restoreRequestTime",
-				Lookback:        15 * 24 * time.Hour,
-				InitialLookback: 1 * time.Hour,
-				PollInterval:    20 * time.Millisecond,
+				Lookback:        "360h",
+				InitialLookback: "1h",
+				PollInterval:    "20ms",
 				Deduper:         dedup,
 			}},
 		},
@@ -1075,8 +1075,8 @@ func TestEntitiesWindowMode(t *testing.T) {
 				Filter: []EntityPredicate{
 					{Attr: "entityPayload.subject", Op: "contains", Value: "synthetic"},
 				},
-				PollInterval: 20 * time.Millisecond,
-				Lookback:     1 * time.Hour,
+				PollInterval: "20ms",
+				Lookback:     "1h",
 				Deduper:      dedup,
 			}},
 		},
@@ -1147,8 +1147,8 @@ func TestEntitiesScrollDrainsAllPages(t *testing.T) {
 			Queries: []EntityQuery{{
 				Name:         "drain",
 				Saas:         []string{"office365_emails"},
-				PollInterval: 1 * time.Hour, // single poll
-				Lookback:     1 * time.Hour,
+				PollInterval: "1h", // single poll
+				Lookback:     "1h",
 				Deduper:      dedup,
 			}},
 		},
@@ -1216,9 +1216,9 @@ func TestEntitiesCursorAdvancesWithSubsecondPrecision(t *testing.T) {
 					{Attr: "entityPayload.isRestoreRequested", Op: "is", Value: "true"},
 				},
 				CursorField:     "entityPayload.restoreRequestTime",
-				Lookback:        15 * 24 * time.Hour,
-				InitialLookback: 1 * time.Hour,
-				PollInterval:    20 * time.Millisecond,
+				Lookback:        "360h",
+				InitialLookback: "1h",
+				PollInterval:    "20ms",
 				Deduper:         dedup,
 			}},
 		},
@@ -1290,8 +1290,8 @@ func TestEntitiesMultipleQueriesIndependent(t *testing.T) {
 		Entities: EntitiesConfig{
 			Enabled: true,
 			Queries: []EntityQuery{
-				{Name: "q1", Saas: []string{"office365_emails"}, PollInterval: 20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: d1},
-				{Name: "q2", Saas: []string{"office365_emails"}, PollInterval: 20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: d2},
+				{Name: "q1", Saas: []string{"office365_emails"}, PollInterval: "20ms", Lookback: "1h", Deduper: d1},
+				{Name: "q2", Saas: []string{"office365_emails"}, PollInterval: "20ms", Lookback: "1h", Deduper: d2},
 			},
 		},
 	}
@@ -1355,7 +1355,7 @@ func TestEntitiesIncludeSplits(t *testing.T) {
 				Enabled: true,
 				Queries: []EntityQuery{{
 					Name: "default", Saas: []string{"office365_emails"},
-					PollInterval: 20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: dedup,
+					PollInterval: "20ms", Lookback: "1h", Deduper: dedup,
 				}},
 			},
 		}
@@ -1392,7 +1392,7 @@ func TestEntitiesIncludeSplits(t *testing.T) {
 				Queries: []EntityQuery{{
 					Name: "firehose", Saas: []string{"office365_emails"},
 					IncludeSplits: true,
-					PollInterval:  20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: dedup,
+					PollInterval:  "20ms", Lookback: "1h", Deduper: dedup,
 				}},
 			},
 		}
@@ -1484,7 +1484,7 @@ func TestEventsRetrieveTransientRetryRecovers(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: opts,
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: "10ms"},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
@@ -1529,7 +1529,7 @@ func TestEventsRetrieveTransientExhaustionSurfacesError(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: opts,
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: "10ms"},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
@@ -1578,7 +1578,7 @@ func TestAuthTransientRetryRecovers(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: opts,
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: 10 * time.Millisecond},
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Browse"}, PollInterval: "10ms"},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
 	if err != nil {
