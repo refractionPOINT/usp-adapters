@@ -387,13 +387,16 @@ type EntityQuery struct {
 	//     matching email is itself recent.
 	//
 	//   - Non-empty (cursor mode), must be "entityPayload.<k>" or
-	//     "entityInfo.<k>" (e.g. "entityPayload.restoreRequestTime"):
-	//     entityFilter sends only saas + a wide startDate, no endDate, no
-	//     saasEntity. The adapter injects a "{CursorField} greaterThan
-	//     {cursor}" predicate and advances the cursor to the newest value
-	//     observed. Use this when the event of interest is decoupled in
-	//     time from the email's receipt (e.g. a restore request raised on
-	//     an old quarantined email).
+	//     "entityInfo.<k>" and reference a *timestamp-typed* field (e.g.
+	//     "entityPayload.restoreRequestTime"): entityFilter sends only saas
+	//     + a wide startDate, no endDate, no saasEntity. The adapter
+	//     injects a "{CursorField} greaterThan {cursor}" predicate and
+	//     advances the cursor to the newest value observed. Use this when
+	//     the event of interest is decoupled in time from the email's
+	//     receipt (e.g. a restore request raised on an old quarantined
+	//     email). A non-timestamp CursorField will silently fail to
+	//     advance — the gateway evaluates greaterThan on the raw value, so
+	//     the adapter cannot detect the misconfiguration locally.
 	CursorField string `json:"cursor_field" yaml:"cursor_field"`
 
 	// Lookback bounds entityFilter.startDate (received time). Defaults:
@@ -1076,6 +1079,8 @@ func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since 
 		entityFilter["saasEntity"] = saasEntity
 	}
 
+	// entityFilter and predicates are identical across every page of the
+	// scroll, so they are built once outside the page loop and reused.
 	predicates := make([]utils.Dict, 0, len(q.Filter)+1)
 	for _, p := range q.Filter {
 		predicates = append(predicates, utils.Dict{
@@ -1085,10 +1090,16 @@ func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since 
 		})
 	}
 	if cursorMode {
+		// RFC3339Nano (not RFC3339) preserves the gateway's sub-second
+		// precision on the cursor predicate. The gateway emits
+		// restoreRequestTime / entityUpdated values with microsecond
+		// precision; if we round the cursor down to whole seconds, a later
+		// event with the same whole-second timestamp would not satisfy
+		// "greaterThan" and would be silently skipped.
 		predicates = append(predicates, utils.Dict{
 			"saasAttrName":  q.CursorField,
 			"saasAttrOp":    "greaterThan",
-			"saasAttrValue": since.UTC().Format(time.RFC3339),
+			"saasAttrValue": since.UTC().Format(time.RFC3339Nano),
 		})
 	}
 

@@ -1346,6 +1346,157 @@ func TestEntitiesScrollDrainsAllPages(t *testing.T) {
 	}, "expected 4 search calls (3 pages + empty terminator)")
 }
 
+// TestEntitiesCursorAdvancesWithSubsecondPrecision pins two related
+// correctness properties of cursor mode:
+//
+//   - Across polls, the injected cursor predicate value moves forward to
+//     reflect the newest CursorField value shipped (not the initial
+//     InitialLookback floor). A regression that failed to advance the
+//     cursor would re-ship everything every poll.
+//   - The advanced cursor value preserves the gateway's sub-second
+//     precision. Truncating to whole seconds (using RFC3339 instead of
+//     RFC3339Nano) would skip later events that fall in the same whole
+//     second as the cursor — a silent drop that is exactly the bug class
+//     this source exists to avoid.
+func TestEntitiesCursorAdvancesWithSubsecondPrecision(t *testing.T) {
+	fake := &fakeGateway{}
+	// Record's restoreRequestTime is recent (30 min ago) and carries
+	// sub-second precision so we can prove that precision survives.
+	recordTime := time.Now().UTC().Add(-30 * time.Minute).Truncate(time.Microsecond)
+	recordTimeStr := recordTime.Format(time.RFC3339Nano)
+	if !strings.Contains(recordTimeStr, ".") {
+		// Truncate landed exactly on a whole second — pick a sub-second
+		// offset so the precision assertion remains meaningful.
+		recordTime = recordTime.Add(123 * time.Microsecond)
+		recordTimeStr = recordTime.Format(time.RFC3339Nano)
+	}
+	fake.hecRecords = []utils.Dict{{
+		"entityInfo":    utils.Dict{"entityId": "ent-1", "entityCreated": "2026-01-01T00:00:00Z", "entityUpdated": recordTimeStr},
+		"entityPayload": utils.Dict{"isRestoreRequested": "true", "restoreRequestTime": recordTimeStr, "subject": "synthetic"},
+	}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	dedup := newRecordingDeduper()
+	initialCursorFloor := time.Now().UTC().Add(-1 * time.Hour)
+	conf := HarmonyConfig{
+		ClientOptions: validClientOptions(),
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Entities: EntitiesConfig{
+			Enabled: true,
+			Queries: []EntityQuery{{
+				Name: "restore_requests",
+				Saas: []string{"office365_emails"},
+				Filter: []EntityPredicate{
+					{Attr: "entityPayload.isRestoreRequested", Op: "is", Value: "true"},
+				},
+				CursorField:     "entityPayload.restoreRequestTime",
+				Lookback:        15 * 24 * time.Hour,
+				InitialLookback: 1 * time.Hour,
+				PollInterval:    20 * time.Millisecond,
+				Deduper:         dedup,
+			}},
+		},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Wait for the record to be shipped (proves poll 1 ran end-to-end).
+	waitUntil(t, 2*time.Second, func() bool {
+		return len(dedup.admittedKeys()) >= 1
+	}, "expected the record to be admitted on the first poll")
+
+	// Wait for at least one *subsequent* poll request after admission, so
+	// lastSearchQuery reflects a request built with the advanced cursor.
+	callsAtAdmission := atomic.LoadInt32(&fake.searchCalls)
+	waitUntil(t, 2*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.searchCalls) > callsAtAdmission
+	}, "expected a follow-up poll after admission")
+
+	ext, _ := fake.lastSearchQuery()
+	var cursorValue string
+	for _, e := range ext {
+		m, _ := e.(map[string]interface{})
+		if m["saasAttrName"] == "entityPayload.restoreRequestTime" && m["saasAttrOp"] == "greaterThan" {
+			cursorValue, _ = m["saasAttrValue"].(string)
+		}
+	}
+	if cursorValue == "" {
+		t.Fatalf("cursor predicate not found in follow-up poll request; got ext=%v", ext)
+	}
+	parsed, perr := time.Parse(time.RFC3339Nano, cursorValue)
+	if perr != nil {
+		t.Fatalf("cursor predicate value should parse as RFC3339Nano; got %q (%v)", cursorValue, perr)
+	}
+	// Cursor must have advanced strictly past the initial floor — otherwise
+	// the worker would re-ship every poll.
+	if !parsed.After(initialCursorFloor) {
+		t.Fatalf("cursor did not advance: predicate value %s is not after initial floor %s", parsed, initialCursorFloor)
+	}
+	// And it must equal the record's restoreRequestTime: confirms both the
+	// "newest value seen" semantics and that sub-second precision survives.
+	if !parsed.Equal(recordTime) {
+		t.Fatalf("cursor predicate value should equal the record's restoreRequestTime (sub-second preserved); want %s, got %s", recordTime.Format(time.RFC3339Nano), parsed.Format(time.RFC3339Nano))
+	}
+}
+
+// TestEntitiesMultipleQueriesIndependent is the central guarantee of the
+// generic design: two queries run side-by-side, each maintains its own
+// dedup state, and each entity is shipped per query with the query's own
+// _lc_harmony_query annotation (here observed via the namespaced dedup
+// key). Cross-query interference would defeat the "add a new scenario by
+// adding a config entry" promise.
+func TestEntitiesMultipleQueriesIndependent(t *testing.T) {
+	fake := &fakeGateway{}
+	fake.hecRecords = []utils.Dict{{
+		"entityInfo":    utils.Dict{"entityId": "ent-1", "entityUpdated": "2026-01-02T10:00:00Z"},
+		"entityPayload": utils.Dict{"subject": "synthetic"},
+	}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	d1, d2 := newRecordingDeduper(), newRecordingDeduper()
+	conf := HarmonyConfig{
+		ClientOptions: validClientOptions(),
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Entities: EntitiesConfig{
+			Enabled: true,
+			Queries: []EntityQuery{
+				{Name: "q1", Saas: []string{"office365_emails"}, PollInterval: 20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: d1},
+				{Name: "q2", Saas: []string{"office365_emails"}, PollInterval: 20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: d2},
+			},
+		},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 2*time.Second, func() bool {
+		return len(d1.admittedKeys()) >= 1 && len(d2.admittedKeys()) >= 1
+	}, "expected both queries to independently admit the entity")
+
+	// A few extra polls must not cause cross-query re-admission: each
+	// query's deduper handles its own keys, unaffected by the other.
+	time.Sleep(150 * time.Millisecond)
+	if got := len(d1.admittedKeys()); got != 1 {
+		t.Fatalf("q1: expected exactly 1 admitted key, got %d: %v", got, d1.admittedKeys())
+	}
+	if got := len(d2.admittedKeys()); got != 1 {
+		t.Fatalf("q2: expected exactly 1 admitted key, got %d: %v", got, d2.admittedKeys())
+	}
+	if !strings.HasPrefix(d1.admittedKeys()[0], "q1:") {
+		t.Fatalf("q1 key should be namespaced; got %q", d1.admittedKeys()[0])
+	}
+	if !strings.HasPrefix(d2.admittedKeys()[0], "q2:") {
+		t.Fatalf("q2 key should be namespaced; got %q", d2.admittedKeys()[0])
+	}
+}
+
 func TestTransientClassification(t *testing.T) {
 	if !isTransientStatus(502) || !isTransientStatus(503) || !isTransientStatus(504) {
 		t.Fatalf("502/503/504 must be transient")
