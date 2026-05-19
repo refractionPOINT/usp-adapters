@@ -111,44 +111,67 @@ const (
 	maxEmailsPages = 1000
 )
 
-// Defaults for the Restore Requests source.
+// Defaults for the generic Entities source.
 //
-// This source exists because the Emails feed cannot surface restore
-// requests. The HEC search/query `entityFilter` window
-// (startDate/endDate) filters on the email's *received* time
-// (entityInfo.entityCreated), not on entityUpdated or restoreRequestTime.
-// A quarantined-email restore request is, by definition, raised against an
-// email that was received and quarantined earlier — often hours, days, or
-// months before the request. The Emails source's short received-time window
-// therefore never returns those entities, so their isRestoreRequested flag
-// is never shipped.
+// HEC search/query is already a generic entity engine: an entityFilter
+// (saas + a received-time startDate/endDate window) plus a list of
+// server-side entityExtendedFilter predicates. The Emails firehose is just
+// that engine with no predicates; "restore requests", "spam X addressed to
+// Y", "all DLP-flagged mail", etc. are the same engine with different
+// predicates. Rather than hardcode a Go source per scenario, this source
+// exposes the engine as configuration: a list of named query specs whose
+// predicates pass straight through to entityExtendedFilter.
 //
-// The fix mirrors Check Point's own Cortex XSOAR integration
-// (CheckPointHEC.py -> restore_requests): keep a wide received-time
-// startDate so old quarantined mail is in range, send NO endDate / NO
-// saasEntity, and let the gateway do the work via a server-side
-// entityExtendedFilter on entityPayload.isRestoreRequested +
-// entityPayload.restoreRequestTime. That makes the result set the restore
-// requests themselves (a handful), independent of total mail volume — so
-// this source scales regardless of how busy the tenant is.
+// Two cursor modes (see EntityQuery.CursorField):
+//
+//   - Window mode (no CursorField): entityFilter sends startDate+endDate
+//     (a received-time window) plus saasEntity, exactly like the Emails
+//     feed. Suited to content/recipient filters where the matching email is
+//     itself recent. Incremental progress is the rolling window + dedup.
+//
+//   - Cursor mode (CursorField set, e.g. entityPayload.restoreRequestTime):
+//     entityFilter sends only saas + a *wide* startDate and NO endDate / NO
+//     saasEntity, and the adapter injects a "{CursorField} greaterThan
+//     {cursor}" predicate, advancing the cursor to the newest value seen.
+//     This is the only way to surface an event (e.g. a restore request)
+//     that is decoupled in time from the email's receipt — the underlying
+//     mail may have been received hours, days, or months earlier, so a
+//     received-time window would never return it. Mirrors Check Point's own
+//     Cortex XSOAR integration (CheckPointHEC.py -> restore_requests).
+//
+// Either way the result set is bounded by the server-side predicates, so it
+// scales independently of total mail volume.
 const (
-	defaultRestoreRequestsPollInterval = 5 * time.Minute
+	defaultEntitiesPollInterval = 5 * time.Minute
 
-	// defaultRestoreRequestsLookback bounds entityFilter.startDate — i.e.
-	// how far back in *received* time the underlying quarantined email may
-	// have been delivered and still be found. 15 days matches the window
-	// Check Point's XSOAR integration uses. It does not gate which restore
-	// requests are emitted (that is the restoreRequestTime cursor below); it
-	// only bounds how old the quarantined email itself may be.
-	defaultRestoreRequestsLookback = 15 * 24 * time.Hour
+	// defaultEntitiesWindowLookback is the received-time window for
+	// window-mode queries (no CursorField). Kept short like the Emails feed:
+	// the window filters on received time and a long window risks the
+	// gateway's per-query record ceiling.
+	defaultEntitiesWindowLookback = 1 * time.Hour
 
-	// defaultRestoreRequestsInitialLookback is how far back the
-	// restoreRequestTime cursor starts on the first poll, matching the
-	// "1 hour" first-fetch default Check Point's XSOAR integration uses.
-	// After the first poll the cursor advances to the newest
-	// restoreRequestTime seen.
-	defaultRestoreRequestsInitialLookback = 1 * time.Hour
+	// defaultEntitiesCursorLookback bounds entityFilter.startDate for
+	// cursor-mode queries — how far back in *received* time the underlying
+	// email may have been delivered and still be found. 15 days matches the
+	// window Check Point's XSOAR integration uses for restore requests. It
+	// does not gate which events are emitted (the CursorField cursor does);
+	// it only bounds how old the underlying email itself may be.
+	defaultEntitiesCursorLookback = 15 * 24 * time.Hour
+
+	// defaultEntitiesInitialLookback is how far back the cursor starts on
+	// the first poll of a cursor-mode query, matching the "1 hour"
+	// first-fetch default Check Point's XSOAR integration uses.
+	defaultEntitiesInitialLookback = 1 * time.Hour
 )
+
+// entitiesFilterOps is the set of saasAttrOp values the HEC search/query
+// endpoint accepts. Validation rejects anything else so a typo in a config
+// predicate fails loudly at startup instead of silently matching nothing.
+var entitiesFilterOps = map[string]struct{}{
+	"is": {}, "isNot": {}, "contains": {}, "notContains": {},
+	"startsWith": {}, "isEmpty": {}, "isNotEmpty": {},
+	"greaterThan": {}, "lessThan": {},
+}
 
 // harmonySource is the contract every ingestion source in this adapter
 // implements. Adding a new source is mechanical: implement the four
@@ -326,90 +349,169 @@ func (c *EmailsConfig) Close() {
 	}
 }
 
-// RestoreRequestsConfig controls polling for end-user quarantined-email
-// restore requests. Unlike the Emails source this issues a server-side
-// filtered query (isRestoreRequested + restoreRequestTime), so it returns
-// only the restore requests themselves rather than the full mail feed.
-type RestoreRequestsConfig struct {
-	Enabled bool `json:"enabled" yaml:"enabled"`
+// EntityPredicate is one server-side HEC search/query filter clause.
+// It passes straight through as an entityExtendedFilter entry, so Attr is
+// a Check Point saasAttrName (e.g. "entityPayload.isRestoreRequested"),
+// Op a saasAttrOp ("is", "contains", "greaterThan", …), and Value the
+// saasAttrValue. The full set of accepted ops is in entitiesFilterOps.
+type EntityPredicate struct {
+	Attr  string `json:"attr" yaml:"attr"`
+	Op    string `json:"op" yaml:"op"`
+	Value string `json:"value" yaml:"value"`
+}
 
-	// Saas platforms to query. Defaults to office365_emails + google_mail.
-	// Validate rejects anything outside the supported set, matching the
-	// Emails source's scoping.
+// EntityQuery is one named, server-side-filtered HEC entity feed. See the
+// "Defaults for the generic Entities source" comment for the two cursor
+// modes. Adding a new scenario ("all DLP-flagged mail", a restore-requests
+// preset, mail-to-VIP-recipient watch, …) is a config entry — no Go change.
+type EntityQuery struct {
+	// Name identifies the feed in errors and the "_lc_harmony_query"
+	// annotation. Must be unique within the source and non-empty.
+	Name string `json:"name" yaml:"name"`
+
+	// Saas platforms to query, each independently. Defaults to
+	// office365_emails + google_mail; rejected outside the supported set.
 	Saas []string `json:"saas" yaml:"saas"`
+
+	// Filter is the list of server-side predicates the gateway ANDs. May
+	// be empty (then the query is bounded only by the entity window and,
+	// in cursor mode, the injected cursor predicate). Passed through to
+	// entityExtendedFilter verbatim.
+	Filter []EntityPredicate `json:"filter" yaml:"filter"`
+
+	// CursorField selects the cursor mode:
+	//
+	//   - Empty (window mode): entityFilter sends startDate+endDate (a
+	//     received-time window) plus saasEntity scoped from the saas map,
+	//     exactly like the Emails feed. Suited to filters where the
+	//     matching email is itself recent.
+	//
+	//   - Non-empty (cursor mode), must be "entityPayload.<k>" or
+	//     "entityInfo.<k>" (e.g. "entityPayload.restoreRequestTime"):
+	//     entityFilter sends only saas + a wide startDate, no endDate, no
+	//     saasEntity. The adapter injects a "{CursorField} greaterThan
+	//     {cursor}" predicate and advances the cursor to the newest value
+	//     observed. Use this when the event of interest is decoupled in
+	//     time from the email's receipt (e.g. a restore request raised on
+	//     an old quarantined email).
+	CursorField string `json:"cursor_field" yaml:"cursor_field"`
+
+	// Lookback bounds entityFilter.startDate (received time). Defaults:
+	// 1h in window mode, 15d in cursor mode.
+	Lookback time.Duration `json:"lookback" yaml:"lookback"`
+
+	// InitialLookback (cursor mode only) is how far back the cursor starts
+	// on the first poll. Defaults to 1h.
+	InitialLookback time.Duration `json:"initial_lookback" yaml:"initial_lookback"`
 
 	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
 
-	// Lookback bounds entityFilter.startDate: how far back in received time
-	// the underlying quarantined email may have been delivered. Defaults to
-	// 15d. This is not the event window — restore requests are gated by the
-	// restoreRequestTime cursor, not this.
-	Lookback time.Duration `json:"lookback" yaml:"lookback"`
-
-	// InitialLookback is how far back the restoreRequestTime cursor starts
-	// on the first poll. Defaults to 1h. After that the cursor advances to
-	// the newest restoreRequestTime shipped.
-	InitialLookback time.Duration `json:"initial_lookback" yaml:"initial_lookback"`
-
-	// Deduper avoids re-emitting the same restore request on every poll.
-	// The key includes entityUpdated and restoreRequestTime, so a state
-	// advance (requested -> declined / restored) re-emits. If nil, Start
-	// allocates one; a caller-supplied deduper takes precedence. Close
-	// releases it unconditionally, matching the Emails source.
+	// Deduper avoids re-emitting unchanged entities every poll. Key is
+	// query-name + entityId + entityUpdated (+ CursorField value in cursor
+	// mode), so a lifecycle advance (entityUpdated bump on requested ->
+	// declined / restored) re-emits while unchanged repeats don't. If nil
+	// Start allocates one; a caller-supplied deduper takes precedence.
+	// Each query has its own deduper; Close releases it.
 	Deduper utils.Deduper `json:"-" yaml:"-"`
 }
 
-func (c *RestoreRequestsConfig) Name() string    { return "restore_requests" }
-func (c *RestoreRequestsConfig) IsEnabled() bool { return c != nil && c.Enabled }
+// EntitiesConfig is the generic HEC entity-query source: a list of named
+// server-side-filtered feeds. The Emails firehose remains a separate
+// source for the deliberate "ship every email" case; this source covers
+// every scenario where filtering belongs server-side, so a new scenario is
+// a config entry rather than another bespoke Go source.
+type EntitiesConfig struct {
+	Enabled bool          `json:"enabled" yaml:"enabled"`
+	Queries []EntityQuery `json:"queries" yaml:"queries"`
+}
 
-func (c *RestoreRequestsConfig) Validate() error {
-	if len(c.Saas) == 0 {
-		c.Saas = append([]string{}, defaultEmailsSaas...)
+func (c *EntitiesConfig) Name() string    { return "entities" }
+func (c *EntitiesConfig) IsEnabled() bool { return c != nil && c.Enabled }
+
+func (c *EntitiesConfig) Validate() error {
+	if len(c.Queries) == 0 {
+		return errors.New("entities enabled but no queries configured")
 	}
-	for _, s := range c.Saas {
-		if _, ok := defaultEmailsSaasEntity[s]; !ok {
-			return fmt.Errorf("restore_requests.saas %q is not supported (supported: %v)", s, defaultEmailsSaas)
+	seen := map[string]struct{}{}
+	for i := range c.Queries {
+		q := &c.Queries[i]
+		if q.Name == "" {
+			return fmt.Errorf("entities.queries[%d]: name is required", i)
 		}
-	}
-	if c.PollInterval <= 0 {
-		c.PollInterval = defaultRestoreRequestsPollInterval
-	}
-	if c.Lookback <= 0 {
-		c.Lookback = defaultRestoreRequestsLookback
-	}
-	if c.InitialLookback <= 0 {
-		c.InitialLookback = defaultRestoreRequestsInitialLookback
+		if _, dup := seen[q.Name]; dup {
+			return fmt.Errorf("entities.queries: duplicate name %q", q.Name)
+		}
+		seen[q.Name] = struct{}{}
+		if len(q.Saas) == 0 {
+			q.Saas = append([]string{}, defaultEmailsSaas...)
+		}
+		for _, s := range q.Saas {
+			if _, ok := defaultEmailsSaasEntity[s]; !ok {
+				return fmt.Errorf("entities.queries[%q].saas %q is not supported (supported: %v)", q.Name, s, defaultEmailsSaas)
+			}
+		}
+		for j := range q.Filter {
+			p := q.Filter[j]
+			if p.Attr == "" {
+				return fmt.Errorf("entities.queries[%q].filter[%d]: attr is required", q.Name, j)
+			}
+			if _, ok := entitiesFilterOps[p.Op]; !ok {
+				return fmt.Errorf("entities.queries[%q].filter[%d]: unsupported op %q (supported: is, isNot, contains, notContains, startsWith, isEmpty, isNotEmpty, greaterThan, lessThan)", q.Name, j, p.Op)
+			}
+		}
+		if q.CursorField != "" &&
+			!strings.HasPrefix(q.CursorField, "entityPayload.") &&
+			!strings.HasPrefix(q.CursorField, "entityInfo.") {
+			return fmt.Errorf("entities.queries[%q].cursor_field %q must reference entityPayload.* or entityInfo.*", q.Name, q.CursorField)
+		}
+		if q.PollInterval <= 0 {
+			q.PollInterval = defaultEntitiesPollInterval
+		}
+		if q.Lookback <= 0 {
+			if q.CursorField != "" {
+				q.Lookback = defaultEntitiesCursorLookback
+			} else {
+				q.Lookback = defaultEntitiesWindowLookback
+			}
+		}
+		if q.InitialLookback <= 0 {
+			q.InitialLookback = defaultEntitiesInitialLookback
+		}
 	}
 	return nil
 }
 
-func (c *RestoreRequestsConfig) Start(a *HarmonyAdapter) error {
-	if c.Deduper == nil {
-		// Size the TTL to the received-time window so a restore request
-		// that keeps matching every poll for as long as the underlying
-		// email stays in the lookback window doesn't fall out of dedup and
-		// get re-emitted as if it were new. Floor at 24h.
-		ttl := c.Lookback + 1*time.Hour
-		if ttl < 24*time.Hour {
-			ttl = 24 * time.Hour
+func (c *EntitiesConfig) Start(a *HarmonyAdapter) error {
+	for i := range c.Queries {
+		q := &c.Queries[i]
+		if q.Deduper == nil {
+			// TTL covers the received-time window so an entity matching
+			// every poll for as long as it stays in lookback doesn't fall
+			// out of dedup and get re-emitted. Floor at 24h.
+			ttl := q.Lookback + 1*time.Hour
+			if ttl < 24*time.Hour {
+				ttl = 24 * time.Hour
+			}
+			d, err := utils.NewLocalDeduper(1*time.Hour, ttl)
+			if err != nil {
+				return err
+			}
+			q.Deduper = d
 		}
-		d, err := utils.NewLocalDeduper(1*time.Hour, ttl)
-		if err != nil {
-			return err
+		for _, saas := range q.Saas {
+			a.wgSenders.Add(1)
+			go a.fetchEntities(q, saas)
 		}
-		c.Deduper = d
-	}
-	for _, saas := range c.Saas {
-		a.wgSenders.Add(1)
-		go a.fetchRestoreRequestsForSaas(saas)
 	}
 	return nil
 }
 
-func (c *RestoreRequestsConfig) Close() {
-	if c.Deduper != nil {
-		c.Deduper.Close()
-		c.Deduper = nil
+func (c *EntitiesConfig) Close() {
+	for i := range c.Queries {
+		if c.Queries[i].Deduper != nil {
+			c.Queries[i].Deduper.Close()
+			c.Queries[i].Deduper = nil
+		}
 	}
 }
 
@@ -430,15 +532,15 @@ type HarmonyConfig struct {
 	// share the same hostname per region.
 	URL string `json:"url" yaml:"url"`
 
-	Events          EventsConfig          `json:"events" yaml:"events"`
-	Emails          EmailsConfig          `json:"emails" yaml:"emails"`
-	RestoreRequests RestoreRequestsConfig `json:"restore_requests" yaml:"restore_requests"`
+	Events   EventsConfig   `json:"events" yaml:"events"`
+	Emails   EmailsConfig   `json:"emails" yaml:"emails"`
+	Entities EntitiesConfig `json:"entities" yaml:"entities"`
 }
 
 // sources returns the registered ingestion sources in a stable order. Adding
 // a new source is a single line here plus the source-config struct.
 func (c *HarmonyConfig) sources() []harmonySource {
-	return []harmonySource{&c.Events, &c.Emails, &c.RestoreRequests}
+	return []harmonySource{&c.Events, &c.Emails, &c.Entities}
 }
 
 func (c *HarmonyConfig) Validate() error {
@@ -906,50 +1008,89 @@ func emailDedupKey(rec utils.Dict) string {
 	return "email:" + entityID + "|" + updated
 }
 
-// ----- Source 3: Restore Requests ---------------------------------------------------------
+// ----- Source 3: Entities (generic) -------------------------------------------------------
 
-func (a *HarmonyAdapter) fetchRestoreRequestsForSaas(saas string) {
+func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony restore_requests worker exiting (saas=%q)", saas))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony entities worker exiting (query=%q saas=%q)", q.Name, saas))
 
-	// The cursor tracks the newest restoreRequestTime shipped. It starts
-	// InitialLookback in the past so the first poll picks up requests raised
-	// shortly before the adapter started.
-	cursor := time.Now().UTC().Add(-a.conf.RestoreRequests.InitialLookback)
+	// Cursor mode tracks the newest CursorField value shipped and starts
+	// InitialLookback in the past so the first poll picks up events raised
+	// shortly before the adapter started. Window mode does not use the
+	// cursor — it relies on the rolling startDate/endDate window + dedup —
+	// but we still initialise the variable so the call signature stays
+	// uniform across modes.
+	cursor := time.Now().UTC().Add(-q.InitialLookback)
 
 	for {
 		if a.doStop.IsSet() {
 			return
 		}
-		newCursor, err := a.runOneRestoreRequestsQuery(saas, cursor)
+		newCursor, err := a.runOneEntitiesQuery(q, saas, cursor)
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[restore_requests:%s]: %v", saas, err))
-		} else if newCursor.After(cursor) {
+			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[entities:%s:%s]: %v", q.Name, saas, err))
+		} else if q.CursorField != "" && newCursor.After(cursor) {
 			cursor = newCursor
 		}
-		if a.doStop.WaitFor(a.conf.RestoreRequests.PollInterval) {
+		if a.doStop.WaitFor(q.PollInterval) {
 			return
 		}
 	}
 }
 
-// runOneRestoreRequestsQuery asks the HEC search/query endpoint for email
-// entities whose isRestoreRequested flag is set and whose restoreRequestTime
-// is newer than `since`, scrolls the (small) result set, and ships each
-// once per (entityId, entityUpdated, restoreRequestTime). It returns the
-// newest restoreRequestTime observed so the caller can advance its cursor.
+// runOneEntitiesQuery issues one HEC search/query for the given saas under
+// the named query spec, scrolls the result set, and ships each new record
+// once per (query, entityId, entityUpdated [, CursorField value]).
 //
-// entityFilter intentionally carries only saas + a wide startDate (no
-// endDate, no saasEntity): startDate filters on the email's *received* time,
-// and a restore request can target mail received long ago. The actual
-// selection is the server-side entityExtendedFilter — that is what keeps the
-// result set bounded to the restore requests regardless of mail volume.
-func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, since time.Time) (time.Time, error) {
-	if _, ok := defaultEmailsSaasEntity[saas]; !ok {
-		return time.Time{}, fmt.Errorf("unsupported saas %q", saas)
+// The request shape is mode-dependent:
+//
+//   - Window mode (q.CursorField == ""): entityFilter sends startDate +
+//     endDate (received-time window) and saasEntity scoped from the
+//     defaultEmailsSaasEntity map, exactly like the Emails feed. The
+//     configured Filter is sent verbatim; no cursor predicate is injected.
+//
+//   - Cursor mode (q.CursorField set): entityFilter sends only saas + a
+//     wide startDate (no endDate, no saasEntity). The configured Filter is
+//     sent, plus an injected "{CursorField} greaterThan {since}" predicate
+//     so only events newer than the cursor come back. The newest
+//     CursorField value observed is returned for the caller to advance the
+//     cursor.
+//
+// Either mode keeps the result set bounded by server-side predicates, so
+// the gateway's per-query record ceiling is not approached for typical
+// scenarios. The maxEmailsPages bound remains as an anti-spin safety net.
+func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since time.Time) (time.Time, error) {
+	saasEntity, ok := defaultEmailsSaasEntity[saas]
+	if !ok {
+		return since, fmt.Errorf("unsupported saas %q", saas)
 	}
-	startDate := time.Now().UTC().Add(-a.conf.RestoreRequests.Lookback).Format(time.RFC3339)
-	sinceStr := since.UTC().Format(time.RFC3339)
+	now := time.Now().UTC()
+	cursorMode := q.CursorField != ""
+
+	entityFilter := utils.Dict{
+		"saas":      saas,
+		"startDate": now.Add(-q.Lookback).Format(time.RFC3339),
+	}
+	if !cursorMode {
+		entityFilter["endDate"] = now.Format(time.RFC3339)
+		entityFilter["saasEntity"] = saasEntity
+	}
+
+	predicates := make([]utils.Dict, 0, len(q.Filter)+1)
+	for _, p := range q.Filter {
+		predicates = append(predicates, utils.Dict{
+			"saasAttrName":  p.Attr,
+			"saasAttrOp":    p.Op,
+			"saasAttrValue": p.Value,
+		})
+	}
+	if cursorMode {
+		predicates = append(predicates, utils.Dict{
+			"saasAttrName":  q.CursorField,
+			"saasAttrOp":    "greaterThan",
+			"saasAttrValue": since.UTC().Format(time.RFC3339),
+		})
+	}
 
 	latest := since
 	scrollID := ""
@@ -960,21 +1101,12 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, since time.Time
 
 		body := utils.Dict{
 			"requestData": utils.Dict{
-				"entityFilter": utils.Dict{
-					"saas":      saas,
-					"startDate": startDate,
-				},
-				"entityExtendedFilter": []utils.Dict{
-					{"saasAttrName": "entityPayload.isRestoreRequested", "saasAttrOp": "is", "saasAttrValue": "true"},
-					{"saasAttrName": "entityPayload.restoreRequestTime", "saasAttrOp": "greaterThan", "saasAttrValue": sinceStr},
-				},
-				"scrollId": scrollID,
+				"entityFilter":         entityFilter,
+				"entityExtendedFilter": predicates,
+				"scrollId":             scrollID,
 			},
 		}
-
-		headers := map[string]string{
-			"x-av-req-id": newRequestID(),
-		}
+		headers := map[string]string{"x-av-req-id": newRequestID()}
 		resp, err := a.doAuthRequest("POST", a.conf.URL+hecSearchEntityPath, body, headers)
 		if err != nil {
 			return latest, err
@@ -983,36 +1115,39 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, since time.Time
 		envelope, _ := resp.GetDict("responseEnvelope")
 		nextScroll, _ := envelope.GetString("scrollId")
 		records, _ := resp.GetListOfDict("responseData")
-
 		if len(records) == 0 {
 			return latest, nil
 		}
 
 		for _, rec := range records {
-			// A "split" record is the master of a split email; the child
-			// carries the actionable copy. Skipping the master avoids
-			// double-emitting the same restore request, matching Check
-			// Point's XSOAR integration.
 			info, _ := rec.GetDict("entityInfo")
 			payload, _ := rec.GetDict("entityPayload")
+			// A "split" record is the master of a split email; the child
+			// carries the actionable copy. Skipping the master avoids
+			// double-emitting the same event. Harmless for non-email
+			// entities (the field is simply absent).
 			if s, _ := payload.GetString("emailSplit"); s == "split" {
 				continue
 			}
-
-			key := restoreDedupKey(info, payload)
+			key := entitiesDedupKey(q, info, payload)
 			if key == "" {
 				continue
 			}
-			if a.conf.RestoreRequests.Deduper.CheckAndAdd(key) {
+			if q.Deduper.CheckAndAdd(key) {
 				continue
 			}
-			rec["_lc_harmony_source"] = "restore_requests"
+			rec["_lc_harmony_source"] = "entities"
+			rec["_lc_harmony_query"] = q.Name
 			rec["_lc_harmony_saas"] = saas
 			if err := a.shipRecord(rec); err != nil {
 				return latest, err
 			}
-			if t := parseHarmonyTime(payload, "restoreRequestTime"); t.After(latest) {
-				latest = t
+			if cursorMode {
+				if v, ok := lookupHarmonyField(info, payload, q.CursorField); ok {
+					if t, err := time.Parse(time.RFC3339Nano, v); err == nil && t.After(latest) {
+						latest = t
+					}
+				}
 			}
 		}
 
@@ -1021,17 +1156,18 @@ func (a *HarmonyAdapter) runOneRestoreRequestsQuery(saas string, since time.Time
 		}
 		scrollID = nextScroll
 	}
-	return latest, fmt.Errorf("restore_requests query exceeded %d pages (saas=%q): gateway did not signal end of scroll", maxEmailsPages, saas)
+	return latest, fmt.Errorf("entities query %q exceeded %d pages (saas=%q): gateway did not signal end of scroll", q.Name, maxEmailsPages, saas)
 }
 
-// restoreDedupKey changes when a restore request's lifecycle advances. We
-// anchor on entityId + entityUpdated (the gateway bumps entityUpdated on
-// every state change, including requested -> declined / restored) and also
-// fold in restoreRequestTime so a fresh request on the same email re-emits
-// even in the unlikely case entityUpdated did not move. A record without an
-// entityId yields an empty key so the caller skips it rather than dropping
-// it silently.
-func restoreDedupKey(info, payload utils.Dict) string {
+// entitiesDedupKey changes when an entity's state advances. We anchor on
+// entityId + entityUpdated (the gateway bumps entityUpdated on every state
+// change) and, in cursor mode, fold in the CursorField value so a fresh
+// event on the same entity re-emits even if entityUpdated were somehow not
+// bumped. The query name is prefixed so distinct queries can't collide
+// even if a single deduper were ever shared across them. A record without
+// an entityId yields an empty key so the caller skips it rather than
+// dropping it silently.
+func entitiesDedupKey(q *EntityQuery, info, payload utils.Dict) string {
 	entityID, _ := info.GetString("entityId")
 	if entityID == "" {
 		return ""
@@ -1040,23 +1176,36 @@ func restoreDedupKey(info, payload utils.Dict) string {
 	if updated == "" {
 		updated, _ = info.GetString("entityCreated")
 	}
-	rrt, _ := payload.GetString("restoreRequestTime")
-	return "restore:" + entityID + "|" + updated + "|" + rrt
-}
-
-// parseHarmonyTime parses an RFC3339(/Nano) timestamp string at key in d,
-// returning the zero time if it is absent or unparseable. RFC3339Nano
-// accepts both fractional and non-fractional seconds.
-func parseHarmonyTime(d utils.Dict, key string) time.Time {
-	if d == nil {
-		return time.Time{}
-	}
-	if s, ok := d.GetString(key); ok && s != "" {
-		if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
-			return t
+	key := q.Name + ":" + entityID + "|" + updated
+	if q.CursorField != "" {
+		if v, ok := lookupHarmonyField(info, payload, q.CursorField); ok {
+			key += "|" + v
 		}
 	}
-	return time.Time{}
+	return key
+}
+
+// lookupHarmonyField resolves a dotted field path against a record's
+// entityInfo / entityPayload. Accepts "entityInfo.<k>" or
+// "entityPayload.<k>"; the CursorField validator rejects anything else, so
+// other shapes are intentionally unsupported. Only a single level of
+// nesting is resolved — that covers every HEC cursor field documented for
+// search/query.
+func lookupHarmonyField(info, payload utils.Dict, path string) (string, bool) {
+	section, key, ok := strings.Cut(path, ".")
+	if !ok {
+		return "", false
+	}
+	var d utils.Dict
+	switch section {
+	case "entityInfo":
+		d = info
+	case "entityPayload":
+		d = payload
+	default:
+		return "", false
+	}
+	return d.GetString(key)
 }
 
 // ----- Shared helpers ---------------------------------------------------------------------

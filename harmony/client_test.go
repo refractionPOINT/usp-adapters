@@ -982,46 +982,119 @@ func TestEmailsScrollDrainsAllPages(t *testing.T) {
 	}
 }
 
-func TestRestoreRequestsValidate(t *testing.T) {
-	t.Run("defaults fill in", func(t *testing.T) {
-		c := HarmonyConfig{
+func TestEntitiesValidate(t *testing.T) {
+	base := func(q EntityQuery) *HarmonyConfig {
+		return &HarmonyConfig{
 			ClientOptions: validClientOptions(),
 			ClientID:      "x", AccessKey: "y",
-			RestoreRequests: RestoreRequestsConfig{Enabled: true},
+			Entities: EntitiesConfig{Enabled: true, Queries: []EntityQuery{q}},
 		}
+	}
+
+	t.Run("window-mode defaults", func(t *testing.T) {
+		c := base(EntityQuery{Name: "q1"})
 		if err := c.Validate(); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if c.RestoreRequests.PollInterval != defaultRestoreRequestsPollInterval {
-			t.Fatalf("expected default poll interval, got %s", c.RestoreRequests.PollInterval)
+		q := c.Entities.Queries[0]
+		if q.PollInterval != defaultEntitiesPollInterval {
+			t.Fatalf("poll interval default; got %s", q.PollInterval)
 		}
-		if c.RestoreRequests.Lookback != defaultRestoreRequestsLookback {
-			t.Fatalf("expected default lookback, got %s", c.RestoreRequests.Lookback)
+		if q.Lookback != defaultEntitiesWindowLookback {
+			t.Fatalf("window-mode lookback default; got %s", q.Lookback)
 		}
-		if c.RestoreRequests.InitialLookback != defaultRestoreRequestsInitialLookback {
-			t.Fatalf("expected default initial lookback, got %s", c.RestoreRequests.InitialLookback)
+		if len(q.Saas) != len(defaultEmailsSaas) {
+			t.Fatalf("saas default")
 		}
-		if len(c.RestoreRequests.Saas) != len(defaultEmailsSaas) {
-			t.Fatalf("expected default saas list")
+	})
+
+	t.Run("cursor-mode defaults differ", func(t *testing.T) {
+		c := base(EntityQuery{Name: "q1", CursorField: "entityPayload.restoreRequestTime"})
+		if err := c.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.Entities.Queries[0].Lookback != defaultEntitiesCursorLookback {
+			t.Fatalf("cursor-mode lookback default (15d); got %s", c.Entities.Queries[0].Lookback)
+		}
+		if c.Entities.Queries[0].InitialLookback != defaultEntitiesInitialLookback {
+			t.Fatalf("cursor-mode initial lookback default; got %s", c.Entities.Queries[0].InitialLookback)
+		}
+	})
+
+	t.Run("enabled with no queries is rejected", func(t *testing.T) {
+		c := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "x", AccessKey: "y",
+			Entities: EntitiesConfig{Enabled: true},
+		}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected error when entities is enabled but has no queries")
+		}
+	})
+
+	t.Run("missing name is rejected", func(t *testing.T) {
+		if err := base(EntityQuery{}).Validate(); err == nil {
+			t.Fatalf("expected error for missing name")
+		}
+	})
+
+	t.Run("duplicate names are rejected", func(t *testing.T) {
+		c := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "x", AccessKey: "y",
+			Entities: EntitiesConfig{Enabled: true, Queries: []EntityQuery{
+				{Name: "dup"}, {Name: "dup"},
+			}},
+		}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected error for duplicate query names")
 		}
 	})
 
 	t.Run("unsupported saas is rejected", func(t *testing.T) {
-		c := HarmonyConfig{
-			ClientOptions: validClientOptions(),
-			ClientID:      "x", AccessKey: "y",
-			RestoreRequests: RestoreRequestsConfig{Enabled: true, Saas: []string{"slack"}},
-		}
-		if err := c.Validate(); err == nil {
+		if err := base(EntityQuery{Name: "q1", Saas: []string{"slack"}}).Validate(); err == nil {
 			t.Fatalf("expected error for unsupported saas")
 		}
 	})
 
-	t.Run("source still required when restore_requests disabled", func(t *testing.T) {
+	t.Run("unknown filter op is rejected", func(t *testing.T) {
+		err := base(EntityQuery{Name: "q1", Filter: []EntityPredicate{
+			{Attr: "entityPayload.subject", Op: "matches", Value: "x"},
+		}}).Validate()
+		if err == nil {
+			t.Fatalf("expected error for unknown op")
+		}
+	})
+
+	t.Run("filter missing attr is rejected", func(t *testing.T) {
+		err := base(EntityQuery{Name: "q1", Filter: []EntityPredicate{
+			{Op: "is", Value: "x"},
+		}}).Validate()
+		if err == nil {
+			t.Fatalf("expected error for missing attr")
+		}
+	})
+
+	t.Run("cursor_field must be entityInfo or entityPayload prefixed", func(t *testing.T) {
+		if err := base(EntityQuery{Name: "q1", CursorField: "restoreRequestTime"}).Validate(); err == nil {
+			t.Fatalf("expected error for bare cursor_field")
+		}
+		if err := base(EntityQuery{Name: "q1", CursorField: "foo.bar"}).Validate(); err == nil {
+			t.Fatalf("expected error for unknown section in cursor_field")
+		}
+		if err := base(EntityQuery{Name: "q1", CursorField: "entityPayload.restoreRequestTime"}).Validate(); err != nil {
+			t.Fatalf("entityPayload.* cursor_field should be accepted; got %v", err)
+		}
+		if err := base(EntityQuery{Name: "q1", CursorField: "entityInfo.entityUpdated"}).Validate(); err != nil {
+			t.Fatalf("entityInfo.* cursor_field should be accepted; got %v", err)
+		}
+	})
+
+	t.Run("source still required when entities is disabled", func(t *testing.T) {
 		c := HarmonyConfig{
 			ClientOptions: validClientOptions(),
 			ClientID:      "x", AccessKey: "y",
-			RestoreRequests: RestoreRequestsConfig{Enabled: false},
+			Entities: EntitiesConfig{Enabled: false},
 		}
 		if err := c.Validate(); err == nil {
 			t.Fatalf("expected error when no source is enabled")
@@ -1029,22 +1102,24 @@ func TestRestoreRequestsValidate(t *testing.T) {
 	})
 }
 
-// TestRestoreRequestsQueryShapeAndLifecycle is the regression test for the
-// reported bug ("quarantined-email restore requests never come in"). It
-// pins three things:
+// TestEntitiesCursorModeRestorePreset expresses the original reported bug
+// ("quarantined-email restore requests never come in") as the generic
+// source's cursor-mode preset, and pins the behavior the fix relies on:
 //
-//   - The query is server-side filtered: entityExtendedFilter carries the
-//     isRestoreRequested + restoreRequestTime predicates, and entityFilter
-//     sends only saas + a wide startDate — no endDate, no saasEntity. That
-//     is what lets an old quarantined email's restore request surface at
-//     all (the Emails feed's received-time window never returns it).
-//   - A "split" master record is skipped (the child carries the actionable
-//     copy), so the same request isn't emitted twice.
+//   - The query is server-side filtered: the configured predicate is sent
+//     as-is, AND the adapter auto-injects a "{CursorField} greaterThan
+//     {cursor}" predicate so cursor mode actually advances.
+//   - entityFilter sends only saas + a wide startDate — no endDate, no
+//     saasEntity. That is what lets an old quarantined email's restore
+//     request surface at all (the Emails feed's received-time window
+//     never returns it).
+//   - A "split" master record is skipped, so the same event isn't emitted
+//     twice.
 //   - Dedup suppresses unchanged repeats, and a lifecycle advance
-//     (entityUpdated bump: requested -> declined/restored) re-emits.
+//     (entityUpdated bump) re-emits — under the query's name namespace.
 //
 // All records are synthetic — no real tenant data.
-func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
+func TestEntitiesCursorModeRestorePreset(t *testing.T) {
 	fake := &fakeGateway{}
 	fake.hecRecords = []utils.Dict{
 		{
@@ -1052,7 +1127,6 @@ func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
 			"entityPayload": utils.Dict{"isRestoreRequested": "true", "restoreRequestTime": "2026-01-02T10:04:30Z", "subject": "synthetic restore request"},
 		},
 		{
-			// Split master — must be skipped so the request isn't double-emitted.
 			"entityInfo":    utils.Dict{"entityId": "rr-split-master", "entityUpdated": "2026-01-02T10:06:00Z"},
 			"entityPayload": utils.Dict{"isRestoreRequested": "true", "restoreRequestTime": "2026-01-02T10:05:30Z", "emailSplit": "split", "subject": "synthetic split master"},
 		},
@@ -1064,13 +1138,20 @@ func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
 	conf := HarmonyConfig{
 		ClientOptions: validClientOptions(),
 		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		RestoreRequests: RestoreRequestsConfig{
-			Enabled:         true,
-			Saas:            []string{"office365_emails"},
-			PollInterval:    20 * time.Millisecond,
-			Lookback:        15 * 24 * time.Hour,
-			InitialLookback: 1 * time.Hour,
-			Deduper:         dedup,
+		Entities: EntitiesConfig{
+			Enabled: true,
+			Queries: []EntityQuery{{
+				Name: "restore_requests",
+				Saas: []string{"office365_emails"},
+				Filter: []EntityPredicate{
+					{Attr: "entityPayload.isRestoreRequested", Op: "is", Value: "true"},
+				},
+				CursorField:     "entityPayload.restoreRequestTime",
+				Lookback:        15 * 24 * time.Hour,
+				InitialLookback: 1 * time.Hour,
+				PollInterval:    20 * time.Millisecond,
+				Deduper:         dedup,
+			}},
 		},
 	}
 	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
@@ -1083,15 +1164,16 @@ func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
 		return len(dedup.admittedKeys()) >= 1
 	}, "expected the restore request to be admitted/shipped")
 
-	// Several more polls must not admit the split master, and must not
-	// re-admit the unchanged request.
 	time.Sleep(150 * time.Millisecond)
 	keys := dedup.admittedKeys()
 	if len(keys) != 1 {
 		t.Fatalf("expected exactly 1 admitted key (split skipped, repeats deduped); got %d: %v", len(keys), keys)
 	}
+	if !strings.HasPrefix(keys[0], "restore_requests:") {
+		t.Fatalf("admitted key should be namespaced by query name; got %q", keys[0])
+	}
 	if !strings.Contains(keys[0], "rr-1") {
-		t.Fatalf("admitted key should be the real request; got %q", keys[0])
+		t.Fatalf("admitted key should reference the real entity; got %q", keys[0])
 	}
 	for _, k := range keys {
 		if strings.Contains(k, "rr-split-master") {
@@ -1099,14 +1181,15 @@ func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
 		}
 	}
 
-	// Query shape: server-side restore filter present; entityFilter scoped
-	// to saas + startDate only (no endDate, no saasEntity).
 	ext, entFilter := fake.lastSearchQuery()
+	// Configured predicate passes through verbatim.
 	if !extFilterHas(ext, "entityPayload.isRestoreRequested", "is") {
-		t.Fatalf("expected isRestoreRequested predicate in extended filter; got %v", ext)
+		t.Fatalf("expected configured isRestoreRequested predicate; got %v", ext)
 	}
+	// Cursor predicate is injected automatically — this is what makes
+	// cursor mode actually advance and not re-ship.
 	if !extFilterHas(ext, "entityPayload.restoreRequestTime", "greaterThan") {
-		t.Fatalf("expected restoreRequestTime predicate in extended filter; got %v", ext)
+		t.Fatalf("expected auto-injected cursor predicate; got %v", ext)
 	}
 	if entFilter["saas"] != "office365_emails" {
 		t.Fatalf("entityFilter.saas should be set; got %v", entFilter)
@@ -1115,14 +1198,14 @@ func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
 		t.Fatalf("entityFilter.startDate should be set; got %v", entFilter)
 	}
 	if _, ok := entFilter["endDate"]; ok {
-		t.Fatalf("entityFilter must NOT send endDate (it would re-impose the received-time window); got %v", entFilter)
+		t.Fatalf("cursor mode must NOT send endDate (it would re-impose the received-time window); got %v", entFilter)
 	}
 	if _, ok := entFilter["saasEntity"]; ok {
-		t.Fatalf("entityFilter must NOT send saasEntity for restore requests; got %v", entFilter)
+		t.Fatalf("cursor mode must NOT send saasEntity; got %v", entFilter)
 	}
 
-	// Lifecycle advance: the gateway bumps entityUpdated when the request is
-	// declined/restored. A new dedup key must admit it again.
+	// Lifecycle advance: gateway bumps entityUpdated when the request is
+	// declined/restored. A new dedup key admits it again.
 	fake.mu.Lock()
 	fake.hecRecords[0] = utils.Dict{
 		"entityInfo":    utils.Dict{"entityId": "rr-1", "entityCreated": "2026-01-01T09:00:00Z", "entityUpdated": "2026-01-02T11:00:00Z"},
@@ -1133,11 +1216,134 @@ func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
 	waitUntil(t, 2*time.Second, func() bool {
 		return len(dedup.admittedKeys()) >= 2
 	}, "expected the lifecycle advance (entityUpdated bump) to re-emit")
-
 	keys = dedup.admittedKeys()
 	if !strings.Contains(keys[1], "2026-01-02T11:00:00Z") {
 		t.Fatalf("re-emitted key should reflect the new entityUpdated; got %q", keys[1])
 	}
+}
+
+// TestEntitiesWindowMode covers the "spam/content/recipient filter on a
+// received-time window" scenario: no cursor_field, just a server-side
+// predicate. entityFilter must carry startDate+endDate+saasEntity (like
+// the Emails feed), the configured predicate must pass through, and no
+// cursor predicate must be injected.
+func TestEntitiesWindowMode(t *testing.T) {
+	fake := &fakeGateway{}
+	fake.hecRecords = []utils.Dict{
+		{
+			"entityInfo":    utils.Dict{"entityId": "ent-1", "entityUpdated": "2026-01-02T10:00:00Z"},
+			"entityPayload": utils.Dict{"subject": "synthetic match"},
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	dedup := newRecordingDeduper()
+	conf := HarmonyConfig{
+		ClientOptions: validClientOptions(),
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Entities: EntitiesConfig{
+			Enabled: true,
+			Queries: []EntityQuery{{
+				Name: "subject_watch",
+				Saas: []string{"office365_emails"},
+				Filter: []EntityPredicate{
+					{Attr: "entityPayload.subject", Op: "contains", Value: "synthetic"},
+				},
+				PollInterval: 20 * time.Millisecond,
+				Lookback:     1 * time.Hour,
+				Deduper:      dedup,
+			}},
+		},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 2*time.Second, func() bool {
+		return len(dedup.admittedKeys()) >= 1
+	}, "expected the matching entity to be admitted")
+
+	// Repeats must dedup, and no cursor advancement happens in window mode.
+	time.Sleep(150 * time.Millisecond)
+	if got := len(dedup.admittedKeys()); got != 1 {
+		t.Fatalf("expected dedup to suppress repeats in window mode; admitted=%d", got)
+	}
+
+	ext, entFilter := fake.lastSearchQuery()
+	if !extFilterHas(ext, "entityPayload.subject", "contains") {
+		t.Fatalf("expected configured subject predicate; got %v", ext)
+	}
+	// Critically: NO cursor predicate is injected in window mode.
+	for _, e := range ext {
+		m, _ := e.(map[string]interface{})
+		if m["saasAttrOp"] == "greaterThan" {
+			t.Fatalf("window mode must not inject a cursor predicate; got %v", ext)
+		}
+	}
+	if _, ok := entFilter["startDate"]; !ok {
+		t.Fatalf("window mode must send startDate; got %v", entFilter)
+	}
+	if _, ok := entFilter["endDate"]; !ok {
+		t.Fatalf("window mode must send endDate; got %v", entFilter)
+	}
+	if entFilter["saasEntity"] != "office365_emails_email" {
+		t.Fatalf("window mode must scope saasEntity from the saas map; got %v", entFilter["saasEntity"])
+	}
+}
+
+// TestEntitiesScrollDrainsAllPages mirrors TestEmailsScrollDrainsAllPages
+// for the entities source: the stable-handle scroll must keep re-sending
+// the handle until an empty terminator page, not stop on an unchanged
+// scrollId. With 5 records paged 2 at a time that is 3 non-empty pages +
+// 1 empty terminator = 4 search calls, and all 5 entities shipped.
+func TestEntitiesScrollDrainsAllPages(t *testing.T) {
+	fake := &fakeGateway{hecPageSize: 2}
+	for i := 1; i <= 5; i++ {
+		fake.hecRecords = append(fake.hecRecords, utils.Dict{
+			"entityInfo": utils.Dict{
+				"entityId":      fmt.Sprintf("ent-%d", i),
+				"entityUpdated": fmt.Sprintf("2026-01-02T10:00:%02dZ", i),
+			},
+			"entityPayload": utils.Dict{"subject": "synthetic"},
+		})
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	dedup := newRecordingDeduper()
+	conf := HarmonyConfig{
+		ClientOptions: validClientOptions(),
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Entities: EntitiesConfig{
+			Enabled: true,
+			Queries: []EntityQuery{{
+				Name:         "drain",
+				Saas:         []string{"office365_emails"},
+				PollInterval: 1 * time.Hour, // single poll
+				Lookback:     1 * time.Hour,
+				Deduper:      dedup,
+			}},
+		},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		return len(dedup.admittedKeys()) >= 5
+	}, "expected the scroll to drain every page (all 5 entities shipped)")
+
+	if got := len(dedup.admittedKeys()); got != 5 {
+		t.Fatalf("expected exactly 5 entities shipped, got %d: %v", got, dedup.admittedKeys())
+	}
+	waitUntil(t, 2*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.searchCalls) >= 4
+	}, "expected 4 search calls (3 pages + empty terminator)")
 }
 
 func TestTransientClassification(t *testing.T) {
