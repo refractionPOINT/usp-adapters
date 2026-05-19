@@ -279,6 +279,12 @@ type fakeGateway struct {
 	lastExtFilterLen int
 	sawSearchRequest bool
 
+	// Full entityExtendedFilter list and entityFilter object from the most
+	// recent HEC search request, so a test can assert the exact restore
+	// query shape (predicates, and that no endDate/saasEntity is sent).
+	lastExtFilter    []interface{}
+	lastEntityFilter utils.Dict
+
 	// hecPageSize > 0 makes serveHECSearch model HEC's stable-handle scroll:
 	// records are returned in pages of this size, the scrollId is the same
 	// on every page, and an empty page marks the end. 0 keeps the legacy
@@ -437,17 +443,23 @@ func (f *fakeGateway) serveHECSearch(w http.ResponseWriter, r *http.Request) {
 
 	extLen := 0
 	reqScroll := ""
+	var extFilter []interface{}
+	var entFilter utils.Dict
 	var reqBody utils.Dict
 	if json.NewDecoder(r.Body).Decode(&reqBody) == nil {
 		rd, _ := reqBody.GetDict("requestData")
 		if ef, ok := rd["entityExtendedFilter"].([]interface{}); ok {
 			extLen = len(ef)
+			extFilter = ef
 		}
+		entFilter, _ = rd.GetDict("entityFilter")
 		reqScroll, _ = rd.GetString("scrollId")
 	}
 
 	f.mu.Lock()
 	f.lastExtFilterLen = extLen
+	f.lastExtFilter = extFilter
+	f.lastEntityFilter = entFilter
 	f.sawSearchRequest = true
 	total := append([]utils.Dict{}, f.hecRecords...)
 
@@ -491,6 +503,29 @@ func (f *fakeGateway) lastSearchExtFilter() (length int, seen bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lastExtFilterLen, f.sawSearchRequest
+}
+
+// lastSearchQuery returns copies of the entityExtendedFilter list and
+// entityFilter object from the most recent HEC search request.
+func (f *fakeGateway) lastSearchQuery() ([]interface{}, utils.Dict) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]interface{}{}, f.lastExtFilter...), f.lastEntityFilter
+}
+
+// extFilterHas reports whether the extended-filter list contains a predicate
+// with the given saasAttrName and saasAttrOp.
+func extFilterHas(ext []interface{}, name, op string) bool {
+	for _, e := range ext {
+		m, ok := e.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if m["saasAttrName"] == name && m["saasAttrOp"] == op {
+			return true
+		}
+	}
+	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, body utils.Dict) {
@@ -944,6 +979,164 @@ func TestEmailsScrollDrainsAllPages(t *testing.T) {
 	}, "expected the scroll to continue past page 1 until an empty page")
 	if got := atomic.LoadInt32(&fake.searchCalls); got != 5 {
 		t.Fatalf("expected exactly 5 search calls (4 pages + empty terminator), got %d", got)
+	}
+}
+
+func TestRestoreRequestsValidate(t *testing.T) {
+	t.Run("defaults fill in", func(t *testing.T) {
+		c := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "x", AccessKey: "y",
+			RestoreRequests: RestoreRequestsConfig{Enabled: true},
+		}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if c.RestoreRequests.PollInterval != defaultRestoreRequestsPollInterval {
+			t.Fatalf("expected default poll interval, got %s", c.RestoreRequests.PollInterval)
+		}
+		if c.RestoreRequests.Lookback != defaultRestoreRequestsLookback {
+			t.Fatalf("expected default lookback, got %s", c.RestoreRequests.Lookback)
+		}
+		if c.RestoreRequests.InitialLookback != defaultRestoreRequestsInitialLookback {
+			t.Fatalf("expected default initial lookback, got %s", c.RestoreRequests.InitialLookback)
+		}
+		if len(c.RestoreRequests.Saas) != len(defaultEmailsSaas) {
+			t.Fatalf("expected default saas list")
+		}
+	})
+
+	t.Run("unsupported saas is rejected", func(t *testing.T) {
+		c := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "x", AccessKey: "y",
+			RestoreRequests: RestoreRequestsConfig{Enabled: true, Saas: []string{"slack"}},
+		}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected error for unsupported saas")
+		}
+	})
+
+	t.Run("source still required when restore_requests disabled", func(t *testing.T) {
+		c := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "x", AccessKey: "y",
+			RestoreRequests: RestoreRequestsConfig{Enabled: false},
+		}
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected error when no source is enabled")
+		}
+	})
+}
+
+// TestRestoreRequestsQueryShapeAndLifecycle is the regression test for the
+// reported bug ("quarantined-email restore requests never come in"). It
+// pins three things:
+//
+//   - The query is server-side filtered: entityExtendedFilter carries the
+//     isRestoreRequested + restoreRequestTime predicates, and entityFilter
+//     sends only saas + a wide startDate — no endDate, no saasEntity. That
+//     is what lets an old quarantined email's restore request surface at
+//     all (the Emails feed's received-time window never returns it).
+//   - A "split" master record is skipped (the child carries the actionable
+//     copy), so the same request isn't emitted twice.
+//   - Dedup suppresses unchanged repeats, and a lifecycle advance
+//     (entityUpdated bump: requested -> declined/restored) re-emits.
+//
+// All records are synthetic — no real tenant data.
+func TestRestoreRequestsQueryShapeAndLifecycle(t *testing.T) {
+	fake := &fakeGateway{}
+	fake.hecRecords = []utils.Dict{
+		{
+			"entityInfo":    utils.Dict{"entityId": "rr-1", "entityCreated": "2026-01-01T09:00:00Z", "entityUpdated": "2026-01-02T10:05:00Z"},
+			"entityPayload": utils.Dict{"isRestoreRequested": "true", "restoreRequestTime": "2026-01-02T10:04:30Z", "subject": "synthetic restore request"},
+		},
+		{
+			// Split master — must be skipped so the request isn't double-emitted.
+			"entityInfo":    utils.Dict{"entityId": "rr-split-master", "entityUpdated": "2026-01-02T10:06:00Z"},
+			"entityPayload": utils.Dict{"isRestoreRequested": "true", "restoreRequestTime": "2026-01-02T10:05:30Z", "emailSplit": "split", "subject": "synthetic split master"},
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	dedup := newRecordingDeduper()
+	conf := HarmonyConfig{
+		ClientOptions: validClientOptions(),
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		RestoreRequests: RestoreRequestsConfig{
+			Enabled:         true,
+			Saas:            []string{"office365_emails"},
+			PollInterval:    20 * time.Millisecond,
+			Lookback:        15 * 24 * time.Hour,
+			InitialLookback: 1 * time.Hour,
+			Deduper:         dedup,
+		},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 2*time.Second, func() bool {
+		return len(dedup.admittedKeys()) >= 1
+	}, "expected the restore request to be admitted/shipped")
+
+	// Several more polls must not admit the split master, and must not
+	// re-admit the unchanged request.
+	time.Sleep(150 * time.Millisecond)
+	keys := dedup.admittedKeys()
+	if len(keys) != 1 {
+		t.Fatalf("expected exactly 1 admitted key (split skipped, repeats deduped); got %d: %v", len(keys), keys)
+	}
+	if !strings.Contains(keys[0], "rr-1") {
+		t.Fatalf("admitted key should be the real request; got %q", keys[0])
+	}
+	for _, k := range keys {
+		if strings.Contains(k, "rr-split-master") {
+			t.Fatalf("split master must never be admitted; got %q", k)
+		}
+	}
+
+	// Query shape: server-side restore filter present; entityFilter scoped
+	// to saas + startDate only (no endDate, no saasEntity).
+	ext, entFilter := fake.lastSearchQuery()
+	if !extFilterHas(ext, "entityPayload.isRestoreRequested", "is") {
+		t.Fatalf("expected isRestoreRequested predicate in extended filter; got %v", ext)
+	}
+	if !extFilterHas(ext, "entityPayload.restoreRequestTime", "greaterThan") {
+		t.Fatalf("expected restoreRequestTime predicate in extended filter; got %v", ext)
+	}
+	if entFilter["saas"] != "office365_emails" {
+		t.Fatalf("entityFilter.saas should be set; got %v", entFilter)
+	}
+	if _, ok := entFilter["startDate"]; !ok {
+		t.Fatalf("entityFilter.startDate should be set; got %v", entFilter)
+	}
+	if _, ok := entFilter["endDate"]; ok {
+		t.Fatalf("entityFilter must NOT send endDate (it would re-impose the received-time window); got %v", entFilter)
+	}
+	if _, ok := entFilter["saasEntity"]; ok {
+		t.Fatalf("entityFilter must NOT send saasEntity for restore requests; got %v", entFilter)
+	}
+
+	// Lifecycle advance: the gateway bumps entityUpdated when the request is
+	// declined/restored. A new dedup key must admit it again.
+	fake.mu.Lock()
+	fake.hecRecords[0] = utils.Dict{
+		"entityInfo":    utils.Dict{"entityId": "rr-1", "entityCreated": "2026-01-01T09:00:00Z", "entityUpdated": "2026-01-02T11:00:00Z"},
+		"entityPayload": utils.Dict{"isRestoreRequested": "true", "isRestoreDeclined": "true", "restoreRequestTime": "2026-01-02T10:04:30Z", "subject": "synthetic restore request"},
+	}
+	fake.mu.Unlock()
+
+	waitUntil(t, 2*time.Second, func() bool {
+		return len(dedup.admittedKeys()) >= 2
+	}, "expected the lifecycle advance (entityUpdated bump) to re-emit")
+
+	keys = dedup.admittedKeys()
+	if !strings.Contains(keys[1], "2026-01-02T11:00:00Z") {
+		t.Fatalf("re-emitted key should reflect the new entityUpdated; got %q", keys[1])
 	}
 }
 
