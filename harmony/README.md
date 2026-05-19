@@ -2,15 +2,14 @@
 
 USP adapter for [Check Point Harmony](https://www.checkpoint.com/harmony/) — pulls events and email-entity data through the Infinity Portal gateway and ships it to LimaCharlie.
 
-The adapter has three independent sources. You can enable any combination.
+The adapter has two sources. You can enable either or both.
 
-| Source | API | Use it for | Result-set shape |
-| --- | --- | --- | --- |
-| `events` | Infinity Events / Logs-as-a-Service (`/app/laas-logs-api`) | The unified event stream across Harmony products (Endpoint, Email & Collaboration, Mobile, Connect, Browse). | Per-service polled stream. |
-| `emails` | HEC `/app/hec-api/v1.0/search/query` | **Firehose** — every email entity HEC processes, with its security verdicts and quarantine/restore flags inline. | Every email in a rolling received-time window. |
-| `entities` | HEC `/app/hec-api/v1.0/search/query` | **Targeted, server-side-filtered** entity feeds: a list of named queries. The general-purpose source for any HEC scenario that is *not* "ship every email" (restore requests, content/recipient watches, DLP-flagged mail, …). | Only the entities the gateway-side filter matches. |
+| Source | API | Use it for |
+| --- | --- | --- |
+| `events` | Infinity Events / Logs-as-a-Service (`/app/laas-logs-api`) | The unified event stream across Harmony products (Endpoint, Email & Collaboration, Mobile, Connect, Browse). |
+| `entities` | HEC `/app/hec-api/v1.0/search/query` | Every email-entity scenario: targeted server-side-filtered feeds (restore requests, content/recipient watches, DLP-flagged mail, …), or an unfiltered firehose as a preset. Adding a new scenario is a config entry, not a code change. |
 
-Adding a new HEC scenario should almost always be a new `entities.queries` entry, not a new source.
+A previous `emails` firehose source was folded into `entities` as a preset. See [Migrating from `emails`](#migrating-from-emails) below.
 
 ## Credentials and gateway URL
 
@@ -27,8 +26,7 @@ harmony:
   # and /app/hec-api paths share the same hostname per region.
   url: "https://cloudinfra-gw.portal.checkpoint.com"
 
-  events: { enabled: false, ... }
-  emails: { enabled: false, ... }
+  events:   { enabled: false, ... }
   entities: { enabled: false, queries: [ ... ] }
 ```
 
@@ -63,46 +61,24 @@ If a configured `cloud_service` is not provisioned for the tenant the gateway re
 Each shipped record is annotated:
 
 ```
-_lc_harmony_source: "infinity_events"
+_lc_harmony_source:  "infinity_events"
 _lc_harmony_service: "<the cloud_service it came from>"
 ```
 
-## Source: `emails` (firehose)
+## Source: `entities`
 
-Ships **every** email entity HEC processes in a rolling received-time window, deduped on `(entityId, entityUpdated)`. There is no server-side filter — triage and alerting happen downstream.
-
-```yaml
-harmony:
-  emails:
-    enabled: true
-    saas: [office365_emails, google_mail]  # default
-    poll_interval: 5m
-    lookback: 1h
-```
-
-Annotations on each shipped record:
-
-```
-_lc_harmony_source: "emails"
-_lc_harmony_saas:   "office365_emails" | "google_mail"
-```
-
-**Scaling note.** The HEC `search/query` endpoint enforces a per-query record ceiling (~10,000 records, oldest-first within the window). The default 1h lookback keeps the unfiltered feed under that on a typical tenant, but a very high-volume tenant could exceed it within an hour and silently lose the oldest events in that window. For targeted feeds prefer the `entities` source, which is server-side filtered and therefore independent of total mail volume.
-
-**Important: the firehose cannot surface restore requests.** The `entityFilter.startDate/endDate` window filters on the email's *received* time, not on `entityUpdated` and not on `restoreRequestTime`. A restore request is raised against an email received and quarantined earlier (often hours, days, or months ago), so its `isRestoreRequested` flag never appears in a recent received-time window. Use the `entities` source with a `restore_requests` query for that — see the preset below.
-
-## Source: `entities` (generic, server-side filtered)
-
-A single source that takes a list of named queries. Each query is one HEC `search/query` request shape: a `saas` scope, an optional set of server-side predicates (`entityExtendedFilter`), and a choice of cursor mode.
+A single source that takes a list of named queries. Each query is one HEC `search/query` request shape: a `saas` scope, an optional set of server-side predicates (`entityExtendedFilter`), and a choice of cursor mode. Restore requests, the firehose, and ad-hoc content/recipient watches are all just different `EntityQuery` entries.
 
 ### Two cursor modes
 
 | Mode | When to use | `entityFilter` sent | Cursor |
 | --- | --- | --- | --- |
-| **Window mode** (`cursor_field` empty) | The matching email is itself recent — content/recipient/detection filters. | `saas` + `startDate` + `endDate` + `saasEntity` (received-time window). | Rolling window + dedup. |
+| **Window mode** (`cursor_field` empty) | The matching email is itself recent — content/recipient/detection filters, or the unfiltered firehose. | `saas` + `startDate` + `endDate` + `saasEntity` (received-time window). | Rolling window + dedup. |
 | **Cursor mode** (`cursor_field` set) | The event of interest is decoupled in time from the email's receipt — e.g. a restore request on an old quarantined email. | `saas` + wide `startDate` only — no `endDate`, no `saasEntity`. | Adapter auto-injects `{cursor_field} greaterThan {cursor}` and advances `cursor` to the newest value seen. **`cursor_field` must reference a timestamp-typed field** under `entityPayload.*` or `entityInfo.*`. |
 
 Either mode is bounded by server-side predicates, so the gateway's per-query record ceiling is not approached — and the design scales independently of total mail volume.
+
+> **Restore requests need cursor mode.** A window-mode query (or the firehose preset) cannot surface a restore request. The `entityFilter` window filters on the email's *received* time, but the underlying quarantined email may have been received hours, days, or months before the restore was requested — so it isn't in any recent received-time window. Use the `restore_requests` preset below.
 
 ### Filter predicates
 
@@ -131,7 +107,7 @@ Use `_lc_harmony_query` to route per-scenario downstream — e.g. send `restore_
 
 ### Examples
 
-#### 1. Quarantined-email restore requests (cursor-mode canonical preset)
+#### 1. Quarantined-email restore requests (cursor mode, canonical preset)
 
 Mirrors Check Point's own XSOAR `restore_requests`. Wide received-time floor so old quarantined mail is in range; server-side filter selects only the restore requests; cursor advances on `restoreRequestTime`.
 
@@ -152,9 +128,27 @@ harmony:
 
 The same email re-emits when its lifecycle advances (gateway bumps `entityUpdated` on requested → declined / restored).
 
-#### 2. Subject / sender watch (window mode)
+#### 2. Email firehose (window mode, no filter, splits included)
 
-A targeted content filter on recent mail. No `cursor_field` — the matching email is itself recent.
+Every email entity HEC processes, with verdict / quarantine flags inline. Triage downstream. Equivalent to the old `emails` source.
+
+```yaml
+harmony:
+  entities:
+    enabled: true
+    queries:
+      - name: emails
+        saas: [office365_emails, google_mail]
+        include_splits: true   # ship "split" master records (firehose semantics)
+        lookback: 1h
+        poll_interval: 5m
+```
+
+The HEC `search/query` endpoint enforces a per-query record ceiling (~10,000 records, oldest-first within the window). The default 1h lookback keeps the firehose under that on a typical tenant, but a very high-volume tenant could exceed it within an hour and silently lose the oldest events. For targeted feeds prefer a filtered query — server-side filtering makes the result set independent of total mail volume.
+
+#### 3. Subject / sender watch (window mode)
+
+A targeted content filter on recent mail.
 
 ```yaml
 harmony:
@@ -170,9 +164,7 @@ harmony:
         poll_interval: 5m
 ```
 
-#### 3. VIP-recipient watch (window mode, multiple predicates)
-
-All predicates AND on the gateway side. Combine content + recipient + sender as needed.
+#### 4. VIP-recipient watch (window mode, multiple predicates AND'd)
 
 ```yaml
 harmony:
@@ -188,7 +180,7 @@ harmony:
         poll_interval: 5m
 ```
 
-#### 4. Multiple queries in one source
+#### 5. Multiple queries in one source
 
 Just list them. Each query runs independently, has its own dedup state, and ships with its own `_lc_harmony_query` annotation.
 
@@ -220,20 +212,52 @@ harmony:
 | `saas` | `[office365_emails, google_mail]` | Each saas runs its own worker. Must be one of the supported values above. |
 | `filter` | `[]` | List of `{attr, op, value}` predicates passed through as `entityExtendedFilter`. Empty is allowed (then the query is bounded only by the entity window and, in cursor mode, the injected cursor predicate). |
 | `cursor_field` | `""` | Empty → window mode. Set to `entityPayload.<k>` or `entityInfo.<k>` (timestamp-typed) → cursor mode. |
+| `include_splits` | `false` | If true, ship `entityPayload.emailSplit == "split"` master records alongside their child copies (firehose semantics). Default skips them so a single email isn't double-emitted per query. |
 | `lookback` | `1h` (window) / `360h` (cursor) | Floor on `entityFilter.startDate` (received time). |
 | `initial_lookback` | `1h` | Cursor mode only: how far back the cursor starts on the first poll. |
 | `poll_interval` | `5m` | Time between polls. |
 
 ### Operational notes
 
-- **Per-query record ceiling.** HEC enforces a `recordsNumber: 10000` per-query cap, oldest-first within the window. Targeted server-side filters (the point of this source) keep the matching result set small and well below the cap. The maximum scroll-page count is bounded at 1000 pages as an anti-spin safety net; hitting it surfaces a loud error rather than silently truncating.
+- **Per-query record ceiling.** HEC enforces a `recordsNumber: 10000` per-query cap, oldest-first within the window. Targeted server-side filters keep the matching result set small and well below the cap; only the unfiltered firehose preset (`include_splits: true`, no filter) can approach it on a high-volume tenant. The maximum scroll-page count is bounded at 1000 pages as an anti-spin safety net; hitting it surfaces a loud error rather than silently truncating.
 - **Scroll mechanics.** HEC's scroll handle is *stable* — the same `scrollId` comes back on every page. Termination is signalled by an empty page, not by a changed/empty scroll id. The adapter re-sends the handle until it receives an empty page.
 - **Dedup.** Per-query, keyed on `(query name, entityId, entityUpdated)` and, in cursor mode, also the `cursor_field` value. Unchanged repeats are suppressed; lifecycle advances (the gateway bumps `entityUpdated`) re-emit.
-- **Split emails.** A record with `entityPayload.emailSplit == "split"` is the master of a split email; the child carries the actionable copy. The `entities` source skips masters to avoid double-emission. The `emails` firehose does not — it ships everything.
+- **Split emails.** See `include_splits` above. Default-off avoids double-emission on filtered queries; set true on a firehose-style query to match the gateway's raw output.
 - **Retries.** Gateway calls absorb transient HTTP 502/503/504 and timeout/reset errors via bounded retry with jitter. A persistent 401 triggers a single token refresh + re-issue; a persistent failure surfaces as an error.
+
+## Migrating from `emails`
+
+The previous `emails` source has been removed. Adapter configs carrying `harmony.emails: {enabled: true}` will fail Validate at startup with a clear message pointing here.
+
+**Before:**
+
+```yaml
+harmony:
+  emails:
+    enabled: true
+    saas: [office365_emails, google_mail]
+    lookback: 1h
+    poll_interval: 5m
+```
+
+**After:**
+
+```yaml
+harmony:
+  entities:
+    enabled: true
+    queries:
+      - name: emails              # picked any name; appears as _lc_harmony_query
+        saas: [office365_emails, google_mail]
+        include_splits: true      # matches the old firehose semantics
+        lookback: 1h
+        poll_interval: 5m
+```
+
+Downstream rules / dashboards that filter on `_lc_harmony_source: "emails"` need to be updated to filter on `_lc_harmony_source: "entities"` (plus optionally `_lc_harmony_query: "emails"` if you want to scope to this specific feed).
 
 ## References
 
 - Check Point HEC API reference: <https://sc1.checkpoint.com/documents/Harmony_Email_and_Collaboration_API_Reference/CP_Harmony_Email_Collaboration_API_Reference_Guide.pdf>
 - HEC `search/query` endpoint: <https://sc1.checkpoint.com/documents/Harmony_Email_and_Collaboration_API_Reference/Topics-HEC-Avanan-API-Reference-Guide/Managing-Secured-Entities/Search-query.htm>
-- The `entities` source's cursor-mode pattern (wide `startDate`, no `endDate`, server-side filter + `restoreRequestTime` cursor) mirrors Check Point's official Cortex XSOAR integration `CheckPointHEC.py → restore_requests()`.
+- The cursor-mode pattern (wide `startDate`, no `endDate`, server-side filter + `restoreRequestTime` cursor) mirrors Check Point's official Cortex XSOAR integration `CheckPointHEC.py → restore_requests()`.

@@ -20,34 +20,58 @@ import (
 
 // ----- Pure helpers ------------------------------------------------------------------------
 
-func TestEmailDedupKey(t *testing.T) {
+func TestEntitiesDedupKey(t *testing.T) {
+	q := &EntityQuery{Name: "myquery"}
+
 	t.Run("no entityId returns empty key so caller skips it", func(t *testing.T) {
-		if got := emailDedupKey(utils.Dict{}); got != "" {
+		if got := entitiesDedupKey(q, utils.Dict{}, utils.Dict{}); got != "" {
 			t.Fatalf("expected empty key, got %q", got)
 		}
 	})
 
-	t.Run("entityUpdated drives the key", func(t *testing.T) {
-		a := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}}
-		b := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}}
-		c := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T11:00:00Z"}}
-		if emailDedupKey(a) != emailDedupKey(b) {
+	t.Run("entityUpdated drives the key in window mode", func(t *testing.T) {
+		infoA := utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}
+		infoB := utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}
+		infoC := utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T11:00:00Z"}
+		if entitiesDedupKey(q, infoA, nil) != entitiesDedupKey(q, infoB, nil) {
 			t.Fatalf("same entityUpdated should produce same key")
 		}
-		if emailDedupKey(a) == emailDedupKey(c) {
+		if entitiesDedupKey(q, infoA, nil) == entitiesDedupKey(q, infoC, nil) {
 			t.Fatalf("different entityUpdated should produce different keys (state change)")
 		}
 	})
 
 	t.Run("falls back to entityCreated when entityUpdated is absent", func(t *testing.T) {
-		noUpdated := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityCreated": "2026-05-12T09:00:00Z"}}
-		withUpdated := utils.Dict{"entityInfo": utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}}
-		got := emailDedupKey(noUpdated)
+		noUpdated := utils.Dict{"entityId": "abc", "entityCreated": "2026-05-12T09:00:00Z"}
+		withUpdated := utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}
+		got := entitiesDedupKey(q, noUpdated, nil)
 		if got == "" || !strings.Contains(got, "2026-05-12T09:00:00Z") {
 			t.Fatalf("expected key to fall back to entityCreated, got %q", got)
 		}
-		if emailDedupKey(noUpdated) == emailDedupKey(withUpdated) {
+		if entitiesDedupKey(q, noUpdated, nil) == entitiesDedupKey(q, withUpdated, nil) {
 			t.Fatalf("entityCreated fallback must not collide with an entityUpdated key")
+		}
+	})
+
+	t.Run("query name namespaces the key", func(t *testing.T) {
+		info := utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}
+		q1 := &EntityQuery{Name: "q1"}
+		q2 := &EntityQuery{Name: "q2"}
+		if entitiesDedupKey(q1, info, nil) == entitiesDedupKey(q2, info, nil) {
+			t.Fatalf("two queries on the same entity must produce different keys")
+		}
+		if !strings.HasPrefix(entitiesDedupKey(q1, info, nil), "q1:") {
+			t.Fatalf("key should be prefixed with the query name")
+		}
+	})
+
+	t.Run("cursor mode folds the cursor field value into the key", func(t *testing.T) {
+		qc := &EntityQuery{Name: "rr", CursorField: "entityPayload.restoreRequestTime"}
+		info := utils.Dict{"entityId": "abc", "entityUpdated": "2026-05-12T10:00:00Z"}
+		payA := utils.Dict{"restoreRequestTime": "2026-05-12T09:00:00Z"}
+		payB := utils.Dict{"restoreRequestTime": "2026-05-12T09:30:00Z"}
+		if entitiesDedupKey(qc, info, payA) == entitiesDedupKey(qc, info, payB) {
+			t.Fatalf("different cursor-field values must produce different keys (fresh request)")
 		}
 	})
 }
@@ -196,34 +220,21 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
-	t.Run("unsupported saas value is rejected", func(t *testing.T) {
-		c := HarmonyConfig{
-			ClientOptions: validClientOptions(),
-			ClientID:      "x", AccessKey: "y",
-			Emails: EmailsConfig{Enabled: true, Saas: []string{"slack"}},
-		}
-		if err := c.Validate(); err == nil {
-			t.Fatalf("expected error for unsupported saas")
-		}
-	})
-
-	t.Run("emails defaults fill in", func(t *testing.T) {
+	t.Run("deprecated emails field surfaces a migration error", func(t *testing.T) {
 		c := HarmonyConfig{
 			ClientOptions: validClientOptions(),
 			ClientID:      "x", AccessKey: "y",
 			Emails: EmailsConfig{Enabled: true},
 		}
-		if err := c.Validate(); err != nil {
-			t.Fatalf("unexpected error: %v", err)
+		err := c.Validate()
+		if err == nil {
+			t.Fatalf("expected migration error when `emails` is still enabled")
 		}
-		if c.Emails.PollInterval != defaultEmailsPollInterval {
-			t.Fatalf("expected default poll interval, got %s", c.Emails.PollInterval)
-		}
-		if c.Emails.Lookback != defaultEmailsLookback {
-			t.Fatalf("expected default lookback, got %s", c.Emails.Lookback)
-		}
-		if len(c.Emails.Saas) != len(defaultEmailsSaas) {
-			t.Fatalf("expected default saas list")
+		// The error must name the new path and the flag — anyone reading it
+		// in a deployment log should know exactly what to change.
+		msg := err.Error()
+		if !strings.Contains(msg, "entities") || !strings.Contains(msg, "include_splits") {
+			t.Fatalf("migration error should point to `entities` + `include_splits`; got %q", msg)
 		}
 	})
 }
@@ -273,15 +284,9 @@ type fakeGateway struct {
 	// Records returned by the HEC search; can be swapped at runtime to simulate transitions.
 	hecRecords []utils.Dict
 
-	// Number of entityExtendedFilter entries on the most recent HEC search
-	// request, and whether a search request has been observed. The emails
-	// feed must send zero (unfiltered).
-	lastExtFilterLen int
-	sawSearchRequest bool
-
 	// Full entityExtendedFilter list and entityFilter object from the most
-	// recent HEC search request, so a test can assert the exact restore
-	// query shape (predicates, and that no endDate/saasEntity is sent).
+	// recent HEC search request, so tests can assert the exact query shape
+	// (predicates, and that no endDate/saasEntity is sent in cursor mode).
 	lastExtFilter    []interface{}
 	lastEntityFilter utils.Dict
 
@@ -441,7 +446,6 @@ func (f *fakeGateway) serveHECSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	atomic.AddInt32(&f.searchCalls, 1)
 
-	extLen := 0
 	reqScroll := ""
 	var extFilter []interface{}
 	var entFilter utils.Dict
@@ -449,7 +453,6 @@ func (f *fakeGateway) serveHECSearch(w http.ResponseWriter, r *http.Request) {
 	if json.NewDecoder(r.Body).Decode(&reqBody) == nil {
 		rd, _ := reqBody.GetDict("requestData")
 		if ef, ok := rd["entityExtendedFilter"].([]interface{}); ok {
-			extLen = len(ef)
 			extFilter = ef
 		}
 		entFilter, _ = rd.GetDict("entityFilter")
@@ -457,10 +460,8 @@ func (f *fakeGateway) serveHECSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f.mu.Lock()
-	f.lastExtFilterLen = extLen
 	f.lastExtFilter = extFilter
 	f.lastEntityFilter = entFilter
-	f.sawSearchRequest = true
 	total := append([]utils.Dict{}, f.hecRecords...)
 
 	if f.hecPageSize <= 0 {
@@ -495,14 +496,6 @@ func (f *fakeGateway) serveHECSearch(w http.ResponseWriter, r *http.Request) {
 		"responseEnvelope": utils.Dict{"recordsNumber": len(total), "scrollId": "hec-scroll"},
 		"responseData":     dictListToInterface(page),
 	})
-}
-
-// lastSearchExtFilter reports the entityExtendedFilter length on the most
-// recent HEC search request and whether one was seen at all.
-func (f *fakeGateway) lastSearchExtFilter() (length int, seen bool) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.lastExtFilterLen, f.sawSearchRequest
 }
 
 // lastSearchQuery returns copies of the entityExtendedFilter list and
@@ -813,174 +806,6 @@ func (d *recordingDeduper) admittedKeys() []string {
 	return append([]string(nil), d.admitted...)
 }
 
-// TestEmailsDedupAndStateChange verifies the feed semantics:
-//   - On first poll, an email entity is admitted to dedup (and therefore shipped).
-//   - On subsequent polls with no change, the same entity is suppressed.
-//   - When the gateway bumps entityUpdated to reflect a state change, a new
-//     dedup key admits the entity again, capturing the change.
-func TestEmailsDedupAndStateChange(t *testing.T) {
-	fake := &fakeGateway{}
-	fake.hecRecords = []utils.Dict{
-		{
-			"entityInfo":    utils.Dict{"entityId": "e1", "entityUpdated": "2026-05-12T10:00:00Z"},
-			"entityPayload": utils.Dict{"direction": "incoming"},
-		},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	dedup := newRecordingDeduper()
-
-	conf := HarmonyConfig{
-		ClientOptions: validClientOptions(),
-		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Emails: EmailsConfig{
-			Enabled:      true,
-			Saas:         []string{"office365_emails"},
-			PollInterval: 30 * time.Millisecond,
-			Lookback:     1 * time.Hour,
-			Deduper:      dedup,
-		},
-	}
-	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
-	if err != nil {
-		t.Fatalf("NewHarmonyAdapter: %v", err)
-	}
-	defer adapter.Close()
-
-	// Wait until the first admission lands.
-	waitUntil(t, 2*time.Second, func() bool {
-		return len(dedup.admittedKeys()) >= 1
-	}, "expected the first poll to admit the entity")
-
-	firstKey := dedup.admittedKeys()[0]
-	if !strings.Contains(firstKey, "e1") || !strings.Contains(firstKey, "2026-05-12T10:00:00Z") {
-		t.Fatalf("unexpected dedup key: %q", firstKey)
-	}
-
-	// Let a few more polls happen — count must stay at 1 since the record hasn't changed.
-	time.Sleep(200 * time.Millisecond)
-	if got := len(dedup.admittedKeys()); got != 1 {
-		t.Fatalf("expected dedup to suppress repeats; admitted=%d keys=%v", got, dedup.admittedKeys())
-	}
-	if got := atomic.LoadInt32(&fake.searchCalls); got < 2 {
-		t.Fatalf("expected multiple search polls; got %d", got)
-	}
-
-	// Now advance the entity's state with a fresh entityUpdated.
-	fake.mu.Lock()
-	fake.hecRecords[0] = utils.Dict{
-		"entityInfo":    utils.Dict{"entityId": "e1", "entityUpdated": "2026-05-12T11:00:00Z"},
-		"entityPayload": utils.Dict{"direction": "incoming", "isQuarantined": true},
-	}
-	fake.mu.Unlock()
-
-	waitUntil(t, 2*time.Second, func() bool {
-		return len(dedup.admittedKeys()) >= 2
-	}, "expected the state change to produce a second admission")
-
-	keys := dedup.admittedKeys()
-	changeKey := keys[1]
-	if !strings.Contains(changeKey, "2026-05-12T11:00:00Z") {
-		t.Fatalf("expected changed key to include new entityUpdated, got %q", changeKey)
-	}
-}
-
-// TestEmailsUnfilteredSingleQueryPerPoll asserts the emails source issues
-// exactly one query per poll and sends no server-side filter, so the full
-// email-entity feed comes through and triage happens downstream.
-func TestEmailsUnfilteredSingleQueryPerPoll(t *testing.T) {
-	fake := &fakeGateway{}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	conf := HarmonyConfig{
-		ClientOptions: validClientOptions(),
-		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Emails: EmailsConfig{
-			Enabled:      true,
-			Saas:         []string{"office365_emails"},
-			PollInterval: 1 * time.Hour, // single poll
-			Lookback:     1 * time.Hour,
-			Deduper:      newRecordingDeduper(),
-		},
-	}
-	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
-	if err != nil {
-		t.Fatalf("NewHarmonyAdapter: %v", err)
-	}
-	// Allow the initial poll to complete.
-	time.Sleep(300 * time.Millisecond)
-	adapter.Close()
-
-	if got := atomic.LoadInt32(&fake.searchCalls); got != 1 {
-		t.Fatalf("expected exactly 1 search call per poll, got %d", got)
-	}
-	extLen, seen := fake.lastSearchExtFilter()
-	if !seen {
-		t.Fatalf("expected the emails source to issue a search request")
-	}
-	if extLen != 0 {
-		t.Fatalf("emails feed must send no extended filter; got %d filter entries", extLen)
-	}
-}
-
-// TestEmailsScrollDrainsAllPages is the regression test for the HEC
-// stable-handle scroll bug: the endpoint returns the *same* scrollId on
-// every page, so terminating on an unchanged scrollId stops after page 1
-// and silently drops the rest of the window. The adapter must keep
-// re-sending the handle until it gets an empty page. With 7 records paged
-// 2 at a time that is 4 non-empty pages + 1 empty terminator = 5 search
-// calls, and all 7 entities must be shipped.
-func TestEmailsScrollDrainsAllPages(t *testing.T) {
-	fake := &fakeGateway{hecPageSize: 2}
-	for i := 1; i <= 7; i++ {
-		fake.hecRecords = append(fake.hecRecords, utils.Dict{
-			"entityInfo": utils.Dict{
-				"entityId":      fmt.Sprintf("e%d", i),
-				"entityUpdated": fmt.Sprintf("2026-05-15T10:00:%02dZ", i),
-			},
-			"entityPayload": utils.Dict{"direction": "incoming"},
-		})
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	dedup := newRecordingDeduper()
-	conf := HarmonyConfig{
-		ClientOptions: validClientOptions(),
-		ClientID:      "c", AccessKey: "s", URL: srv.URL,
-		Emails: EmailsConfig{
-			Enabled:      true,
-			Saas:         []string{"office365_emails"},
-			PollInterval: 1 * time.Hour, // single poll
-			Lookback:     1 * time.Hour,
-			Deduper:      dedup,
-		},
-	}
-	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
-	if err != nil {
-		t.Fatalf("NewHarmonyAdapter: %v", err)
-	}
-	defer adapter.Close()
-
-	// All 7 must be shipped — the buggy termination would yield only the
-	// first page (2).
-	waitUntil(t, 3*time.Second, func() bool {
-		return len(dedup.admittedKeys()) >= 7
-	}, "expected every page to be drained (all 7 entities shipped)")
-
-	if got := len(dedup.admittedKeys()); got != 7 {
-		t.Fatalf("expected exactly 7 entities shipped, got %d: %v", got, dedup.admittedKeys())
-	}
-	// 4 pages of records (2,2,2,1) + 1 empty terminator page.
-	waitUntil(t, 2*time.Second, func() bool {
-		return atomic.LoadInt32(&fake.searchCalls) >= 5
-	}, "expected the scroll to continue past page 1 until an empty page")
-	if got := atomic.LoadInt32(&fake.searchCalls); got != 5 {
-		t.Fatalf("expected exactly 5 search calls (4 pages + empty terminator), got %d", got)
-	}
-}
 
 func TestEntitiesValidate(t *testing.T) {
 	base := func(q EntityQuery) *HarmonyConfig {
@@ -1003,7 +828,7 @@ func TestEntitiesValidate(t *testing.T) {
 		if q.Lookback != defaultEntitiesWindowLookback {
 			t.Fatalf("window-mode lookback default; got %s", q.Lookback)
 		}
-		if len(q.Saas) != len(defaultEmailsSaas) {
+		if len(q.Saas) != len(defaultEntitiesSaas) {
 			t.Fatalf("saas default")
 		}
 	})
@@ -1495,6 +1320,101 @@ func TestEntitiesMultipleQueriesIndependent(t *testing.T) {
 	if !strings.HasPrefix(d2.admittedKeys()[0], "q2:") {
 		t.Fatalf("q2 key should be namespaced; got %q", d2.admittedKeys()[0])
 	}
+}
+
+// TestEntitiesIncludeSplits pins the firehose preset's behavior. With the
+// default (IncludeSplits == false) a "split" master record is skipped to
+// avoid double-emission. With IncludeSplits == true the master is shipped
+// alongside its child — the semantics the old `emails` firehose had, and
+// which operators opt back into by setting this flag on a query with no
+// filter.
+func TestEntitiesIncludeSplits(t *testing.T) {
+	makeRecords := func() []utils.Dict {
+		return []utils.Dict{
+			{
+				"entityInfo":    utils.Dict{"entityId": "child-1", "entityUpdated": "2026-01-02T10:00:00Z"},
+				"entityPayload": utils.Dict{"subject": "synthetic"},
+			},
+			{
+				"entityInfo":    utils.Dict{"entityId": "master-1", "entityUpdated": "2026-01-02T10:00:00Z"},
+				"entityPayload": utils.Dict{"emailSplit": "split", "subject": "synthetic master"},
+			},
+		}
+	}
+
+	t.Run("default skips split masters", func(t *testing.T) {
+		fake := &fakeGateway{hecRecords: makeRecords()}
+		srv := httptest.NewServer(fake.handler())
+		defer srv.Close()
+
+		dedup := newRecordingDeduper()
+		conf := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "c", AccessKey: "s", URL: srv.URL,
+			Entities: EntitiesConfig{
+				Enabled: true,
+				Queries: []EntityQuery{{
+					Name: "default", Saas: []string{"office365_emails"},
+					PollInterval: 20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: dedup,
+				}},
+			},
+		}
+		adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+		if err != nil {
+			t.Fatalf("NewHarmonyAdapter: %v", err)
+		}
+		defer adapter.Close()
+
+		waitUntil(t, 2*time.Second, func() bool {
+			return len(dedup.admittedKeys()) >= 1
+		}, "expected the child to be admitted")
+		time.Sleep(150 * time.Millisecond)
+		keys := dedup.admittedKeys()
+		if len(keys) != 1 {
+			t.Fatalf("expected only the child to ship (master skipped); got %d: %v", len(keys), keys)
+		}
+		if !strings.Contains(keys[0], "child-1") {
+			t.Fatalf("admitted key should be the child; got %q", keys[0])
+		}
+	})
+
+	t.Run("include_splits true ships the master too (firehose preset)", func(t *testing.T) {
+		fake := &fakeGateway{hecRecords: makeRecords()}
+		srv := httptest.NewServer(fake.handler())
+		defer srv.Close()
+
+		dedup := newRecordingDeduper()
+		conf := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "c", AccessKey: "s", URL: srv.URL,
+			Entities: EntitiesConfig{
+				Enabled: true,
+				Queries: []EntityQuery{{
+					Name: "firehose", Saas: []string{"office365_emails"},
+					IncludeSplits: true,
+					PollInterval:  20 * time.Millisecond, Lookback: 1 * time.Hour, Deduper: dedup,
+				}},
+			},
+		}
+		adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+		if err != nil {
+			t.Fatalf("NewHarmonyAdapter: %v", err)
+		}
+		defer adapter.Close()
+
+		waitUntil(t, 2*time.Second, func() bool {
+			return len(dedup.admittedKeys()) >= 2
+		}, "expected both child and master to ship with include_splits=true")
+		time.Sleep(100 * time.Millisecond)
+		keys := dedup.admittedKeys()
+		if len(keys) != 2 {
+			t.Fatalf("expected exactly 2 admitted keys (child + master); got %d: %v", len(keys), keys)
+		}
+		joined := strings.Join(keys, "|")
+		if !strings.Contains(joined, "child-1") || !strings.Contains(joined, "master-1") {
+			t.Fatalf("expected both child-1 and master-1 to be admitted; got %v", keys)
+		}
+	})
 }
 
 func TestTransientClassification(t *testing.T) {

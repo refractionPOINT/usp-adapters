@@ -71,44 +71,27 @@ const (
 	defaultEventsPerCloudLimit   = 5000
 )
 
-// Defaults for the Emails source.
-//
-// The HEC search/query endpoint is a generic entity API keyed by
-// saas + saasEntity — it is not email-only and accepts other Harmony
-// Email & Collaboration entity types (files, Teams, Slack, …). This
-// source deliberately scopes to the email entities: that is the surface
-// verified end-to-end (payload shape, scroll pagination, dedup) against a
-// live tenant. Widening to non-email entity types is a separate, explicitly
-// verified change (and would warrant a generic "entities" source rather
-// than extending one named for email), not an allowlist tweak here.
-var defaultEmailsSaas = []string{"office365_emails", "google_mail"}
+// HEC search/query is generic over saas + saasEntity and would accept
+// other Harmony Email & Collaboration entity types (files, Teams, Slack,
+// …). The Entities source deliberately scopes to the email entities below:
+// that is the surface verified end-to-end (payload shape, scroll
+// pagination, dedup, restore-request lifecycle) against a live tenant.
+// Widening to non-email entity types is a separate, explicitly verified
+// change, not an allowlist tweak here.
+var defaultEntitiesSaas = []string{"office365_emails", "google_mail"}
 
-var defaultEmailsSaasEntity = map[string]string{
+var defaultEntitiesSaasEntity = map[string]string{
 	"office365_emails": "office365_emails_email",
 	"google_mail":      "google_mail_email",
 }
 
 const (
-	defaultEmailsPollInterval = 5 * time.Minute
-
-	// defaultEmailsLookback is intentionally short. The HEC search/query
-	// window filters on entityUpdated, not receipt time: when an email's
-	// state changes (verdict re-evaluated, quarantined, restored, declined)
-	// the gateway bumps entityUpdated, which re-dates the entity into a
-	// recent window. So a short lookback polled frequently — with dedup on
-	// entityId+entityUpdated — still captures late state changes without
-	// needing a long window. The lookback only has to exceed the poll
-	// interval (plus margin for clock skew / processing lag) so no update
-	// slips between polls. A long lookback is unnecessary and risks the
-	// per-query record ceiling the endpoint enforces on large windows.
-	defaultEmailsLookback = 1 * time.Hour
-
-	// maxEmailsPages bounds the HEC scroll loop. HEC pages at ~100 records
+	// maxScrollPages bounds the HEC scroll loop. HEC pages at ~100 records
 	// each and enforces its own per-query record ceiling, so a legitimate
 	// window never approaches this; the bound only exists so a gateway that
 	// keeps returning a non-empty page can't spin forever. Hitting it is a
 	// real fault and is surfaced as an error rather than silently truncating.
-	maxEmailsPages = 1000
+	maxScrollPages = 1000
 )
 
 // Defaults for the generic Entities source.
@@ -145,9 +128,9 @@ const (
 	defaultEntitiesPollInterval = 5 * time.Minute
 
 	// defaultEntitiesWindowLookback is the received-time window for
-	// window-mode queries (no CursorField). Kept short like the Emails feed:
-	// the window filters on received time and a long window risks the
-	// gateway's per-query record ceiling.
+	// window-mode queries (no CursorField). Kept short: the window filters
+	// on received time and a long window risks the gateway's per-query
+	// record ceiling on a high-volume tenant.
 	defaultEntitiesWindowLookback = 1 * time.Hour
 
 	// defaultEntitiesCursorLookback bounds entityFilter.startDate for
@@ -262,91 +245,24 @@ func (c *EventsConfig) Start(a *HarmonyAdapter) error {
 
 func (c *EventsConfig) Close() {}
 
-// EmailsConfig controls polling of the HEC entity search API for the full,
-// unfiltered email-entity feed: every email entity Harmony processes (with
-// its security verdicts and quarantine/restore lifecycle flags inline),
-// shipped once per (entityId, entityUpdated) so state changes re-emit while
-// unchanged entities don't. No server-side filtering is applied — triage and
-// alerting are expected to happen downstream.
+// EmailsConfig is a deprecation stub.
+//
+// The previous "emails" firehose source was folded into the generic
+// `entities` source as a preset (a query with no filter and IncludeSplits
+// = true). The struct is kept only so an old YAML config carrying
+// `harmony.emails: {enabled: true}` fails Validate with a clear migration
+// message instead of the cryptic "no source enabled" that would otherwise
+// result from the unknown field being silently ignored.
+//
+// New deployments should use:
+//
+//   entities:
+//     enabled: true
+//     queries:
+//       - name: emails
+//         include_splits: true   # match the old firehose semantics
 type EmailsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
-
-	// Saas platforms to query. Defaults to office365_emails + google_mail.
-	// Validate rejects anything outside defaultEmailsSaasEntity — an
-	// intentional scope to the verified email entities, not an API limit
-	// (the HEC entity API itself is generic over saas/saasEntity).
-	Saas []string `json:"saas" yaml:"saas"`
-
-	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
-
-	// How far back each poll searches. Defaults to 1h. Keep this short: the
-	// feed is unfiltered and high volume, and the HEC search/query endpoint
-	// silently truncates a window that exceeds its per-query record cap. A
-	// short lookback polled frequently (with dedup on entityId+entityUpdated)
-	// keeps the feed complete; a long lookback would drop the oldest events.
-	Lookback time.Duration `json:"lookback" yaml:"lookback"`
-
-	// Deduper avoids re-emitting the same entity for the same state on
-	// every poll. State changes are still emitted because the dedup key
-	// includes the entityUpdated timestamp. If nil, Start allocates one
-	// sized to Lookback + 1h (24h floor); a caller-supplied deduper takes
-	// precedence. The source's Close releases the deduper unconditionally,
-	// matching the ownership convention used by the o365 adapter.
-	Deduper utils.Deduper `json:"-" yaml:"-"`
-}
-
-func (c *EmailsConfig) Name() string    { return "emails" }
-func (c *EmailsConfig) IsEnabled() bool { return c != nil && c.Enabled }
-
-func (c *EmailsConfig) Validate() error {
-	if len(c.Saas) == 0 {
-		c.Saas = append([]string{}, defaultEmailsSaas...)
-	}
-	for _, s := range c.Saas {
-		if _, ok := defaultEmailsSaasEntity[s]; !ok {
-			return fmt.Errorf("emails.saas %q is not supported (supported: %v)", s, defaultEmailsSaas)
-		}
-	}
-	if c.PollInterval <= 0 {
-		c.PollInterval = defaultEmailsPollInterval
-	}
-	if c.Lookback <= 0 {
-		c.Lookback = defaultEmailsLookback
-	}
-	return nil
-}
-
-func (c *EmailsConfig) Start(a *HarmonyAdapter) error {
-	if c.Deduper == nil {
-		// Size the TTL to the full lookback window so an entity that keeps
-		// matching every poll for as long as it remains in the lookback
-		// window doesn't fall out of dedup and get re-emitted as if it were
-		// new. Floor at 24h.
-		ttl := c.Lookback + 1*time.Hour
-		if ttl < 24*time.Hour {
-			ttl = 24 * time.Hour
-		}
-		d, err := utils.NewLocalDeduper(1*time.Hour, ttl)
-		if err != nil {
-			return err
-		}
-		c.Deduper = d
-	}
-	for _, saas := range c.Saas {
-		a.wgSenders.Add(1)
-		go a.fetchEmailsForSaas(saas)
-	}
-	return nil
-}
-
-func (c *EmailsConfig) Close() {
-	if c.Deduper != nil {
-		// Close any deduper attached to this source — both ones we allocated
-		// and caller-supplied ones, matching the convention other adapters
-		// in this repo use (e.g. o365).
-		c.Deduper.Close()
-		c.Deduper = nil
-	}
 }
 
 // EntityPredicate is one server-side HEC search/query filter clause.
@@ -382,9 +298,8 @@ type EntityQuery struct {
 	// CursorField selects the cursor mode:
 	//
 	//   - Empty (window mode): entityFilter sends startDate+endDate (a
-	//     received-time window) plus saasEntity scoped from the saas map,
-	//     exactly like the Emails feed. Suited to filters where the
-	//     matching email is itself recent.
+	//     received-time window) plus saasEntity scoped from the saas map.
+	//     Suited to filters where the matching email is itself recent.
 	//
 	//   - Non-empty (cursor mode), must be "entityPayload.<k>" or
 	//     "entityInfo.<k>" and reference a *timestamp-typed* field (e.g.
@@ -398,6 +313,14 @@ type EntityQuery struct {
 	//     advance — the gateway evaluates greaterThan on the raw value, so
 	//     the adapter cannot detect the misconfiguration locally.
 	CursorField string `json:"cursor_field" yaml:"cursor_field"`
+
+	// IncludeSplits controls whether "split" master records are emitted.
+	// HEC sometimes returns an email as a master (entityPayload.emailSplit
+	// == "split") together with one or more child copies; the child carries
+	// the actionable state. By default the adapter skips the master to
+	// avoid double-emission per query. Set true to opt into the firehose
+	// semantics: emit every record the gateway returns, including masters.
+	IncludeSplits bool `json:"include_splits" yaml:"include_splits"`
 
 	// Lookback bounds entityFilter.startDate (received time). Defaults:
 	// 1h in window mode, 15d in cursor mode.
@@ -419,10 +342,8 @@ type EntityQuery struct {
 }
 
 // EntitiesConfig is the generic HEC entity-query source: a list of named
-// server-side-filtered feeds. The Emails firehose remains a separate
-// source for the deliberate "ship every email" case; this source covers
-// every scenario where filtering belongs server-side, so a new scenario is
-// a config entry rather than another bespoke Go source.
+// server-side-filtered feeds. The old "emails" firehose is now expressed
+// as a query with no filter and IncludeSplits = true.
 type EntitiesConfig struct {
 	Enabled bool          `json:"enabled" yaml:"enabled"`
 	Queries []EntityQuery `json:"queries" yaml:"queries"`
@@ -446,11 +367,11 @@ func (c *EntitiesConfig) Validate() error {
 		}
 		seen[q.Name] = struct{}{}
 		if len(q.Saas) == 0 {
-			q.Saas = append([]string{}, defaultEmailsSaas...)
+			q.Saas = append([]string{}, defaultEntitiesSaas...)
 		}
 		for _, s := range q.Saas {
-			if _, ok := defaultEmailsSaasEntity[s]; !ok {
-				return fmt.Errorf("entities.queries[%q].saas %q is not supported (supported: %v)", q.Name, s, defaultEmailsSaas)
+			if _, ok := defaultEntitiesSaasEntity[s]; !ok {
+				return fmt.Errorf("entities.queries[%q].saas %q is not supported (supported: %v)", q.Name, s, defaultEntitiesSaas)
 			}
 		}
 		for j := range q.Filter {
@@ -523,8 +444,9 @@ type HarmonyConfig struct {
 
 	// Infinity Portal API credentials (Global Settings > API Keys).
 	// For Infinity Events the key must include the "Logs as a Service" service.
-	// For the Emails feed the key must include the Harmony Email & Collaboration service.
-	// One key with both services attached is fine.
+	// For HEC-backed sources (entities) the key must include the Harmony
+	// Email & Collaboration service. One key with both services attached
+	// is fine.
 	ClientID  string `json:"client_id" yaml:"client_id"`
 	AccessKey string `json:"access_key" yaml:"access_key"`
 
@@ -536,14 +458,18 @@ type HarmonyConfig struct {
 	URL string `json:"url" yaml:"url"`
 
 	Events   EventsConfig   `json:"events" yaml:"events"`
-	Emails   EmailsConfig   `json:"emails" yaml:"emails"`
 	Entities EntitiesConfig `json:"entities" yaml:"entities"`
+
+	// Deprecated stub — see EmailsConfig. The field stays so an old YAML
+	// config gets a clear migration error in Validate rather than a
+	// confusing "no source enabled".
+	Emails EmailsConfig `json:"emails" yaml:"emails"`
 }
 
 // sources returns the registered ingestion sources in a stable order. Adding
 // a new source is a single line here plus the source-config struct.
 func (c *HarmonyConfig) sources() []harmonySource {
-	return []harmonySource{&c.Events, &c.Emails, &c.Entities}
+	return []harmonySource{&c.Events, &c.Entities}
 }
 
 func (c *HarmonyConfig) Validate() error {
@@ -558,6 +484,9 @@ func (c *HarmonyConfig) Validate() error {
 	}
 	if c.URL == "" {
 		c.URL = defaultBaseURL
+	}
+	if c.Emails.Enabled {
+		return errors.New("the `emails` firehose source has been removed; express it as an `entities` query with `include_splits: true` (see harmony/README.md for the migration)")
 	}
 	c.URL = strings.TrimRight(c.URL, "/")
 
@@ -886,132 +815,7 @@ func (a *HarmonyAdapter) retrieveEventsPage(taskID, pageToken string) ([]utils.D
 	return records, nextToken, nil
 }
 
-// ----- Source 2: HEC Emails ---------------------------------------------------------------
-
-func (a *HarmonyAdapter) fetchEmailsForSaas(saas string) {
-	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("harmony emails worker exiting (saas=%q)", saas))
-
-	for {
-		if a.doStop.IsSet() {
-			return
-		}
-		if err := a.runOneEmailsQuery(saas); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[emails:%s]: %v", saas, err))
-		}
-		if a.doStop.WaitFor(a.conf.Emails.PollInterval) {
-			return
-		}
-	}
-}
-
-// runOneEmailsQuery scrolls through every email entity for the saas within
-// the configured lookback window and ships each entity once per
-// (entityId, entityUpdated) pair. No server-side filter is applied: the
-// gateway bumps entityUpdated on every state change (quarantine, restore,
-// decline, …), so deduping on that pair both suppresses unchanged repeats
-// and re-emits an entity each time its state advances — downstream does the
-// triage.
-//
-// HEC scroll uses a *stable* handle: the scrollId is the same on every page
-// and you advance by re-POSTing it (the cursor lives server-side). The end
-// of the result set is signalled by an empty page, not a changed/empty
-// scrollId — so termination is "no records returned", bounded by
-// maxEmailsPages as an anti-spin safety net. (Terminating on an unchanged
-// scrollId, as a generic scroll would, stops after the first page here and
-// silently drops the rest of the window.)
-func (a *HarmonyAdapter) runOneEmailsQuery(saas string) error {
-	saasEntity, ok := defaultEmailsSaasEntity[saas]
-	if !ok {
-		return fmt.Errorf("unsupported saas %q", saas)
-	}
-	startDate := time.Now().UTC().Add(-a.conf.Emails.Lookback).Format(time.RFC3339)
-	endDate := time.Now().UTC().Format(time.RFC3339)
-
-	scrollID := ""
-	for page := 0; page < maxEmailsPages; page++ {
-		if a.doStop.IsSet() {
-			return nil
-		}
-
-		body := utils.Dict{
-			"requestData": utils.Dict{
-				"entityFilter": utils.Dict{
-					"saas":       saas,
-					"saasEntity": saasEntity,
-					"startDate":  startDate,
-					"endDate":    endDate,
-				},
-				// Unfiltered: an empty extended filter returns every email
-				// entity in the window, not just a flagged subset.
-				"entityExtendedFilter": []utils.Dict{},
-				"scrollId":             scrollID,
-			},
-		}
-
-		headers := map[string]string{
-			"x-av-req-id": newRequestID(),
-		}
-		resp, err := a.doAuthRequest("POST", a.conf.URL+hecSearchEntityPath, body, headers)
-		if err != nil {
-			return err
-		}
-
-		envelope, _ := resp.GetDict("responseEnvelope")
-		nextScroll, _ := envelope.GetString("scrollId")
-		records, _ := resp.GetListOfDict("responseData")
-
-		// An empty page marks the end of the scroll (also covers an empty
-		// window on the first request).
-		if len(records) == 0 {
-			return nil
-		}
-
-		for _, rec := range records {
-			key := emailDedupKey(rec)
-			if key == "" {
-				continue
-			}
-			if a.conf.Emails.Deduper.CheckAndAdd(key) {
-				continue
-			}
-			rec["_lc_harmony_source"] = "emails"
-			rec["_lc_harmony_saas"] = saas
-			if err := a.shipRecord(rec); err != nil {
-				return err
-			}
-		}
-
-		// No handle to continue with means this was a single, complete page.
-		if nextScroll == "" {
-			return nil
-		}
-		// Re-send the same (stable) handle to advance the server-side cursor.
-		scrollID = nextScroll
-	}
-	return fmt.Errorf("emails query exceeded %d pages (saas=%q): gateway did not signal end of scroll", maxEmailsPages, saas)
-}
-
-// emailDedupKey returns a key that changes only when an email entity's state
-// advances. We anchor on entityId + entityUpdated because the gateway bumps
-// entityUpdated on every state change, while an unchanged entity keeps the
-// same timestamp poll-over-poll. If entityUpdated is absent we fall back to
-// entityCreated; a record with an id never yields an empty key, so a missing
-// timestamp can't silently drop it.
-func emailDedupKey(rec utils.Dict) string {
-	info, _ := rec.GetDict("entityInfo")
-	entityID, _ := info.GetString("entityId")
-	if entityID == "" {
-		return ""
-	}
-	updated, _ := info.GetString("entityUpdated")
-	if updated == "" {
-		updated, _ = info.GetString("entityCreated")
-	}
-	return "email:" + entityID + "|" + updated
-}
-
-// ----- Source 3: Entities (generic) -------------------------------------------------------
+// ----- Source 2: Entities (generic, HEC search/query) ------------------------------------
 
 func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 	defer a.wgSenders.Done()
@@ -1049,8 +853,8 @@ func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 //
 //   - Window mode (q.CursorField == ""): entityFilter sends startDate +
 //     endDate (received-time window) and saasEntity scoped from the
-//     defaultEmailsSaasEntity map, exactly like the Emails feed. The
-//     configured Filter is sent verbatim; no cursor predicate is injected.
+//     defaultEntitiesSaasEntity map. The configured Filter is sent
+//     verbatim; no cursor predicate is injected.
 //
 //   - Cursor mode (q.CursorField set): entityFilter sends only saas + a
 //     wide startDate (no endDate, no saasEntity). The configured Filter is
@@ -1061,9 +865,9 @@ func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 //
 // Either mode keeps the result set bounded by server-side predicates, so
 // the gateway's per-query record ceiling is not approached for typical
-// scenarios. The maxEmailsPages bound remains as an anti-spin safety net.
+// scenarios. The maxScrollPages bound remains as an anti-spin safety net.
 func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since time.Time) (time.Time, error) {
-	saasEntity, ok := defaultEmailsSaasEntity[saas]
+	saasEntity, ok := defaultEntitiesSaasEntity[saas]
 	if !ok {
 		return since, fmt.Errorf("unsupported saas %q", saas)
 	}
@@ -1105,7 +909,7 @@ func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since 
 
 	latest := since
 	scrollID := ""
-	for page := 0; page < maxEmailsPages; page++ {
+	for page := 0; page < maxScrollPages; page++ {
 		if a.doStop.IsSet() {
 			return latest, nil
 		}
@@ -1135,10 +939,13 @@ func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since 
 			payload, _ := rec.GetDict("entityPayload")
 			// A "split" record is the master of a split email; the child
 			// carries the actionable copy. Skipping the master avoids
-			// double-emitting the same event. Harmless for non-email
-			// entities (the field is simply absent).
-			if s, _ := payload.GetString("emailSplit"); s == "split" {
-				continue
+			// double-emitting the same event. Set IncludeSplits = true on
+			// the query to opt into the firehose semantics that emit it.
+			// Harmless for non-email entities (the field is simply absent).
+			if !q.IncludeSplits {
+				if s, _ := payload.GetString("emailSplit"); s == "split" {
+					continue
+				}
 			}
 			key := entitiesDedupKey(q, info, payload)
 			if key == "" {
@@ -1167,7 +974,7 @@ func (a *HarmonyAdapter) runOneEntitiesQuery(q *EntityQuery, saas string, since 
 		}
 		scrollID = nextScroll
 	}
-	return latest, fmt.Errorf("entities query %q exceeded %d pages (saas=%q): gateway did not signal end of scroll", q.Name, maxEmailsPages, saas)
+	return latest, fmt.Errorf("entities query %q exceeded %d pages (saas=%q): gateway did not signal end of scroll", q.Name, maxScrollPages, saas)
 }
 
 // entitiesDedupKey changes when an entity's state advances. We anchor on
