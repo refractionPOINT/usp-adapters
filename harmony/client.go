@@ -98,19 +98,21 @@ const (
 //
 // HEC search/query is already a generic entity engine: an entityFilter
 // (saas + a received-time startDate/endDate window) plus a list of
-// server-side entityExtendedFilter predicates. The Emails firehose is just
-// that engine with no predicates; "restore requests", "spam X addressed to
-// Y", "all DLP-flagged mail", etc. are the same engine with different
-// predicates. Rather than hardcode a Go source per scenario, this source
-// exposes the engine as configuration: a list of named query specs whose
-// predicates pass straight through to entityExtendedFilter.
+// server-side entityExtendedFilter predicates. "Restore requests", "spam
+// X addressed to Y", "all DLP-flagged mail", the unfiltered firehose —
+// they are all the same engine with different predicates. Rather than
+// hardcode a Go source per scenario, this source exposes the engine as
+// configuration: a list of named query specs whose predicates pass
+// straight through to entityExtendedFilter.
 //
 // Two cursor modes (see EntityQuery.CursorField):
 //
 //   - Window mode (no CursorField): entityFilter sends startDate+endDate
-//     (a received-time window) plus saasEntity, exactly like the Emails
-//     feed. Suited to content/recipient filters where the matching email is
-//     itself recent. Incremental progress is the rolling window + dedup.
+//     (a received-time window) plus saasEntity. Suited to content /
+//     recipient / detection filters where the matching email is itself
+//     recent — and, with EntityQuery.IncludeSplits = true and an empty
+//     Filter, also covers the unfiltered firehose. Incremental progress is
+//     the rolling window + dedup.
 //
 //   - Cursor mode (CursorField set, e.g. entityPayload.restoreRequestTime):
 //     entityFilter sends only saas + a *wide* startDate and NO endDate / NO
@@ -122,8 +124,12 @@ const (
 //     received-time window would never return it. Mirrors Check Point's own
 //     Cortex XSOAR integration (CheckPointHEC.py -> restore_requests).
 //
-// Either way the result set is bounded by the server-side predicates, so it
-// scales independently of total mail volume.
+// A *filtered* query's result set is bounded server-side by the predicates,
+// so it scales independently of total mail volume. The unfiltered firehose
+// preset (window mode, empty Filter, IncludeSplits=true) is bounded only
+// by the received-time window, so a very high-volume tenant can hit the
+// gateway's per-query record ceiling within the window — keep `lookback`
+// short for that preset, or filter server-side.
 const (
 	defaultEntitiesPollInterval = 5 * time.Minute
 
