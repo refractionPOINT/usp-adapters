@@ -240,11 +240,20 @@ func (c *ThreatLockerConfig) Validate() error {
 	return nil
 }
 
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 // ThreatLockerAdapter polls one or more ThreatLocker feeds and ships their
 // records to LimaCharlie.
 type ThreatLockerAdapter struct {
 	conf        ThreatLockerConfig
-	uspClient   *uspclient.Client
+	uspClient   uspSink
 	client      *ThreatLockerClient
 	deduper     utils.Deduper
 	ownsDeduper bool
@@ -259,7 +268,15 @@ type ThreatLockerAdapter struct {
 	ctx context.Context
 }
 
+// NewThreatLockerAdapter creates a ThreatLocker adapter wired to LimaCharlie.
 func NewThreatLockerAdapter(ctx context.Context, conf ThreatLockerConfig) (*ThreatLockerAdapter, chan struct{}, error) {
+	return newThreatLockerAdapter(ctx, conf, nil)
+}
+
+// newThreatLockerAdapter is the implementation behind NewThreatLockerAdapter.
+// When sink is non-nil it is used in place of a real LimaCharlie client -- the
+// seam tests use to capture shipped events.
+func newThreatLockerAdapter(ctx context.Context, conf ThreatLockerConfig, sink uspSink) (*ThreatLockerAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -287,14 +304,18 @@ func NewThreatLockerAdapter(ctx context.Context, conf ThreatLockerConfig) (*Thre
 		a.ownsDeduper = true
 	}
 
-	uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		if a.ownsDeduper {
-			a.deduper.Close()
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			if a.ownsDeduper {
+				a.deduper.Close()
+			}
+			return nil, nil, err
 		}
-		return nil, nil, err
+		a.uspClient = uspClient
 	}
-	a.uspClient = uspClient
 
 	a.client = NewThreatLockerClient(resolveBaseURL(conf), conf.APIKey, conf.ManagedOrganizationID)
 	a.chStopped = make(chan struct{})
