@@ -145,6 +145,11 @@ type ThreatLockerConfig struct {
 	RetryBaseDelay   time.Duration `json:"retry_base_delay" yaml:"retry_base_delay"`
 	MaxRetryDelay    time.Duration `json:"max_retry_delay" yaml:"max_retry_delay"`
 	MaxRetryAttempts int           `json:"max_retry_attempts" yaml:"max_retry_attempts"`
+
+	// Deduper, when set, replaces the built-in in-memory deduper. It is not
+	// settable through a config file; it exists as a seam for tests and for
+	// embedders that want to supply a shared deduper.
+	Deduper utils.Deduper `json:"-" yaml:"-"`
 }
 
 // defaultFeeds returns the out-of-the-box feed set: pending Application Control
@@ -238,14 +243,18 @@ func (c *ThreatLockerConfig) Validate() error {
 // ThreatLockerAdapter polls one or more ThreatLocker feeds and ships their
 // records to LimaCharlie.
 type ThreatLockerAdapter struct {
-	conf      ThreatLockerConfig
-	uspClient *uspclient.Client
-	client    *ThreatLockerClient
-	deduper   utils.Deduper
+	conf        ThreatLockerConfig
+	uspClient   *uspclient.Client
+	client      *ThreatLockerClient
+	deduper     utils.Deduper
+	ownsDeduper bool
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
 	doStop    *utils.Event
+
+	closeOnce sync.Once
+	closeErr  error
 
 	ctx context.Context
 }
@@ -261,23 +270,31 @@ func NewThreatLockerAdapter(ctx context.Context, conf ThreatLockerConfig) (*Thre
 		doStop: utils.NewEvent(),
 	}
 
-	// The same pending record reappears on every poll until it is resolved, so
-	// a deduper is required to ship each record exactly once.
-	window := dedupeBucketWindow
-	if window > conf.DedupeTTL {
-		window = conf.DedupeTTL
+	// Every page is re-fetched on every poll, so a deduper is required to ship
+	// each record exactly once. A deduper may be supplied via the config;
+	// otherwise an in-memory one is created (and owned/closed by the adapter).
+	a.deduper = conf.Deduper
+	if a.deduper == nil {
+		window := dedupeBucketWindow
+		if window > conf.DedupeTTL {
+			window = conf.DedupeTTL
+		}
+		deduper, err := utils.NewLocalDeduper(window, conf.DedupeTTL)
+		if err != nil {
+			return nil, nil, fmt.Errorf("threatlocker: deduper: %v", err)
+		}
+		a.deduper = deduper
+		a.ownsDeduper = true
 	}
-	deduper, err := utils.NewLocalDeduper(window, conf.DedupeTTL)
-	if err != nil {
-		return nil, nil, fmt.Errorf("threatlocker: deduper: %v", err)
-	}
-	a.deduper = deduper
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
-		a.deduper.Close()
+		if a.ownsDeduper {
+			a.deduper.Close()
+		}
 		return nil, nil, err
 	}
+	a.uspClient = uspClient
 
 	a.client = NewThreatLockerClient(resolveBaseURL(conf), conf.APIKey, conf.ManagedOrganizationID)
 	a.chStopped = make(chan struct{})
@@ -296,19 +313,26 @@ func NewThreatLockerAdapter(ctx context.Context, conf ThreatLockerConfig) (*Thre
 	return a, a.chStopped, nil
 }
 
+// Close stops the adapter. It is idempotent: repeated calls are no-ops and
+// return the result of the first call.
 func (a *ThreatLockerAdapter) Close() error {
-	a.conf.ClientOptions.DebugLog("threatlocker: closing")
-	a.doStop.Set()
-	a.wgSenders.Wait()
-	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
-	a.client.Close()
-	a.deduper.Close()
-
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	a.closeOnce.Do(func() {
+		a.conf.ClientOptions.DebugLog("threatlocker: closing")
+		a.doStop.Set()
+		a.wgSenders.Wait()
+		err1 := a.uspClient.Drain(1 * time.Minute)
+		_, err2 := a.uspClient.Close()
+		a.client.Close()
+		if a.ownsDeduper {
+			a.deduper.Close()
+		}
+		if err1 != nil {
+			a.closeErr = err1
+		} else {
+			a.closeErr = err2
+		}
+	})
+	return a.closeErr
 }
 
 // resolveBaseURL computes the ThreatLocker API root from the config.
@@ -332,22 +356,26 @@ func (a *ThreatLockerAdapter) runFeed(feed ThreatLockerFeed) {
 	}
 }
 
-// pollFeed fetches one feed once, walking pages newest-first.
+// pollFeed fetches one feed once. It walks pages until the result set is
+// exhausted (a short or empty page) or the feed's MaxPages cap is reached.
 //
-// Pagination stops as soon as either:
-//   - a short page is returned (fewer records than the page size => last page);
-//   - a page contains no records the adapter has not already shipped. Because
-//     feeds are queried newest-first, a brand new record always lands on the
-//     first page, so the first fully-seen page means everything below is older
-//     and already shipped.
+// Every page is fetched on every poll; the deduper -- not an early exit -- is
+// what keeps a record from being shipped more than once. This is deliberate:
+// the ThreatLocker API paginates by offset over a live, mutable list, so a
+// record can shift across a page boundary between two page fetches. Stopping
+// early on a page of already-seen records would let such a shifted record be
+// skipped permanently. Re-walking every page each poll costs more requests but
+// is correct; bound it per feed with MaxPages and the feed's parameters.
 func (a *ThreatLockerAdapter) pollFeed(feed ThreatLockerFeed) {
 	nSeen := 0
 	nShipped := 0
 
 	for pageNumber := 1; !a.doStop.IsSet(); pageNumber++ {
-		if feed.MaxPages > 0 && pageNumber > feed.MaxPages {
+		if pageNumber > feed.MaxPages {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf(
-				"threatlocker: feed %q reached max_pages=%d, ending this poll early", feed.Name, feed.MaxPages))
+				"threatlocker: feed %q hit max_pages=%d; records past that are not "+
+					"collected this poll -- raise max_pages or narrow the feed's parameters",
+				feed.Name, feed.MaxPages))
 			break
 		}
 
@@ -361,23 +389,19 @@ func (a *ThreatLockerAdapter) pollFeed(feed ThreatLockerFeed) {
 			break
 		}
 
-		nNew := 0
 		for _, item := range items {
 			nSeen++
 			if a.deduper.CheckAndAdd(a.dedupeKey(feed, item)) {
 				continue
 			}
-			nNew++
 			if !a.ship(feed, item) {
 				return
 			}
 			nShipped++
 		}
 
+		// A short page is the end of the result set.
 		if len(items) < a.conf.PageSize {
-			break
-		}
-		if nNew == 0 {
 			break
 		}
 	}
@@ -537,8 +561,11 @@ func fieldAsString(item utils.Dict, path string) string {
 	if s := item.FindOneString(path); s != "" {
 		return s
 	}
-	if n := item.FindOneInt(path); n != 0 {
-		return strconv.FormatUint(n, 10)
+	// FindInt returns every match at the path; a non-empty result means the
+	// field is present -- including a legitimate value of 0, which FindOneInt
+	// cannot distinguish from "absent".
+	if ints := item.FindInt(path); len(ints) > 0 {
+		return strconv.FormatUint(ints[0], 10)
 	}
 	return ""
 }
@@ -558,7 +585,7 @@ func extractItems(raw []byte, itemsPath string) ([]utils.Dict, error) {
 		if err := json.Unmarshal([]byte(trimmed), &arr); err != nil {
 			return nil, fmt.Errorf("invalid JSON array: %v", err)
 		}
-		return rawMessagesToDicts(arr)
+		return rawMessagesToDicts(arr), nil
 
 	case '{':
 		var obj map[string]json.RawMessage
@@ -586,7 +613,7 @@ func extractItems(raw []byte, itemsPath string) ([]utils.Dict, error) {
 		if err := json.Unmarshal(arrRaw, &arr); err != nil {
 			return nil, fmt.Errorf("response field is not an array: %v", err)
 		}
-		return rawMessagesToDicts(arr)
+		return rawMessagesToDicts(arr), nil
 
 	default:
 		return nil, errors.New("response is neither a JSON array nor a JSON object")
@@ -595,17 +622,19 @@ func extractItems(raw []byte, itemsPath string) ([]utils.Dict, error) {
 
 // rawMessagesToDicts decodes each record with utils.UnmarshalCleanJSON, which
 // preserves integer precision (no float coercion) so payloads round-trip
-// faithfully.
-func rawMessagesToDicts(raw []json.RawMessage) ([]utils.Dict, error) {
+// faithfully. A record that is not a non-empty JSON object (a scalar, an array,
+// null, or {}) is skipped rather than failing the whole page -- one anomalous
+// element should not block every other record.
+func rawMessagesToDicts(raw []json.RawMessage) []utils.Dict {
 	items := make([]utils.Dict, 0, len(raw))
-	for i, r := range raw {
+	for _, r := range raw {
 		m, err := utils.UnmarshalCleanJSON(string(r))
-		if err != nil {
-			return nil, fmt.Errorf("record %d is not a JSON object: %v", i, err)
+		if err != nil || len(m) == 0 {
+			continue
 		}
 		items = append(items, utils.Dict(m))
 	}
-	return items, nil
+	return items
 }
 
 func keysOf(m map[string]json.RawMessage) []string {

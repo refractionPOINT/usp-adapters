@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -45,13 +46,61 @@ func approvalItem(id string) map[string]interface{} {
 	}
 }
 
+// decodeRequestBody decodes a JSON request body. It runs inside httptest
+// handler goroutines, so it must not use require (whose FailNow/Goexit is only
+// valid on the test goroutine); assert reports failures safely from any
+// goroutine.
 func decodeRequestBody(t *testing.T, r *http.Request) map[string]interface{} {
 	t.Helper()
-	body, err := io.ReadAll(r.Body)
-	require.NoError(t, err)
 	m := map[string]interface{}{}
-	require.NoError(t, json.Unmarshal(body, &m))
+	body, err := io.ReadAll(r.Body)
+	if !assert.NoError(t, err) {
+		return m
+	}
+	assert.NoError(t, json.Unmarshal(body, &m))
 	return m
+}
+
+// countingDeduper wraps a Deduper and records, per key, how many times the key
+// was reported as new (CheckAndAdd returned false). The adapter ships a record
+// exactly when its key is new, so a count above 1 means a record was shipped
+// more than once -- a dedup failure.
+type countingDeduper struct {
+	inner utils.Deduper
+	mu    sync.Mutex
+	new   map[string]int
+}
+
+func newCountingDeduper(t *testing.T) *countingDeduper {
+	t.Helper()
+	// window == ttl gives a single bucket that never rotates within a test.
+	inner, err := utils.NewLocalDeduper(time.Hour, time.Hour)
+	require.NoError(t, err)
+	return &countingDeduper{inner: inner, new: map[string]int{}}
+}
+
+func (d *countingDeduper) CheckAndAdd(key string) bool {
+	exists := d.inner.CheckAndAdd(key)
+	if !exists {
+		d.mu.Lock()
+		d.new[key]++
+		d.mu.Unlock()
+	}
+	return exists
+}
+
+func (d *countingDeduper) Close() { d.inner.Close() }
+
+func (d *countingDeduper) newCount(key string) int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.new[key]
+}
+
+func (d *countingDeduper) distinctKeys() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.new)
 }
 
 // --- unit tests -------------------------------------------------------------
@@ -113,6 +162,14 @@ func TestExtractItems(t *testing.T) {
 		require.True(t, ok)
 		assert.Equal(t, uint64(123456789012345678), v)
 	})
+
+	t.Run("non-object records are skipped, valid ones kept", func(t *testing.T) {
+		items, err := extractItems([]byte(`[{"id":"a"},"junk",123,null,{"id":"b"}]`), "")
+		require.NoError(t, err)
+		require.Len(t, items, 2)
+		assert.Equal(t, "a", items[0].FindOneString("id"))
+		assert.Equal(t, "b", items[1].FindOneString("id"))
+	})
 }
 
 func TestRecordID(t *testing.T) {
@@ -129,6 +186,12 @@ func TestRecordID(t *testing.T) {
 	t.Run("accepts numeric ids", func(t *testing.T) {
 		feed := ThreatLockerFeed{IDField: "actionId"}
 		assert.Equal(t, "42", recordID(feed, utils.Dict{"actionId": uint64(42)}))
+	})
+
+	t.Run("accepts a numeric id of zero", func(t *testing.T) {
+		// A real id of 0 must not be mistaken for "absent".
+		feed := ThreatLockerFeed{IDField: "actionId"}
+		assert.Equal(t, "0", recordID(feed, utils.Dict{"actionId": uint64(0)}))
 	})
 
 	t.Run("content hash fallback is stable and distinct", func(t *testing.T) {
@@ -340,7 +403,10 @@ func newPagingServer(envelope bool, itemsByPg map[int][]map[string]interface{}) 
 func (s *pagingServer) handler(t *testing.T) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		body := decodeRequestBody(t, r)
-		page := int(body["pageNumber"].(float64))
+		page := 1
+		if pn, ok := body["pageNumber"].(float64); ok {
+			page = int(pn)
+		}
 
 		s.mu.Lock()
 		s.pageHits[page]++
@@ -365,9 +431,8 @@ func (s *pagingServer) hits(page int) int {
 	return s.pageHits[page]
 }
 
-// TestPaginationAndDedup verifies the adapter walks pages while there is new
-// data, and that on later polls it deduplicates and early-stops (so deeper
-// pages are not re-fetched once their content has all been seen).
+// TestPaginationAndDedup verifies the adapter walks every page on every poll
+// and, despite re-fetching pages, ships each record exactly once.
 func TestPaginationAndDedup(t *testing.T) {
 	ps := newPagingServer(false, map[int][]map[string]interface{}{
 		1: {approvalItem("a"), approvalItem("b")},
@@ -379,34 +444,41 @@ func TestPaginationAndDedup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	dd := newCountingDeduper(t)
 	conf := ThreatLockerConfig{
 		ClientOptions: testClientOptions(t),
 		APIKey:        "k",
 		BaseURL:       server.URL,
-		PageSize:      2, // full page == 2 items, forcing multi-page walks
-		PollInterval:  80 * time.Millisecond,
-		DedupeTTL:     time.Hour,
+		PageSize:      2, // a full page is 2 records, forcing a multi-page walk
+		PollInterval:  40 * time.Millisecond,
+		Deduper:       dd,
 	}
 	adapter, _, err := NewThreatLockerAdapter(ctx, conf)
 	require.NoError(t, err)
 
-	// Allow several poll cycles to run.
-	time.Sleep(400 * time.Millisecond)
+	// Wait for at least three polls to complete.
+	require.Eventually(t, func() bool { return ps.hits(1) >= 3 },
+		5*time.Second, 20*time.Millisecond)
 	require.NoError(t, adapter.Close())
 
-	// First poll: page1 (full, new) -> page2 (full, new) -> page3 (empty).
-	// Later polls: page1 is entirely duplicates -> early-stop before page2.
-	assert.GreaterOrEqual(t, ps.hits(1), 2, "page 1 should be polled repeatedly")
-	assert.Equal(t, 1, ps.hits(2), "page 2 should be fetched once (only the first poll has new data)")
-	assert.Equal(t, 1, ps.hits(3), "page 3 should be fetched once (terminates the first poll)")
+	// Every poll re-walks every page (there is no early-stop): pages 2 and 3
+	// are fetched on every completed poll, not just the first.
+	assert.GreaterOrEqual(t, ps.hits(2), 2, "every poll re-walks page 2")
+	assert.GreaterOrEqual(t, ps.hits(3), 2, "every poll re-walks page 3 (empty, ends the walk)")
+
+	// Despite being re-fetched on every poll, each record ships exactly once.
+	for _, id := range []string{"a", "b", "c", "d"} {
+		assert.Equal(t, 1, dd.newCount("approval_request|"+id),
+			"record %q must ship exactly once", id)
+	}
+	assert.Equal(t, 4, dd.distinctKeys())
 }
 
-// TestObjectEnvelopeResponse verifies the same incremental behaviour when the
-// API wraps results in an object envelope instead of a bare array.
+// TestObjectEnvelopeResponse verifies the adapter parses an object-envelope
+// response ({"data": [...]}) and ships each record exactly once.
 func TestObjectEnvelopeResponse(t *testing.T) {
 	ps := newPagingServer(true, map[int][]map[string]interface{}{
-		1: {approvalItem("a")},
-		2: {approvalItem("b")},
+		1: {approvalItem("a"), approvalItem("b")},
 	})
 	server := httptest.NewServer(ps.handler(t))
 	defer server.Close()
@@ -414,25 +486,91 @@ func TestObjectEnvelopeResponse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	dd := newCountingDeduper(t)
 	conf := ThreatLockerConfig{
 		ClientOptions: testClientOptions(t),
 		APIKey:        "k",
 		BaseURL:       server.URL,
-		PageSize:      1,
-		PollInterval:  80 * time.Millisecond,
-		DedupeTTL:     time.Hour,
+		PollInterval:  40 * time.Millisecond,
+		Deduper:       dd,
 	}
 	adapter, _, err := NewThreatLockerAdapter(ctx, conf)
 	require.NoError(t, err)
 
-	time.Sleep(400 * time.Millisecond)
+	require.Eventually(t, func() bool { return ps.hits(1) >= 3 },
+		5*time.Second, 20*time.Millisecond)
 	require.NoError(t, adapter.Close())
 
-	// page2/page3 fetched exactly once proves the envelope was parsed (records
-	// extracted) AND deduplicated on later polls.
-	assert.GreaterOrEqual(t, ps.hits(1), 2)
-	assert.Equal(t, 1, ps.hits(2))
-	assert.Equal(t, 1, ps.hits(3))
+	// The envelope was parsed and its records extracted; each ships exactly
+	// once even though page 1 is re-fetched on every poll.
+	assert.Equal(t, 1, dd.newCount("approval_request|a"))
+	assert.Equal(t, 1, dd.newCount("approval_request|b"))
+	assert.Equal(t, 2, dd.distinctKeys())
+}
+
+// TestMaxPagesCap verifies a feed stops paginating at max_pages rather than
+// walking an unbounded result set.
+func TestMaxPagesCap(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[int]int{}
+	var idCounter atomic.Int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := decodeRequestBody(t, r)
+		page := 1
+		if pn, ok := body["pageNumber"].(float64); ok {
+			page = int(pn)
+		}
+		mu.Lock()
+		hits[page]++
+		mu.Unlock()
+		// Always return a full page of brand-new records, so pagination would
+		// never terminate on its own.
+		items := []map[string]interface{}{
+			approvalItem(fmt.Sprintf("rec-%d", idCounter.Add(1))),
+			approvalItem(fmt.Sprintf("rec-%d", idCounter.Add(1))),
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(items)
+	}))
+	defer server.Close()
+
+	var maxPagesWarned atomic.Bool
+	opts := testClientOptions(t)
+	opts.OnWarning = func(msg string) {
+		t.Logf("WRN: %s", msg)
+		if strings.Contains(msg, "max_pages") {
+			maxPagesWarned.Store(true)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conf := ThreatLockerConfig{
+		ClientOptions: opts,
+		APIKey:        "k",
+		BaseURL:       server.URL,
+		PageSize:      2,
+		PollInterval:  1 * time.Hour, // only the initial poll runs during the test
+		Feeds: []ThreatLockerFeed{
+			{Name: "capped", URL: "Capped/CappedGetByParameters", MaxPages: 3},
+		},
+	}
+	adapter, _, err := NewThreatLockerAdapter(ctx, conf)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// The poll must stop at the cap; the warning is emitted when it does.
+	require.Eventually(t, maxPagesWarned.Load, 5*time.Second, 20*time.Millisecond,
+		"adapter should warn when max_pages is reached")
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 0, hits[4], "page 4 must not be fetched (max_pages=3)")
+	for p := 1; p <= 3; p++ {
+		assert.GreaterOrEqual(t, hits[p], 1, "page %d should be fetched", p)
+	}
 }
 
 // TestTransientErrorRetry verifies the adapter retries 5xx responses rather

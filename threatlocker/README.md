@@ -56,16 +56,23 @@ The API root is `https://portalapi.<instance>.threatlocker.com/portalapi`, where
 
 ## How polling works
 
-For each feed the adapter walks pages **newest-first** and stops as soon as
-either a short page is returned, or a page contains no records it has not
-already shipped. Because new records always land on the first page, this makes
-each poll cheap once caught up. An in-memory deduper (keyed per feed) guarantees
-each record is shipped once. Transient API failures (HTTP 5xx, 429, network
-errors) are retried with exponential backoff; an authentication failure
-(401/403) stops the adapter.
+On every poll the adapter walks a feed's pages (`pageNumber`/`pageSize`) until
+the result set is exhausted (a short or empty page) or the feed's `max_pages`
+cap is reached. An in-memory deduper, keyed per feed, guarantees each record is
+shipped to LimaCharlie exactly once even though pages are re-fetched on every
+poll. Transient API failures (HTTP 5xx, 429, network errors) are retried with
+exponential backoff; an authentication failure (401/403) stops the adapter.
 
-> Feeds must be sorted newest-first (`isAscending = false`, the default) for the
-> incremental polling and early-stop to behave correctly.
+The adapter deliberately re-walks every page rather than stopping early at the
+first page of already-seen records: the API paginates by offset over a live,
+mutable list, so a record can shift across a page boundary between two page
+fetches and an early stop could skip it permanently. Re-walking costs more
+requests but is correct.
+
+For a large or high-churn feed, bound each poll's work with the feed's
+`parameters` (e.g. a date-range filter) and a `max_pages` that comfortably
+exceeds the feed's expected size. Querying newest-first (`isAscending = false`,
+the default) keeps the most recent records when `max_pages` truncates.
 
 ## Examples
 
@@ -104,6 +111,7 @@ threatlocker:
     - name: unified_audit
       url: ActionLog/ActionLogGetByParametersV2
       parameters:
-        # endpoint-specific filters go here
+        # endpoint-specific filters (e.g. a date range) go here
       timestamp_field: dateTime
+      # id_field: set to the record's stable identifier for reliable dedup
 ```
