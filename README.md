@@ -120,3 +120,38 @@ journalctl -f -q | netcat 127.0.0.1 4444
 ```
 ./adapter stdin client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=text "client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" client_options.sensor_seed_key=testclient3 client_options.mapping.event_type_path=exe
 ```
+
+### HaloPSA
+
+The `halopsa` adapter polls a [HaloPSA](https://halopsa.com) REST API list endpoint and
+ingests every record into LimaCharlie in its original JSON form. It is generic: the
+default configuration ingests the **audit log** (the `Audit` endpoint), but pointing it
+at any other list endpoint (`Tickets`, `Actions`, ...) only requires changing the
+`endpoint`, `data_field` and `id_field` configurations — no code changes.
+
+Authentication uses the HaloPSA OAuth2 client credentials flow. Create an API
+application under `Configuration > Integrations > HaloPSA API` in HaloPSA to obtain a
+`client_id`/`client_secret`, and grant it permission to read the resources you intend
+to ingest.
+
+Audit log example (hosted HaloPSA instance):
+```
+./general halopsa client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=halopsa-audit instance_url=https://example.halopsa.com client_id=00000000-0000-0000-0000-000000000000 client_secret=XXXXXXXX
+```
+
+Useful configurations:
+
+* `instance_url`: base URL of the HaloPSA instance (e.g. `https://example.halopsa.com`). The authorisation server (`<instance_url>/auth`) and resource server (`<instance_url>/api`) are derived from it. Use `auth_url` / `api_url` to override them when they differ.
+* `client_id` / `client_secret`: credentials of the HaloPSA API application.
+* `tenant`: optional tenant identifier required by some hosted HaloPSA deployments.
+* `scope`: OAuth2 scope requested for the token (defaults to `all`).
+* `endpoint`: the API resource to poll (defaults to `Audit`).
+* `data_field`: response field holding the records array; auto-detected when omitted.
+* `id_field`: monotonically increasing integer field used as the incremental cursor (defaults to `id`).
+* `extra_params`: extra static query string parameters added to every request (e.g. `extra_params.excludesys=true`).
+* `page_size`: records per page (defaults to `100`).
+* `poll_interval`: seconds between polls (defaults to `60`).
+
+The first poll only establishes the cursor; subsequent polls ship newly created
+records. Set `client_options.mapping.event_time_path` (e.g. to `date` for the audit
+log) so LimaCharlie uses the record's own timestamp as the event time.

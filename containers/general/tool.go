@@ -30,6 +30,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/halopsa"
 	"github.com/refractionPOINT/usp-adapters/harmony"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
@@ -492,6 +493,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.TrendMicro.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.TrendMicro
 		client, chRunning, err = usp_trendmicro.NewTrendMicroAdapter(ctx, configs.TrendMicro)
+	} else if method == "halopsa" {
+		configs.HaloPSA.ClientOptions = applyLogging(configs.HaloPSA.ClientOptions)
+		configs.HaloPSA.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.HaloPSA
+		client, chRunning, err = usp_halopsa.NewHaloPSAAdapter(ctx, configs.HaloPSA)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
