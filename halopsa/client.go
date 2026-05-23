@@ -81,10 +81,12 @@ type HaloPSAConfig struct {
 	// a monotonically increasing integer. Defaults to "id".
 	IDField string `json:"id_field" yaml:"id_field"`
 	// ExtraParams are additional static query string parameters added to
-	// every request (e.g. {"excludesys": "true"}). They override the
-	// adapter's own defaults, so ordering/filtering can be tuned per
-	// endpoint without code changes.
-	ExtraParams map[string]string `json:"extra_params" yaml:"extra_params"`
+	// every request (e.g. {"excludesys": true, "user_id": 42}). They
+	// override the adapter's own defaults, so ordering/filtering can be
+	// tuned per endpoint without code changes. Values are stringified for
+	// the query, so bools, numbers and strings can all be used directly
+	// from YAML or the CLI.
+	ExtraParams map[string]interface{} `json:"extra_params" yaml:"extra_params"`
 
 	// PageSize is the number of records requested per page. Defaults to 100.
 	PageSize int `json:"page_size" yaml:"page_size"`
@@ -383,9 +385,7 @@ func (a *HaloPSAAdapter) requestPage(token string, pageNo int) ([]utils.Dict, in
 	q.Set("order", a.conf.IDField)
 	q.Set("orderdesc", "true")
 	// Caller-supplied parameters win over the adapter's defaults.
-	for k, v := range a.conf.ExtraParams {
-		q.Set(k, v)
-	}
+	applyExtraParams(q, a.conf.ExtraParams)
 
 	req, err := http.NewRequest("GET", reqURL+"?"+q.Encode(), nil)
 	if err != nil {
@@ -551,6 +551,19 @@ func maxID(items []utils.Dict, idField string) uint64 {
 		}
 	}
 	return m
+}
+
+// applyExtraParams copies user-supplied static query parameters into q,
+// stringifying each value so bools and numbers from YAML/CLI configs work
+// as transparently as strings. A nil entry is treated as an empty string.
+func applyExtraParams(q url.Values, extra map[string]interface{}) {
+	for k, v := range extra {
+		if v == nil {
+			q.Set(k, "")
+			continue
+		}
+		q.Set(k, fmt.Sprint(v))
+	}
 }
 
 // truncate shortens a response body for safe inclusion in error messages.

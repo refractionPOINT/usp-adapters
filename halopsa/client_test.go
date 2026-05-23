@@ -2,6 +2,7 @@ package usp_halopsa
 
 import (
 	"errors"
+	"net/url"
 	"reflect"
 	"testing"
 
@@ -297,6 +298,32 @@ func TestCollectNewItems(t *testing.T) {
 			t.Fatalf("expected pagination to stop near 3 pages, made %d calls", calls)
 		}
 	})
+}
+
+func TestApplyExtraParams(t *testing.T) {
+	// The CLI/env parser auto-types values, so an extra_params map can
+	// receive bool/int/float as well as strings. Each must be stringified
+	// so url.Values can carry it.
+	q := url.Values{}
+	applyExtraParams(q, map[string]interface{}{
+		"excludesys": true,
+		"user_id":    42,
+		"ratio":      1.5,
+		"name":       "alice",
+		"missing":    nil,
+	})
+	cases := map[string]string{
+		"excludesys": "true",
+		"user_id":    "42",
+		"ratio":      "1.5",
+		"name":       "alice",
+		"missing":    "",
+	}
+	for k, want := range cases {
+		if got := q.Get(k); got != want {
+			t.Fatalf("q.Get(%q) = %q, want %q", k, got, want)
+		}
+	}
 }
 
 func TestMaxID(t *testing.T) {
