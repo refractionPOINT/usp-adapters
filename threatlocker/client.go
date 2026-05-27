@@ -458,6 +458,17 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 			var httpErr *HTTPError
 			if errors.As(err, &httpErr) &&
 				(httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
+				// ThreatLocker returns the same TOKEN_REVOKED response for a
+				// genuinely revoked token and for a token presented to the
+				// wrong instance. Surface that ambiguity so an operator does
+				// not chase a token rotation when the real fix is to flip
+				// `instance` to the letter their portal shows next to
+				// "ThreatLocker Access" under the Help menu.
+				a.conf.ClientOptions.OnError(fmt.Errorf(
+					"threatlocker: HTTP %d -- token rejected. If the token is known to be active, "+
+						"verify `instance` matches the letter shown in the ThreatLocker Portal "+
+						"(Help > 'ThreatLocker Access (X)'); a token from a different instance "+
+						"is reported as TOKEN_REVOKED.", httpErr.StatusCode))
 				a.doStop.Set()
 			}
 			return nil, false

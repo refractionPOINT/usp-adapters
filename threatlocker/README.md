@@ -26,6 +26,20 @@ The API root is `https://portalapi.<instance>.threatlocker.com/portalapi`, where
 `<instance>` is your ThreatLocker instance. Provide it via `instance`, or set
 `base_url` to override the whole root.
 
+### Finding your instance
+
+ThreatLocker hosts each tenant on one of several lettered instances (`b`, `c`,
+`d`, …) and API tokens are scoped to the instance that minted them. To find
+yours, open the ThreatLocker Portal, click the **Help** button in the top-right
+corner of any page, and read the letter in parentheses next to **ThreatLocker
+Access** (e.g. `ThreatLocker Access (C)` → `instance: c`).
+
+> ⚠️ **A token from one instance returns `403 TOKEN_REVOKED` on every other
+> instance** — the API does not distinguish "wrong instance" from a genuinely
+> revoked token. If you are confident the token is active and still see
+> `TOKEN_REVOKED`, double-check the instance before assuming the token was
+> revoked.
+
 ## Configuration
 
 | Key | Required | Description |
