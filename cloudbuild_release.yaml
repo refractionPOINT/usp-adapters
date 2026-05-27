@@ -87,10 +87,15 @@ steps:
     - 'GOARCH=amd64'
   waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-docker-general']
 
-# Wave 3: 32-bit ARM is the most memory-hungry compile -- run alone.
+# Wave 3: 32-bit ARM is the most memory-hungry compile -- run alone, and
+# with -p=1 to force serial package compilation. Wave isolation alone was
+# not enough: the 32-bit ARM compile of Arrow's compute kernels by itself
+# exceeds the worker's RAM when the toolchain compiles packages in
+# parallel. -p=1 caps inter-package concurrency at one, trading compile
+# time (~2-3x) for a sharply lower peak memory footprint.
 - name: 'golang:1.25-bookworm'
   id: build-linuxarm
-  args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm_$TAG_NAME', './containers/general']
+  args: ['go', 'build', '-p=1', '-v', '-o', 'lc_adapter_linux_arm_$TAG_NAME', './containers/general']
   env:
     - 'GOOS=linux'
     - 'GOARCH=arm'
