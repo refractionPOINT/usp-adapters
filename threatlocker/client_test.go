@@ -36,6 +36,21 @@ func testClientOptions(t *testing.T) uspclient.ClientOptions {
 	}
 }
 
+// approvalRequestFeed is the single feed used by integration tests that focus
+// on adapter behavior rather than the default feed set. Tests pin the config
+// to this feed so they don't accidentally exercise unrelated default feeds
+// (unified_audit, system_audit) on shared httptest servers.
+func approvalRequestFeed() []ThreatLockerFeed {
+	return []ThreatLockerFeed{{
+		Name:           "approval_request",
+		URL:            "ApprovalRequest/ApprovalRequestGetByParameters",
+		Parameters:     utils.Dict{"statusId": 1},
+		OrderBy:        "dateTime",
+		TimestampField: "dateTime",
+		IDField:        "approvalRequestId",
+	}}
+}
+
 // approvalItem builds a minimal ThreatLocker approval-request-shaped record.
 func approvalItem(id string) map[string]interface{} {
 	return map[string]interface{}{
@@ -238,6 +253,45 @@ func TestBuildRequestBody(t *testing.T) {
 		assert.Equal(t, "custom", body["orderBy"])
 		assert.Equal(t, true, body["isAscending"])
 	})
+
+	t.Run("rolling window injects start/end on every poll", func(t *testing.T) {
+		aw := &ThreatLockerAdapter{conf: ThreatLockerConfig{PageSize: 50, PollInterval: 60 * time.Second}}
+		feed := ThreatLockerFeed{
+			Window:         5 * time.Minute,
+			StartDateField: defaultStartDateField,
+			EndDateField:   defaultEndDateField,
+		}
+
+		before := time.Now().UTC()
+		body := aw.buildRequestBody(feed, 1)
+		after := time.Now().UTC()
+
+		startStr, ok := body[defaultStartDateField].(string)
+		require.True(t, ok, "startDate must be a string, got %T", body[defaultStartDateField])
+		endStr, ok := body[defaultEndDateField].(string)
+		require.True(t, ok, "endDate must be a string, got %T", body[defaultEndDateField])
+
+		start, err := time.Parse(windowTimestampLayout, startStr)
+		require.NoError(t, err)
+		end, err := time.Parse(windowTimestampLayout, endStr)
+		require.NoError(t, err)
+
+		// end should be ~ now, start should be window + poll_interval before end
+		assert.False(t, end.Before(before.Truncate(time.Millisecond)), "end %v < before %v", end, before)
+		assert.False(t, end.After(after.Add(time.Second)), "end %v > after+1s %v", end, after)
+		gap := end.Sub(start)
+		assert.Equal(t, feed.Window+aw.conf.PollInterval, gap,
+			"start/end gap must equal window+poll_interval")
+	})
+
+	t.Run("no window means no date fields injected", func(t *testing.T) {
+		feed := ThreatLockerFeed{OrderBy: "dateTime"}
+		body := a.buildRequestBody(feed, 1)
+		_, hasStart := body[defaultStartDateField]
+		_, hasEnd := body[defaultEndDateField]
+		assert.False(t, hasStart, "startDate must be absent when window is unset")
+		assert.False(t, hasEnd, "endDate must be absent when window is unset")
+	})
 }
 
 func TestParseTimestamp(t *testing.T) {
@@ -290,14 +344,26 @@ func TestValidate(t *testing.T) {
 		assert.Error(t, c.Validate())
 	})
 
-	t.Run("applies defaults and the default feed", func(t *testing.T) {
+	t.Run("applies defaults and the default feed set", func(t *testing.T) {
 		c := ThreatLockerConfig{ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g"}
 		require.NoError(t, c.Validate())
 		assert.Equal(t, defaultPageSize, c.PageSize)
 		assert.Equal(t, defaultPollInterval, c.PollInterval)
-		require.Len(t, c.Feeds, 1)
-		assert.Equal(t, "approval_request", c.Feeds[0].Name)
-		assert.Equal(t, defaultMaxPages, c.Feeds[0].MaxPages)
+
+		names := make([]string, 0, len(c.Feeds))
+		for _, f := range c.Feeds {
+			names = append(names, f.Name)
+			assert.Equal(t, defaultMaxPages, f.MaxPages, "feed %q must inherit max_pages default", f.Name)
+		}
+		assert.ElementsMatch(t, []string{"approval_request", "unified_audit", "system_audit"}, names)
+
+		// Feeds with a Window must also have start/end field defaults applied.
+		for _, f := range c.Feeds {
+			if f.Window > 0 {
+				assert.Equal(t, defaultStartDateField, f.StartDateField, "feed %q", f.Name)
+				assert.Equal(t, defaultEndDateField, f.EndDateField, "feed %q", f.Name)
+			}
+		}
 	})
 
 	t.Run("rejects feed without url", func(t *testing.T) {
@@ -353,6 +419,7 @@ func TestApprovalRequestFeed(t *testing.T) {
 		BaseURL:               server.URL,
 		ManagedOrganizationID: "org-123",
 		PollInterval:          200 * time.Millisecond,
+		Feeds:                 approvalRequestFeed(),
 	}
 	adapter, chStopped, err := NewThreatLockerAdapter(ctx, conf)
 	require.NoError(t, err)
@@ -452,6 +519,7 @@ func TestPaginationAndDedup(t *testing.T) {
 		PageSize:      2, // a full page is 2 records, forcing a multi-page walk
 		PollInterval:  40 * time.Millisecond,
 		Deduper:       dd,
+		Feeds:         approvalRequestFeed(),
 	}
 	adapter, _, err := NewThreatLockerAdapter(ctx, conf)
 	require.NoError(t, err)
@@ -493,6 +561,7 @@ func TestObjectEnvelopeResponse(t *testing.T) {
 		BaseURL:       server.URL,
 		PollInterval:  40 * time.Millisecond,
 		Deduper:       dd,
+		Feeds:         approvalRequestFeed(),
 	}
 	adapter, _, err := NewThreatLockerAdapter(ctx, conf)
 	require.NoError(t, err)
@@ -598,6 +667,7 @@ func TestTransientErrorRetry(t *testing.T) {
 		PollInterval:   100 * time.Millisecond,
 		RetryBaseDelay: 20 * time.Millisecond,
 		MaxRetryDelay:  40 * time.Millisecond,
+		Feeds:          approvalRequestFeed(),
 	}
 	adapter, chStopped, err := NewThreatLockerAdapter(ctx, conf)
 	require.NoError(t, err)
@@ -632,6 +702,7 @@ func TestPermanentAuthErrorStops(t *testing.T) {
 				APIKey:        "bad-key",
 				BaseURL:       server.URL,
 				PollInterval:  100 * time.Millisecond,
+				Feeds:         approvalRequestFeed(),
 			}
 			adapter, chStopped, err := NewThreatLockerAdapter(ctx, conf)
 			require.NoError(t, err)

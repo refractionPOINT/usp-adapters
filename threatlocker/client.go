@@ -42,8 +42,16 @@ const (
 	defaultMaxRetryAttempts = 3
 	defaultRetryBaseDelay   = 5 * time.Second
 	defaultMaxRetryDelay    = 30 * time.Second
+	defaultStartDateField   = "startDate"
+	defaultEndDateField     = "endDate"
+	defaultWindow           = 5 * time.Minute
 
 	shipTimeout = 10 * time.Second
+
+	// windowTimestampLayout is the time format the adapter uses to render
+	// rolling-window dates into ThreatLocker request bodies. ThreatLocker's API
+	// accepts RFC 3339 with a Z suffix and millisecond precision.
+	windowTimestampLayout = "2006-01-02T15:04:05.000Z"
 )
 
 // itemsArrayKeys are the keys the adapter probes, in order, to locate the list
@@ -105,6 +113,20 @@ type ThreatLockerFeed struct {
 	// MaxPages caps how many pages are fetched per poll, bounding the work of
 	// a first poll against a large historical data set. Defaults to 100.
 	MaxPages int `json:"max_pages" yaml:"max_pages"`
+
+	// Window, when > 0, enables rolling time-range filtering on each poll. On
+	// each call the adapter sets StartDateField to now-Window-PollInterval and
+	// EndDateField to now. The +PollInterval ensures consecutive polls overlap
+	// (so a slipped or delayed poll cycle does not leave a gap); the deduper
+	// suppresses re-shipping records that fall into the overlap. Endpoints
+	// like ActionLog and SystemAudit reject requests that omit a date range.
+	Window time.Duration `json:"window" yaml:"window"`
+
+	// StartDateField / EndDateField name the request-body fields that carry
+	// the rolling-window endpoints. Defaults: "startDate" / "endDate". Only
+	// consulted when Window > 0.
+	StartDateField string `json:"start_date_field" yaml:"start_date_field"`
+	EndDateField   string `json:"end_date_field" yaml:"end_date_field"`
 }
 
 // ThreatLockerConfig is the adapter configuration.
@@ -152,9 +174,22 @@ type ThreatLockerConfig struct {
 	Deduper utils.Deduper `json:"-" yaml:"-"`
 }
 
-// defaultFeeds returns the out-of-the-box feed set: pending Application Control
-// approval requests, which is the primary use case (driving automated
-// investigations in LimaCharlie).
+// defaultFeeds returns the out-of-the-box feed set. The three feeds together
+// cover the three main telemetry surfaces ThreatLocker exposes:
+//
+//   - approval_request: pending Application Control whitelist requests
+//     (statusId=1). Each request is shipped exactly once, well suited to
+//     triggering automated investigations in LimaCharlie.
+//   - unified_audit: the ActionLog -- ThreatLocker's combined event stream of
+//     execute/install/network/registry/file/web/powershell/elevate activity
+//     across all modules. Polled on a 5-minute rolling window.
+//   - system_audit: portal/administrator activity (logins, policy edits,
+//     approval decisions, ...). Polled on a 5-minute rolling window.
+//
+// ActionLog and SystemAudit both *require* a date range in every request;
+// the adapter's Window mechanism rewrites startDate/endDate on each poll, and
+// the deduper suppresses re-shipping records that fall into successive
+// overlapping windows.
 func defaultFeeds() []ThreatLockerFeed {
 	return []ThreatLockerFeed{
 		{
@@ -169,6 +204,38 @@ func defaultFeeds() []ThreatLockerFeed {
 			OrderBy:        defaultOrderBy,
 			TimestampField: defaultTimestampField,
 			IDField:        "approvalRequestId",
+		},
+		{
+			Name: "unified_audit",
+			URL:  "ActionLog/ActionLogGetByParametersV2",
+			// These body fields are documented as optional in the OpenAPI
+			// spec but ThreatLocker's own Postman example sends every one --
+			// omitting them yields opaque HTTP 500 responses against some
+			// tenants. Keep them populated with their identity defaults.
+			Parameters: utils.Dict{
+				"paramsFieldsDto":        []any{},
+				"groupBys":               []any{},
+				"exportMode":             false,
+				"showTotalCount":         false,
+				"showChildOrganizations": false,
+				"onlyTrueDenies":         false,
+				"simulateDeny":           false,
+			},
+			OrderBy:        defaultOrderBy,
+			TimestampField: defaultTimestampField,
+			IDField:        "actionLogId",
+			Window:         defaultWindow,
+		},
+		{
+			Name: "system_audit",
+			URL:  "SystemAudit/SystemAuditGetByParameters",
+			Parameters: utils.Dict{
+				"viewChildOrganizations": false,
+			},
+			OrderBy:        defaultOrderBy,
+			TimestampField: defaultTimestampField,
+			IDField:        "systemAuditId",
+			Window:         defaultWindow,
 		},
 	}
 }
@@ -235,6 +302,14 @@ func (c *ThreatLockerConfig) Validate() error {
 		}
 		if f.MaxPages <= 0 {
 			f.MaxPages = defaultMaxPages
+		}
+		if f.Window > 0 {
+			if f.StartDateField == "" {
+				f.StartDateField = defaultStartDateField
+			}
+			if f.EndDateField == "" {
+				f.EndDateField = defaultEndDateField
+			}
 		}
 	}
 	return nil
@@ -504,7 +579,10 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 
 // buildRequestBody assembles the JSON body for a "*GetByParameters" call. The
 // adapter always controls pagination; sorting is taken from the feed unless the
-// feed's Parameters override it.
+// feed's Parameters override it. When the feed has Window > 0, the rolling
+// window's start/end timestamps are injected too, so a poll always covers
+// [now-Window-PollInterval, now] -- the small overlap with the prior poll is
+// absorbed by the deduper.
 func (a *ThreatLockerAdapter) buildRequestBody(feed ThreatLockerFeed, pageNumber int) utils.Dict {
 	body := utils.Dict{}
 	for k, v := range feed.Parameters {
@@ -517,6 +595,12 @@ func (a *ThreatLockerAdapter) buildRequestBody(feed ThreatLockerFeed, pageNumber
 	}
 	if _, ok := body["isAscending"]; !ok {
 		body["isAscending"] = false
+	}
+	if feed.Window > 0 {
+		end := time.Now().UTC()
+		start := end.Add(-feed.Window - a.conf.PollInterval)
+		body[feed.StartDateField] = start.Format(windowTimestampLayout)
+		body[feed.EndDateField] = end.Format(windowTimestampLayout)
 	}
 	return body
 }

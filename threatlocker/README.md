@@ -12,10 +12,23 @@ event type is purely a configuration change — no code change required.
 
 ## Out of the box
 
-With no `feeds` configured, the adapter polls a single feed: **pending
-Application Control approval requests** (`statusId = 1`). Each pending request
-is shipped exactly once, which is well suited to triggering automated
-investigations in LimaCharlie.
+With no `feeds` configured, the adapter polls three feeds that together cover
+ThreatLocker's primary telemetry surfaces:
+
+| Default feed | ThreatLocker endpoint | What it carries |
+|---|---|---|
+| `approval_request` | `ApprovalRequest/ApprovalRequestGetByParameters` (`statusId = 1`) | Pending Application Control whitelist requests — one event per new request, shipped exactly once. Well suited to triggering automated investigations in LimaCharlie. |
+| `unified_audit` | `ActionLog/ActionLogGetByParametersV2` | The **Unified Audit** — ThreatLocker's combined event stream of `execute` / `install` / `network` / `registry` / `read` / `write` / `move` / `delete` / `baseline` / `powershell` / `elevate` / web activity across every module. Polled on a 5-minute rolling window. |
+| `system_audit` | `SystemAudit/SystemAuditGetByParameters` | Portal / administrator activity — logins, policy edits, approval decisions, organization changes. Polled on a 5-minute rolling window. |
+
+`unified_audit` and `system_audit` both *require* a `startDate`/`endDate` filter
+on every request; the adapter rewrites those fields automatically (see the
+`window` feed setting below). At-least-once delivery is preserved by the
+per-feed deduper.
+
+Override `feeds` in your config to add custom feeds (e.g. denied approval
+requests, child-organization-scoped queries) or to replace the defaults
+entirely.
 
 ## Authentication
 
@@ -49,7 +62,7 @@ Access** (e.g. `ThreatLocker Access (C)` → `instance: c`).
 | `instance` | yes* | ThreatLocker instance identifier (e.g. `g`). *Required unless `base_url` is set. |
 | `base_url` | no | Full API root override, e.g. `https://portalapi.g.threatlocker.com/portalapi`. |
 | `managed_organization_id` | no | Scopes every request to that organization via the `managedOrganizationId` header. |
-| `feeds` | no | List of feeds to poll. Defaults to pending approval requests. |
+| `feeds` | no | List of feeds to poll. Defaults to the three feeds listed under [Out of the box](#out-of-the-box). |
 | `page_size` | no | Records per page. Default `100` (max `1000`). |
 | `poll_interval` | no | Wait between polls, as a Go duration in nanoseconds. Default `60000000000` (1 minute). |
 | `dedupe_ttl` | no | How long a record id is remembered to suppress re-shipping. Default 7 days. |
@@ -67,6 +80,8 @@ Access** (e.g. `ThreatLocker Access (C)` → `instance: c`).
 | `timestamp_field` | no | Path to the record's event time (supports `/`-separated nested paths). Default `dateTime`. |
 | `id_field` | no | Path to the record's stable identifier, used for deduplication. Falls back to common id fields, then a content hash. |
 | `max_pages` | no | Caps pages fetched per poll. Default `100`. |
+| `window` | no | When set (e.g. `5m`), rewrites `startDate` / `endDate` on every poll to a rolling `[now-window-poll_interval, now]` range. Required for endpoints that mandate a date range (`ActionLog`, `SystemAudit`). The overlap with the previous poll is absorbed by the deduper. |
+| `start_date_field` / `end_date_field` | no | Override the request-body field names used by `window`. Defaults: `startDate` / `endDate`. |
 
 ## How polling works
 
@@ -102,7 +117,8 @@ Default (pending approval requests), via the CLI:
   instance=g
 ```
 
-Multiple feeds, via a YAML config file:
+Adding a custom feed (e.g. ship *denied* approval requests too) on top of the
+defaults, via a YAML config file:
 
 ```yaml
 threatlocker:
@@ -115,17 +131,36 @@ threatlocker:
   api_key: $THREATLOCKER_API_TOKEN
   instance: g
   feeds:
+    # Re-declare the three defaults explicitly so this list fully replaces them,
+    # then append the custom feed.
     - name: approval_request
       url: ApprovalRequest/ApprovalRequestGetByParameters
       parameters:
         statusId: 1            # pending
         showChildOrganizations: false
-      timestamp_field: dateTime
       id_field: approvalRequestId
     - name: unified_audit
       url: ActionLog/ActionLogGetByParametersV2
+      window: 5m
       parameters:
-        # endpoint-specific filters (e.g. a date range) go here
-      timestamp_field: dateTime
-      # id_field: set to the record's stable identifier for reliable dedup
+        paramsFieldsDto: []
+        groupBys: []
+        exportMode: false
+        showTotalCount: false
+        showChildOrganizations: false
+        onlyTrueDenies: false
+        simulateDeny: false
+      id_field: actionLogId
+    - name: system_audit
+      url: SystemAudit/SystemAuditGetByParameters
+      window: 5m
+      parameters:
+        viewChildOrganizations: false
+      id_field: systemAuditId
+    - name: approval_request_denied
+      url: ApprovalRequest/ApprovalRequestGetByParameters
+      parameters:
+        statusId: 3            # denied
+        showChildOrganizations: false
+      id_field: approvalRequestId
 ```
