@@ -4,12 +4,9 @@ steps:
 # The adapter pulls in github.com/apache/arrow/go/v15 for Parquet support
 # (see utils/parquet_supported.go). Compiling arrow/compute/internal/kernels
 # alone needs ~3-4 GB of RAM, and the N1_HIGHCPU_32 worker only has ~28.8 GB.
-# We chain Arrow-heavy compiles into waves via waitFor, capping at 3 concurrent
-# Arrow-heavy builds per wave. 32-bit ARM (GOARCH=arm + GOARM=5) is the most
-# memory-hungry of the targets -- the toolchain has to manage 32-bit pointers
-# but still drives Arrow's same compute kernels -- so it runs in its own wave
-# to keep headroom on the worker. The AIX build uses the parquet_unsupported.go
-# stub and is not Arrow-heavy, so it stays alongside wave 1.
+# We cap Arrow-heavy compiles to 4 concurrent by chaining them into waves via
+# waitFor. The AIX build uses the parquet_unsupported.go stub and is not
+# Arrow-heavy, so it stays in wave 1.
   - name: 'golang:1.25-bookworm'
     id: run-tests
     args: ['go', 'test', './...', '-v']
@@ -41,13 +38,21 @@ steps:
       - 'GOARCH=ppc64'
     waitFor: ['run-tests']
 
-  # Wave 2: 3 Arrow-heavy cross-compiles, after wave 1
+  # Wave 2: 4 Arrow-heavy cross-compiles, after wave 1
   - name: 'golang:1.25-bookworm'
     id: build-macosarm64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64', './containers/general']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
+    waitFor: ['build-linux64', 'build-win64', 'build-macos64']
+  - name: 'golang:1.25-bookworm'
+    id: build-linuxarm
+    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm', './containers/general']
+    env:
+      - 'GOOS=linux'
+      - 'GOARCH=arm'
+      - 'GOARM=5'
     waitFor: ['build-linux64', 'build-win64', 'build-macos64']
   - name: 'golang:1.25-bookworm'
     id: build-linuxarm64
@@ -64,38 +69,28 @@ steps:
       - 'GOARCH=amd64'
     waitFor: ['build-linux64', 'build-win64', 'build-macos64']
 
-  # Wave 3: 32-bit ARM is the most memory-hungry compile -- run alone.
-  - name: 'golang:1.25-bookworm'
-    id: build-linuxarm
-    args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm', './containers/general']
-    env:
-      - 'GOOS=linux'
-      - 'GOARCH=arm'
-      - 'GOARM=5'
-    waitFor: ['build-macosarm64', 'build-linuxarm64', 'build-solarisamd64']
-
-  # Wave 4: 3 Arrow-heavy cross-compiles, after wave 3
+  # Wave 3: 3 Arrow-heavy cross-compiles, after wave 2
   - name: 'golang:1.25-bookworm'
     id: build-freebsdamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64', './containers/general']
     env:
       - 'GOOS=freebsd'
       - 'GOARCH=amd64'
-    waitFor: ['build-linuxarm']
+    waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
   - name: 'golang:1.25-bookworm'
     id: build-netbsdamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_64', './containers/general']
     env:
       - 'GOOS=netbsd'
       - 'GOARCH=amd64'
-    waitFor: ['build-linuxarm']
+    waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
   - name: 'golang:1.25-bookworm'
     id: build-openbsdamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_64', './containers/general']
     env:
       - 'GOOS=openbsd'
       - 'GOARCH=amd64'
-    waitFor: ['build-linuxarm']
+    waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
 
 
 # Connectivity Tester
