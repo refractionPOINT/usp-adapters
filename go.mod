@@ -162,3 +162,8 @@ require (
 )
 
 replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6
+
+// apache/thrift v0.23.0 (CVE-2026-41602 fix) added an int comparison
+// against math.MaxUint32 that doesn't compile on 32-bit GOARCHes (GOARM).
+// Patched fork keeps the CVE fix; one-line cast restores 32-bit builds.
+replace github.com/apache/thrift => github.com/refractionPOINT/thrift v0.23.0-lc1
