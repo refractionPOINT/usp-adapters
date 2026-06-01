@@ -43,6 +43,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
 	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
+	"github.com/refractionPOINT/usp-adapters/quickbooks"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/sentinelone"
 	"github.com/refractionPOINT/usp-adapters/simulator"
@@ -498,6 +499,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ThreatLocker
 		client, chRunning, err = usp_threatlocker.NewThreatLockerAdapter(ctx, configs.ThreatLocker)
+	} else if method == "quickbooks" {
+		configs.QuickBooks.ClientOptions = applyLogging(configs.QuickBooks.ClientOptions)
+		configs.QuickBooks.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.QuickBooks
+		client, chRunning, err = usp_quickbooks.NewQuickBooksAdapter(ctx, configs.QuickBooks)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}

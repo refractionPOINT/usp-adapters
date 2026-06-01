@@ -130,3 +130,15 @@ be added purely through configuration. See [threatlocker/README.md](./threatlock
 ```
 ./general threatlocker client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=threatlocker api_key=$THREATLOCKER_API_TOKEN instance=g
 ```
+
+### QuickBooks Online
+
+Collects change/activity data from a QuickBooks Online company via the
+Accounting API's ChangeDataCapture (CDC) operation, using OAuth 2.0. Note that
+QuickBooks' user-attributed *Audit Log* is not exposed via any API; CDC is the
+authoritative programmatic source of change activity. See
+[quickbooks/README.md](./quickbooks/README.md).
+
+```
+./general quickbooks client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=quickbooks client_id=$QB_CLIENT_ID client_secret=$QB_CLIENT_SECRET refresh_token=$QB_REFRESH_TOKEN realm_id=$QB_REALM_ID
+```
