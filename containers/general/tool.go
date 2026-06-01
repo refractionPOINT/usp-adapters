@@ -30,6 +30,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/gmail"
 	"github.com/refractionPOINT/usp-adapters/harmony"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
@@ -433,6 +434,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.Imap.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Imap
 		client, chRunning, err = usp_imap.NewImapAdapter(ctx, configs.Imap)
+	} else if method == "gmail" {
+		configs.Gmail.ClientOptions = applyLogging(configs.Gmail.ClientOptions)
+		configs.Gmail.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Gmail
+		client, chRunning, err = usp_gmail.NewGmailAdapter(ctx, configs.Gmail)
 	} else if method == "hubspot" {
 		configs.HubSpot.ClientOptions = applyLogging(configs.HubSpot.ClientOptions)
 		configs.HubSpot.ClientOptions.Architecture = "usp_adapter"

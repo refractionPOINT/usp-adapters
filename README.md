@@ -130,3 +130,15 @@ be added purely through configuration. See [threatlocker/README.md](./threatlock
 ```
 ./general threatlocker client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=threatlocker api_key=$THREATLOCKER_API_TOKEN instance=g
 ```
+
+### Gmail
+
+Collects incoming email as telemetry from a Gmail mailbox via the Gmail REST
+API. It polls `users.messages.list` on a rolling window (default query
+`in:inbox`), fetches each newly-seen message, and ships it as a `gmail_message`
+event. Supports both a single-mailbox OAuth refresh token and Google Workspace
+service-account domain-wide delegation. See [gmail/README.md](./gmail/README.md).
+
+```
+./general gmail client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=gmail client_id=$GMAIL_CLIENT_ID client_secret=$GMAIL_CLIENT_SECRET refresh_token=$GMAIL_REFRESH_TOKEN
+```
