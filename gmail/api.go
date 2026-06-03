@@ -27,7 +27,7 @@ type messageRef struct {
 // listMessagesResponse mirrors the users.messages.list response envelope.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.messages/list
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list
 type listMessagesResponse struct {
 	Messages           []messageRef `json:"messages"`
 	NextPageToken      string       `json:"nextPageToken"`
@@ -114,7 +114,7 @@ func (c *GmailClient) ListMessages(ctx context.Context, p listMessagesParams) ([
 // metadataHeaders restricts the headers returned when format is "metadata".
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.messages/get
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get
 func (c *GmailClient) GetMessage(ctx context.Context, id, format string, metadataHeaders []string) ([]byte, error) {
 	q := url.Values{}
 	if format != "" {
@@ -146,7 +146,7 @@ func (c *GmailClient) settingsBaseURL() string {
 // ListFilters issues a users.settings.filters.list request.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.filters/list
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.filters/list
 func (c *GmailClient) ListFilters(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/filters")
 }
@@ -154,7 +154,7 @@ func (c *GmailClient) ListFilters(ctx context.Context) ([]byte, error) {
 // ListForwardingAddresses issues a users.settings.forwardingAddresses.list request.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.forwardingAddresses/list
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.forwardingAddresses/list
 func (c *GmailClient) ListForwardingAddresses(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/forwardingAddresses")
 }
@@ -162,7 +162,7 @@ func (c *GmailClient) ListForwardingAddresses(ctx context.Context) ([]byte, erro
 // GetAutoForwarding issues a users.settings.getAutoForwarding request.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getAutoForwarding
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getAutoForwarding
 func (c *GmailClient) GetAutoForwarding(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/autoForwarding")
 }
@@ -170,7 +170,7 @@ func (c *GmailClient) GetAutoForwarding(ctx context.Context) ([]byte, error) {
 // ListSendAs issues a users.settings.sendAs.list request.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.sendAs/list
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.sendAs/list
 func (c *GmailClient) ListSendAs(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/sendAs")
 }
@@ -179,7 +179,7 @@ func (c *GmailClient) ListSendAs(ctx context.Context) ([]byte, error) {
 // this only to service accounts with domain-wide delegation (Workspace).
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.delegates/list
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.delegates/list
 func (c *GmailClient) ListDelegates(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/delegates")
 }
@@ -187,7 +187,7 @@ func (c *GmailClient) ListDelegates(ctx context.Context) ([]byte, error) {
 // GetImap issues a users.settings.getImap request.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getImap
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getImap
 func (c *GmailClient) GetImap(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/imap")
 }
@@ -195,7 +195,7 @@ func (c *GmailClient) GetImap(ctx context.Context) ([]byte, error) {
 // GetPop issues a users.settings.getPop request.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getPop
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getPop
 func (c *GmailClient) GetPop(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/pop")
 }
@@ -203,7 +203,7 @@ func (c *GmailClient) GetPop(ctx context.Context) ([]byte, error) {
 // GetVacation issues a users.settings.getVacation request.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getVacation
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getVacation
 func (c *GmailClient) GetVacation(ctx context.Context) ([]byte, error) {
 	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/vacation")
 }
@@ -212,7 +212,7 @@ func (c *GmailClient) GetVacation(ctx context.Context) ([]byte, error) {
 // historyId for incremental history collection.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users/getProfile
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users/getProfile
 func (c *GmailClient) GetProfile(ctx context.Context) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s/gmail/v1/users/%s/profile", c.baseURL, url.PathEscape(c.userID))
 	return c.do(ctx, http.MethodGet, reqURL)
@@ -231,7 +231,7 @@ type listHistoryParams struct {
 // body.
 //
 // Reference:
-// https://developers.google.com/gmail/api/reference/rest/v1/users.history/list
+// https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list
 func (c *GmailClient) ListHistory(ctx context.Context, p listHistoryParams) ([]byte, error) {
 	q := url.Values{}
 	if p.startHistoryID != "" {

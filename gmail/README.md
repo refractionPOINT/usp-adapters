@@ -1,7 +1,7 @@
 # Gmail Adapter
 
 Collects telemetry from a Gmail mailbox using the
-[Gmail REST API](https://developers.google.com/gmail/api/reference/rest). Beyond
+[Gmail REST API](https://developers.google.com/workspace/gmail/api/reference/rest). Beyond
 incoming-email telemetry, it can collect the mailbox configuration and change
 signals most relevant to **Business Email Compromise (BEC)** — the mail rules,
 forwarding, aliases, delegates, protocol access, and deletions an intruder uses
@@ -18,14 +18,14 @@ original behavior.
 
 | Flag | Event type(s) | Gmail API | What it gives you / BEC relevance |
 |------|---------------|-----------|-----------------------------------|
-| `collect_messages` | `gmail_message` | [`messages.list`](https://developers.google.com/gmail/api/reference/rest/v1/users.messages/list) + [`messages.get`](https://developers.google.com/gmail/api/reference/rest/v1/users.messages/get) | Incoming email as telemetry (the original behavior). The raw signal for phishing/lure detection. |
-| `collect_filters` | `gmail_filter` | [`settings.filters.list`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings.filters/list) | Mail rules. Attackers create rules that auto-delete or auto-forward, or move replies about invoices/wires out of the inbox so the victim never sees them. |
-| `collect_forwarding` | `gmail_forwarding_address`, `gmail_auto_forwarding` | [`settings.forwardingAddresses.list`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings.forwardingAddresses/list), [`settings.getAutoForwarding`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getAutoForwarding) | Forwarding destinations and the account-wide auto-forward toggle. A classic mail-exfiltration vector. |
-| `collect_send_as` | `gmail_send_as` | [`settings.sendAs.list`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings.sendAs/list) | Send-as / "from" identities. An added identity is an impersonation/persistence signal. |
-| `collect_delegates` | `gmail_delegate` | [`settings.delegates.list`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings.delegates/list) | Mailbox delegates. Granting a delegate is persistence. **Workspace only** — see the note below. |
-| `collect_imap_pop` | `gmail_imap`, `gmail_pop` | [`settings.getImap`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getImap), [`settings.getPop`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getPop) | IMAP/POP access. Enabling these allows bulk mailbox download via a desktop client, bypassing browser-session controls. |
-| `collect_vacation` | `gmail_vacation` | [`settings.getVacation`](https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getVacation) | The vacation responder, occasionally abused for harvesting/social engineering. |
-| `collect_history` | `gmail_history` | [`users.history.list`](https://developers.google.com/gmail/api/reference/rest/v1/users.history/list) | Mailbox changes: message **deletions** and **label changes** (marking a security alert read, trashing the fraud thread) — how an intruder covers their tracks. |
+| `collect_messages` | `gmail_message` | [`messages.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list) + [`messages.get`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get) | Incoming email as telemetry (the original behavior). The raw signal for phishing/lure detection. |
+| `collect_filters` | `gmail_filter` | [`settings.filters.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.filters/list) | Mail rules. Attackers create rules that auto-delete or auto-forward, or move replies about invoices/wires out of the inbox so the victim never sees them. |
+| `collect_forwarding` | `gmail_forwarding_address`, `gmail_auto_forwarding` | [`settings.forwardingAddresses.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.forwardingAddresses/list), [`settings.getAutoForwarding`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getAutoForwarding) | Forwarding destinations and the account-wide auto-forward toggle. A classic mail-exfiltration vector. |
+| `collect_send_as` | `gmail_send_as` | [`settings.sendAs.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.sendAs/list) | Send-as / "from" identities. An added identity is an impersonation/persistence signal. |
+| `collect_delegates` | `gmail_delegate` | [`settings.delegates.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings.delegates/list) | Mailbox delegates. Granting a delegate is persistence. **Workspace only** — see the note below. |
+| `collect_imap_pop` | `gmail_imap`, `gmail_pop` | [`settings.getImap`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getImap), [`settings.getPop`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getPop) | IMAP/POP access. Enabling these allows bulk mailbox download via a desktop client, bypassing browser-session controls. |
+| `collect_vacation` | `gmail_vacation` | [`settings.getVacation`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.settings/getVacation) | The vacation responder, occasionally abused for harvesting/social engineering. |
+| `collect_history` | `gmail_history` | [`users.history.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list) | Mailbox changes: message **deletions** and **label changes** (marking a security alert read, trashing the fraud thread) — how an intruder covers their tracks. |
 
 > **Delegates are Workspace-only.** Google exposes
 > `settings.delegates.list` only to service-account clients with domain-wide
@@ -67,7 +67,7 @@ alias, or delegate. They poll on the slower `settings_poll_interval` (default
 
 On the first run the adapter records a baseline `historyId` from the mailbox
 profile and ships nothing (there is no prior state to diff). Each later poll lists
-[`users.history.list`](https://developers.google.com/gmail/api/reference/rest/v1/users.history/list)
+[`users.history.list`](https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.history/list)
 forward from the cursor — filtered to `messageDeleted`, `labelAdded`, and
 `labelRemoved` (new mail is already covered by `collect_messages`) — ships each
 record, and advances the cursor only after a fully-successful pass. Gmail retains

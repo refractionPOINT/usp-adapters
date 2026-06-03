@@ -16,8 +16,8 @@
 //     account JSON (inline or via a file) and the subject to impersonate.
 //
 // References:
-//   - messages.list: https://developers.google.com/gmail/api/reference/rest/v1/users.messages/list
-//   - messages.get:  https://developers.google.com/gmail/api/reference/rest/v1/users.messages/get
+//   - messages.list: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list
+//   - messages.get:  https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get
 //   - search syntax: https://support.google.com/mail/answer/7190
 //   - OAuth/service accounts: https://developers.google.com/identity/protocols/oauth2/service-account
 package usp_gmail
