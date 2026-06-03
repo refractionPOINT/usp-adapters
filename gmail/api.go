@@ -132,6 +132,131 @@ func (c *GmailClient) GetMessage(ctx context.Context, id, format string, metadat
 	return c.do(ctx, http.MethodGet, reqURL)
 }
 
+// --- BEC capability endpoints ----------------------------------------------
+//
+// These read the mailbox's configuration state and change history. All are
+// readable with the default gmail.readonly scope. Each returns the raw response
+// body; the adapter parses and ships it.
+
+// settingsBaseURL is the root of the per-user settings sub-resources.
+func (c *GmailClient) settingsBaseURL() string {
+	return fmt.Sprintf("%s/gmail/v1/users/%s/settings", c.baseURL, url.PathEscape(c.userID))
+}
+
+// ListFilters issues a users.settings.filters.list request.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.filters/list
+func (c *GmailClient) ListFilters(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/filters")
+}
+
+// ListForwardingAddresses issues a users.settings.forwardingAddresses.list request.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.forwardingAddresses/list
+func (c *GmailClient) ListForwardingAddresses(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/forwardingAddresses")
+}
+
+// GetAutoForwarding issues a users.settings.getAutoForwarding request.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getAutoForwarding
+func (c *GmailClient) GetAutoForwarding(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/autoForwarding")
+}
+
+// ListSendAs issues a users.settings.sendAs.list request.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.sendAs/list
+func (c *GmailClient) ListSendAs(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/sendAs")
+}
+
+// ListDelegates issues a users.settings.delegates.list request. Google exposes
+// this only to service accounts with domain-wide delegation (Workspace).
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings.delegates/list
+func (c *GmailClient) ListDelegates(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/delegates")
+}
+
+// GetImap issues a users.settings.getImap request.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getImap
+func (c *GmailClient) GetImap(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/imap")
+}
+
+// GetPop issues a users.settings.getPop request.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getPop
+func (c *GmailClient) GetPop(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/pop")
+}
+
+// GetVacation issues a users.settings.getVacation request.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.settings/getVacation
+func (c *GmailClient) GetVacation(ctx context.Context) ([]byte, error) {
+	return c.do(ctx, http.MethodGet, c.settingsBaseURL()+"/vacation")
+}
+
+// GetProfile issues a users.getProfile request, used to obtain a baseline
+// historyId for incremental history collection.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users/getProfile
+func (c *GmailClient) GetProfile(ctx context.Context) ([]byte, error) {
+	reqURL := fmt.Sprintf("%s/gmail/v1/users/%s/profile", c.baseURL, url.PathEscape(c.userID))
+	return c.do(ctx, http.MethodGet, reqURL)
+}
+
+// listHistoryParams bundles the query knobs for ListHistory.
+type listHistoryParams struct {
+	startHistoryID string
+	pageToken      string
+	maxResults     int
+	historyTypes   []string
+	labelID        string
+}
+
+// ListHistory issues a users.history.list request and returns the raw response
+// body.
+//
+// Reference:
+// https://developers.google.com/gmail/api/reference/rest/v1/users.history/list
+func (c *GmailClient) ListHistory(ctx context.Context, p listHistoryParams) ([]byte, error) {
+	q := url.Values{}
+	if p.startHistoryID != "" {
+		q.Set("startHistoryId", p.startHistoryID)
+	}
+	if p.pageToken != "" {
+		q.Set("pageToken", p.pageToken)
+	}
+	if p.maxResults > 0 {
+		q.Set("maxResults", fmt.Sprintf("%d", p.maxResults))
+	}
+	for _, ht := range p.historyTypes {
+		q.Add("historyTypes", ht)
+	}
+	if p.labelID != "" {
+		q.Set("labelId", p.labelID)
+	}
+
+	reqURL := fmt.Sprintf("%s/gmail/v1/users/%s/history", c.baseURL, url.PathEscape(c.userID))
+	if encoded := q.Encode(); encoded != "" {
+		reqURL += "?" + encoded
+	}
+	return c.do(ctx, http.MethodGet, reqURL)
+}
+
 // do executes a request, transparently refreshing the access token once if the
 // API answers 401.
 func (c *GmailClient) do(ctx context.Context, method, reqURL string) ([]byte, error) {

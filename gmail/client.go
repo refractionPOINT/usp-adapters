@@ -39,15 +39,16 @@ import (
 )
 
 const (
-	defaultUserID       = "me"
-	defaultQuery        = "in:inbox"
-	defaultFormat       = "full"
-	defaultMaxResults   = 100
-	maxAllowedResults   = 500 // Gmail's per-page ceiling for messages.list.
-	defaultPollInterval = 5 * time.Minute
-	defaultOverlap      = 2 * time.Minute
-	defaultDedupeTTL    = 7 * 24 * time.Hour
-	dedupeBucketWindow  = 1 * time.Hour
+	defaultUserID               = "me"
+	defaultQuery                = "in:inbox"
+	defaultFormat               = "full"
+	defaultMaxResults           = 100
+	maxAllowedResults           = 500 // Gmail's per-page ceiling for messages.list.
+	defaultPollInterval         = 5 * time.Minute
+	defaultSettingsPollInterval = 15 * time.Minute
+	defaultOverlap              = 2 * time.Minute
+	defaultDedupeTTL            = 7 * 24 * time.Hour
+	dedupeBucketWindow          = 1 * time.Hour
 
 	defaultMaxRetryAttempts = 3
 	defaultRetryBaseDelay   = 5 * time.Second
@@ -59,8 +60,18 @@ const (
 	// safety net against a misbehaving nextPageToken that never empties.
 	maxPagesPerPoll = 10000
 
-	// eventType tags every shipped message.
-	eventType = "gmail_message"
+	// Event types. Each capability ships under its own type so detections can be
+	// written against the specific signal.
+	eventTypeMessage           = "gmail_message"            // incoming-mail telemetry
+	eventTypeFilter            = "gmail_filter"             // a mail filter / rule
+	eventTypeForwardingAddress = "gmail_forwarding_address" // a verified forwarding destination
+	eventTypeAutoForwarding    = "gmail_auto_forwarding"    // account-wide auto-forward setting
+	eventTypeSendAs            = "gmail_send_as"            // a send-as alias / "from" identity
+	eventTypeDelegate          = "gmail_delegate"           // a mailbox delegate (Workspace only)
+	eventTypeImap              = "gmail_imap"               // IMAP access setting
+	eventTypePop               = "gmail_pop"                // POP access setting
+	eventTypeVacation          = "gmail_vacation"           // vacation responder setting
+	eventTypeHistory           = "gmail_history"            // a mailbox change record (deletions, label changes)
 )
 
 // validFormats is the set of accepted users.messages.get format values.
@@ -99,6 +110,60 @@ type GmailConfig struct {
 	// domain-wide delegation (e.g. "user@yourdomain.com"). Required for the
 	// service-account flow.
 	Subject string `json:"subject" yaml:"subject"`
+
+	// --- Capabilities ------------------------------------------------------
+	//
+	// Each capability is an independent collector that ships its own event type.
+	// They are opt-in: if NONE of these are set, the adapter defaults to message
+	// telemetry only (CollectMessages), preserving the original behavior. The
+	// configuration-state capabilities (filters, forwarding, send-as, delegates,
+	// imap/pop, vacation) emit change-only events -- an item is shipped when it
+	// first appears or its content changes, suppressed otherwise -- which surfaces
+	// the persistence/exfiltration changes typical of Business Email Compromise.
+
+	// CollectMessages ships incoming email as "gmail_message" telemetry. This is
+	// the original behavior and the default when no capability is selected.
+	CollectMessages bool `json:"collect_messages" yaml:"collect_messages"`
+
+	// CollectFilters ships mail filters/rules as "gmail_filter". BEC actors create
+	// rules that auto-delete or auto-forward mail, or hide replies about
+	// invoices/wires so the victim never sees them.
+	CollectFilters bool `json:"collect_filters" yaml:"collect_filters"`
+
+	// CollectForwarding ships forwarding addresses ("gmail_forwarding_address")
+	// and the account-wide auto-forwarding setting ("gmail_auto_forwarding"). A
+	// classic mail-exfiltration vector.
+	CollectForwarding bool `json:"collect_forwarding" yaml:"collect_forwarding"`
+
+	// CollectSendAs ships send-as aliases as "gmail_send_as". An added "from"
+	// identity is an impersonation/persistence signal.
+	CollectSendAs bool `json:"collect_send_as" yaml:"collect_send_as"`
+
+	// CollectDelegates ships mailbox delegates as "gmail_delegate". Granting a
+	// delegate is a persistence mechanism. Google exposes this only to service
+	// accounts with domain-wide delegation (Workspace); it is unavailable on
+	// consumer accounts and such failures are logged and skipped, not fatal.
+	CollectDelegates bool `json:"collect_delegates" yaml:"collect_delegates"`
+
+	// CollectImapPop ships the IMAP ("gmail_imap") and POP ("gmail_pop") access
+	// settings. Enabling these allows bulk mailbox download via a desktop client,
+	// bypassing browser-session controls.
+	CollectImapPop bool `json:"collect_imap_pop" yaml:"collect_imap_pop"`
+
+	// CollectVacation ships the vacation-responder setting as "gmail_vacation".
+	CollectVacation bool `json:"collect_vacation" yaml:"collect_vacation"`
+
+	// CollectHistory ships mailbox change records as "gmail_history": message
+	// deletions and label changes (e.g. marking security alerts read or trashing
+	// the fraud thread), which is how an intruder covers their tracks. Uses
+	// users.history.list, whose history is retained for roughly a week.
+	CollectHistory bool `json:"collect_history" yaml:"collect_history"`
+
+	// SettingsPollInterval is the cadence for the configuration-state capabilities
+	// (filters, forwarding, send-as, delegates, imap/pop, vacation). These change
+	// rarely, so they poll on a slower clock than messages. Default 15 minutes.
+	// History and messages poll on PollInterval.
+	SettingsPollInterval time.Duration `json:"settings_poll_interval" yaml:"settings_poll_interval"`
 
 	// --- Collection knobs --------------------------------------------------
 
@@ -170,6 +235,19 @@ func (c *GmailConfig) usesServiceAccount() bool {
 	return c.ServiceAccountCredentials != "" || c.ServiceAccountFile != ""
 }
 
+// anyCapabilityEnabled reports whether the operator turned on at least one
+// collector.
+func (c *GmailConfig) anyCapabilityEnabled() bool {
+	return c.CollectMessages || c.CollectHistory || c.anySettingsCapabilityEnabled()
+}
+
+// anySettingsCapabilityEnabled reports whether any configuration-state capability
+// (the ones that poll on SettingsPollInterval) is enabled.
+func (c *GmailConfig) anySettingsCapabilityEnabled() bool {
+	return c.CollectFilters || c.CollectForwarding || c.CollectSendAs ||
+		c.CollectDelegates || c.CollectImapPop || c.CollectVacation
+}
+
 func (c *GmailConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
@@ -202,6 +280,12 @@ func (c *GmailConfig) Validate() error {
 		return errors.New("missing credentials: set either a refresh token (client_id, client_secret, refresh_token) or a service account (service_account_credentials/service_account_file + subject)")
 	}
 
+	// Capabilities are opt-in. If the operator selected none, fall back to the
+	// original behavior: message telemetry only.
+	if !c.anyCapabilityEnabled() {
+		c.CollectMessages = true
+	}
+
 	if c.UserID == "" {
 		c.UserID = defaultUserID
 	}
@@ -225,6 +309,9 @@ func (c *GmailConfig) Validate() error {
 	}
 	if c.PollInterval <= 0 {
 		c.PollInterval = defaultPollInterval
+	}
+	if c.SettingsPollInterval <= 0 {
+		c.SettingsPollInterval = defaultSettingsPollInterval
 	}
 	if c.Overlap < 0 {
 		c.Overlap = 0
@@ -268,9 +355,17 @@ type GmailAdapter struct {
 	deduper     utils.Deduper
 	ownsDeduper bool
 
-	// since is the high-water mark of the collection window. It advances to the
-	// poll's end time after every fully-successful poll.
+	// since is the high-water mark of the message collection window. It advances
+	// to the poll's end time after every fully-successful message poll.
 	since time.Time
+
+	// lastSettings is when the configuration-state capabilities last ran; they
+	// poll on the slower SettingsPollInterval clock. Zero means "never" (due).
+	lastSettings time.Time
+
+	// lastHistoryID is the users.history.list cursor: history is collected from
+	// this id forward. Empty until a baseline is established from the profile.
+	lastHistoryID string
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -430,15 +525,43 @@ func (a *GmailAdapter) run() {
 	isFirstRun := true
 	for isFirstRun || !a.doStop.WaitFor(a.conf.PollInterval) {
 		isFirstRun = false
-		a.poll()
+		a.runCycle()
 	}
 }
 
-// poll performs one collection cycle over the rolling window: list message ids,
-// fetch each not-yet-seen message, and ship it. On success the window's
-// high-water mark advances; on any error it does not, so the next poll re-covers
-// the same range (the deduper prevents re-shipping).
-func (a *GmailAdapter) poll() {
+// runCycle runs one tick of every enabled capability. Messages and history poll
+// every cycle; the configuration-state capabilities poll on their slower
+// SettingsPollInterval clock. A capability failing does not abort the others.
+func (a *GmailAdapter) runCycle() {
+	if a.conf.CollectMessages {
+		a.pollMessages()
+	}
+	if a.doStop.IsSet() {
+		return
+	}
+	if a.conf.CollectHistory {
+		a.pollHistory()
+	}
+	if a.doStop.IsSet() {
+		return
+	}
+	if a.conf.anySettingsCapabilityEnabled() && a.settingsDue(time.Now()) {
+		a.pollSettings()
+		a.lastSettings = time.Now()
+	}
+}
+
+// settingsDue reports whether the configuration-state capabilities should run
+// this cycle: always on the first pass, then once per SettingsPollInterval.
+func (a *GmailAdapter) settingsDue(now time.Time) bool {
+	return a.lastSettings.IsZero() || now.Sub(a.lastSettings) >= a.conf.SettingsPollInterval
+}
+
+// pollMessages performs one message collection cycle over the rolling window:
+// list message ids, fetch each not-yet-seen message, and ship it. On success the
+// window's high-water mark advances; on any error it does not, so the next poll
+// re-covers the same range (the deduper prevents re-shipping).
+func (a *GmailAdapter) pollMessages() {
 	end := time.Now()
 	start := a.since.Add(-a.conf.Overlap)
 	query := buildQuery(a.conf.Query, start)
@@ -618,13 +741,19 @@ func (a *GmailAdapter) handlePermanent(label string, err error) {
 	a.conf.ClientOptions.OnError(fmt.Errorf("gmail: %s failed: %v", label, err))
 }
 
-// ship forwards a single message to LimaCharlie. It returns false if the adapter
-// should stop (an unrecoverable shipping error).
+// ship forwards a single incoming message to LimaCharlie. It returns false if
+// the adapter should stop (an unrecoverable shipping error).
 func (a *GmailAdapter) ship(id string, msg utils.Dict) bool {
+	return a.shipEvent(eventTypeMessage, msg, eventTime(msg))
+}
+
+// shipEvent forwards one event of the given type to LimaCharlie. It returns
+// false if the adapter should stop (an unrecoverable shipping error).
+func (a *GmailAdapter) shipEvent(evtType string, payload utils.Dict, tsMs uint64) bool {
 	dataMsg := &protocol.DataMessage{
-		JsonPayload: msg,
-		EventType:   eventType,
-		TimestampMs: eventTime(msg),
+		JsonPayload: payload,
+		EventType:   evtType,
+		TimestampMs: tsMs,
 	}
 	if err := a.uspClient.Ship(dataMsg, shipTimeout); err != nil {
 		if err == uspclient.ErrorBufferFull {

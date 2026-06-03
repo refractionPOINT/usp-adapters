@@ -110,10 +110,41 @@ type mockGmail struct {
 	// lastAssertionClaims captures the claims of the most recent service-account
 	// assertion, for delegation assertions in tests.
 	lastAssertionClaims jwt.MapClaims
+
+	// --- BEC capability state (settings, profile, history) -----------------
+
+	filters             []utils.Dict
+	forwardingAddresses []utils.Dict
+	autoForwarding      utils.Dict
+	sendAs              []utils.Dict
+	delegates           []utils.Dict
+	imap                utils.Dict
+	pop                 utils.Dict
+	vacation            utils.Dict
+
+	// profileHistoryID is what users.getProfile reports as the current historyId
+	// (the baseline cursor for history collection).
+	profileHistoryID string
+	// history is the change log; the list handler returns records whose id is
+	// greater than the requested startHistoryId.
+	history []utils.Dict
+
+	// statusOverride, keyed by capability path suffix (e.g. "settings/delegates",
+	// "history"), forces that endpoint to answer the given HTTP status, to
+	// simulate a feature unavailable for the account type or an expired cursor.
+	statusOverride map[string]int
+
+	// per-capability request counters, for asserting cadence.
+	capabilityRequests map[string]int
 }
 
 func newMockGmail() *mockGmail {
-	return &mockGmail{messages: map[string]utils.Dict{}, getNotFound: map[string]bool{}}
+	return &mockGmail{
+		messages:           map[string]utils.Dict{},
+		getNotFound:        map[string]bool{},
+		statusOverride:     map[string]int{},
+		capabilityRequests: map[string]int{},
+	}
 }
 
 // markGetNotFound makes get(id) answer 404 while the id stays listable.
@@ -144,6 +175,18 @@ func (m *mockGmail) handler(t *testing.T) http.Handler {
 	mux.HandleFunc("/token", m.tokenHandler(t))
 	mux.HandleFunc("/gmail/v1/users/me/messages", m.listHandler(t))
 	mux.HandleFunc("/gmail/v1/users/me/messages/", m.getHandler(t))
+
+	// BEC capability endpoints.
+	mux.HandleFunc("/gmail/v1/users/me/settings/filters", m.capListHandler("settings/filters", "filter", func() []utils.Dict { return m.filters }))
+	mux.HandleFunc("/gmail/v1/users/me/settings/forwardingAddresses", m.capListHandler("settings/forwardingAddresses", "forwardingAddresses", func() []utils.Dict { return m.forwardingAddresses }))
+	mux.HandleFunc("/gmail/v1/users/me/settings/sendAs", m.capListHandler("settings/sendAs", "sendAs", func() []utils.Dict { return m.sendAs }))
+	mux.HandleFunc("/gmail/v1/users/me/settings/delegates", m.capListHandler("settings/delegates", "delegates", func() []utils.Dict { return m.delegates }))
+	mux.HandleFunc("/gmail/v1/users/me/settings/autoForwarding", m.capObjectHandler("settings/autoForwarding", func() utils.Dict { return m.autoForwarding }))
+	mux.HandleFunc("/gmail/v1/users/me/settings/imap", m.capObjectHandler("settings/imap", func() utils.Dict { return m.imap }))
+	mux.HandleFunc("/gmail/v1/users/me/settings/pop", m.capObjectHandler("settings/pop", func() utils.Dict { return m.pop }))
+	mux.HandleFunc("/gmail/v1/users/me/settings/vacation", m.capObjectHandler("settings/vacation", func() utils.Dict { return m.vacation }))
+	mux.HandleFunc("/gmail/v1/users/me/profile", m.profileHandler())
+	mux.HandleFunc("/gmail/v1/users/me/history", m.historyHandler())
 	return mux
 }
 
@@ -535,7 +578,7 @@ func TestMockEndToEndRefreshToken(t *testing.T) {
 
 	byID := map[string]*protocol.DataMessage{}
 	for _, msg := range sink.snapshot() {
-		assert.Equal(t, eventType, msg.EventType)
+		assert.Equal(t, eventTypeMessage, msg.EventType)
 		require.NotNil(t, msg.JsonPayload)
 		byID[utils.Dict(msg.JsonPayload).FindOneString("id")] = msg
 	}

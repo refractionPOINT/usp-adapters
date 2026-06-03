@@ -106,6 +106,21 @@ func TestValidate(t *testing.T) {
 		assert.Error(t, c.Validate())
 	})
 
+	t.Run("defaults to message collection when no capability is set", func(t *testing.T) {
+		c := refresh()
+		require.NoError(t, c.Validate())
+		assert.True(t, c.CollectMessages, "messages must default on for backward compatibility")
+		assert.Equal(t, defaultSettingsPollInterval, c.SettingsPollInterval)
+	})
+
+	t.Run("does not force messages on when a BEC capability is selected", func(t *testing.T) {
+		c := refresh()
+		c.CollectFilters = true
+		require.NoError(t, c.Validate())
+		assert.False(t, c.CollectMessages, "selecting only a BEC capability must leave messages off")
+		assert.True(t, c.CollectFilters)
+	})
+
 	t.Run("clamps max_results to the API ceiling", func(t *testing.T) {
 		c := refresh()
 		c.MaxResults = 9000
