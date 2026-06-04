@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -38,12 +38,26 @@ var URL = map[string]string{
 	"eu":         "https://events.1password.eu",
 }
 
+// defaultPollInterval is how long fetchEvents idles between polling ticks once
+// it has drained all immediately-available pages.
+const defaultPollInterval = 30 * time.Second
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type OnePasswordAdapter struct {
 	conf       OnePasswordConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
-	endpoint string
+	endpoint     string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -78,9 +92,10 @@ func (c *OnePasswordConfig) Validate() error {
 func NewOnePasswordpAdapter(ctx context.Context, conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
 	var err error
 	a := &OnePasswordAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		pollInterval: defaultPollInterval,
 	}
 
 	if strings.HasPrefix(conf.Endpoint, "https://") {
@@ -140,37 +155,65 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastCursor := ""
-	for !a.doStop.WaitFor(30 * time.Second) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
-		items, newCursor := a.makeOneRequest(url, lastCursor)
-		lastCursor = newCursor
-		if items == nil {
-			continue
-		}
+	for !a.doStop.WaitFor(a.pollInterval) {
+		// The 1Password Events API uses cursor pagination and returns
+		// a has_more flag indicating that more data is immediately
+		// available to fetch. Keep draining until has_more is false (or
+		// we are asked to stop) before going idle again, otherwise we
+		// only fetch one page (up to `limit` events) per polling tick
+		// and fall permanently behind on busy accounts.
+		for {
+			// The makeOneRequest function handles error
+			// handling and fatal error handling.
+			prevCursor := lastCursor
+			items, newCursor, hasMore := a.makeOneRequest(url, lastCursor)
+			lastCursor = newCursor
 
-		for _, item := range items {
-			msg := &protocol.DataMessage{
-				JsonPayload: item,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+			for _, item := range items {
+				// Every 1Password event carries a required RFC3339
+				// `timestamp` field; use the event's own time and only
+				// fall back to ingestion time if it is missing or
+				// unparseable.
+				tsMs := uint64(time.Now().UnixNano() / int64(time.Millisecond))
+				if ts, ok := item.GetString("timestamp"); ok {
+					if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+						tsMs = uint64(t.UnixNano() / int64(time.Millisecond))
+					}
+				}
+				msg := &protocol.DataMessage{
+					JsonPayload: item,
+					TimestampMs: tsMs,
+				}
+				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+					if err == uspclient.ErrorBufferFull {
+						a.conf.ClientOptions.OnWarning("stream falling behind")
+						err = a.uspClient.Ship(msg, 1*time.Hour)
+					}
+					if err == nil {
+						continue
+					}
+					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					a.doStop.Set()
+					return
+				}
 			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
-				}
-				if err == nil {
-					continue
-				}
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				a.doStop.Set()
-				return
+
+			if !hasMore || a.doStop.IsSet() {
+				break
+			}
+			// Defensive: only keep draining if the cursor actually
+			// advanced. A has_more response that repeats the previous
+			// cursor would spin tightly, and an empty cursor would make
+			// the next request reset the stream back to "now" (losing
+			// our position). In either case, stop and resume next tick.
+			if newCursor == "" || newCursor == prevCursor {
+				break
 			}
 		}
 	}
 }
 
-func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]utils.Dict, string) {
+func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]utils.Dict, string, bool) {
 	// Prepare the request body.
 	reqData := opRequest{}
 	if lastCursor != "" {
@@ -183,14 +226,14 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	b, err := json.Marshal(reqData)
 	if err != nil {
 		a.doStop.Set()
-		return nil, ""
+		return nil, "", false
 	}
 
 	// Prepare the request.
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s%s", a.endpoint, url), bytes.NewBuffer(b))
 	if err != nil {
 		a.doStop.Set()
-		return nil, ""
+		return nil, "", false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.conf.Token))
@@ -199,15 +242,15 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-		return nil, lastCursor
+		return nil, lastCursor, false
 	}
 	defer resp.Body.Close()
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		a.conf.ClientOptions.OnWarning(fmt.Sprintf("1password api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
-		return nil, lastCursor
+		return nil, lastCursor, false
 	}
 
 	// Parse the response.
@@ -215,12 +258,13 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	jsonDecoder := json.NewDecoder(resp.Body)
 	if err := jsonDecoder.Decode(&respData); err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("1password api invalid json: %v", err))
-		return nil, lastCursor
+		return nil, lastCursor, false
 	}
 
-	// Report if a cursor was returned
-	// as well as the items.
+	// Report if a cursor was returned as well as the items, and whether
+	// the API indicates more data is immediately available to fetch.
 	lastCursor = respData.FindOneString("cursor")
 	items, _ := respData.GetListOfDict("items")
-	return items, lastCursor
+	hasMore, _ := respData.GetBool("has_more")
+	return items, lastCursor, hasMore
 }
