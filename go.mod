@@ -62,7 +62,7 @@ require (
 	github.com/Velocidex/pkcs7 v0.0.0-20230220112103-d4ed02e1862a // indirect
 	github.com/Velocidex/yaml/v2 v2.2.8 // indirect
 	github.com/andybalholm/brotli v1.0.5 // indirect
-	github.com/apache/thrift v0.17.0 // indirect
+	github.com/apache/thrift v0.23.0 // indirect
 	github.com/blang/semver/v4 v4.0.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
@@ -162,3 +162,8 @@ require (
 )
 
 replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6
+
+// apache/thrift v0.23.0 (CVE-2026-41602 fix) added an int comparison
+// against math.MaxUint32 that doesn't compile on 32-bit GOARCHes (GOARM).
+// Patched fork keeps the CVE fix; one-line cast restores 32-bit builds.
+replace github.com/apache/thrift => github.com/refractionPOINT/thrift v0.23.0-lc1

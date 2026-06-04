@@ -120,3 +120,13 @@ journalctl -f -q | netcat 127.0.0.1 4444
 ```
 ./adapter stdin client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=text "client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" client_options.sensor_seed_key=testclient3 client_options.mapping.event_type_path=exe
 ```
+
+### ThreatLocker
+
+Pulls events from the ThreatLocker Portal API. By default it collects pending
+Application Control approval requests; additional ThreatLocker event types can
+be added purely through configuration. See [threatlocker/README.md](./threatlocker/README.md).
+
+```
+./general threatlocker client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=threatlocker api_key=$THREATLOCKER_API_TOKEN instance=g
+```

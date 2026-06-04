@@ -53,6 +53,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
+	"github.com/refractionPOINT/usp-adapters/threatlocker"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/wiz"
@@ -492,6 +493,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.TrendMicro.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.TrendMicro
 		client, chRunning, err = usp_trendmicro.NewTrendMicroAdapter(ctx, configs.TrendMicro)
+	} else if method == "threatlocker" {
+		configs.ThreatLocker.ClientOptions = applyLogging(configs.ThreatLocker.ClientOptions)
+		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.ThreatLocker
+		client, chRunning, err = usp_threatlocker.NewThreatLockerAdapter(ctx, configs.ThreatLocker)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
