@@ -38,12 +38,26 @@ var URL = map[string]string{
 	"eu":         "https://events.1password.eu",
 }
 
+// defaultPollInterval is how long fetchEvents idles between polling ticks once
+// it has drained all immediately-available pages.
+const defaultPollInterval = 30 * time.Second
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type OnePasswordAdapter struct {
 	conf       OnePasswordConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
-	endpoint string
+	endpoint     string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -78,9 +92,10 @@ func (c *OnePasswordConfig) Validate() error {
 func NewOnePasswordpAdapter(ctx context.Context, conf OnePasswordConfig) (*OnePasswordAdapter, chan struct{}, error) {
 	var err error
 	a := &OnePasswordAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		pollInterval: defaultPollInterval,
 	}
 
 	if strings.HasPrefix(conf.Endpoint, "https://") {
@@ -140,7 +155,7 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastCursor := ""
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The 1Password Events API uses cursor pagination and returns
 		// a has_more flag indicating that more data is immediately
 		// available to fetch. Keep draining until has_more is false (or
