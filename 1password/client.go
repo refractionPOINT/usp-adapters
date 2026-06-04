@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -155,9 +155,19 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 			lastCursor = newCursor
 
 			for _, item := range items {
+				// Every 1Password event carries a required RFC3339
+				// `timestamp` field; use the event's own time and only
+				// fall back to ingestion time if it is missing or
+				// unparseable.
+				tsMs := uint64(time.Now().UnixNano() / int64(time.Millisecond))
+				if ts, ok := item.GetString("timestamp"); ok {
+					if t, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+						tsMs = uint64(t.UnixNano() / int64(time.Millisecond))
+					}
+				}
 				msg := &protocol.DataMessage{
 					JsonPayload: item,
-					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+					TimestampMs: tsMs,
 				}
 				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
 					if err == uspclient.ErrorBufferFull {
@@ -223,7 +233,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
+		body, _ := io.ReadAll(resp.Body)
 		a.conf.ClientOptions.OnWarning(fmt.Sprintf("1password api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
 		return nil, lastCursor, false
 	}
