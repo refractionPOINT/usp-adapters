@@ -121,6 +121,11 @@ func (c *SentinelOneConfig) Validate() error {
 }
 
 func NewSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig) (*SentinelOneAdapter, chan struct{}, error) {
+	// Ensure defaults are set (these may not be set if Validate() wasn't called,
+	// e.g. when launched through the general adapter runner).
+	if conf.TimeBetweenRequests == 0 {
+		conf.TimeBetweenRequests = 1 * time.Minute
+	}
 	// Ensure retry defaults are set (these may not be set if Validate() wasn't called)
 	if conf.RetryBaseDelay == 0 {
 		conf.RetryBaseDelay = baseRetryDelay
