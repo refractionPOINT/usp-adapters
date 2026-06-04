@@ -1,61 +1,35 @@
 # Registering a new adapter
 
 After the `myadapter/` package compiles, wire it into the general container so
-`./general myadapter ...` runs it. Three files, plus the root README.
+`./general myadapter ...` runs it. The cleanest way is to **copy how an existing
+adapter is wired** — grep for `threatlocker` (or `gmail`) across these files and
+replicate every hit for your adapter. Four touch points:
 
 ## 1. `containers/conf/all.go`
 
-Add the import (keep the alphabetical-ish grouping with the others):
-
-```go
-import (
-    // ...
-    usp_myadapter "github.com/refractionPOINT/usp-adapters/myadapter"
-    // ...
-)
-```
-
-Add a field to the `GeneralConfigs` struct. The `json`/`yaml` tag is the
-adapter's CLI/config name:
-
-```go
-type GeneralConfigs struct {
-    // ...
-    ThreatLocker usp_threatlocker.ThreatLockerConfig `json:"threatlocker" yaml:"threatlocker"`
-    MyAdapter    usp_myadapter.MyAdapterConfig       `json:"myadapter" yaml:"myadapter"`
-    // ...
-}
-```
+- Add the package import alongside the others (`usp_myadapter "…/myadapter"` —
+  match the alias style the file already uses).
+- Add a field to the `GeneralConfigs` struct. The `json`/`yaml` tag **is** the
+  adapter's CLI/config name. Find the `ThreatLocker` field there and add an
+  analogous `MyAdapter usp_myadapter.MyAdapterConfig` line.
 
 ## 2. `containers/general/tool.go`
 
-Add the import:
+- Add the package import.
+- In `runAdapter` (the `else if method == …` chain that ends in
+  `unknown adapter_type`), copy the `else if method == "threatlocker"` branch
+  and adapt it: `applyLogging`, set `Architecture = "usp_adapter"`, set
+  `configToShow`, then call your `usp_myadapter.NewMyAdapter(ctx, …)`.
 
-```go
-"github.com/refractionPOINT/usp-adapters/myadapter"
-```
-
-Add a dispatch branch in `runAdapter` (the `else if` chain ending in `unknown
-adapter_type`). Match the existing branches exactly:
-
-```go
-} else if method == "myadapter" {
-    configs.MyAdapter.ClientOptions = applyLogging(configs.MyAdapter.ClientOptions)
-    configs.MyAdapter.ClientOptions.Architecture = "usp_adapter"
-    configToShow = configs.MyAdapter
-    client, chRunning, err = usp_myadapter.NewMyAdapter(ctx, configs.MyAdapter)
-}
-```
-
-(Use whatever package alias the import resolves to — `threatlocker`'s package is
-`usp_threatlocker`, so its branch calls `usp_threatlocker.NewThreatLockerAdapter`.
-Name your package `usp_myadapter` and the call is `usp_myadapter.NewMyAdapter`.)
+Read the real `threatlocker` branch in `tool.go` and the real `ThreatLocker`
+field in `all.go` rather than working from memory — that way you match the
+current conventions exactly (package alias, field ordering, tags).
 
 ## 3. Root `README.md`
 
 Add a short section under "## Examples" describing the adapter and a run line,
-mirroring the ThreatLocker/Gmail entries. Link to `myadapter/README.md` for the
-full config reference.
+mirroring the existing **ThreatLocker** / **Gmail** entries. Link to
+`myadapter/README.md` for the full config reference.
 
 ## 4. Build to verify
 
@@ -64,5 +38,5 @@ go fmt ./myadapter/...
 go build ./containers/general
 ```
 
-The config field shows up automatically in `./general` (no args) usage output
-because `printUsage` reflects over `Configuration` / `GeneralConfigs`.
+The config field shows up automatically in `./general` (no args) usage output —
+`printUsage` reflects over `Configuration` / `GeneralConfigs`.

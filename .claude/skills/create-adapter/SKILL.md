@@ -89,8 +89,9 @@ Mirror the `threatlocker` file layout:
 - **`mock_test.go`** — the end-to-end test against an in-memory mock API.
 - **`README.md`** — adapter documentation (see Phase 6).
 
-Key conventions to copy exactly (see `references/patterns.md` for annotated
-snippets):
+Key conventions to copy exactly — `references/patterns.md` is a reading guide
+that points you at the specific files and symbols in `threatlocker/` (and the
+right alternative adapter when your API differs) to study and imitate:
 
 1. **Config**: embed `uspclient.ClientOptions` as `client_options`. Use
    `json`+`yaml` tags on every field. Implement `Validate()` that calls
