@@ -141,36 +141,45 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 
 	lastCursor := ""
 	for !a.doStop.WaitFor(30 * time.Second) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
-		items, newCursor := a.makeOneRequest(url, lastCursor)
-		lastCursor = newCursor
-		if items == nil {
-			continue
-		}
+		// The 1Password Events API uses cursor pagination and returns
+		// a has_more flag indicating that more data is immediately
+		// available to fetch. Keep draining until has_more is false (or
+		// we are asked to stop) before going idle again, otherwise we
+		// only fetch one page (up to `limit` events) per polling tick
+		// and fall permanently behind on busy accounts.
+		for {
+			// The makeOneRequest function handles error
+			// handling and fatal error handling.
+			items, newCursor, hasMore := a.makeOneRequest(url, lastCursor)
+			lastCursor = newCursor
 
-		for _, item := range items {
-			msg := &protocol.DataMessage{
-				JsonPayload: item,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+			for _, item := range items {
+				msg := &protocol.DataMessage{
+					JsonPayload: item,
+					TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+				}
+				if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+					if err == uspclient.ErrorBufferFull {
+						a.conf.ClientOptions.OnWarning("stream falling behind")
+						err = a.uspClient.Ship(msg, 1*time.Hour)
+					}
+					if err == nil {
+						continue
+					}
+					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					a.doStop.Set()
+					return
+				}
 			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
-				}
-				if err == nil {
-					continue
-				}
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				a.doStop.Set()
-				return
+
+			if !hasMore || a.doStop.IsSet() {
+				break
 			}
 		}
 	}
 }
 
-func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]utils.Dict, string) {
+func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]utils.Dict, string, bool) {
 	// Prepare the request body.
 	reqData := opRequest{}
 	if lastCursor != "" {
@@ -183,14 +192,14 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	b, err := json.Marshal(reqData)
 	if err != nil {
 		a.doStop.Set()
-		return nil, ""
+		return nil, "", false
 	}
 
 	// Prepare the request.
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s%s", a.endpoint, url), bytes.NewBuffer(b))
 	if err != nil {
 		a.doStop.Set()
-		return nil, ""
+		return nil, "", false
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.conf.Token))
@@ -199,7 +208,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-		return nil, lastCursor
+		return nil, lastCursor, false
 	}
 	defer resp.Body.Close()
 
@@ -207,7 +216,7 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	if resp.StatusCode != http.StatusOK {
 		body, _ := ioutil.ReadAll(resp.Body)
 		a.conf.ClientOptions.OnWarning(fmt.Sprintf("1password api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(b), string(body)))
-		return nil, lastCursor
+		return nil, lastCursor, false
 	}
 
 	// Parse the response.
@@ -215,12 +224,13 @@ func (a *OnePasswordAdapter) makeOneRequest(url string, lastCursor string) ([]ut
 	jsonDecoder := json.NewDecoder(resp.Body)
 	if err := jsonDecoder.Decode(&respData); err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("1password api invalid json: %v", err))
-		return nil, lastCursor
+		return nil, lastCursor, false
 	}
 
-	// Report if a cursor was returned
-	// as well as the items.
+	// Report if a cursor was returned as well as the items, and whether
+	// the API indicates more data is immediately available to fetch.
 	lastCursor = respData.FindOneString("cursor")
 	items, _ := respData.GetListOfDict("items")
-	return items, lastCursor
+	hasMore, _ := respData.GetBool("has_more")
+	return items, lastCursor, hasMore
 }
