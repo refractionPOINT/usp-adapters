@@ -150,6 +150,7 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 		for {
 			// The makeOneRequest function handles error
 			// handling and fatal error handling.
+			prevCursor := lastCursor
 			items, newCursor, hasMore := a.makeOneRequest(url, lastCursor)
 			lastCursor = newCursor
 
@@ -173,6 +174,14 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 			}
 
 			if !hasMore || a.doStop.IsSet() {
+				break
+			}
+			// Defensive: only keep draining if the cursor actually
+			// advanced. A has_more response that repeats the previous
+			// cursor would spin tightly, and an empty cursor would make
+			// the next request reset the stream back to "now" (losing
+			// our position). In either case, stop and resume next tick.
+			if newCursor == "" || newCursor == prevCursor {
 				break
 			}
 		}
