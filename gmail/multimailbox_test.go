@@ -66,6 +66,12 @@ func (m *mockGmail) setDirectoryUsers(u ...discoveredUser) {
 	m.mu.Unlock()
 }
 
+func (m *mockGmail) rejectSubject(sub string) {
+	m.mu.Lock()
+	m.rejectSubjects[sub] = true
+	m.mu.Unlock()
+}
+
 func activeUser(email string) discoveredUser { return discoveredUser{PrimaryEmail: email} }
 func suspendedUser(email string) discoveredUser {
 	return discoveredUser{PrimaryEmail: email, Suspended: true}
@@ -534,4 +540,194 @@ func TestValidateMultiMailbox(t *testing.T) {
 		require.NoError(t, c.Validate())
 		assert.Equal(t, defaultCustomer, c.Customer)
 	})
+}
+
+// TestPerMailboxCredentialIsolation verifies that one mailbox whose impersonation
+// is rejected stops only its own collector, while sibling mailboxes keep
+// collecting and the adapter as a whole stays up.
+func TestPerMailboxCredentialIsolation(t *testing.T) {
+	saJSON, pub := generateServiceAccount(t)
+
+	mock := newMockGmail()
+	mock.saPublicKey = pub
+	mock.rejectSubject("bad@corp.test") // this mailbox's delegation is rejected
+	mock.addMessage(realisticMessage("m1", "t1", recentMs(10*time.Minute), "x@partner.test", "Hello"))
+
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	conf := saConfig(t, server.URL, saJSON)
+	conf.Subjects = []string{"good@corp.test", "bad@corp.test"}
+
+	hub := newSinkHub()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	adapter, chStopped, err := newGmailAdapter(ctx, conf, hub.factory())
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// The healthy mailbox collects; the rejected one ships nothing.
+	require.Eventually(t, func() bool { return hub.countByType("good@corp.test", eventTypeMessage) == 1 },
+		5*time.Second, 20*time.Millisecond, "the healthy mailbox must keep collecting")
+	assert.Equal(t, 0, hub.countByType("bad@corp.test", eventTypeMessage), "the rejected mailbox must ship nothing")
+
+	// The rejected mailbox stopping must not bring the adapter down.
+	select {
+	case <-chStopped:
+		t.Fatal("one mailbox's rejected credentials must not stop the whole adapter")
+	case <-time.After(300 * time.Millisecond):
+	}
+	assert.True(t, adapter.activeMailboxes()["good@corp.test"], "the healthy mailbox must still be active")
+}
+
+// TestMultiMailboxBECCapability verifies a BEC (configuration-state) capability is
+// collected independently for each mailbox, to its own sensor, even when a single
+// deduper is shared across mailboxes (keys are mailbox-namespaced).
+func TestMultiMailboxBECCapability(t *testing.T) {
+	saJSON, pub := generateServiceAccount(t)
+
+	mock := newMockGmail()
+	mock.saPublicKey = pub
+	mock.setFilters(utils.Dict{"id": "f1", "action": utils.Dict{"forward": "attacker@evil.test"}})
+
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	conf := saConfig(t, server.URL, saJSON)
+	conf.Subjects = []string{"a@corp.test", "b@corp.test"}
+	conf.CollectMessages = false
+	conf.CollectFilters = true
+	conf.SettingsPollInterval = 25 * time.Millisecond
+	dd, err := utils.NewLocalDeduper(time.Hour, 24*time.Hour)
+	require.NoError(t, err)
+	defer dd.Close()
+	conf.Deduper = dd // shared across mailboxes on purpose
+
+	hub := newSinkHub()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	adapter, _, err := newGmailAdapter(ctx, conf, hub.factory())
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool {
+		return hub.countByType("a@corp.test", eventTypeFilter) == 1 &&
+			hub.countByType("b@corp.test", eventTypeFilter) == 1
+	}, 5*time.Second, 20*time.Millisecond, "each mailbox must ship its filter to its own sensor")
+	require.Never(t, func() bool {
+		return hub.countByType("a@corp.test", eventTypeFilter) > 1 ||
+			hub.countByType("b@corp.test", eventTypeFilter) > 1
+	}, 300*time.Millisecond, 30*time.Millisecond, "an unchanged filter must not re-ship per mailbox")
+}
+
+// TestDiscoveryIncludeSuspended verifies that include_suspended collects suspended
+// mailboxes that are otherwise skipped.
+func TestDiscoveryIncludeSuspended(t *testing.T) {
+	saJSON, pub := generateServiceAccount(t)
+
+	mock := newMockGmail()
+	mock.saPublicKey = pub
+	mock.addMessage(realisticMessage("m1", "t1", recentMs(10*time.Minute), "x@partner.test", "Hello"))
+	mock.setDirectoryUsers(activeUser("ann@corp.test"), suspendedUser("susie@corp.test"))
+
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	conf := saConfig(t, server.URL, saJSON)
+	conf.DiscoverMailboxes = true
+	conf.AdminSubject = "admin@corp.test"
+	conf.IncludeSuspended = true
+
+	hub := newSinkHub()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	adapter, _, err := newGmailAdapter(ctx, conf, hub.factory())
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool {
+		active := adapter.activeMailboxes()
+		return active["ann@corp.test"] && active["susie@corp.test"]
+	}, 5*time.Second, 20*time.Millisecond, "include_suspended must collect the suspended mailbox too")
+}
+
+// TestDiscoveryEmptyResultKeepsCollectors verifies that an empty discovery result
+// while mailboxes are already being collected does NOT tear them down (guard
+// against a misconfigured query or transient API state).
+func TestDiscoveryEmptyResultKeepsCollectors(t *testing.T) {
+	saJSON, pub := generateServiceAccount(t)
+
+	mock := newMockGmail()
+	mock.saPublicKey = pub
+	mock.addMessage(realisticMessage("m1", "t1", recentMs(10*time.Minute), "x@partner.test", "Hello"))
+	mock.setDirectoryUsers(activeUser("ann@corp.test"), activeUser("ben@corp.test"))
+
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	conf := saConfig(t, server.URL, saJSON)
+	conf.DiscoverMailboxes = true
+	conf.AdminSubject = "admin@corp.test"
+
+	hub := newSinkHub()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	adapter, _, err := newGmailAdapter(ctx, conf, hub.factory())
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool {
+		active := adapter.activeMailboxes()
+		return active["ann@corp.test"] && active["ben@corp.test"]
+	}, 5*time.Second, 20*time.Millisecond, "both mailboxes should be discovered")
+
+	// Discovery now returns nothing. The existing collectors must be kept.
+	mock.setDirectoryUsers()
+	require.Never(t, func() bool {
+		active := adapter.activeMailboxes()
+		return !active["ann@corp.test"] || !active["ben@corp.test"]
+	}, 600*time.Millisecond, 40*time.Millisecond, "an empty discovery result must not tear down existing collectors")
+}
+
+// TestMailboxAddressCanonicalization verifies that mailbox addresses are
+// case-folded, so differing casings of the same mailbox collapse to one
+// collector / one sensor rather than producing duplicates.
+func TestMailboxAddressCanonicalization(t *testing.T) {
+	saJSON, pub := generateServiceAccount(t)
+
+	mock := newMockGmail()
+	mock.saPublicKey = pub
+	mock.addMessage(realisticMessage("m1", "t1", recentMs(10*time.Minute), "x@partner.test", "Hello"))
+	// Static config names the mailbox in one casing; discovery returns another.
+	mock.setDirectoryUsers(activeUser("alice@corp.test"))
+
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	conf := saConfig(t, server.URL, saJSON)
+	conf.Subjects = []string{"Alice@Corp.test", "ALICE@corp.test"} // same mailbox, two casings
+	conf.DiscoverMailboxes = true
+	conf.AdminSubject = "admin@corp.test"
+
+	hub := newSinkHub()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	adapter, _, err := newGmailAdapter(ctx, conf, hub.factory())
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return adapter.activeMailboxes()["alice@corp.test"] },
+		5*time.Second, 20*time.Millisecond, "the canonical (lower-cased) mailbox should collect")
+
+	// There must be exactly one collector for this mailbox, and none under any
+	// other casing, even though discovery also returns it.
+	require.Never(t, func() bool {
+		active := adapter.activeMailboxes()
+		return len(active) != 1 || active["Alice@Corp.test"] || active["ALICE@corp.test"]
+	}, 500*time.Millisecond, 40*time.Millisecond, "differing casings must collapse to a single collector")
 }

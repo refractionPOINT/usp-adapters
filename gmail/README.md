@@ -143,7 +143,11 @@ Enumerate the Workspace domain's mailboxes via the Admin SDK
 [Directory API `users.list`](https://developers.google.com/admin-sdk/directory/reference/rest/v1/users/list),
 re-run on `discovery_interval` so newly-provisioned mailboxes are picked up and
 deprovisioned ones are dropped automatically (their collector is stopped and torn
-down). Suspended/archived accounts are skipped unless `include_suspended` is set.
+down). Suspended accounts are skipped unless `include_suspended` is set. If a
+discovery pass comes back empty or truncated while mailboxes are already being
+collected, the current set is **kept** (and a warning logged) rather than torn
+down — a safety net against a misconfigured `discovery_query` or a transient API
+blip.
 
 Discovery has **two extra requirements** beyond the Gmail collection itself:
 
@@ -161,7 +165,7 @@ gmail:
   admin_subject: admin@yourdomain.com
   # customer: my_customer        # default; or restrict to a single domain:
   # domain: yourdomain.com
-  # discovery_query: "orgUnitPath=/Finance"   # optional Directory user filter
+  # discovery_query: "orgUnitPath='/Finance'"   # optional Directory user filter (note the quoting)
   discovery_interval: 1h
 ```
 
@@ -180,7 +184,7 @@ or the explicitly-listed mailboxes.
 | `domain` | — | Restrict discovery to one domain of a multi-domain Workspace |
 | `discovery_query` | — | Optional Directory API user search filter |
 | `discovery_interval` | `1h` | How often discovery re-enumerates |
-| `include_suspended` | `false` | Also collect suspended/archived mailboxes |
+| `include_suspended` | `false` | Also collect suspended mailboxes |
 | `max_concurrent_polls` | `10` | Cap on how many mailboxes poll the Gmail API at once (protects the per-project quota) |
 
 ## Configuration

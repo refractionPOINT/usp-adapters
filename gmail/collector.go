@@ -44,6 +44,13 @@ type mailboxCollector struct {
 	ts        *tokenSource
 	uspClient uspSink
 
+	// apiCtx scopes every Gmail API request for this mailbox; apiCancel aborts an
+	// in-flight request the instant the collector is asked to stop, so shutdown
+	// and deprovisioning do not wait out the HTTP timeout. It descends from the
+	// adapter context, not the sink context, so cleanup can still drain the sink.
+	apiCtx    context.Context
+	apiCancel context.CancelFunc
+
 	deduper     utils.Deduper
 	ownsDeduper bool
 
@@ -70,11 +77,16 @@ type mailboxCollector struct {
 	cleanOnce sync.Once
 }
 
-// requestStop signals this collector to wind down. It is idempotent.
+// requestStop signals this collector to wind down. It trips the stop Event and
+// stopCh (waking sleeps and selects) and cancels any in-flight API request. It is
+// idempotent.
 func (c *mailboxCollector) requestStop() {
 	c.stopOnce.Do(func() {
 		close(c.stopCh)
 		c.stop.Set()
+		if c.apiCancel != nil {
+			c.apiCancel()
+		}
 	})
 }
 
@@ -98,15 +110,12 @@ func (c *mailboxCollector) run() {
 	}
 }
 
-// runCycle runs one tick of every enabled capability for this mailbox, while
-// holding one of the adapter's bounded poll slots so concurrent API usage across
-// all mailboxes stays capped. A capability failing does not abort the others.
+// runCycle runs one tick of every enabled capability for this mailbox. Each
+// individual API request acquires one of the adapter's bounded poll slots (see
+// withRetry), so concurrent API usage across all mailboxes stays capped without a
+// slow mailbox holding a slot across its whole cycle. A capability failing does
+// not abort the others.
 func (c *mailboxCollector) runCycle() {
-	if !c.acquire() {
-		return
-	}
-	defer c.release()
-
 	if c.a.conf.CollectMessages {
 		c.pollMessages()
 	}
@@ -223,7 +232,7 @@ func (c *mailboxCollector) pollMessages() {
 // collector is stopping).
 func (c *mailboxCollector) list(query, pageToken string) ([]byte, bool) {
 	raw, err := c.withRetry("messages.list", func() ([]byte, error) {
-		return c.client.ListMessages(c.a.ctx, listMessagesParams{
+		return c.client.ListMessages(c.apiCtx, listMessagesParams{
 			query:            query,
 			pageToken:        pageToken,
 			maxResults:       c.a.conf.MaxResults,
@@ -252,7 +261,7 @@ const (
 // benign and skipped; auth/permission failures abort and stop this collector.
 func (c *mailboxCollector) fetch(id string) (utils.Dict, fetchResult) {
 	raw, err := c.withRetry("messages.get", func() ([]byte, error) {
-		return c.client.GetMessage(c.a.ctx, id, c.a.conf.Format, c.a.conf.MetadataHeaders)
+		return c.client.GetMessage(c.apiCtx, id, c.a.conf.Format, c.a.conf.MetadataHeaders)
 	})
 	if err != nil {
 		var httpErr *HTTPError
@@ -272,9 +281,12 @@ func (c *mailboxCollector) fetch(id string) (utils.Dict, fetchResult) {
 	return utils.Dict(msg), fetchOK
 }
 
-// withRetry runs fn, retrying transient errors with exponential backoff. It
-// returns the final result, or the final (non-transient or attempts-exhausted)
-// error for the caller to classify. It does not set the stop event.
+// withRetry runs fn, retrying transient errors with exponential backoff. Each
+// attempt holds one of the adapter's poll slots only for the duration of the call
+// (not across the backoff sleep), so the concurrency cap bounds in-flight API
+// requests without a backing-off mailbox starving the others. It returns the
+// final result, or the final (non-transient or attempts-exhausted) error for the
+// caller to classify. It does not set the stop event.
 func (c *mailboxCollector) withRetry(label string, fn func() ([]byte, error)) ([]byte, error) {
 	var raw []byte
 	var err error
@@ -283,7 +295,12 @@ func (c *mailboxCollector) withRetry(label string, fn func() ([]byte, error)) ([
 			return nil, context.Canceled
 		}
 
+		if !c.acquire() {
+			return nil, context.Canceled
+		}
 		raw, err = fn()
+		c.release()
+
 		if err == nil {
 			return raw, nil
 		}
@@ -349,16 +366,26 @@ func (c *mailboxCollector) shipEvent(evtType string, payload utils.Dict, tsMs ui
 		EventType:   evtType,
 		TimestampMs: tsMs,
 	}
-	if err := c.uspClient.Ship(dataMsg, shipTimeout); err != nil {
-		if err == uspclient.ErrorBufferFull {
-			c.a.conf.ClientOptions.OnWarning(c.tag + ": stream falling behind")
-			err = c.uspClient.Ship(dataMsg, 1*time.Hour)
+	err := c.uspClient.Ship(dataMsg, shipTimeout)
+	if err == uspclient.ErrorBufferFull {
+		// The stream is backed up. Keep trying in bounded steps, rechecking the
+		// stop signal between attempts so a stalled sensor cannot block shutdown
+		// or deprovisioning indefinitely.
+		c.a.conf.ClientOptions.OnWarning(c.tag + ": stream falling behind")
+		for {
+			if c.stop.IsSet() {
+				return false
+			}
+			err = c.uspClient.Ship(dataMsg, shipTimeout)
+			if err != uspclient.ErrorBufferFull {
+				break
+			}
 		}
-		if err != nil {
-			c.a.conf.ClientOptions.OnError(fmt.Errorf("%s: Ship(): %v", c.tag, err))
-			c.requestStop()
-			return false
-		}
+	}
+	if err != nil {
+		c.a.conf.ClientOptions.OnError(fmt.Errorf("%s: Ship(): %v", c.tag, err))
+		c.requestStop()
+		return false
 	}
 	return true
 }

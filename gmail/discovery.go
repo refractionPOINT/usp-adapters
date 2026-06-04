@@ -35,10 +35,13 @@ const directoryAPIBaseURL = "https://admin.googleapis.com"
 const directoryMaxResults = 500
 
 // discoveredUser is the subset of a Directory API user resource we use.
+//
+// Only `suspended` is consulted for filtering: it is returned under the default
+// "basic" projection. (`archived` is not part of the basic projection, so it
+// would always read false here and cannot be relied on.)
 type discoveredUser struct {
 	PrimaryEmail string `json:"primaryEmail"`
 	Suspended    bool   `json:"suspended"`
-	Archived     bool   `json:"archived"`
 }
 
 // directoryUsersResponse mirrors the users.list response envelope.
@@ -147,39 +150,42 @@ func (d *directoryClient) getOnce(ctx context.Context, reqURL string, forceToken
 	return respBody, nil
 }
 
-// enumerate walks every page of the domain's users and returns the mailbox
-// addresses to collect, honoring the suspended/archived filters.
-func (d *directoryClient) enumerate(ctx context.Context, conf GmailConfig) ([]string, error) {
-	var out []string
+// enumerate walks every page of the domain's users and returns the canonicalized
+// mailbox addresses to collect, skipping suspended accounts (unless
+// IncludeSuspended). `complete` is false if the page cap was hit before the
+// listing ended, i.e. the result is a truncated view of the domain -- callers
+// must not treat a truncated result as authoritative for removals.
+func (d *directoryClient) enumerate(ctx context.Context, conf GmailConfig) (emails []string, complete bool, err error) {
 	seen := map[string]bool{}
 	pageToken := ""
 	for page := 0; page < maxPagesPerPoll; page++ {
-		resp, err := d.listUsers(ctx, listUsersParams{
+		resp, lerr := d.listUsers(ctx, listUsersParams{
 			customer:  conf.Customer,
 			domain:    conf.Domain,
 			query:     conf.DiscoveryQuery,
 			pageToken: pageToken,
 		})
-		if err != nil {
-			return nil, err
+		if lerr != nil {
+			return nil, false, lerr
 		}
 		for _, u := range resp.Users {
-			email := strings.TrimSpace(u.PrimaryEmail)
+			if u.Suspended && !conf.IncludeSuspended {
+				continue
+			}
+			email := canonicalMailbox(u.PrimaryEmail)
 			if email == "" || seen[email] {
 				continue
 			}
-			if (u.Suspended || u.Archived) && !conf.IncludeSuspended {
-				continue
-			}
 			seen[email] = true
-			out = append(out, email)
+			emails = append(emails, email)
 		}
 		if resp.NextPageToken == "" {
-			break
+			return emails, true, nil
 		}
 		pageToken = resp.NextPageToken
 	}
-	return out, nil
+	// Loop exited on the page cap, not an empty nextPageToken: the view is partial.
+	return emails, false, nil
 }
 
 // runDiscovery enumerates the domain immediately, then re-enumerates every
@@ -202,7 +208,7 @@ func (a *GmailAdapter) runDiscovery() {
 // discoverOnce performs one enumeration + reconciliation pass. Errors are logged
 // and the pass is abandoned; the static mailboxes keep collecting regardless.
 func (a *GmailAdapter) discoverOnce() {
-	emails, err := a.directory.enumerate(a.ctx, a.conf)
+	emails, complete, err := a.directory.enumerate(a.apiRootCtx, a.conf)
 	if err != nil {
 		a.conf.ClientOptions.OnWarning(fmt.Sprintf("gmail: mailbox discovery failed, keeping the current set: %v", err))
 		return
@@ -235,20 +241,34 @@ func (a *GmailAdapter) discoverOnce() {
 		nAdded++
 	}
 
-	// Stop collectors for mailboxes that are no longer present (never the static
+	// Determine which active mailboxes are no longer present (never the static
 	// ones, which are always in `desired`).
-	nRemoved := 0
+	var stale []string
 	for addr := range a.activeMailboxes() {
-		if desired[addr] {
-			continue
+		if !desired[addr] {
+			stale = append(stale, addr)
 		}
+	}
+
+	// Guard against mass teardown on a suspicious enumeration. A truncated view
+	// (page cap hit) is not authoritative, and an empty result while we are
+	// already collecting discovered mailboxes is far more likely a misconfigured
+	// query or a transient API state than the whole domain vanishing. In those
+	// cases, keep the current set and try again next interval.
+	if len(stale) > 0 && (!complete || len(emails) == 0) {
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+			"gmail: discovery returned a %s result (%d mailboxes); keeping %d existing collector(s) rather than removing them",
+			map[bool]string{true: "truncated", false: "complete"}[!complete], len(emails), len(stale)))
+		stale = nil
+	}
+
+	for _, addr := range stale {
 		a.removeCollector(addr)
-		nRemoved++
 	}
 
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf(
 		"gmail: discovery pass complete (discovered=%d added=%d removed=%d active=%d)",
-		len(emails), nAdded, nRemoved, len(a.activeMailboxes())))
+		len(emails), nAdded, len(stale), len(a.activeMailboxes())))
 }
 
 // resolveDirectoryBaseURL computes the Directory API root from the config.

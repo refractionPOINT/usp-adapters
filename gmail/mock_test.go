@@ -101,6 +101,11 @@ type mockGmail struct {
 	// every expected mailbox was delegated.
 	impersonatedSubjects map[string]int
 
+	// rejectSubjects makes the token endpoint answer 400 invalid_grant for a
+	// service-account assertion impersonating that subject, simulating a mailbox
+	// whose delegation/credentials are rejected while others succeed.
+	rejectSubjects map[string]bool
+
 	tokenRequests int
 	listRequests  int
 	getRequests   int
@@ -160,6 +165,7 @@ func newMockGmail() *mockGmail {
 		statusOverride:       map[string]int{},
 		capabilityRequests:   map[string]int{},
 		impersonatedSubjects: map[string]int{},
+		rejectSubjects:       map[string]bool{},
 	}
 }
 
@@ -238,10 +244,16 @@ func (m *mockGmail) tokenHandler(t *testing.T) http.HandlerFunc {
 				writeJSON(w, http.StatusBadRequest, `{"error":"invalid_grant","error_description":"assertion failed verification"}`)
 				return
 			}
-			if sub, _ := claims["sub"].(string); sub != "" {
-				m.mu.Lock()
+			sub, _ := claims["sub"].(string)
+			m.mu.Lock()
+			if sub != "" {
 				m.impersonatedSubjects[sub]++
-				m.mu.Unlock()
+			}
+			rejected := m.rejectSubjects[sub]
+			m.mu.Unlock()
+			if rejected {
+				writeJSON(w, http.StatusBadRequest, `{"error":"invalid_grant","error_description":"subject not authorized"}`)
+				return
 			}
 		default:
 			writeJSON(w, http.StatusBadRequest, `{"error":"unsupported_grant_type"}`)

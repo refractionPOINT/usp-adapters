@@ -161,8 +161,11 @@ type GmailConfig struct {
 	// Domain restricts discovery to a single domain of a multi-domain Workspace.
 	Domain string `json:"domain" yaml:"domain"`
 
-	// DiscoveryQuery is an optional Directory API user search filter (e.g.
-	// "orgUnitPath=/Sales"); see the Directory API users.list "query" parameter.
+	// DiscoveryQuery is an optional Directory API user search filter, passed
+	// through verbatim as the users.list "query" parameter (e.g.
+	// "orgUnitPath='/Finance'" or "isSuspended=false"). See
+	// https://developers.google.com/admin-sdk/directory/v1/guides/search-users
+	// for the exact syntax (note that values like an org-unit path are quoted).
 	DiscoveryQuery string `json:"discovery_query" yaml:"discovery_query"`
 
 	// DiscoveryInterval is how often discovery re-enumerates. Default 1 hour.
@@ -484,6 +487,12 @@ type GmailAdapter struct {
 	newSink   sinkFactory
 	pollSlots chan struct{} // bounded poll-concurrency across all mailboxes
 
+	// apiRootCtx parents every Gmail and Directory API request (but not the
+	// sinks, which use ctx directly so they can still drain after apiCancel).
+	// Close cancels it to abort in-flight requests promptly.
+	apiRootCtx context.Context
+	apiCancel  context.CancelFunc
+
 	directory *directoryClient // nil unless discovery is enabled
 
 	mu          sync.Mutex
@@ -510,6 +519,7 @@ func newGmailAdapter(ctx context.Context, conf GmailConfig, newSink sinkFactory)
 		return nil, nil, err
 	}
 
+	apiRootCtx, apiCancel := context.WithCancel(ctx)
 	a := &GmailAdapter{
 		conf:       conf,
 		ctx:        ctx,
@@ -520,6 +530,8 @@ func newGmailAdapter(ctx context.Context, conf GmailConfig, newSink sinkFactory)
 		apiHTTP:    newAPIHTTPClient(),
 		newSink:    newSink,
 		pollSlots:  make(chan struct{}, conf.MaxConcurrentPolls),
+		apiRootCtx: apiRootCtx,
+		apiCancel:  apiCancel,
 		collectors: map[string]*mailboxCollector{},
 		doStop:     utils.NewEvent(),
 		chStopped:  make(chan struct{}),
@@ -528,6 +540,9 @@ func newGmailAdapter(ctx context.Context, conf GmailConfig, newSink sinkFactory)
 	if a.usesSA {
 		key, rsaKey, err := a.parseServiceAccount()
 		if err != nil {
+			a.apiCancel()
+			a.apiHTTP.CloseIdleConnections()
+			a.authHTTP.CloseIdleConnections()
 			return nil, nil, err
 		}
 		a.saKey, a.saRSA = key, rsaKey
@@ -548,6 +563,7 @@ func newGmailAdapter(ctx context.Context, conf GmailConfig, newSink sinkFactory)
 		}
 		if err := a.startCollector(t, delay); err != nil {
 			a.shutdownStartedCollectors()
+			a.apiCancel()
 			a.apiHTTP.CloseIdleConnections()
 			a.authHTTP.CloseIdleConnections()
 			return nil, nil, err
@@ -560,6 +576,7 @@ func newGmailAdapter(ctx context.Context, conf GmailConfig, newSink sinkFactory)
 		dir, err := a.newDirectoryClient()
 		if err != nil {
 			a.shutdownStartedCollectors()
+			a.apiCancel()
 			a.apiHTTP.CloseIdleConnections()
 			a.authHTTP.CloseIdleConnections()
 			return nil, nil, err
@@ -580,12 +597,13 @@ func newGmailAdapter(ctx context.Context, conf GmailConfig, newSink sinkFactory)
 // staticTargets enumerates the mailboxes known at startup (before discovery).
 func (a *GmailAdapter) staticTargets() []mailboxTarget {
 	if !a.usesSA {
-		return []mailboxTarget{{address: a.conf.UserID, subject: "", userID: a.conf.UserID}}
+		addr := canonicalMailbox(a.conf.UserID)
+		return []mailboxTarget{{address: addr, subject: "", userID: a.conf.UserID}}
 	}
 	seen := map[string]bool{}
 	var out []mailboxTarget
 	add := func(s string) {
-		s = strings.TrimSpace(s)
+		s = canonicalMailbox(s)
 		if s == "" || seen[s] {
 			return
 		}
@@ -597,6 +615,13 @@ func (a *GmailAdapter) staticTargets() []mailboxTarget {
 		add(s)
 	}
 	return out
+}
+
+// canonicalMailbox normalizes a mailbox address to a stable key. Workspace
+// addresses are case-insensitive, so two casings of the same mailbox must map to
+// one collector / one sensor / one dedupe namespace.
+func canonicalMailbox(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 // parseServiceAccount loads and parses the configured service-account key.
@@ -689,6 +714,12 @@ func (a *GmailAdapter) startCollector(t mailboxTarget, startDelay time.Duration)
 		since = now.Add(-a.conf.InitialLookback)
 	}
 
+	// The API context descends from the adapter's apiRootCtx so both this
+	// collector's requestStop and the adapter's Close can abort an in-flight Gmail
+	// request; the sink, by contrast, was created with the raw adapter context so
+	// cleanup can still drain it after the request context is cancelled.
+	apiCtx, apiCancel := context.WithCancel(a.apiRootCtx)
+
 	c := &mailboxCollector{
 		a:           a,
 		mailbox:     t.address,
@@ -696,6 +727,8 @@ func (a *GmailAdapter) startCollector(t mailboxTarget, startDelay time.Duration)
 		client:      client,
 		ts:          ts,
 		uspClient:   sink,
+		apiCtx:      apiCtx,
+		apiCancel:   apiCancel,
 		deduper:     deduper,
 		ownsDeduper: ownsDeduper,
 		since:       since,
@@ -758,8 +791,8 @@ func (a *GmailAdapter) shutdownStartedCollectors() {
 	}
 	for _, c := range cs {
 		<-c.stopped
-		_ = c.cleanup()
 	}
+	cleanupCollectors(cs)
 }
 
 // Close stops the adapter and all mailbox collectors. It is idempotent.
@@ -778,23 +811,49 @@ func (a *GmailAdapter) Close() error {
 		for _, c := range cs {
 			c.requestStop()
 		}
+		a.apiCancel()      // abort any in-flight Gmail/Directory request (e.g. a discovery enumeration)
 		a.wgSenders.Wait() // all collector loops and the discovery loop have exited
 
-		var firstErr error
-		for _, c := range cs {
-			if err := c.cleanup(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
+		// Drain the sensors concurrently: each Drain can wait up to a minute, and
+		// a large domain may have many mailboxes, so a serial loop could take far
+		// too long to shut down.
+		a.closeErr = cleanupCollectors(cs)
 
 		if a.directory != nil {
 			a.directory.Close()
 		}
 		a.apiHTTP.CloseIdleConnections()
 		a.authHTTP.CloseIdleConnections()
-		a.closeErr = firstErr
 	})
 	return a.closeErr
+}
+
+// cleanupCollectors drains and closes a set of collectors concurrently (bounded
+// fan-out), returning the first error. Each collector's cleanup is idempotent.
+func cleanupCollectors(cs []*mailboxCollector) error {
+	if len(cs) == 0 {
+		return nil
+	}
+	const maxConcurrentDrains = 16
+	sem := make(chan struct{}, maxConcurrentDrains)
+	errs := make([]error, len(cs))
+	var wg sync.WaitGroup
+	for i, c := range cs {
+		wg.Add(1)
+		go func(i int, c *mailboxCollector) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			errs[i] = c.cleanup()
+		}(i, c)
+	}
+	wg.Wait()
+	for _, e := range errs {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // resolveBaseURL computes the Gmail API root from the config.

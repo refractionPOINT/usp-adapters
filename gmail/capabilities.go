@@ -122,7 +122,7 @@ func (c *mailboxCollector) pollSingletonCapability(label, evtType, keyPrefix str
 // transient-retry backoff and the non-fatal capability error handling. ok is
 // false when the capability should be skipped this cycle.
 func (c *mailboxCollector) fetchCapability(label string, fetch func(context.Context) ([]byte, error)) (utils.Dict, bool) {
-	raw, err := c.withRetry(label, func() ([]byte, error) { return fetch(c.a.ctx) })
+	raw, err := c.withRetry(label, func() ([]byte, error) { return fetch(c.apiCtx) })
 	if err != nil {
 		c.handleCapabilityError(label, err)
 		return nil, false
@@ -207,7 +207,7 @@ func (c *mailboxCollector) pollHistory() {
 		}
 
 		raw, err := c.withRetry("history.list", func() ([]byte, error) {
-			return c.client.ListHistory(c.a.ctx, listHistoryParams{
+			return c.client.ListHistory(c.apiCtx, listHistoryParams{
 				startHistoryID: c.lastHistoryID,
 				pageToken:      pageToken,
 				maxResults:     historyMaxResults,
