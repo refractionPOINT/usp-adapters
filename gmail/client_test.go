@@ -16,6 +16,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// staticSink returns a sinkFactory that hands every mailbox the same sink. Used
+// by the single-mailbox tests, which assert against one captureSink.
+func staticSink(s uspSink) sinkFactory {
+	return func(context.Context, uspclient.ClientOptions, string) (uspSink, error) {
+		return s, nil
+	}
+}
+
 // testClientOptions returns ClientOptions wired for a sink (no real LimaCharlie
 // connection) with the logging callbacks pointed at the test log.
 func testClientOptions(t *testing.T) uspclient.ClientOptions {

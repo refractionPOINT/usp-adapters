@@ -1,6 +1,6 @@
 # Gmail Adapter
 
-Collects telemetry from a Gmail mailbox using the
+Collects telemetry from one or many Gmail mailboxes using the
 [Gmail REST API](https://developers.google.com/workspace/gmail/api/reference/rest). Beyond
 incoming-email telemetry, it can collect the mailbox configuration and change
 signals most relevant to **Business Email Compromise (BEC)** — the mail rules,
@@ -9,6 +9,11 @@ to persist, exfiltrate mail, and cover their tracks.
 
 Each signal is an independent, opt-in **capability** that ships its own event
 type. They are all readable with the default `gmail.readonly` scope.
+
+With the service-account flow the adapter can watch **many mailboxes at once** —
+an explicit list, or every mailbox in a Workspace domain via auto-discovery — and
+ships **each mailbox to its own LimaCharlie sensor**. See
+[Multiple mailboxes](#multiple-mailboxes).
 
 ## Capabilities
 
@@ -101,7 +106,82 @@ scope. The adapter signs a JWT assertion impersonating the `subject`.
 |-------|-------------|
 | `service_account_credentials` | The service account JSON key, inline |
 | `service_account_file` | Path to the service account JSON key file (alternative to the inline form) |
-| `subject` | The mailbox owner to impersonate, e.g. `user@yourdomain.com` (required) |
+| `subject` | A single mailbox owner to impersonate, e.g. `user@yourdomain.com` |
+
+Provide the mailbox(es) with `subject` (one), `subjects` (a list), and/or
+`discover_mailboxes` (the whole domain) — see [Multiple mailboxes](#multiple-mailboxes).
+At least one of these is required.
+
+## Multiple mailboxes
+
+The service-account flow can collect more than one mailbox. Each mailbox is
+impersonated independently and **shipped to its own sensor**: when more than one
+mailbox is collected, the sensor seed key is derived as
+`<client_options.sensor_seed_key>/<mailbox-address>` and the sensor hostname is
+set to the mailbox address. (A single explicit `subject` keeps the
+`sensor_seed_key`/hostname you configured, verbatim.)
+
+There are two ways to enumerate mailboxes, and they can be combined (the union is
+collected):
+
+### Static list (`subjects`)
+
+List the mailboxes explicitly. Good for a fixed set of high-value mailboxes.
+
+```yaml
+gmail:
+  service_account_file: /secrets/gmail-collector.json
+  subjects:
+    - ceo@yourdomain.com
+    - cfo@yourdomain.com
+    - ap@yourdomain.com
+```
+
+### Auto-discovery (`discover_mailboxes`)
+
+Enumerate the Workspace domain's mailboxes via the Admin SDK
+[Directory API `users.list`](https://developers.google.com/admin-sdk/directory/reference/rest/v1/users/list),
+re-run on `discovery_interval` so newly-provisioned mailboxes are picked up and
+deprovisioned ones are dropped automatically (their collector is stopped and torn
+down). Suspended/archived accounts are skipped unless `include_suspended` is set.
+
+Discovery has **two extra requirements** beyond the Gmail collection itself:
+
+1. **An admin to impersonate** — `admin_subject` must be a Workspace admin user
+   the service account impersonates for the Directory call (the Gmail collection
+   of each discovered mailbox still impersonates that mailbox).
+2. **An extra delegated scope** — in the Workspace Admin console, the service
+   account's client id must additionally be authorized for
+   `https://www.googleapis.com/auth/admin.directory.user.readonly`.
+
+```yaml
+gmail:
+  service_account_file: /secrets/gmail-collector.json
+  discover_mailboxes: true
+  admin_subject: admin@yourdomain.com
+  # customer: my_customer        # default; or restrict to a single domain:
+  # domain: yourdomain.com
+  # discovery_query: "orgUnitPath=/Finance"   # optional Directory user filter
+  discovery_interval: 1h
+```
+
+If a discovery pass fails (e.g. the directory scope is missing), it is logged and
+the current set of mailboxes keeps collecting — discovery never stops the adapter
+or the explicitly-listed mailboxes.
+
+### Multi-mailbox knobs
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `subjects` | — | Static list of mailboxes to impersonate (service-account flow) |
+| `discover_mailboxes` | `false` | Enumerate the domain's mailboxes via the Directory API |
+| `admin_subject` | — | Admin user to impersonate for the Directory API (required with `discover_mailboxes`) |
+| `customer` | `my_customer` | Directory API customer id (mutually exclusive with `domain`) |
+| `domain` | — | Restrict discovery to one domain of a multi-domain Workspace |
+| `discovery_query` | — | Optional Directory API user search filter |
+| `discovery_interval` | `1h` | How often discovery re-enumerates |
+| `include_suspended` | `false` | Also collect suspended/archived mailboxes |
+| `max_concurrent_polls` | `10` | Cap on how many mailboxes poll the Gmail API at once (protects the per-project quota) |
 
 ## Configuration
 
@@ -123,7 +203,7 @@ scope. The adapter signs a JWT assertion impersonating the `subject`.
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `user_id` | `me` | Mailbox to read (`me` or an email address) |
+| `user_id` | `me` | Mailbox path segment for the refresh-token flow (`me` or an email address). Ignored by the service-account flow, where each mailbox is reached as `me` under its own impersonation |
 | `query` | `in:inbox` | Gmail [search query](https://support.google.com/mail/answer/7190); a time bound is appended automatically — do not add one |
 | `scopes` | `gmail.readonly` | OAuth scopes to request |
 | `format` | `full` | Message detail: `minimal`, `full`, `raw`, or `metadata` |
@@ -232,8 +312,13 @@ BEC flags and leave `collect_messages` unset/false:
 - **429 / 5xx / 403 rate-limit** — treated as transient and retried with
   exponential backoff.
 - **Rejected credentials** (a dead refresh token, a bad service account key, or a
-  delegation/scope problem surfacing as a persistent 401/403) — the adapter stops,
-  since these need operator attention rather than endless retries.
+  delegation/scope problem surfacing as a persistent 401/403) — that **mailbox's**
+  collector stops, since it needs operator attention rather than endless retries.
+  Other mailboxes are unaffected (a rejected impersonation for one subject does
+  not imply the others are dead); if every mailbox fails, the adapter winds down.
+- **A discovery pass failing** (e.g. the admin lacks the directory scope) — logged
+  as a warning; the currently-collecting mailboxes (including the static ones)
+  keep running, and discovery retries on the next interval.
 - **404 on a single message** (deleted between the list and the fetch) — skipped;
   the poll continues.
 - **A BEC capability failing** (e.g. `delegates` on a consumer account, or a

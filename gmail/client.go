@@ -1,39 +1,48 @@
-// Package usp_gmail implements a USP adapter that collects incoming email as
-// telemetry from a Gmail mailbox via the Gmail REST API.
+// Package usp_gmail implements a USP adapter that collects incoming email and
+// Business-Email-Compromise signals from one or many Gmail mailboxes via the
+// Gmail REST API.
 //
-// It polls users.messages.list on a rolling time window (default query
-// "in:inbox"), fetches each newly-seen message with users.messages.get, and
-// ships it to LimaCharlie tagged as a "gmail_message" event. A deduper keyed on
-// the immutable Gmail message id guarantees each message ships exactly once even
-// though overlapping windows re-list recent messages.
+// Each mailbox is collected independently and shipped to its own LimaCharlie
+// sensor (the sensor seed key and hostname are derived from the mailbox address).
+// The adapter polls users.messages.list on a rolling time window (default query
+// "in:inbox"), fetches each newly-seen message with users.messages.get, and ships
+// it tagged as a "gmail_message" event. A deduper keyed on the immutable Gmail
+// message id (namespaced by mailbox) guarantees each message ships exactly once
+// even though overlapping windows re-list recent messages.
 //
-// Two authentication modes are supported:
+// Authentication:
 //
-//   - OAuth 2.0 refresh token: for collecting a single user's mailbox. Provide
-//     client_id, client_secret and refresh_token.
-//   - Service account with domain-wide delegation: for a Google Workspace, where
-//     a service account impersonates a mailbox owner. Provide the service
-//     account JSON (inline or via a file) and the subject to impersonate.
+//   - OAuth 2.0 refresh token: a single mailbox. Provide client_id,
+//     client_secret and refresh_token.
+//   - Service account with domain-wide delegation: one or many Google Workspace
+//     mailboxes. Provide the service account JSON (inline or via a file) and the
+//     mailbox(es) to impersonate, as either:
+//   - subject:  a single mailbox, or
+//   - subjects: an explicit static list of mailboxes, and/or
+//   - discover_mailboxes: enumerate the domain's mailboxes via the Admin SDK
+//     Directory API (requires admin_subject and the
+//     admin.directory.user.readonly scope in the delegation).
 //
 // References:
 //   - messages.list: https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/list
 //   - messages.get:  https://developers.google.com/workspace/gmail/api/reference/rest/v1/users.messages/get
+//   - directory:     https://developers.google.com/admin-sdk/directory/reference/rest/v1/users/list
 //   - search syntax: https://support.google.com/mail/answer/7190
 //   - OAuth/service accounts: https://developers.google.com/identity/protocols/oauth2/service-account
 package usp_gmail
 
 import (
 	"context"
+	"crypto/rsa"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/refractionPOINT/go-uspclient"
+	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
@@ -59,6 +68,22 @@ const (
 	// maxPagesPerPoll caps the number of list pages walked in a single poll, a
 	// safety net against a misbehaving nextPageToken that never empties.
 	maxPagesPerPoll = 10000
+
+	// defaultMaxConcurrentPolls bounds how many mailboxes hit the Gmail API at
+	// the same instant, so a large domain does not blow the per-project quota.
+	defaultMaxConcurrentPolls = 10
+
+	// defaultDiscoveryInterval is how often the Directory API is re-enumerated to
+	// pick up newly-provisioned (or deprovisioned) mailboxes.
+	defaultDiscoveryInterval = 1 * time.Hour
+
+	// defaultCustomer is the Directory API customer alias for "the account that
+	// made the request".
+	defaultCustomer = "my_customer"
+
+	// adminDirectoryUserReadonlyScope is the delegated scope the discovery flow
+	// needs to enumerate the domain's mailboxes.
+	adminDirectoryUserReadonlyScope = "https://www.googleapis.com/auth/admin.directory.user.readonly"
 
 	// Event types. Each capability ships under its own type so detections can be
 	// written against the specific signal.
@@ -106,23 +131,59 @@ type GmailConfig struct {
 	// when ServiceAccountCredentials is empty.
 	ServiceAccountFile string `json:"service_account_file" yaml:"service_account_file"`
 
-	// Subject is the mailbox owner the service account impersonates via
-	// domain-wide delegation (e.g. "user@yourdomain.com"). Required for the
-	// service-account flow.
+	// Subject is a single mailbox owner the service account impersonates via
+	// domain-wide delegation (e.g. "user@yourdomain.com").
 	Subject string `json:"subject" yaml:"subject"`
+
+	// --- Multi-mailbox (service-account flow only) -------------------------
+
+	// Subjects is an explicit static list of mailboxes to collect, each
+	// impersonated independently and shipped to its own sensor. May be combined
+	// with Subject and with DiscoverMailboxes (the union is collected).
+	Subjects []string `json:"subjects" yaml:"subjects"`
+
+	// DiscoverMailboxes enables automatic enumeration of the Workspace domain's
+	// mailboxes via the Admin SDK Directory API, re-run on DiscoveryInterval so
+	// newly-provisioned mailboxes are picked up and deprovisioned ones dropped.
+	// Requires AdminSubject and that domain-wide delegation grants the
+	// admin.directory.user.readonly scope.
+	DiscoverMailboxes bool `json:"discover_mailboxes" yaml:"discover_mailboxes"`
+
+	// AdminSubject is the admin user the service account impersonates for the
+	// Directory API enumeration (the Gmail collection still impersonates each
+	// discovered mailbox). Required when DiscoverMailboxes is set.
+	AdminSubject string `json:"admin_subject" yaml:"admin_subject"`
+
+	// Customer is the Directory API customer id (default "my_customer"). Mutually
+	// exclusive with Domain.
+	Customer string `json:"customer" yaml:"customer"`
+
+	// Domain restricts discovery to a single domain of a multi-domain Workspace.
+	Domain string `json:"domain" yaml:"domain"`
+
+	// DiscoveryQuery is an optional Directory API user search filter (e.g.
+	// "orgUnitPath=/Sales"); see the Directory API users.list "query" parameter.
+	DiscoveryQuery string `json:"discovery_query" yaml:"discovery_query"`
+
+	// DiscoveryInterval is how often discovery re-enumerates. Default 1 hour.
+	DiscoveryInterval time.Duration `json:"discovery_interval" yaml:"discovery_interval"`
+
+	// IncludeSuspended collects suspended mailboxes too. By default discovery
+	// skips suspended accounts.
+	IncludeSuspended bool `json:"include_suspended" yaml:"include_suspended"`
 
 	// --- Capabilities ------------------------------------------------------
 	//
 	// Each capability is an independent collector that ships its own event type.
 	// They are opt-in: if NONE of these are set, the adapter defaults to message
-	// telemetry only (CollectMessages), preserving the original behavior. The
-	// configuration-state capabilities (filters, forwarding, send-as, delegates,
-	// imap/pop, vacation) emit change-only events -- an item is shipped when it
-	// first appears or its content changes, suppressed otherwise -- which surfaces
-	// the persistence/exfiltration changes typical of Business Email Compromise.
+	// telemetry only (CollectMessages). The configuration-state capabilities
+	// (filters, forwarding, send-as, delegates, imap/pop, vacation) emit
+	// change-only events -- an item is shipped when it first appears or its
+	// content changes, suppressed otherwise -- which surfaces the
+	// persistence/exfiltration changes typical of Business Email Compromise.
 
 	// CollectMessages ships incoming email as "gmail_message" telemetry. This is
-	// the original behavior and the default when no capability is selected.
+	// the default when no capability is selected.
 	CollectMessages bool `json:"collect_messages" yaml:"collect_messages"`
 
 	// CollectFilters ships mail filters/rules as "gmail_filter". BEC actors create
@@ -167,8 +228,9 @@ type GmailConfig struct {
 
 	// --- Collection knobs --------------------------------------------------
 
-	// UserID is the mailbox to read. Default "me" (the authenticated or
-	// impersonated user). May be an email address.
+	// UserID is the mailbox path segment for the refresh-token flow. Default "me"
+	// (the authenticated user). Ignored for the service-account flow, where each
+	// mailbox is reached as "me" under its own impersonation.
 	UserID string `json:"user_id" yaml:"user_id"`
 
 	// Query is the Gmail search query selecting which messages to collect.
@@ -176,7 +238,9 @@ type GmailConfig struct {
 	// per poll; do not include one here.
 	Query string `json:"query" yaml:"query"`
 
-	// Scopes overrides the OAuth scopes requested. Default: gmail.readonly.
+	// Scopes overrides the OAuth scopes requested for Gmail collection. Default:
+	// gmail.readonly. (Discovery uses the admin.directory.user.readonly scope
+	// separately.)
 	Scopes []string `json:"scopes" yaml:"scopes"`
 
 	// Format selects how much of each message to fetch: minimal, full, raw or
@@ -198,6 +262,10 @@ type GmailConfig struct {
 	// PollInterval is the wait between list polls. Default 5 minutes.
 	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
 
+	// MaxConcurrentPolls bounds how many mailboxes poll the Gmail API at once.
+	// Default 10. Only meaningful with many mailboxes.
+	MaxConcurrentPolls int `json:"max_concurrent_polls" yaml:"max_concurrent_polls"`
+
 	// Overlap extends each poll's window backwards past the previous poll so a
 	// slipped cycle or a late-indexed message leaves no gap; the deduper
 	// suppresses the resulting re-listing. Default 2 minutes.
@@ -205,7 +273,7 @@ type GmailConfig struct {
 
 	// InitialLookback, when > 0, makes the first poll reach back this far to
 	// backfill recent mail on startup. Default 0: collection starts from the
-	// moment the adapter launches (minus Overlap).
+	// moment the mailbox's collector launches (minus Overlap).
 	InitialLookback time.Duration `json:"initial_lookback" yaml:"initial_lookback"`
 
 	// DedupeTTL is how long a message id is remembered to suppress re-shipping
@@ -225,14 +293,31 @@ type GmailConfig struct {
 	// TokenURL overrides the OAuth token endpoint (e.g. for testing).
 	TokenURL string `json:"token_url" yaml:"token_url"`
 
-	// Deduper, when set, replaces the built-in in-memory deduper. Not settable
-	// through a config file; it is a seam for tests and embedders.
+	// DirectoryBaseURL overrides the Admin SDK Directory API root (e.g. for
+	// testing).
+	DirectoryBaseURL string `json:"directory_base_url" yaml:"directory_base_url"`
+
+	// Deduper, when set, replaces the built-in in-memory deduper. Shared across
+	// all mailboxes (keys are mailbox-namespaced). Not settable through a config
+	// file; it is a seam for tests and embedders.
 	Deduper utils.Deduper `json:"-" yaml:"-"`
 }
 
 // usesServiceAccount reports whether the config selects the service-account flow.
 func (c *GmailConfig) usesServiceAccount() bool {
 	return c.ServiceAccountCredentials != "" || c.ServiceAccountFile != ""
+}
+
+// usesDiscovery reports whether Directory-API mailbox discovery is enabled.
+func (c *GmailConfig) usesDiscovery() bool {
+	return c.DiscoverMailboxes
+}
+
+// isMultiMailbox reports whether more than one mailbox may be collected, in which
+// case each mailbox gets a per-mailbox-derived sensor identity. A single explicit
+// mailbox keeps the operator's configured sensor identity verbatim.
+func (c *GmailConfig) isMultiMailbox() bool {
+	return len(c.Subjects) > 0 || c.DiscoverMailboxes
 }
 
 // anyCapabilityEnabled reports whether the operator turned on at least one
@@ -263,8 +348,15 @@ func (c *GmailConfig) Validate() error {
 		if c.ServiceAccountCredentials != "" && c.ServiceAccountFile != "" {
 			return errors.New("provide service_account_credentials or service_account_file, not both")
 		}
-		if strings.TrimSpace(c.Subject) == "" {
-			return errors.New("service account flow requires subject (the mailbox user to impersonate via domain-wide delegation)")
+		if c.Customer != "" && c.Domain != "" {
+			return errors.New("provide customer or domain, not both")
+		}
+		hasSubjects := strings.TrimSpace(c.Subject) != "" || len(nonEmpty(c.Subjects)) > 0
+		if !hasSubjects && !c.DiscoverMailboxes {
+			return errors.New("service account flow requires at least one mailbox: set subject, subjects, or enable discover_mailboxes")
+		}
+		if c.DiscoverMailboxes && strings.TrimSpace(c.AdminSubject) == "" {
+			return errors.New("discover_mailboxes requires admin_subject (an admin user to impersonate for the Directory API)")
 		}
 	case hasRefresh:
 		if c.ClientID == "" {
@@ -276,12 +368,15 @@ func (c *GmailConfig) Validate() error {
 		if c.RefreshToken == "" {
 			return errors.New("missing refresh_token")
 		}
+		if c.isMultiMailbox() || strings.TrimSpace(c.AdminSubject) != "" {
+			return errors.New("multi-mailbox (subjects / discover_mailboxes / admin_subject) requires the service-account flow")
+		}
 	default:
-		return errors.New("missing credentials: set either a refresh token (client_id, client_secret, refresh_token) or a service account (service_account_credentials/service_account_file + subject)")
+		return errors.New("missing credentials: set either a refresh token (client_id, client_secret, refresh_token) or a service account (service_account_credentials/service_account_file + subject/subjects/discover_mailboxes)")
 	}
 
-	// Capabilities are opt-in. If the operator selected none, fall back to the
-	// original behavior: message telemetry only.
+	// Capabilities are opt-in. If the operator selected none, fall back to
+	// message telemetry only.
 	if !c.anyCapabilityEnabled() {
 		c.CollectMessages = true
 	}
@@ -312,6 +407,15 @@ func (c *GmailConfig) Validate() error {
 	}
 	if c.SettingsPollInterval <= 0 {
 		c.SettingsPollInterval = defaultSettingsPollInterval
+	}
+	if c.MaxConcurrentPolls <= 0 {
+		c.MaxConcurrentPolls = defaultMaxConcurrentPolls
+	}
+	if c.DiscoveryInterval <= 0 {
+		c.DiscoveryInterval = defaultDiscoveryInterval
+	}
+	if c.DiscoverMailboxes && c.Customer == "" && c.Domain == "" {
+		c.Customer = defaultCustomer
 	}
 	if c.Overlap < 0 {
 		c.Overlap = 0
@@ -346,106 +450,124 @@ type uspSink interface {
 	Close() ([]*protocol.DataMessage, error)
 }
 
-// GmailAdapter polls a Gmail mailbox and ships incoming messages to LimaCharlie.
+// sinkFactory builds the LimaCharlie sink (sensor) for one mailbox. Production
+// uses defaultSinkFactory; tests inject a capturing factory.
+type sinkFactory func(ctx context.Context, opts uspclient.ClientOptions, mailbox string) (uspSink, error)
+
+func defaultSinkFactory(ctx context.Context, opts uspclient.ClientOptions, _ string) (uspSink, error) {
+	return uspclient.NewClient(ctx, opts)
+}
+
+// mailboxTarget identifies one mailbox to collect and how to reach it.
+type mailboxTarget struct {
+	address string // mailbox address; identifies the sensor and namespaces dedupe keys
+	subject string // service-account subject to impersonate; "" for the refresh-token flow
+	userID  string // Gmail API path userId
+}
+
+// GmailAdapter orchestrates per-mailbox collectors and (optionally) Directory-API
+// mailbox discovery.
 type GmailAdapter struct {
-	conf        GmailConfig
-	uspClient   uspSink
-	client      *GmailClient
-	ts          *tokenSource
-	deduper     utils.Deduper
-	ownsDeduper bool
+	conf GmailConfig
+	ctx  context.Context
 
-	// since is the high-water mark of the message collection window. It advances
-	// to the poll's end time after every fully-successful message poll.
-	since time.Time
+	usesSA bool
+	saKey  *serviceAccountKey
+	saRSA  *rsa.PrivateKey
 
-	// lastSettings is when the configuration-state capabilities last ran; they
-	// poll on the slower SettingsPollInterval clock. Zero means "never" (due).
-	lastSettings time.Time
+	baseURL  string
+	tokenURL string
 
-	// lastHistoryID is the users.history.list cursor: history is collected from
-	// this id forward. Empty until a baseline is established from the profile.
-	lastHistoryID string
+	authHTTP *http.Client // shared by all token sources
+	apiHTTP  *http.Client // shared by all Gmail clients
 
-	chStopped chan struct{}
+	newSink   sinkFactory
+	pollSlots chan struct{} // bounded poll-concurrency across all mailboxes
+
+	directory *directoryClient // nil unless discovery is enabled
+
+	mu          sync.Mutex
+	collectors  map[string]*mailboxCollector // keyed by mailbox address
+	staticAddrs map[string]bool              // mailboxes from config; discovery never removes these
+
+	doStop    *utils.Event // stops the discovery loop; gates Close
 	wgSenders sync.WaitGroup
-	doStop    *utils.Event
+	chStopped chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
-
-	ctx context.Context
 }
 
 // NewGmailAdapter creates a Gmail adapter wired to LimaCharlie.
 func NewGmailAdapter(ctx context.Context, conf GmailConfig) (*GmailAdapter, chan struct{}, error) {
-	return newGmailAdapter(ctx, conf, nil)
+	return newGmailAdapter(ctx, conf, defaultSinkFactory)
 }
 
-// newGmailAdapter is the implementation behind NewGmailAdapter. When sink is
-// non-nil it is used in place of a real LimaCharlie client -- the seam tests use
-// to capture shipped events.
-func newGmailAdapter(ctx context.Context, conf GmailConfig, sink uspSink) (*GmailAdapter, chan struct{}, error) {
+// newGmailAdapter is the implementation behind NewGmailAdapter. newSink is the
+// seam tests use to capture shipped events per mailbox.
+func newGmailAdapter(ctx context.Context, conf GmailConfig, newSink sinkFactory) (*GmailAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
 
 	a := &GmailAdapter{
-		conf:   conf,
-		ctx:    ctx,
-		doStop: utils.NewEvent(),
+		conf:       conf,
+		ctx:        ctx,
+		usesSA:     conf.usesServiceAccount(),
+		baseURL:    resolveBaseURL(conf),
+		tokenURL:   resolveTokenURL(conf),
+		authHTTP:   newAuthHTTPClient(),
+		apiHTTP:    newAPIHTTPClient(),
+		newSink:    newSink,
+		pollSlots:  make(chan struct{}, conf.MaxConcurrentPolls),
+		collectors: map[string]*mailboxCollector{},
+		doStop:     utils.NewEvent(),
+		chStopped:  make(chan struct{}),
 	}
 
-	now := time.Now()
-	a.since = now
-	if conf.InitialLookback > 0 {
-		a.since = now.Add(-conf.InitialLookback)
-	}
-
-	// Overlapping windows re-list recent messages, so a deduper is required to
-	// ship each message exactly once.
-	a.deduper = conf.Deduper
-	if a.deduper == nil {
-		window := dedupeBucketWindow
-		if window > conf.DedupeTTL {
-			window = conf.DedupeTTL
-		}
-		deduper, err := utils.NewLocalDeduper(window, conf.DedupeTTL)
+	if a.usesSA {
+		key, rsaKey, err := a.parseServiceAccount()
 		if err != nil {
-			return nil, nil, fmt.Errorf("gmail: deduper: %v", err)
-		}
-		a.deduper = deduper
-		a.ownsDeduper = true
-	}
-
-	ts, err := buildTokenSource(conf)
-	if err != nil {
-		if a.ownsDeduper {
-			a.deduper.Close()
-		}
-		return nil, nil, err
-	}
-	a.ts = ts
-
-	if sink != nil {
-		a.uspClient = sink
-	} else {
-		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
-		if err != nil {
-			if a.ownsDeduper {
-				a.deduper.Close()
-			}
-			a.ts.Close()
 			return nil, nil, err
 		}
-		a.uspClient = uspClient
+		a.saKey, a.saRSA = key, rsaKey
 	}
 
-	a.client = NewGmailClient(resolveBaseURL(conf), conf.UserID, a.ts, newAPIHTTPClient())
+	// Start the static mailboxes (the single refresh-token mailbox, or the
+	// explicit service-account subject/subjects). Spread their first polls across
+	// one PollInterval so they do not all fire together.
+	static := a.staticTargets()
+	a.staticAddrs = make(map[string]bool, len(static))
+	for _, t := range static {
+		a.staticAddrs[t.address] = true
+	}
+	for i, t := range static {
+		var delay time.Duration
+		if len(static) > 1 {
+			delay = time.Duration(i) * (conf.PollInterval / time.Duration(len(static)))
+		}
+		if err := a.startCollector(t, delay); err != nil {
+			a.shutdownStartedCollectors()
+			a.apiHTTP.CloseIdleConnections()
+			a.authHTTP.CloseIdleConnections()
+			return nil, nil, err
+		}
+	}
 
-	a.chStopped = make(chan struct{})
-	a.wgSenders.Add(1)
-	go a.run()
+	// Discovery runs as a sender so the wait group never drains to zero while it
+	// is still looking for mailboxes.
+	if a.conf.usesDiscovery() {
+		dir, err := a.newDirectoryClient()
+		if err != nil {
+			a.shutdownStartedCollectors()
+			a.apiHTTP.CloseIdleConnections()
+			a.authHTTP.CloseIdleConnections()
+			return nil, nil, err
+		}
+		a.directory = dir
+		a.wgSenders.Add(1)
+		go a.runDiscovery()
+	}
 
 	go func() {
 		a.wgSenders.Wait()
@@ -455,48 +577,222 @@ func newGmailAdapter(ctx context.Context, conf GmailConfig, sink uspSink) (*Gmai
 	return a, a.chStopped, nil
 }
 
-// buildTokenSource constructs the token source for the configured auth flow.
-func buildTokenSource(conf GmailConfig) (*tokenSource, error) {
-	tokenURL := resolveTokenURL(conf)
-	httpClient := newAuthHTTPClient()
-
-	if conf.usesServiceAccount() {
-		raw := []byte(conf.ServiceAccountCredentials)
-		if len(raw) == 0 {
-			data, err := os.ReadFile(conf.ServiceAccountFile)
-			if err != nil {
-				return nil, fmt.Errorf("gmail: failed to read service_account_file %q: %v", conf.ServiceAccountFile, err)
-			}
-			raw = data
-		}
-		key, rsaKey, err := parseServiceAccountKey(raw)
-		if err != nil {
-			return nil, fmt.Errorf("gmail: %v", err)
-		}
-		return newServiceAccountSource(key, rsaKey, conf.Subject, conf.Scopes, tokenURL, httpClient), nil
+// staticTargets enumerates the mailboxes known at startup (before discovery).
+func (a *GmailAdapter) staticTargets() []mailboxTarget {
+	if !a.usesSA {
+		return []mailboxTarget{{address: a.conf.UserID, subject: "", userID: a.conf.UserID}}
 	}
-
-	return newRefreshTokenSource(tokenURL, conf.ClientID, conf.ClientSecret, conf.RefreshToken, httpClient), nil
+	seen := map[string]bool{}
+	var out []mailboxTarget
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, mailboxTarget{address: s, subject: s, userID: defaultUserID})
+	}
+	add(a.conf.Subject)
+	for _, s := range a.conf.Subjects {
+		add(s)
+	}
+	return out
 }
 
-// Close stops the adapter. It is idempotent.
+// parseServiceAccount loads and parses the configured service-account key.
+func (a *GmailAdapter) parseServiceAccount() (*serviceAccountKey, *rsa.PrivateKey, error) {
+	raw := []byte(a.conf.ServiceAccountCredentials)
+	if len(raw) == 0 {
+		data, err := os.ReadFile(a.conf.ServiceAccountFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("gmail: failed to read service_account_file %q: %v", a.conf.ServiceAccountFile, err)
+		}
+		raw = data
+	}
+	key, rsaKey, err := parseServiceAccountKey(raw)
+	if err != nil {
+		return nil, nil, fmt.Errorf("gmail: %v", err)
+	}
+	return key, rsaKey, nil
+}
+
+// tokenSourceForGmail builds a token source for collecting one mailbox.
+func (a *GmailAdapter) tokenSourceForGmail(t mailboxTarget) *tokenSource {
+	if a.usesSA {
+		return newServiceAccountSource(a.saKey, a.saRSA, t.subject, a.conf.Scopes, a.tokenURL, a.authHTTP)
+	}
+	return newRefreshTokenSource(a.tokenURL, a.conf.ClientID, a.conf.ClientSecret, a.conf.RefreshToken, a.authHTTP)
+}
+
+// sensorOptions derives the LimaCharlie ClientOptions for one mailbox. In
+// multi-mailbox mode the sensor seed key and hostname are derived from the
+// mailbox address so each mailbox maps to its own sensor; for a single explicit
+// mailbox the operator's configured identity is used verbatim.
+func (a *GmailAdapter) sensorOptions(mailbox string) uspclient.ClientOptions {
+	opts := a.conf.ClientOptions
+	if a.conf.isMultiMailbox() {
+		opts.SensorSeedKey = mailboxSeedKey(a.conf.ClientOptions.SensorSeedKey, mailbox)
+		opts.Hostname = mailbox
+	}
+	return opts
+}
+
+// mailboxSeedKey derives a stable, per-mailbox sensor seed key.
+func mailboxSeedKey(base, mailbox string) string {
+	if base == "" {
+		return mailbox
+	}
+	return base + "/" + mailbox
+}
+
+// startCollector creates and starts a collector for one mailbox, if not already
+// running. It is safe for concurrent use (discovery calls it).
+func (a *GmailAdapter) startCollector(t mailboxTarget, startDelay time.Duration) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.doStop.IsSet() {
+		return nil // adapter is closing; do not spin up new work
+	}
+	if _, exists := a.collectors[t.address]; exists {
+		return nil
+	}
+
+	ts := a.tokenSourceForGmail(t)
+	client := NewGmailClient(a.baseURL, t.userID, ts, a.apiHTTP)
+
+	sink, err := a.newSink(a.ctx, a.sensorOptions(t.address), t.address)
+	if err != nil {
+		return fmt.Errorf("gmail: sensor init for mailbox %q: %v", t.address, err)
+	}
+
+	deduper := a.conf.Deduper
+	ownsDeduper := false
+	if deduper == nil {
+		window := dedupeBucketWindow
+		if window > a.conf.DedupeTTL {
+			window = a.conf.DedupeTTL
+		}
+		d, derr := utils.NewLocalDeduper(window, a.conf.DedupeTTL)
+		if derr != nil {
+			_ = sink.Drain(time.Second)
+			_, _ = sink.Close()
+			return fmt.Errorf("gmail: deduper for mailbox %q: %v", t.address, derr)
+		}
+		deduper = d
+		ownsDeduper = true
+	}
+
+	now := time.Now()
+	since := now
+	if a.conf.InitialLookback > 0 {
+		since = now.Add(-a.conf.InitialLookback)
+	}
+
+	c := &mailboxCollector{
+		a:           a,
+		mailbox:     t.address,
+		tag:         "gmail[" + t.address + "]",
+		client:      client,
+		ts:          ts,
+		uspClient:   sink,
+		deduper:     deduper,
+		ownsDeduper: ownsDeduper,
+		since:       since,
+		startDelay:  startDelay,
+		stop:        utils.NewEvent(),
+		stopCh:      make(chan struct{}),
+		stopped:     make(chan struct{}),
+	}
+	a.collectors[t.address] = c
+	a.wgSenders.Add(1)
+	go c.run()
+	return nil
+}
+
+// removeCollector stops and tears down the collector for a mailbox that is no
+// longer present (deprovisioned). It blocks until the collector's loop has
+// exited and its sensor has drained.
+func (a *GmailAdapter) removeCollector(address string) {
+	a.mu.Lock()
+	c, ok := a.collectors[address]
+	if ok {
+		delete(a.collectors, address)
+	}
+	a.mu.Unlock()
+	if !ok {
+		return
+	}
+	c.requestStop()
+	<-c.stopped
+	if err := c.cleanup(); err != nil {
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("gmail: draining sensor for %q: %v", address, err))
+	}
+	a.conf.ClientOptions.DebugLog("gmail: stopped collecting deprovisioned mailbox " + address)
+}
+
+// activeMailboxes returns the set of mailboxes currently being collected.
+func (a *GmailAdapter) activeMailboxes() map[string]bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make(map[string]bool, len(a.collectors))
+	for addr := range a.collectors {
+		out[addr] = true
+	}
+	return out
+}
+
+// shutdownStartedCollectors stops and tears down every collector started so far.
+// Used to unwind a partially-constructed adapter.
+func (a *GmailAdapter) shutdownStartedCollectors() {
+	a.mu.Lock()
+	cs := make([]*mailboxCollector, 0, len(a.collectors))
+	for _, c := range a.collectors {
+		cs = append(cs, c)
+	}
+	a.collectors = map[string]*mailboxCollector{}
+	a.mu.Unlock()
+
+	for _, c := range cs {
+		c.requestStop()
+	}
+	for _, c := range cs {
+		<-c.stopped
+		_ = c.cleanup()
+	}
+}
+
+// Close stops the adapter and all mailbox collectors. It is idempotent.
 func (a *GmailAdapter) Close() error {
 	a.closeOnce.Do(func() {
 		a.conf.ClientOptions.DebugLog("gmail: closing")
-		a.doStop.Set()
-		a.wgSenders.Wait()
-		err1 := a.uspClient.Drain(1 * time.Minute)
-		_, err2 := a.uspClient.Close()
-		a.client.Close()
-		a.ts.Close()
-		if a.ownsDeduper {
-			a.deduper.Close()
+		a.doStop.Set() // stop the discovery loop
+
+		a.mu.Lock()
+		cs := make([]*mailboxCollector, 0, len(a.collectors))
+		for _, c := range a.collectors {
+			cs = append(cs, c)
 		}
-		if err1 != nil {
-			a.closeErr = err1
-		} else {
-			a.closeErr = err2
+		a.mu.Unlock()
+
+		for _, c := range cs {
+			c.requestStop()
 		}
+		a.wgSenders.Wait() // all collector loops and the discovery loop have exited
+
+		var firstErr error
+		for _, c := range cs {
+			if err := c.cleanup(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+
+		if a.directory != nil {
+			a.directory.Close()
+		}
+		a.apiHTTP.CloseIdleConnections()
+		a.authHTTP.CloseIdleConnections()
+		a.closeErr = firstErr
 	})
 	return a.closeErr
 }
@@ -517,278 +813,13 @@ func resolveTokenURL(conf GmailConfig) string {
 	return googleTokenEndpoint
 }
 
-// run polls Gmail forever, until the adapter is asked to stop.
-func (a *GmailAdapter) run() {
-	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog("gmail: collection stopped")
-
-	isFirstRun := true
-	for isFirstRun || !a.doStop.WaitFor(a.conf.PollInterval) {
-		isFirstRun = false
-		a.runCycle()
-	}
-}
-
-// runCycle runs one tick of every enabled capability. Messages and history poll
-// every cycle; the configuration-state capabilities poll on their slower
-// SettingsPollInterval clock. A capability failing does not abort the others.
-func (a *GmailAdapter) runCycle() {
-	if a.conf.CollectMessages {
-		a.pollMessages()
-	}
-	if a.doStop.IsSet() {
-		return
-	}
-	if a.conf.CollectHistory {
-		a.pollHistory()
-	}
-	if a.doStop.IsSet() {
-		return
-	}
-	if a.conf.anySettingsCapabilityEnabled() && a.settingsDue(time.Now()) {
-		a.pollSettings()
-		a.lastSettings = time.Now()
-	}
-}
-
-// settingsDue reports whether the configuration-state capabilities should run
-// this cycle: always on the first pass, then once per SettingsPollInterval.
-func (a *GmailAdapter) settingsDue(now time.Time) bool {
-	return a.lastSettings.IsZero() || now.Sub(a.lastSettings) >= a.conf.SettingsPollInterval
-}
-
-// pollMessages performs one message collection cycle over the rolling window:
-// list message ids, fetch each not-yet-seen message, and ship it. On success the
-// window's high-water mark advances; on any error it does not, so the next poll
-// re-covers the same range (the deduper prevents re-shipping).
-func (a *GmailAdapter) pollMessages() {
-	end := time.Now()
-	start := a.since.Add(-a.conf.Overlap)
-	query := buildQuery(a.conf.Query, start)
-
-	pageToken := ""
-	nFetched, nShipped := 0, 0
-	for page := 0; page < maxPagesPerPoll; page++ {
-		if a.doStop.IsSet() {
-			return
-		}
-
-		raw, ok := a.list(query, pageToken)
-		if !ok {
-			return
-		}
-		list, err := parseListMessages(raw)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("gmail: list parse error: %v", err))
-			return
-		}
-
-		for _, ref := range list.Messages {
-			if a.doStop.IsSet() {
-				return
-			}
-			if ref.ID == "" {
-				continue
-			}
-
-			// Fetch before consulting the deduper: a fetch can fail and we must
-			// not mark a message seen unless it actually shipped. The overlap
-			// re-lists at most a couple of minutes of recent ids, so the
-			// redundant fetches are bounded.
-			msg, status := a.fetch(ref.ID)
-			switch status {
-			case fetchSkip:
-				continue
-			case fetchAbort:
-				return
-			}
-			nFetched++
-
-			if a.deduper.CheckAndAdd(ref.ID) {
-				continue
-			}
-			if !a.ship(ref.ID, msg) {
-				return
-			}
-			nShipped++
-		}
-
-		if list.NextPageToken == "" {
-			break
-		}
-		pageToken = list.NextPageToken
-	}
-
-	// Only advance the high-water mark once the poll fully succeeded.
-	a.since = end
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf(
-		"gmail: poll complete (fetched=%d shipped=%d) up to %s",
-		nFetched, nShipped, end.UTC().Format(time.RFC3339)))
-}
-
-// list issues one messages.list request with transient-retry backoff. The bool
-// is false when the poll should be abandoned (a permanent error, or the adapter
-// is stopping).
-func (a *GmailAdapter) list(query, pageToken string) ([]byte, bool) {
-	raw, err := a.withRetry("messages.list", func() ([]byte, error) {
-		return a.client.ListMessages(a.ctx, listMessagesParams{
-			query:            query,
-			pageToken:        pageToken,
-			maxResults:       a.conf.MaxResults,
-			includeSpamTrash: a.conf.IncludeSpamTrash,
-			labelIDs:         a.conf.LabelIDs,
-		})
-	})
-	if err != nil {
-		a.handlePermanent("messages.list", err)
-		return nil, false
-	}
-	return raw, true
-}
-
-// fetchResult tells poll what to do after a messages.get attempt.
-type fetchResult int
-
-const (
-	fetchOK    fetchResult = iota // message fetched, proceed to dedupe/ship
-	fetchSkip                     // message gone (404); skip it, keep polling
-	fetchAbort                    // unrecoverable; abandon this poll
-)
-
-// fetch retrieves one message with transient-retry backoff and classifies the
-// outcome. A 404 (the message was deleted between the list and the get) is
-// benign and skipped; auth/permission failures abort and stop the adapter.
-func (a *GmailAdapter) fetch(id string) (utils.Dict, fetchResult) {
-	raw, err := a.withRetry("messages.get", func() ([]byte, error) {
-		return a.client.GetMessage(a.ctx, id, a.conf.Format, a.conf.MetadataHeaders)
-	})
-	if err != nil {
-		var httpErr *HTTPError
-		if errors.As(err, &httpErr) && httpErr.StatusCode == http.StatusNotFound {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("gmail: message %s vanished before fetch; skipping", id))
-			return nil, fetchSkip
-		}
-		a.handlePermanent("messages.get", err)
-		return nil, fetchAbort
-	}
-
-	msg, err := utils.UnmarshalCleanJSON(string(raw))
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("gmail: failed to parse message %s: %v", id, err))
-		return nil, fetchAbort
-	}
-	return utils.Dict(msg), fetchOK
-}
-
-// withRetry runs fn, retrying transient errors with exponential backoff. It
-// returns the final result, or the final (non-transient or attempts-exhausted)
-// error for the caller to classify. It does not set doStop.
-func (a *GmailAdapter) withRetry(label string, fn func() ([]byte, error)) ([]byte, error) {
-	var raw []byte
-	var err error
-	for attempt := 0; attempt < a.conf.MaxRetryAttempts; attempt++ {
-		if a.doStop.IsSet() {
-			return nil, context.Canceled
-		}
-
-		raw, err = fn()
-		if err == nil {
-			return raw, nil
-		}
-		if !isTransientError(err) {
-			return nil, err
-		}
-		if attempt+1 >= a.conf.MaxRetryAttempts {
-			break
-		}
-		delay := a.conf.RetryBaseDelay * time.Duration(1<<attempt)
-		if delay > a.conf.MaxRetryDelay {
-			delay = a.conf.MaxRetryDelay
-		}
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
-			"gmail: %s transient error (attempt %d/%d), retrying in %v: %v",
-			label, attempt+1, a.conf.MaxRetryAttempts, delay, err))
-		if a.doStop.WaitFor(delay) {
-			return nil, context.Canceled
+// nonEmpty returns the input with blank entries removed.
+func nonEmpty(in []string) []string {
+	var out []string
+	for _, s := range in {
+		if strings.TrimSpace(s) != "" {
+			out = append(out, s)
 		}
 	}
-	return nil, fmt.Errorf("%s failed after %d attempts: %w", label, a.conf.MaxRetryAttempts, err)
-}
-
-// handlePermanent logs a non-recoverable error and, when it is a credential
-// failure, stops the adapter so it does not spin uselessly every interval. A
-// credential problem needs operator attention; other permanent errors (e.g. a
-// bad query) abandon this poll but keep the adapter alive to retry next interval.
-func (a *GmailAdapter) handlePermanent(label string, err error) {
-	if errors.Is(err, context.Canceled) {
-		// Adapter is stopping; not an error to surface.
-		return
-	}
-
-	var tokenErr *TokenError
-	var httpErr *HTTPError
-	if errors.As(err, &tokenErr) ||
-		(errors.As(err, &httpErr) &&
-			(httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden)) {
-		a.conf.ClientOptions.OnError(fmt.Errorf("gmail: %s failed: %v", label, err))
-		a.conf.ClientOptions.OnError(fmt.Errorf(
-			"gmail: credentials rejected. Verify the OAuth client / refresh token (or service "+
-				"account key and that domain-wide delegation grants the %q scope for subject %q), "+
-				"and that the Gmail API is enabled for the project", strings.Join(a.conf.Scopes, ","), a.conf.Subject))
-		a.doStop.Set()
-		return
-	}
-	a.conf.ClientOptions.OnError(fmt.Errorf("gmail: %s failed: %v", label, err))
-}
-
-// ship forwards a single incoming message to LimaCharlie. It returns false if
-// the adapter should stop (an unrecoverable shipping error).
-func (a *GmailAdapter) ship(id string, msg utils.Dict) bool {
-	return a.shipEvent(eventTypeMessage, msg, eventTime(msg))
-}
-
-// shipEvent forwards one event of the given type to LimaCharlie. It returns
-// false if the adapter should stop (an unrecoverable shipping error).
-func (a *GmailAdapter) shipEvent(evtType string, payload utils.Dict, tsMs uint64) bool {
-	dataMsg := &protocol.DataMessage{
-		JsonPayload: payload,
-		EventType:   evtType,
-		TimestampMs: tsMs,
-	}
-	if err := a.uspClient.Ship(dataMsg, shipTimeout); err != nil {
-		if err == uspclient.ErrorBufferFull {
-			a.conf.ClientOptions.OnWarning("gmail: stream falling behind")
-			err = a.uspClient.Ship(dataMsg, 1*time.Hour)
-		}
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("gmail: Ship(): %v", err))
-			a.doStop.Set()
-			return false
-		}
-	}
-	return true
-}
-
-// buildQuery appends a time bound to the configured search query so each poll
-// only lists messages received at or after `start`. Gmail's `after:` operator
-// accepts an epoch-seconds value for second-level precision.
-func buildQuery(base string, start time.Time) string {
-	bound := fmt.Sprintf("after:%d", start.Unix())
-	base = strings.TrimSpace(base)
-	if base == "" {
-		return bound
-	}
-	return base + " " + bound
-}
-
-// eventTime extracts the message's event time from its internalDate (epoch
-// milliseconds, as a string), falling back to now when it is absent or
-// unparseable.
-func eventTime(msg utils.Dict) uint64 {
-	if raw := msg.FindOneString("internalDate"); raw != "" {
-		if ms, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64); err == nil && ms > 0 {
-			return uint64(ms)
-		}
-	}
-	return uint64(time.Now().UnixMilli())
+	return out
 }

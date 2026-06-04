@@ -88,12 +88,18 @@ type mockGmail struct {
 	getNotFound map[string]bool
 
 	tokensIssued int
-	activeToken  string
 
 	// rejectTokensBefore makes data endpoints answer 401 for any access token
 	// numbered at or below this value, simulating an expired access token and
-	// forcing the adapter to refresh.
+	// forcing the adapter to refresh. Any issued token numbered above it is
+	// accepted, so multiple mailboxes minting tokens concurrently do not
+	// invalidate each other.
 	rejectTokensBefore int
+
+	// impersonatedSubjects counts, per impersonated subject, the service-account
+	// assertions the token endpoint minted. It lets multi-mailbox tests assert
+	// every expected mailbox was delegated.
+	impersonatedSubjects map[string]int
 
 	tokenRequests int
 	listRequests  int
@@ -136,14 +142,24 @@ type mockGmail struct {
 
 	// per-capability request counters, for asserting cadence.
 	capabilityRequests map[string]int
+
+	// --- Admin SDK Directory API (mailbox discovery) -----------------------
+
+	// directoryUsers is what users.list returns, across pages of directoryPageSize.
+	directoryUsers []discoveredUser
+	// directoryPageSize, when > 0, forces users.list to paginate at this size.
+	directoryPageSize int
+	directoryStatus   int // when non-zero, users.list answers this HTTP status
+	directoryRequests int
 }
 
 func newMockGmail() *mockGmail {
 	return &mockGmail{
-		messages:           map[string]utils.Dict{},
-		getNotFound:        map[string]bool{},
-		statusOverride:     map[string]int{},
-		capabilityRequests: map[string]int{},
+		messages:             map[string]utils.Dict{},
+		getNotFound:          map[string]bool{},
+		statusOverride:       map[string]int{},
+		capabilityRequests:   map[string]int{},
+		impersonatedSubjects: map[string]int{},
 	}
 }
 
@@ -187,6 +203,9 @@ func (m *mockGmail) handler(t *testing.T) http.Handler {
 	mux.HandleFunc("/gmail/v1/users/me/settings/vacation", m.capObjectHandler("settings/vacation", func() utils.Dict { return m.vacation }))
 	mux.HandleFunc("/gmail/v1/users/me/profile", m.profileHandler())
 	mux.HandleFunc("/gmail/v1/users/me/history", m.historyHandler())
+
+	// Admin SDK Directory API (mailbox discovery).
+	mux.HandleFunc("/admin/directory/v1/users", m.directoryUsersHandler())
 	return mux
 }
 
@@ -214,9 +233,15 @@ func (m *mockGmail) tokenHandler(t *testing.T) http.HandlerFunc {
 				return
 			}
 		case jwtBearerGrantType:
-			if !m.verifyAssertion(t, r.Form.Get("assertion")) {
+			claims, ok := m.verifyAssertion(t, r.Form.Get("assertion"))
+			if !ok {
 				writeJSON(w, http.StatusBadRequest, `{"error":"invalid_grant","error_description":"assertion failed verification"}`)
 				return
+			}
+			if sub, _ := claims["sub"].(string); sub != "" {
+				m.mu.Lock()
+				m.impersonatedSubjects[sub]++
+				m.mu.Unlock()
 			}
 		default:
 			writeJSON(w, http.StatusBadRequest, `{"error":"unsupported_grant_type"}`)
@@ -230,8 +255,7 @@ func (m *mockGmail) tokenHandler(t *testing.T) http.HandlerFunc {
 
 		m.mu.Lock()
 		m.tokensIssued++
-		m.activeToken = fmt.Sprintf("AT-%d", m.tokensIssued)
-		token := m.activeToken
+		token := fmt.Sprintf("AT-%d", m.tokensIssued)
 		m.mu.Unlock()
 
 		writeJSON(w, http.StatusOK, fmt.Sprintf(
@@ -241,13 +265,13 @@ func (m *mockGmail) tokenHandler(t *testing.T) http.HandlerFunc {
 }
 
 // verifyAssertion validates a service-account JWT assertion's signature and
-// records its claims. Caller must not hold m.mu.
-func (m *mockGmail) verifyAssertion(t *testing.T, assertion string) bool {
+// records its claims, returning the parsed claims. Caller must not hold m.mu.
+func (m *mockGmail) verifyAssertion(t *testing.T, assertion string) (jwt.MapClaims, bool) {
 	m.mu.Lock()
 	pub := m.saPublicKey
 	m.mu.Unlock()
 	if pub == nil || assertion == "" {
-		return false
+		return nil, false
 	}
 	claims := jwt.MapClaims{}
 	_, err := jwt.ParseWithClaims(assertion, claims, func(tok *jwt.Token) (interface{}, error) {
@@ -258,12 +282,12 @@ func (m *mockGmail) verifyAssertion(t *testing.T, assertion string) bool {
 	})
 	if err != nil {
 		t.Logf("assertion verification failed: %v", err)
-		return false
+		return nil, false
 	}
 	m.mu.Lock()
 	m.lastAssertionClaims = claims
 	m.mu.Unlock()
-	return true
+	return claims, true
 }
 
 func (m *mockGmail) listHandler(t *testing.T) http.HandlerFunc {
@@ -326,14 +350,15 @@ func (m *mockGmail) getHandler(t *testing.T) http.HandlerFunc {
 }
 
 // authorize validates the bearer token, writing a 401 and returning false on
-// failure.
+// failure. Any token the endpoint issued (AT-n with 1<=n<=tokensIssued) is
+// accepted, except those at or below rejectTokensBefore -- so concurrent
+// mailboxes minting their own tokens never invalidate each other.
 func (m *mockGmail) authorize(w http.ResponseWriter, r *http.Request) bool {
 	auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	m.mu.Lock()
-	active := m.activeToken
-	reject := m.tokenRejected(auth)
+	ok := m.tokenAccepted(auth)
 	m.mu.Unlock()
-	if auth == "" || auth != active || reject {
+	if !ok {
 		writeJSON(w, http.StatusUnauthorized,
 			`{"error":{"code":401,"message":"Invalid Credentials","errors":[{"reason":"authError"}],"status":"UNAUTHENTICATED"}}`)
 		return false
@@ -341,17 +366,14 @@ func (m *mockGmail) authorize(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// tokenRejected reports whether the given access token should be answered with a
-// 401. Caller holds m.mu.
-func (m *mockGmail) tokenRejected(token string) bool {
-	if m.rejectTokensBefore == 0 {
-		return false
-	}
+// tokenAccepted reports whether the given access token is a currently-valid
+// issued token. Caller holds m.mu.
+func (m *mockGmail) tokenAccepted(token string) bool {
 	var n int
 	if _, err := fmt.Sscanf(token, "AT-%d", &n); err != nil {
 		return false
 	}
-	return n <= m.rejectTokensBefore
+	return n >= 1 && n <= m.tokensIssued && n > m.rejectTokensBefore
 }
 
 // buildList renders a messages.list response: ids whose internalDate is at or
@@ -567,7 +589,7 @@ func TestMockEndToEndRefreshToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	adapter, _, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), sink)
+	adapter, _, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -621,7 +643,7 @@ func TestMockEndToEndServiceAccount(t *testing.T) {
 		InitialLookback:           24 * time.Hour,
 		PollInterval:              40 * time.Millisecond,
 	}
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -651,7 +673,7 @@ func TestMockNewMessageShippedOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	adapter, _, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), sink)
+	adapter, _, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -691,7 +713,7 @@ func TestMockMultiPollNoReship(t *testing.T) {
 	// A generous overlap forces every poll to re-list both messages.
 	conf := refreshConfig(t, server.URL)
 	conf.Overlap = time.Hour
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -718,7 +740,7 @@ func TestMockTokenRefreshOn401(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	adapter, chStopped, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), sink)
+	adapter, chStopped, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -749,7 +771,7 @@ func TestMockBadCredentialsStops(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	adapter, chStopped, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), sink)
+	adapter, chStopped, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -782,7 +804,7 @@ func TestMockPagination(t *testing.T) {
 
 	conf := refreshConfig(t, server.URL)
 	conf.MaxResults = 2 // force three pages (2 + 2 + 1)
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -819,7 +841,7 @@ func TestMockMissingMessageSkipped(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	adapter, chStopped, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), sink)
+	adapter, chStopped, err := newGmailAdapter(ctx, refreshConfig(t, server.URL), staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 

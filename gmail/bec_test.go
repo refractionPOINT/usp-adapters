@@ -219,7 +219,7 @@ func TestFiltersChangeOnly(t *testing.T) {
 
 	conf := becConfig(t, server.URL)
 	conf.CollectFilters = true
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -267,7 +267,7 @@ func TestForwardingCapability(t *testing.T) {
 
 	conf := becConfig(t, server.URL)
 	conf.CollectForwarding = true
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -302,7 +302,7 @@ func TestSendAsAndImapPopVacation(t *testing.T) {
 	conf.CollectSendAs = true
 	conf.CollectImapPop = true
 	conf.CollectVacation = true
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -332,7 +332,7 @@ func TestDelegatesCollection(t *testing.T) {
 
 	conf := becConfig(t, server.URL)
 	conf.CollectDelegates = true
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -363,7 +363,7 @@ func TestDelegateUnavailableIsNonFatal(t *testing.T) {
 	conf := becConfig(t, server.URL)
 	conf.CollectFilters = true
 	conf.CollectDelegates = true
-	adapter, chStopped, err := newGmailAdapter(ctx, conf, sink)
+	adapter, chStopped, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -393,7 +393,7 @@ func TestHistoryCollection(t *testing.T) {
 
 	conf := becConfig(t, server.URL)
 	conf.CollectHistory = true
-	adapter, _, err := newGmailAdapter(ctx, conf, sink)
+	adapter, _, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -437,7 +437,7 @@ func TestHistoryCursorExpiryReBaselines(t *testing.T) {
 
 	conf := becConfig(t, server.URL)
 	conf.CollectHistory = true
-	adapter, chStopped, err := newGmailAdapter(ctx, conf, sink)
+	adapter, chStopped, err := newGmailAdapter(ctx, conf, staticSink(sink))
 	require.NoError(t, err)
 	defer adapter.Close()
 
