@@ -238,7 +238,7 @@ Refresh-token flow (single mailbox), via CLI:
 ./general gmail \
   client_options.identity.oid=$OID \
   client_options.identity.installation_key=$IK \
-  client_options.platform=json \
+  client_options.platform=gmail \
   client_options.sensor_seed_key=gmail \
   client_id=$GMAIL_CLIENT_ID \
   client_secret=$GMAIL_CLIENT_SECRET \
@@ -255,7 +255,7 @@ gmail:
     identity:
       oid: 11111111-1111-1111-1111-111111111111
       installation_key: e9a3bcdf-efa2-47ae-b6df-579a02f3a54d
-    platform: json
+    platform: gmail
     sensor_seed_key: gmail
   service_account_file: /secrets/gmail-collector.json
   subject: soc-mailbox@yourdomain.com
@@ -275,7 +275,7 @@ gmail:
     identity:
       oid: 11111111-1111-1111-1111-111111111111
       installation_key: e9a3bcdf-efa2-47ae-b6df-579a02f3a54d
-    platform: json
+    platform: gmail
     sensor_seed_key: gmail
   service_account_file: /secrets/gmail-collector.json
   subject: soc-mailbox@yourdomain.com
@@ -298,7 +298,7 @@ BEC flags and leave `collect_messages` unset/false:
 ./general gmail \
   client_options.identity.oid=$OID \
   client_options.identity.installation_key=$IK \
-  client_options.platform=json \
+  client_options.platform=gmail \
   client_options.sensor_seed_key=gmail \
   client_id=$GMAIL_CLIENT_ID \
   client_secret=$GMAIL_CLIENT_SECRET \

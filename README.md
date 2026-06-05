@@ -144,5 +144,15 @@ auto-discovery of the whole domain — each mailbox shipped to its own sensor. S
 [gmail/README.md](./gmail/README.md).
 
 ```
-./general gmail client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=gmail client_id=$GMAIL_CLIENT_ID client_secret=$GMAIL_CLIENT_SECRET refresh_token=$GMAIL_REFRESH_TOKEN
+./general gmail client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=gmail client_options.sensor_seed_key=gmail client_id=$GMAIL_CLIENT_ID client_secret=$GMAIL_CLIENT_SECRET refresh_token=$GMAIL_REFRESH_TOKEN
+```
+
+### Cato
+
+Pulls events from the Cato Networks API for a given account. It polls the event
+feed, using a marker to page through and resume from the last position across
+restarts.
+
+```
+./general cato client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=cato client_options.sensor_seed_key=cato apikey=$CATO_API_KEY accountid=$CATO_ACCOUNT_ID
 ```
