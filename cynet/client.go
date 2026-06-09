@@ -27,6 +27,7 @@ const (
 	authEndpoint         = "/api/account/token"
 	alertsEndpoint       = "/api/alerts/bulk"
 	maxConsecutiveErrors = 5
+	incidentJSONField    = "IncidentJsonDescription"
 )
 
 type CynetConfig struct {
@@ -64,17 +65,18 @@ type CynetAdapter struct {
 	consecutiveErrors int
 }
 
-// Authentication structures
+// AuthRequest is the credential payload sent to the token endpoint.
 type AuthRequest struct {
 	User     string `json:"user_name"`
 	Password string `json:"password"`
 }
 
+// AuthResponse is the token endpoint's response carrying the access token.
 type AuthResponse struct {
 	AccessToken string `json:"access_token"`
 }
 
-// Alerts response structure
+// AlertsResponse is the response body returned by the bulk alerts endpoint.
 type AlertsResponse struct {
 	SyncTimeUtc string       `json:"SyncTimeUtc"`
 	Entities    []utils.Dict `json:"Entities"`
@@ -305,8 +307,6 @@ func (a *CynetAdapter) runFetchCycle() {
 	if len(alerts) > 0 {
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d new alerts", len(alerts)))
 		a.submitEvents(alerts)
-	} else {
-		//a.conf.ClientOptions.DebugLog("no new alerts found")
 	}
 }
 
@@ -542,6 +542,10 @@ func (a *CynetAdapter) processAlerts(resp *AlertsResponse) ([]utils.Dict, time.T
 		// Track for deduplication using sync time
 		a.alertsDedupe[entityID] = time.Now().Unix()
 
+		// Parse the JSON-encoded IncidentJsonDescription field into a nested
+		// object so its subfields become addressable downstream.
+		a.parseIncidentJSON(entity)
+
 		newAlerts = append(newAlerts, entity)
 
 		if syncTime.After(latestTime) {
@@ -550,6 +554,33 @@ func (a *CynetAdapter) processAlerts(resp *AlertsResponse) ([]utils.Dict, time.T
 	}
 
 	return newAlerts, latestTime
+}
+
+// parseIncidentJSON replaces the IncidentJsonDescription field, which Cynet
+// delivers as a JSON-encoded string, with the parsed object. This lets
+// downstream D&R rules navigate its structure (process details, extra info,
+// etc.) instead of matching against an opaque string. If the field is absent,
+// already an object, empty, or not valid JSON, the entity is left untouched.
+func (a *CynetAdapter) parseIncidentJSON(entity utils.Dict) {
+	raw, ok := entity[incidentJSONField]
+	if !ok {
+		return
+	}
+
+	// Only string values need parsing; anything else is left as-is.
+	s, ok := raw.(string)
+	if !ok || s == "" {
+		return
+	}
+
+	var parsed utils.Dict
+	if err := json.Unmarshal([]byte(s), &parsed); err != nil {
+		// Leave the raw string in place so no data is lost on malformed JSON.
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("failed to parse %s: %v", incidentJSONField, err))
+		return
+	}
+
+	entity[incidentJSONField] = parsed
 }
 
 func (a *CynetAdapter) cleanupDedupe() {
