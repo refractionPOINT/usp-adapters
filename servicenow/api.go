@@ -93,9 +93,14 @@ func NewServiceNowClient(baseURL, username, password string) *ServiceNowClient {
 		httpClient: &http.Client{
 			Timeout: 60 * time.Second,
 			Transport: &http.Transport{
-				Dial: (&net.Dialer{
+				DialContext: (&net.Dialer{
 					Timeout: 10 * time.Second,
-				}).Dial,
+				}).DialContext,
+				// All feeds poll the same instance host concurrently; keep
+				// enough warm connections that each poll does not pay a fresh
+				// TLS handshake (the stdlib default of 2 per host would).
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     5 * time.Minute,
 			},
 		},
 	}

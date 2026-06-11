@@ -20,6 +20,7 @@
 package usp_servicenow
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -43,6 +44,7 @@ const (
 	maxPageSize             = 10000
 	defaultPollInterval     = 1 * time.Minute
 	defaultBackfill         = 15 * time.Minute
+	defaultCheckpointLag    = 5 * time.Minute
 	defaultDedupeTTL        = 7 * 24 * time.Hour
 	dedupeBucketWindow      = 1 * time.Hour
 	defaultMaxPages         = 100
@@ -141,6 +143,15 @@ type ServiceNowConfig struct {
 	// Backfill is how far back the first poll reaches. Default 15 minutes.
 	Backfill time.Duration `json:"backfill" yaml:"backfill"`
 
+	// CheckpointLag is how long the checkpoint trails the clock. A row can
+	// become visible in the Table API some time after its timestamp (it is
+	// stamped when written but only queryable once its transaction commits,
+	// and instance nodes can disagree on the time); a row that appears more
+	// than CheckpointLag late may be missed. Larger values re-read more
+	// recent records per poll (the deduper absorbs the overlap). Default 5
+	// minutes.
+	CheckpointLag time.Duration `json:"checkpoint_lag" yaml:"checkpoint_lag"`
+
 	// DedupeTTL is how long a record's identifier is remembered to suppress
 	// re-shipping it on subsequent polls. Default 7 days.
 	DedupeTTL time.Duration `json:"dedupe_ttl" yaml:"dedupe_ttl"`
@@ -200,6 +211,9 @@ func (c *ServiceNowConfig) Validate() error {
 	if c.Backfill <= 0 {
 		c.Backfill = defaultBackfill
 	}
+	if c.CheckpointLag <= 0 {
+		c.CheckpointLag = defaultCheckpointLag
+	}
 	if c.DedupeTTL <= 0 {
 		c.DedupeTTL = defaultDedupeTTL
 	}
@@ -239,6 +253,18 @@ func (c *ServiceNowConfig) Validate() error {
 		}
 		if f.MaxPages <= 0 {
 			f.MaxPages = defaultMaxPages
+		}
+		if f.Fields != "" {
+			cols := map[string]bool{}
+			for _, col := range strings.Split(f.Fields, ",") {
+				cols[strings.TrimSpace(col)] = true
+			}
+			// Without these two columns the checkpoint silently freezes and
+			// deduplication degrades to content hashes -- reject early.
+			if !cols[f.TimestampField] || !cols[f.IDField] {
+				return fmt.Errorf("feed %q: fields must include timestamp_field (%s) and id_field (%s)",
+					f.Name, f.TimestampField, f.IDField)
+			}
 		}
 	}
 	return nil
@@ -386,71 +412,120 @@ func (a *ServiceNowAdapter) runFeed(feed ServiceNowFeed) {
 }
 
 // pollFeed fetches one feed once, walking pages from the checkpoint in
-// ascending time order, and returns the new checkpoint.
+// ascending (timestamp, id) order, and returns the new checkpoint.
 //
 // The end-of-data signal is the Link rel="next" header, not the page's record
 // count: ServiceNow applies sysparm_limit before ACL evaluation, so a short
 // or even empty page can still be followed by more records.
 //
-// The returned checkpoint is the timestamp of the newest record processed.
-// Because records are walked oldest-first, stopping early (MaxPages) is safe:
-// everything up to the new checkpoint has been processed and the next poll
-// resumes from there. On failure the original checkpoint is returned so the
-// range is retried.
+// Checkpoint semantics:
+//
+//   - A failed or interrupted poll returns the original checkpoint so the
+//     same range is retried -- failures never open a gap.
+//   - A completed walk has processed every record currently visible at or
+//     after the checkpoint, so the checkpoint advances to now-CheckpointLag:
+//     anything older than that is guaranteed visible by the lag model, and
+//     anything newer is re-read on later polls (the deduper absorbs the
+//     overlap). Advancing on the clock -- not on record timestamps -- also
+//     walks the checkpoint past an idle feed's boundary records, so they are
+//     not re-fetched forever.
+//   - A walk capped by MaxPages has NOT seen everything: it resumes from the
+//     newest record actually processed (clamped to now-CheckpointLag in case
+//     of future-dated records). Records are walked oldest-first, so nothing
+//     before that is missed.
 func (a *ServiceNowAdapter) pollFeed(feed ServiceNowFeed, checkpoint time.Time) time.Time {
 	nSeen := 0
 	nShipped := 0
 	maxSeen := checkpoint
+	capped := false
 
-	for pageNumber := 1; !a.doStop.IsSet(); pageNumber++ {
+	for pageNumber := 1; ; pageNumber++ {
+		if a.doStop.IsSet() {
+			return checkpoint
+		}
 		if pageNumber > feed.MaxPages {
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf(
-				"servicenow: feed %q hit max_pages=%d this poll; the remaining records "+
-					"will be collected on the next poll from the advanced checkpoint",
-				feed.Name, feed.MaxPages))
+			capped = true
 			break
 		}
 
 		offset := (pageNumber - 1) * a.conf.PageSize
-		items, hasNext, ok := a.fetchPage(feed, checkpoint, offset)
+		page, ok := a.fetchPage(feed, checkpoint, offset)
 		if !ok {
 			// The error has already been reported; abandon this poll without
 			// advancing the checkpoint so the same range is retried.
 			return checkpoint
 		}
 
-		for _, item := range items {
+		for _, item := range page.items {
 			nSeen++
-			if raw := item.FindOneString(feed.TimestampField); raw != "" {
-				if t, ok := parseTimestamp(raw); ok && t.After(maxSeen) {
-					maxSeen = t
-				}
+			rawTs := item.FindOneString(feed.TimestampField)
+			ts, tsOK := parseTimestamp(rawTs)
+			if tsOK && ts.After(maxSeen) {
+				maxSeen = ts
 			}
 			if a.deduper.CheckAndAdd(a.dedupeKey(feed, item)) {
 				continue
 			}
-			if !a.ship(feed, item) {
+			eventMs := uint64(time.Now().UnixMilli())
+			if tsOK {
+				eventMs = uint64(ts.UnixMilli())
+			} else if rawTs != "" {
+				a.conf.ClientOptions.DebugLog(fmt.Sprintf(
+					"servicenow: feed %q unparseable timestamp %q at field %q", feed.Name, rawTs, feed.TimestampField))
+			}
+			if !a.ship(feed, item, eventMs) {
 				return checkpoint
 			}
 			nShipped++
 		}
 
-		if !hasNext {
+		if !page.hasNext {
 			break
 		}
 	}
 
+	lagged := time.Now().UTC().Add(-a.conf.CheckpointLag)
+	newCheckpoint := lagged
+	if capped {
+		if maxSeen.Before(lagged) {
+			newCheckpoint = maxSeen
+		}
+		if maxSeen.Equal(checkpoint) {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+				"servicenow: feed %q hit max_pages=%d without being able to advance the "+
+					"checkpoint: more than max_pages*page_size records share the timestamp %q. "+
+					"Raise max_pages or page_size, or narrow the feed's query, or records past "+
+					"the cap will never be collected",
+				feed.Name, feed.MaxPages, checkpoint.Format(serviceNowTimeLayout)))
+		} else {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+				"servicenow: feed %q hit max_pages=%d this poll; the remaining records "+
+					"will be collected on the next poll from the advanced checkpoint",
+				feed.Name, feed.MaxPages))
+		}
+	}
+	if newCheckpoint.Before(checkpoint) {
+		newCheckpoint = checkpoint
+	}
+
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf(
 		"servicenow: feed %q poll complete (seen=%d shipped=%d checkpoint=%s)",
-		feed.Name, nSeen, nShipped, maxSeen.Format(serviceNowTimeLayout)))
-	return maxSeen
+		feed.Name, nSeen, nShipped, newCheckpoint.Format(serviceNowTimeLayout)))
+	return newCheckpoint
+}
+
+// pageResult is one fetched page: its records and whether the API advertised
+// a further page via Link rel="next".
+type pageResult struct {
+	items   []utils.Dict
+	hasNext bool
 }
 
 // fetchPage requests one page of a feed, retrying transient failures with
 // exponential backoff (honoring Retry-After on HTTP 429). The bool result is
 // false when the poll should be abandoned (a permanent error, or the adapter
 // is stopping).
-func (a *ServiceNowAdapter) fetchPage(feed ServiceNowFeed, checkpoint time.Time, offset int) ([]utils.Dict, bool, bool) {
+func (a *ServiceNowAdapter) fetchPage(feed ServiceNowFeed, checkpoint time.Time, offset int) (pageResult, bool) {
 	params := a.buildParams(feed, checkpoint, offset)
 
 	var raw []byte
@@ -458,7 +533,7 @@ func (a *ServiceNowAdapter) fetchPage(feed ServiceNowFeed, checkpoint time.Time,
 	var err error
 	for attempt := 0; attempt < a.conf.MaxRetryAttempts; attempt++ {
 		if a.doStop.IsSet() {
-			return nil, false, false
+			return pageResult{}, false
 		}
 
 		raw, hasNext, err = a.client.GetTable(a.ctx, feed.Table, params)
@@ -468,24 +543,32 @@ func (a *ServiceNowAdapter) fetchPage(feed ServiceNowFeed, checkpoint time.Time,
 
 		if !isTransientError(err) {
 			a.conf.ClientOptions.OnError(fmt.Errorf("servicenow: feed %q request failed: %v", feed.Name, err))
-			// An authentication/authorization failure affects every feed, so
-			// stop the whole adapter rather than spin uselessly. Other
-			// permanent errors (e.g. a misnamed table) are isolated to this
-			// feed: abandon the poll but keep the adapter alive.
 			var httpErr *HTTPError
-			if errors.As(err, &httpErr) &&
-				(httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
-				// ServiceNow reports both bad credentials and missing table
-				// ACLs this way; surface both possibilities. Reading sys_audit
-				// requires the admin or security_admin role (or a custom ACL).
-				a.conf.ClientOptions.OnError(fmt.Errorf(
-					"servicenow: HTTP %d -- credentials rejected or the account lacks read "+
-						"access to table %q. Verify username/password and that the account's "+
-						"roles satisfy the table's ACLs (sys_audit requires admin or "+
-						"security_admin out of the box).", httpErr.StatusCode, feed.Table))
-				a.doStop.Set()
+			if errors.As(err, &httpErr) {
+				switch httpErr.StatusCode {
+				case http.StatusUnauthorized:
+					// Rejected credentials affect every feed: stop the whole
+					// adapter rather than burn the account with retries.
+					a.conf.ClientOptions.OnError(fmt.Errorf(
+						"servicenow: HTTP 401 -- credentials rejected; verify username/password. " +
+							"Stopping the adapter."))
+					a.doStop.Set()
+				case http.StatusForbidden:
+					// 403 is how ServiceNow reports a per-table ACL denial:
+					// the credentials are valid but this table is not
+					// readable. That is feed-local -- keep the other feeds
+					// (and this feed's polling, in case the ACL gets fixed)
+					// alive rather than killing the adapter.
+					a.conf.ClientOptions.OnError(fmt.Errorf(
+						"servicenow: HTTP 403 -- the account lacks read access to table %q "+
+							"(missing role or ACL; sys_audit requires admin or security_admin "+
+							"out of the box). The feed will keep retrying every poll_interval.",
+						feed.Table))
+				}
 			}
-			return nil, false, false
+			// Other permanent errors (e.g. a misnamed table) are isolated to
+			// this feed: abandon the poll but keep the adapter alive.
+			return pageResult{}, false
 		}
 
 		if attempt+1 >= a.conf.MaxRetryAttempts {
@@ -505,36 +588,48 @@ func (a *ServiceNowAdapter) fetchPage(feed ServiceNowFeed, checkpoint time.Time,
 			"servicenow: feed %q transient error (attempt %d/%d), retrying in %v: %v",
 			feed.Name, attempt+1, a.conf.MaxRetryAttempts, delay, err))
 		if a.doStop.WaitFor(delay) {
-			return nil, false, false
+			return pageResult{}, false
 		}
 	}
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf(
 			"servicenow: feed %q failed after %d attempts: %v", feed.Name, a.conf.MaxRetryAttempts, err))
-		return nil, false, false
+		return pageResult{}, false
 	}
 
 	items, err := extractResult(raw)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("servicenow: feed %q response parse error: %v", feed.Name, err))
-		return nil, false, false
+		return pageResult{}, false
 	}
-	return items, hasNext, true
+	return pageResult{items: items, hasNext: hasNext}, true
 }
 
 // buildParams assembles the Table API query parameters for one page of a
 // feed: the feed's own encoded-query filter ANDed with the incremental
-// checkpoint filter, ascending time order, and offset pagination. Database
-// (UTC) values are requested rather than display values, and reference-field
-// link objects are excluded, so payloads are stable regardless of the service
-// account's locale.
+// checkpoint filter, ascending (timestamp, id) order, and offset pagination.
+// Database (UTC) values are requested rather than display values, and
+// reference-field link objects are excluded, so payloads are stable
+// regardless of the service account's locale.
+//
+// The id ORDERBY tiebreaker is load-bearing: timestamps have one-second
+// granularity and each page is an independent query, so without a total
+// order, records sharing a second have no stable position across page
+// fetches and one could fall through a page boundary -- skipped permanently
+// once the checkpoint advances. With the tiebreaker, a mid-walk insert can
+// only shift records to later offsets, producing re-reads the deduper
+// absorbs, never skips.
 func (a *ServiceNowAdapter) buildParams(feed ServiceNowFeed, checkpoint time.Time, offset int) url.Values {
 	query := ""
 	if feed.Query != "" {
 		query = feed.Query + "^"
 	}
-	query += fmt.Sprintf("%s>=%s^ORDERBY%s",
-		feed.TimestampField, checkpoint.UTC().Format(serviceNowTimeLayout), feed.TimestampField)
+	idField := feed.IDField
+	if idField == "" {
+		idField = defaultIDField
+	}
+	query += fmt.Sprintf("%s>=%s^ORDERBY%s^ORDERBY%s",
+		feed.TimestampField, checkpoint.UTC().Format(serviceNowTimeLayout), feed.TimestampField, idField)
 
 	params := url.Values{}
 	params.Set("sysparm_query", query)
@@ -550,11 +645,11 @@ func (a *ServiceNowAdapter) buildParams(feed ServiceNowFeed, checkpoint time.Tim
 
 // ship forwards a single record to LimaCharlie. It returns false if the
 // adapter should stop (an unrecoverable shipping error).
-func (a *ServiceNowAdapter) ship(feed ServiceNowFeed, item utils.Dict) bool {
+func (a *ServiceNowAdapter) ship(feed ServiceNowFeed, item utils.Dict, eventMs uint64) bool {
 	msg := &protocol.DataMessage{
 		JsonPayload: item,
 		EventType:   feed.Name,
-		TimestampMs: a.eventTime(feed, item),
+		TimestampMs: eventMs,
 	}
 	if err := a.uspClient.Ship(msg, shipTimeout); err != nil {
 		if err == uspclient.ErrorBufferFull {
@@ -568,19 +663,6 @@ func (a *ServiceNowAdapter) ship(feed ServiceNowFeed, item utils.Dict) bool {
 		}
 	}
 	return true
-}
-
-// eventTime extracts the record's event time, falling back to now when the
-// configured timestamp field is absent or unparseable.
-func (a *ServiceNowAdapter) eventTime(feed ServiceNowFeed, item utils.Dict) uint64 {
-	if raw := item.FindOneString(feed.TimestampField); raw != "" {
-		if t, ok := parseTimestamp(raw); ok {
-			return uint64(t.UnixMilli())
-		}
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf(
-			"servicenow: feed %q unparseable timestamp %q at field %q", feed.Name, raw, feed.TimestampField))
-	}
-	return uint64(time.Now().UnixMilli())
 }
 
 // dedupeKey returns a stable deduplication key for a record, namespaced by
@@ -604,28 +686,33 @@ func recordID(feed ServiceNowFeed, item utils.Dict) string {
 }
 
 // extractResult parses a Table API response: a JSON object whose "result" key
-// holds the array of records. Each record is decoded with
-// utils.UnmarshalCleanJSON, which preserves integer precision (no float
-// coercion) so payloads round-trip faithfully. A record that is not a
-// non-empty JSON object is skipped rather than failing the whole page.
+// holds the array of records ("result": null is treated as an empty page; a
+// missing key is an error -- it means the body is not a Table API envelope).
+// Each record is decoded with utils.UnmarshalCleanJSON, which preserves
+// integer precision (no float coercion) so payloads round-trip faithfully. A
+// record that is not a non-empty JSON object is skipped rather than failing
+// the whole page.
 func extractResult(raw []byte) ([]utils.Dict, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
 		return nil, nil
 	}
 
-	var envelope struct {
-		Result []json.RawMessage `json:"result"`
-	}
-	if err := json.Unmarshal([]byte(trimmed), &envelope); err != nil {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &envelope); err != nil {
 		return nil, fmt.Errorf("invalid JSON response: %v", err)
 	}
-	if envelope.Result == nil && !strings.Contains(trimmed, `"result"`) {
-		return nil, errors.New(`response object has no "result" array`)
+	arrRaw, ok := envelope["result"]
+	if !ok {
+		return nil, fmt.Errorf(`response object has no "result" key (keys: %v)`, keysOf(envelope))
+	}
+	var arr []json.RawMessage
+	if err := json.Unmarshal(arrRaw, &arr); err != nil {
+		return nil, fmt.Errorf(`response "result" is not an array: %v`, err)
 	}
 
-	items := make([]utils.Dict, 0, len(envelope.Result))
-	for _, r := range envelope.Result {
+	items := make([]utils.Dict, 0, len(arr))
+	for _, r := range arr {
 		m, err := utils.UnmarshalCleanJSON(string(r))
 		if err != nil || len(m) == 0 {
 			continue
@@ -633,6 +720,14 @@ func extractResult(raw []byte) ([]utils.Dict, error) {
 		items = append(items, utils.Dict(m))
 	}
 	return items, nil
+}
+
+func keysOf(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func parseTimestamp(s string) (time.Time, bool) {

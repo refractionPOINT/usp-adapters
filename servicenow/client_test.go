@@ -87,6 +87,27 @@ func TestExtractResult(t *testing.T) {
 		assert.Error(t, err)
 	})
 
+	t.Run("null result is an empty page", func(t *testing.T) {
+		items, err := extractResult([]byte(`{"result": null}`))
+		require.NoError(t, err)
+		assert.Empty(t, items)
+	})
+
+	t.Run("result substring in a value does not mask a missing key", func(t *testing.T) {
+		_, err := extractResult([]byte(`{"error":{"message":"no result for query","detail":"\"result\""},"status":"failure"}`))
+		assert.Error(t, err)
+	})
+
+	t.Run("nested result key is not the envelope", func(t *testing.T) {
+		_, err := extractResult([]byte(`{"data":{"result":[{"sys_id":"a"}]}}`))
+		assert.Error(t, err)
+	})
+
+	t.Run("non-array result errors", func(t *testing.T) {
+		_, err := extractResult([]byte(`{"result":{"sys_id":"a"}}`))
+		assert.Error(t, err)
+	})
+
 	t.Run("empty body yields no items", func(t *testing.T) {
 		items, err := extractResult([]byte("   "))
 		require.NoError(t, err)
@@ -150,7 +171,7 @@ func TestBuildParams(t *testing.T) {
 	t.Run("incremental filter, order and pagination", func(t *testing.T) {
 		feed := ServiceNowFeed{Table: "sys_audit", TimestampField: "sys_created_on"}
 		params := a.buildParams(feed, checkpoint, 100)
-		assert.Equal(t, "sys_created_on>=2026-06-11 09:14:33^ORDERBYsys_created_on",
+		assert.Equal(t, "sys_created_on>=2026-06-11 09:14:33^ORDERBYsys_created_on^ORDERBYsys_id",
 			params.Get("sysparm_query"))
 		assert.Equal(t, "50", params.Get("sysparm_limit"))
 		assert.Equal(t, "100", params.Get("sysparm_offset"))
@@ -167,8 +188,15 @@ func TestBuildParams(t *testing.T) {
 			TimestampField: "sys_created_on",
 		}
 		params := a.buildParams(feed, checkpoint, 0)
-		assert.Equal(t, "name=login^sys_created_on>=2026-06-11 09:14:33^ORDERBYsys_created_on",
+		assert.Equal(t, "name=login^sys_created_on>=2026-06-11 09:14:33^ORDERBYsys_created_on^ORDERBYsys_id",
 			params.Get("sysparm_query"))
+	})
+
+	t.Run("id field is the pagination tiebreaker", func(t *testing.T) {
+		feed := ServiceNowFeed{Table: "sysevent", TimestampField: "sys_created_on", IDField: "uniq"}
+		params := a.buildParams(feed, checkpoint, 0)
+		assert.True(t, strings.HasSuffix(params.Get("sysparm_query"), "^ORDERBYsys_created_on^ORDERBYuniq"),
+			"got %q", params.Get("sysparm_query"))
 	})
 
 	t.Run("fields restriction is forwarded", func(t *testing.T) {
@@ -269,6 +297,7 @@ func TestValidate(t *testing.T) {
 		assert.Equal(t, defaultPageSize, c.PageSize)
 		assert.Equal(t, defaultPollInterval, c.PollInterval)
 		assert.Equal(t, defaultBackfill, c.Backfill)
+		assert.Equal(t, defaultCheckpointLag, c.CheckpointLag)
 
 		require.Len(t, c.Feeds, 1)
 		f := c.Feeds[0]
@@ -300,6 +329,28 @@ func TestValidate(t *testing.T) {
 			Feeds: []ServiceNowFeed{{Name: "x"}},
 		}
 		assert.Error(t, c.Validate())
+	})
+
+	t.Run("rejects a fields list missing the timestamp or id column", func(t *testing.T) {
+		for _, fields := range []string{
+			"tablename,fieldname,newvalue", // missing both
+			"sys_id,tablename",             // missing timestamp
+			"sys_created_on,tablename",     // missing id
+		} {
+			c := ServiceNowConfig{
+				ClientOptions: testClientOptions(t), Username: "u", Password: "p", Instance: "example",
+				Feeds: []ServiceNowFeed{{Table: "sys_audit", Fields: fields}},
+			}
+			assert.Error(t, c.Validate(), "fields=%q must be rejected", fields)
+		}
+	})
+
+	t.Run("accepts a fields list carrying the timestamp and id columns", func(t *testing.T) {
+		c := ServiceNowConfig{
+			ClientOptions: testClientOptions(t), Username: "u", Password: "p", Instance: "example",
+			Feeds: []ServiceNowFeed{{Table: "sys_audit", Fields: "sys_id, sys_created_on, tablename"}},
+		}
+		assert.NoError(t, c.Validate())
 	})
 
 	t.Run("rejects duplicate feed names", func(t *testing.T) {
@@ -408,18 +459,37 @@ func TestRequestShape(t *testing.T) {
 
 	q := req.query.Get("sysparm_query")
 	assert.Contains(t, q, "sys_created_on>=")
-	assert.True(t, strings.HasSuffix(q, "^ORDERBYsys_created_on"),
-		"records must be requested oldest-first for checkpointing, got %q", q)
+	assert.True(t, strings.HasSuffix(q, "^ORDERBYsys_created_on^ORDERBYsys_id"),
+		"records must be requested oldest-first with an id tiebreaker, got %q", q)
 }
 
-// TestCheckpointAdvances verifies the incremental filter moves forward to the
-// newest record seen, and that a poll returning nothing leaves it unchanged.
+// queryCheckpoint extracts and parses the checkpoint timestamp from a
+// captured sysparm_query.
+func queryCheckpoint(t *testing.T, q string) time.Time {
+	t.Helper()
+	start := strings.Index(q, "sys_created_on>=")
+	require.GreaterOrEqual(t, start, 0, "no checkpoint filter in %q", q)
+	rest := q[start+len("sys_created_on>="):]
+	end := strings.Index(rest, "^")
+	require.Greater(t, end, 0, "unterminated checkpoint filter in %q", q)
+	ts, err := time.Parse(serviceNowTimeLayout, rest[:end])
+	require.NoError(t, err, "unparseable checkpoint in %q", q)
+	return ts
+}
+
+// TestCheckpointAdvances verifies a completed poll advances the incremental
+// filter to now-CheckpointLag: past every record already collected (so an
+// idle feed stops re-reading its boundary forever) but no further than the
+// lag allows (so late-visible records are still caught).
 func TestCheckpointAdvances(t *testing.T) {
-	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
-	newest := base.Add(2 * time.Second).Format(serviceNowTimeLayout)
+	const lag = 30 * time.Minute
+
+	testStart := time.Now().UTC()
+	base := testStart.Add(-time.Hour).Truncate(time.Second)
+	newest := base.Add(2 * time.Second)
 	srv := &recordingServer{items: []map[string]interface{}{
 		auditItem("a", base.Format(serviceNowTimeLayout)),
-		auditItem("b", newest),
+		auditItem("b", newest.Format(serviceNowTimeLayout)),
 	}}
 	server := httptest.NewServer(srv.handler())
 	defer server.Close()
@@ -433,6 +503,7 @@ func TestCheckpointAdvances(t *testing.T) {
 		Password:      "p",
 		BaseURL:       server.URL,
 		Backfill:      2 * time.Hour,
+		CheckpointLag: lag,
 		PollInterval:  40 * time.Millisecond,
 		Feeds:         auditFeed(),
 	}
@@ -444,12 +515,19 @@ func TestCheckpointAdvances(t *testing.T) {
 		5*time.Second, 20*time.Millisecond)
 	require.NoError(t, adapter.Close())
 
-	// Poll 1 starts from the backfill checkpoint; every later poll must
-	// filter from the newest record's timestamp, inclusively.
+	// Poll 1 starts from the backfill checkpoint.
+	cp0 := queryCheckpoint(t, srv.request(0).query.Get("sysparm_query"))
+	assert.True(t, cp0.Before(base), "poll 1 must start from the backfill checkpoint, got %v", cp0)
+
+	// Later polls run from an advanced checkpoint: past the records already
+	// collected (records are an hour old, far older than the lag), but
+	// trailing the clock by at least CheckpointLag.
 	for i := 1; i < 3; i++ {
-		q := srv.request(i).query.Get("sysparm_query")
-		assert.Equal(t, fmt.Sprintf("sys_created_on>=%s^ORDERBYsys_created_on", newest), q,
-			"poll %d should resume from the newest seen record", i)
+		cp := queryCheckpoint(t, srv.request(i).query.Get("sysparm_query"))
+		assert.True(t, cp.After(newest),
+			"poll %d should have advanced past the collected records, got %v", i, cp)
+		assert.False(t, cp.After(time.Now().UTC().Add(-lag).Add(2*time.Second)),
+			"poll %d checkpoint %v must trail the clock by ~CheckpointLag", i, cp)
 	}
 }
 
@@ -460,9 +538,10 @@ func TestMaxPagesCapResumes(t *testing.T) {
 
 	var mu sync.Mutex
 	var requests []url.Values
-	// Records are stamped just ahead of the initial checkpoint so the
-	// checkpoint tracks the newest record served, on any day this test runs.
-	base := time.Now().UTC().Truncate(time.Second)
+	// Records are an hour old: newer than the 2h backfill checkpoint but
+	// older than now-CheckpointLag, so a capped poll resumes from the newest
+	// record processed (not from the lagged clock), on any day this test runs.
+	base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -499,6 +578,8 @@ func TestMaxPagesCapResumes(t *testing.T) {
 		Username:      "u",
 		Password:      "p",
 		BaseURL:       server.URL,
+		Backfill:      2 * time.Hour,
+		CheckpointLag: 1 * time.Minute,
 		PageSize:      pageSize,
 		PollInterval:  60 * time.Millisecond,
 		Feeds: []ServiceNowFeed{
@@ -533,9 +614,59 @@ func TestMaxPagesCapResumes(t *testing.T) {
 	assert.Equal(t, "0", requests[3].Get("sysparm_offset"), "a new poll restarts offsets")
 	wantCheckpoint := base.Add(7 * time.Second).Format(serviceNowTimeLayout)
 	assert.Equal(t,
-		fmt.Sprintf("sys_created_on>=%s^ORDERBYsys_created_on", wantCheckpoint),
+		fmt.Sprintf("sys_created_on>=%s^ORDERBYsys_created_on^ORDERBYsys_id", wantCheckpoint),
 		requests[3].Get("sysparm_query"),
 		"the capped poll must advance the checkpoint to the last record processed")
+}
+
+// TestMaxPagesStuckWarns verifies the distinct loud warning when a capped
+// poll cannot advance the checkpoint at all (more than max_pages*page_size
+// records share one timestamp), instead of the misleading "will be collected
+// next poll" message.
+func TestMaxPagesStuckWarns(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Full pages of records all older than the initial checkpoint (the
+		// mock ignores the filter), so maxSeen never moves; Link always
+		// advertises more.
+		items := []map[string]interface{}{
+			auditItem("a", "2000-01-01 00:00:01"),
+			auditItem("b", "2000-01-01 00:00:01"),
+		}
+		w.Header().Set("Link", fmt.Sprintf(`<%s>;rel="next"`, r.URL.String()))
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(resultEnvelope(items))
+	}))
+	defer server.Close()
+
+	var stuckWarned atomic.Bool
+	opts := testClientOptions(t)
+	opts.OnWarning = func(msg string) {
+		t.Logf("WRN: %s", msg)
+		if strings.Contains(msg, "without being able to advance") {
+			stuckWarned.Store(true)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conf := ServiceNowConfig{
+		ClientOptions: opts,
+		Username:      "u",
+		Password:      "p",
+		BaseURL:       server.URL,
+		PageSize:      2,
+		PollInterval:  1 * time.Hour, // only the initial poll runs during the test
+		Feeds: []ServiceNowFeed{
+			{Name: "stuck", Table: "sys_audit", MaxPages: 2},
+		},
+	}
+	adapter, _, err := NewServiceNowAdapter(ctx, conf)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, stuckWarned.Load, 5*time.Second, 20*time.Millisecond,
+		"adapter should warn loudly when the checkpoint cannot advance at the cap")
 }
 
 // TestTransientErrorRetry verifies the adapter retries 5xx responses rather
@@ -581,40 +712,78 @@ func TestTransientErrorRetry(t *testing.T) {
 	assert.False(t, adapter.doStop.IsSet())
 }
 
-// TestPermanentAuthErrorStops verifies a 401/403 stops the whole adapter.
-func TestPermanentAuthErrorStops(t *testing.T) {
-	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.WriteHeader(status)
-				_, _ = w.Write([]byte(`{"error":{"message":"Insufficient rights","detail":null},"status":"failure"}`))
-			}))
-			defer server.Close()
+// TestUnauthorizedStops verifies rejected credentials (HTTP 401) stop the
+// whole adapter.
+func TestUnauthorizedStops(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"User Not Authenticated","detail":null},"status":"failure"}`))
+	}))
+	defer server.Close()
 
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-			conf := ServiceNowConfig{
-				ClientOptions: testClientOptions(t),
-				Username:      "u",
-				Password:      "bad",
-				BaseURL:       server.URL,
-				PollInterval:  100 * time.Millisecond,
-				Feeds:         auditFeed(),
-			}
-			adapter, chStopped, err := NewServiceNowAdapter(ctx, conf)
-			require.NoError(t, err)
-			defer adapter.Close()
-
-			select {
-			case <-chStopped:
-				// Expected: an auth failure terminates the adapter.
-			case <-time.After(3 * time.Second):
-				t.Fatalf("adapter should have stopped on HTTP %d", status)
-			}
-			assert.True(t, adapter.doStop.IsSet())
-		})
+	conf := ServiceNowConfig{
+		ClientOptions: testClientOptions(t),
+		Username:      "u",
+		Password:      "bad",
+		BaseURL:       server.URL,
+		PollInterval:  100 * time.Millisecond,
+		Feeds:         auditFeed(),
 	}
+	adapter, chStopped, err := NewServiceNowAdapter(ctx, conf)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	select {
+	case <-chStopped:
+		// Expected: rejected credentials terminate the adapter.
+	case <-time.After(3 * time.Second):
+		t.Fatal("adapter should have stopped on HTTP 401")
+	}
+	assert.True(t, adapter.doStop.IsSet())
+}
+
+// TestForbiddenKeepsAdapterAlive verifies a 403 -- ServiceNow's per-table ACL
+// denial -- does not stop the adapter: the feed ships nothing but keeps
+// retrying on the poll interval (the ACL may be fixed live, and other feeds
+// must not be killed by one table's missing role).
+func TestForbiddenKeepsAdapterAlive(t *testing.T) {
+	var requestCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":{"message":"Insufficient rights to query records","detail":null},"status":"failure"}`))
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conf := ServiceNowConfig{
+		ClientOptions: testClientOptions(t),
+		Username:      "u",
+		Password:      "p",
+		BaseURL:       server.URL,
+		PollInterval:  50 * time.Millisecond,
+		Feeds:         auditFeed(),
+	}
+	adapter, chStopped, err := NewServiceNowAdapter(ctx, conf)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// The feed must keep polling across intervals (one request per poll: the
+	// 403 is permanent, not retried within a poll).
+	require.Eventually(t, func() bool { return requestCount.Load() >= 3 },
+		5*time.Second, 20*time.Millisecond, "the feed should keep retrying every poll_interval")
+
+	select {
+	case <-chStopped:
+		t.Fatal("a per-table 403 must not stop the adapter")
+	default:
+	}
+	assert.False(t, adapter.doStop.IsSet())
 }
 
 // TestRetryAfterIsHonored verifies a 429's Retry-After delay is respected

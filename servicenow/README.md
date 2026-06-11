@@ -39,9 +39,10 @@ integration account — work with your ServiceNow administrator.
 > correct either way, but an account that can read the whole table avoids
 > wasted requests and surprises.
 
-An authentication/authorization failure (HTTP 401/403) stops the adapter so a
-misconfiguration is surfaced loudly; 403 can mean either bad credentials or
-missing table ACLs.
+Rejected credentials (HTTP 401) stop the adapter so a misconfiguration is
+surfaced loudly. A per-table ACL denial (HTTP 403) is feed-local: the feed
+ships nothing and keeps retrying every `poll_interval` (so a live ACL fix is
+picked up), while other feeds keep collecting.
 
 ## Deployment Configurations
 
@@ -65,8 +66,9 @@ Adapter Type: `servicenow`
 | `password` | yes | Service-account password. |
 | `feeds` | no | List of tables to poll (see [Feed fields](#feed-fields)). Default: the `sys_audit` table. |
 | `page_size` | no | Records per page (`sysparm_limit`). Default `1000`, maximum `10000`. |
-| `poll_interval` | no | Wait between polls of a feed, as a Go duration in **nanoseconds**. Default `60000000000` (1 minute). |
+| `poll_interval` | no | Wait between polls of a feed, as a Go duration in **nanoseconds** (like every duration below). Default `60000000000` (1 minute). |
 | `backfill` | no | How far back the first poll reaches. Default 15 minutes. |
+| `checkpoint_lag` | no | How long the incremental checkpoint trails the clock, bounding how late a record may become visible in the Table API (slow transactions, node clock differences) without being missed. Default 5 minutes. |
 | `dedupe_ttl` | no | How long a record id is remembered to suppress re-shipping. Default 7 days. |
 | `retry_base_delay` / `max_retry_delay` / `max_retry_attempts` | no | Transient-failure retry tuning. |
 
@@ -112,18 +114,30 @@ Each record ships verbatim under an `EventType` matching the feed's `name`. A
 ## How polling works
 
 Each feed keeps a per-feed **checkpoint** on its timestamp column. Every poll
-queries `<timestamp_field> >= <checkpoint>` ordered oldest-first
-(`ORDERBY`), walking pages with `sysparm_offset`/`sysparm_limit` until the
-API stops advertising a `Link: rel="next"` header. The checkpoint then
-advances to the newest record processed:
+queries `<timestamp_field> >= <checkpoint>` ordered oldest-first with the id
+column as a tiebreaker (`ORDERBY<timestamp>^ORDERBY<id>` — timestamps have
+one-second granularity, and without a total order a record could slip through
+a page boundary between page fetches), walking pages with
+`sysparm_offset`/`sysparm_limit` until the API stops advertising a
+`Link: rel="next"` header. Then:
 
 - A poll that fails midway does **not** advance the checkpoint — the same
-  range is retried on the next interval, so failures never open a gap.
-- The checkpoint filter is inclusive (`>=`), so records at the boundary are
-  re-read; an in-memory deduper keyed on `sys_id` ships each record exactly
-  once.
-- A poll capped by `max_pages` still advances the checkpoint to the last
-  record processed, so the next poll picks up exactly where it left off.
+  range is retried on the next interval.
+- A completed poll advances the checkpoint to `now - checkpoint_lag`: the lag
+  leaves room for records that become visible in the API some time after
+  their timestamp (slow transactions, node clock differences). Records inside
+  the lag window are re-read on later polls; an in-memory deduper keyed on
+  `sys_id` keeps them from shipping twice.
+- A poll capped by `max_pages` advances the checkpoint only to the newest
+  record processed, so the next poll picks up exactly where it left off. If
+  more than `max_pages × page_size` records share a single timestamp the
+  checkpoint cannot advance at all and the adapter warns loudly — raise
+  `max_pages` or `page_size` if that ever happens.
+
+Delivery is **at-least-once**: the checkpoint and dedup state live in memory,
+so a restart re-reads (and the fresh deduper re-ships) up to `backfill` of
+recent history, and downtime longer than `backfill` leaves a gap — size
+`backfill` above your expected restart-to-recovery time.
 
 Transient API failures (HTTP 5xx, 429, network errors) are retried with
 exponential backoff, honoring a 429's `Retry-After` delay. ServiceNow
