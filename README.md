@@ -121,6 +121,17 @@ journalctl -f -q | netcat 127.0.0.1 4444
 ./adapter stdin client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=text "client_options.mapping.parsing_re=(?P<date>... \d\d \d\d:\d\d:\d\d) (?P<host>.+) (?P<exe>.+?)\[(?P<pid>\d+)\]: (?P<msg>.*)" client_options.sensor_seed_key=testclient3 client_options.mapping.event_type_path=exe
 ```
 
+### ServiceNow
+
+Pulls audit and system logs from the ServiceNow REST Table API. By default it
+collects the `sys_audit` table (field-level change history); other tables like
+`syslog_transaction` (transaction log) and `sysevent` (login events) can be
+added purely through configuration. See [servicenow/README.md](./servicenow/README.md).
+
+```
+./general servicenow client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=servicenow instance=example username=$SERVICENOW_USERNAME password=$SERVICENOW_PASSWORD
+```
+
 ### ThreatLocker
 
 Pulls events from the ThreatLocker Portal API. By default it collects pending

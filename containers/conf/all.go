@@ -32,6 +32,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/sentinelone"
+	"github.com/refractionPOINT/usp-adapters/servicenow"
 	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/sophos"
@@ -90,6 +91,7 @@ type GeneralConfigs struct {
 	Box               usp_box.BoxConfig                               `json:"box" yaml:"box"`
 	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
+	ServiceNow        usp_servicenow.ServiceNowConfig                 `json:"servicenow" yaml:"servicenow"`
 	ThreatLocker      usp_threatlocker.ThreatLockerConfig             `json:"threatlocker" yaml:"threatlocker"`
 	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`

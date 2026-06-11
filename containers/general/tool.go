@@ -46,6 +46,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/sentinelone"
+	"github.com/refractionPOINT/usp-adapters/servicenow"
 	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/sophos"
@@ -499,6 +500,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.TrendMicro.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.TrendMicro
 		client, chRunning, err = usp_trendmicro.NewTrendMicroAdapter(ctx, configs.TrendMicro)
+	} else if method == "servicenow" {
+		configs.ServiceNow.ClientOptions = applyLogging(configs.ServiceNow.ClientOptions)
+		configs.ServiceNow.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.ServiceNow
+		client, chRunning, err = usp_servicenow.NewServiceNowAdapter(ctx, configs.ServiceNow)
 	} else if method == "threatlocker" {
 		configs.ThreatLocker.ClientOptions = applyLogging(configs.ThreatLocker.ClientOptions)
 		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
