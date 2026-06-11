@@ -68,7 +68,9 @@ func TestValidate(t *testing.T) {
 		assert.Equal(t, "us", c.Region, "region still defaults even when url is overridden")
 	})
 
-	t.Run("every documented region maps to a Trend Micro domain", func(t *testing.T) {
+	// Trend Micro's v3.0 spec lists more regions (e.g. mea, uk, ca); the
+	// adapter supports these six, and the URL override covers the rest.
+	t.Run("every supported region maps to a Trend Micro domain", func(t *testing.T) {
 		for _, region := range []string{"us", "eu", "sg", "jp", "in", "au"} {
 			c := TrendMicroConfig{ClientOptions: testClientOptions(t), APIToken: "k", Region: region}
 			require.NoError(t, c.Validate(), "region %s", region)

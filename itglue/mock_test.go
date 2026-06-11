@@ -23,17 +23,31 @@ import (
 // This file exercises the adapter end-to-end against a mock IT Glue API,
 // capturing the exact messages it ships so their content can be asserted.
 //
-// The mock reproduces the IT Glue logs API as the adapter uses it: a GET on
-// /logs authenticated with the x-api-key header, taking filter[created_at]
-// (treated as "created at or after this RFC3339 time", the semantics the
-// adapter's 30s-lookback watermark relies on), sort=created_at and
-// page[size]/page[number] query parameters, and returning the JSON:API
-// envelope: {"data": [...], "links": {...}, "meta": {...}} with pagination
-// URLs nested under "links" per the JSON API spec.
+// The mock reproduces the IT Glue logs API (GET /logs, documented at
+// https://api.itglue.com/developer/ under "Logs") as the adapter uses it:
+// authenticated with the x-api-key header, taking sort=created_at (the only
+// documented sort for /logs) and page[size]/page[number] query parameters
+// (page size capped at 1000 per the docs), and returning the JSON:API
+// envelope: {"data": [...], "links": {...}, "meta": {...}} -- IT Glue states
+// it conforms to the JSON API spec (jsonapi.org), which nests pagination URLs
+// under top-level "links", and the official pagination article
+// (https://help.itglue.kaseya.com/help/Content/1-admin/it-glue-api/pagination-in-the-it-glue-api.html)
+// documents the "meta" page counters (total-pages, total-count). Note the real
+// /logs endpoint is additionally "limited to 5 pages of results" (page[number]
+// "Must be a value between 1 and 5 (inclusive)"); the documented way to iterate
+// further is filter[created_at] plus the created_at sort. The mock does not
+// enforce that cap -- the tests never page past 3 -- but it matters when
+// reasoning about the real API.
+//
+// filter[created_at]: the official docs only document a comma-separated range
+// ("start_date, end_date", with "*" for an unbounded side). The adapter sends
+// a single timestamp instead -- an undocumented form -- so the mock implements
+// the semantics the adapter's 30s-lookback watermark relies on: "created at or
+// after this RFC3339 time".
 
-// itglueTimeLayout matches the timestamp format the adapter sends in
-// filter[created_at] and that IT Glue uses in created-at attributes.
-const itglueTimeLayout = "2006-01-02T15:04:05.000000Z07:00"
+// itglueCreatedAtLayout matches the created-at format in the documented /logs
+// example response ("2021-07-24T00:55:31.000Z": RFC3339, UTC, milliseconds).
+const itglueCreatedAtLayout = "2006-01-02T15:04:05.000Z07:00"
 
 // --- in-memory USP sink -------------------------------------------------------
 
@@ -184,10 +198,12 @@ func (m *mockITGlue) handler() http.HandlerFunc {
 			_, _ = w.Write([]byte(`{"errors":[{"status":"404","title":"Not Found"}]}`))
 			return
 		}
-		// IT Glue authenticates with the key in the x-api-key header.
+		// IT Glue authenticates with the key in the x-api-key header. Per the
+		// developer docs ("API Key" section), "Trying to access the API with
+		// an incorrect key will result in an HTTP 403 error."
 		if rec.apiKey != m.apiKey {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"errors":[{"status":"401","title":"Unauthorized","detail":"invalid or missing api key"}]}`))
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"errors":[{"status":"403","title":"Forbidden","detail":"incorrect api key"}]}`))
 			return
 		}
 
@@ -277,25 +293,30 @@ func (m *mockITGlue) handler() http.HandlerFunc {
 // --- realistic fixtures -------------------------------------------------------
 
 // realisticLogRecord returns a JSON:API resource shaped like an IT Glue
-// activity log: a string id, type "logs", and kebab-case attributes mirroring
-// what the activity log surfaces (who did what to which resource, when, from
-// where). All identifying values are clearly fake (RFC 5737 test addresses,
-// example.com-style names).
+// activity log: a string id, type "logs", and exactly the kebab-case
+// attributes shown in the documented GET /logs example response at
+// https://api.itglue.com/developer/ (created-at, level, account-id, user-id,
+// organization-id, action, resource-type, resource-name, ip-address, ip-city,
+// ip-region, ip-country, user-agent). All identifying values are clearly fake
+// (RFC 5737 test addresses, example-style names).
 func realisticLogRecord(id string, createdAt time.Time) utils.Dict {
 	return utils.Dict{
 		"id":   id,
 		"type": "logs",
 		"attributes": utils.Dict{
-			"created-at":        createdAt.UTC().Format(itglueTimeLayout),
-			"action":            "viewed",
-			"resource-id":       1111111,
-			"resource-type":     "Password",
-			"resource-name":     "Example Firewall Admin",
-			"organization-id":   2222222,
-			"organization-name": "Example Org Inc.",
-			"member-id":         3333333,
-			"member-name":       "Jane Doe",
-			"ip-address":        "203.0.113.10",
+			"created-at":      createdAt.UTC().Format(itglueCreatedAtLayout),
+			"level":           2,
+			"account-id":      1111111,
+			"user-id":         3333333,
+			"organization-id": 2222222,
+			"action":          "viewed",
+			"resource-type":   "Password",
+			"resource-name":   "Example Firewall Admin",
+			"ip-address":      "203.0.113.10",
+			"ip-city":         "Example City",
+			"ip-region":       "EX",
+			"ip-country":      "Exampleland",
+			"user-agent":      "Mozilla/5.0 (TestRunner) ExampleBrowser/1.0",
 		},
 	}
 }
@@ -546,11 +567,11 @@ func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// The adapter keeps polling (and warning) despite the 401s.
+	// The adapter keeps polling (and warning) despite the 403s.
 	require.Eventually(t, func() bool { return mock.requestCount() >= 3 },
 		5*time.Second, 10*time.Millisecond, "the adapter should keep retrying on auth failure")
 	require.Eventually(t, func() bool { return non200Warnings.Load() >= 1 },
-		5*time.Second, 10*time.Millisecond, "the 401 should be surfaced via OnWarning")
+		5*time.Second, 10*time.Millisecond, "the 403 should be surfaced via OnWarning")
 
 	assert.Equal(t, 0, sink.count(), "nothing should ship when authentication fails")
 	select {

@@ -73,15 +73,23 @@ type cursorState struct {
 
 // mockZendesk is an in-memory stand-in for the Zendesk Audit Logs API as the
 // adapter consumes it: GET /api/v2/audit_logs authenticated with
-// "<email>/token:<api_token>" basic auth, filtered by a two-valued
-// filter[created_at][] window (inclusive), paginated by page[size] with a
-// {audit_logs, meta{has_more}, links{next}} envelope.
+// "{email_address}/token:{api_token}" basic auth, filtered by a created_at
+// window, paginated by page[size] with a {audit_logs, meta{has_more,
+// after_cursor, before_cursor}, links{next, prev}} envelope.
 //
-// Fidelity note: the real API's links.next is a full URL carrying a
-// page[after] cursor. This adapter feeds links.next back verbatim as the
-// *first* filter[created_at][] value of the next request (see makeOneRequest),
-// so the mock returns an opaque token instead and recognizes it there --
-// matching how the adapter actually consumes pagination.
+// Fidelity notes vs the official docs
+// (https://developer.zendesk.com/api-reference/ticketing/account-configuration/audit_logs/):
+//   - The docs spell the range param "filter[created_at]", supplied twice
+//     ("first with the start time and again with an end time"); the adapter
+//     sends the Rails array spelling "filter[created_at][]", which the mock
+//     mirrors. The docs do not say whether the bounds are inclusive; the mock
+//     treats them as inclusive.
+//   - The real API's links.next is a full URL carrying a page[after] cursor
+//     (https://developer.zendesk.com/api-reference/introduction/pagination/).
+//     This adapter instead feeds links.next back verbatim as the *first*
+//     filter[created_at][] value of the next request (see makeOneRequest), so
+//     the mock returns an opaque token and recognizes it there -- matching how
+//     the adapter actually consumes pagination.
 type mockZendesk struct {
 	mu    sync.Mutex
 	email string
@@ -260,12 +268,14 @@ const (
 )
 
 // auditLogFixture returns a record shaped like a real Zendesk audit log entry
-// (the documented fields of GET /api/v2/audit_logs).
+// (the documented fields of GET /api/v2/audit_logs, per
+// https://developer.zendesk.com/api-reference/ticketing/account-configuration/audit_logs/).
 //
-// NOTE: the real API returns "id" (and actor_id/source_id) as JSON numbers.
-// The adapter dedupes on `item["id"].(string)`, so string ids are required for
-// it to function; the fixtures use string ids to match what the adapter can
-// actually consume (see the caveat in the test report / adapter review).
+// NOTE: the docs type "id" (like actor_id/source_id) as an integer, i.e. a
+// JSON number. The adapter dedupes on `item["id"].(string)`, so string ids are
+// required for it to function; the fixtures use string ids to match what the
+// adapter can actually consume (see the caveat in the test report / adapter
+// review). actor_id/source_id stay numeric as documented.
 func auditLogFixture(id string, createdAt time.Time, action string) utils.Dict {
 	return utils.Dict{
 		"id":                 id,

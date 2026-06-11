@@ -86,7 +86,7 @@ func TestMakeOneRequestFiltersAndAdvancesSince(t *testing.T) {
 			{"id": "bad-ts", "created_at": "not a timestamp"},
 			{"id": "new-1", "created_at": "` + now.Add(5*time.Minute).Format(time.RFC3339Nano) + `"},
 			{"id": "new-2", "created_at": "` + newest.Format(time.RFC3339Nano) + `"}
-		], "count": 5}`))
+		], "count": 5, "total": 5}`))
 	}))
 	defer server.Close()
 
@@ -113,7 +113,7 @@ func TestMakeOneRequestDedupes(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"events": [
 			{"id": "evt-1", "created_at": "` + now.Add(5*time.Minute).Format(time.RFC3339Nano) + `"}
-		], "count": 1}`))
+		], "count": 1, "total": 1}`))
 	}))
 	defer server.Close()
 

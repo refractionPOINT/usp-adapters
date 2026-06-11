@@ -285,52 +285,51 @@ func sophosTime(ts time.Time) string {
 }
 
 // realisticThreatEvent returns an event shaped like a real Sophos Central SIEM
-// endpoint threat detection.
+// endpoint threat detection. Field names follow the raw /siem/v1/events schema
+// (id, created_at, when, severity, type, name, group, endpoint_id,
+// endpoint_type, customer_id, user_id, source, location, threat, origin,
+// source_info.ip); "when" is when the event occurred on the endpoint and
+// "created_at" is when Sophos Central ingested it, so created_at trails when.
 func realisticThreatEvent(id string, createdAt time.Time) utils.Dict {
-	when := sophosTime(createdAt)
 	return utils.Dict{
 		"id":            id,
-		"created_at":    when,
-		"when":          when,
+		"created_at":    sophosTime(createdAt),
+		"when":          sophosTime(createdAt.Add(-90 * time.Second)),
 		"severity":      "high",
 		"type":          "Event::Endpoint::Threat::Detected",
 		"name":          `Malware detected: 'EICAR-AV-Test' at 'C:\Users\jdoe\Downloads\eicar.com'`,
 		"group":         "MALWARE",
-		"datastream":    "event",
 		"endpoint_id":   "11111111-1111-1111-1111-111111111111",
 		"endpoint_type": "computer",
 		"customer_id":   "11111111-1111-1111-1111-222222222222",
-		"user_id":       "11111111-1111-1111-1111-333333333333",
-		"source":        `EXAMPLE\jdoe`,
-		"suser":         `EXAMPLE\jdoe`,
+		"user_id":       "111111111111111111111111",
+		"source":        "Jane Doe",
 		"location":      "WIN-EXAMPLE-01",
-		"dhost":         "WIN-EXAMPLE-01",
 		"threat":        "EICAR-AV-Test",
+		"origin":        nil,
 		"source_info":   utils.Dict{"ip": "10.1.2.3"},
 	}
 }
 
 // realisticWebEvent returns an event shaped like a Sophos Central SIEM web
-// control event.
+// filtering event (same raw schema as above; web events carry a null threat).
 func realisticWebEvent(id string, createdAt time.Time) utils.Dict {
-	when := sophosTime(createdAt)
 	return utils.Dict{
 		"id":            id,
-		"created_at":    when,
-		"when":          when,
-		"severity":      "medium",
+		"created_at":    sophosTime(createdAt),
+		"when":          sophosTime(createdAt.Add(-90 * time.Second)),
+		"severity":      "low",
 		"type":          "Event::Endpoint::WebFilteringBlocked",
-		"name":          "Access to 'blocked.example.com' was blocked by policy",
+		"name":          "'https://blocked.example.com' blocked due to category 'Personals and Dating'",
 		"group":         "WEB",
-		"datastream":    "event",
 		"endpoint_id":   "11111111-1111-1111-1111-111111111111",
 		"endpoint_type": "computer",
 		"customer_id":   "11111111-1111-1111-1111-222222222222",
-		"user_id":       "11111111-1111-1111-1111-333333333333",
-		"source":        `EXAMPLE\jdoe`,
-		"suser":         `EXAMPLE\jdoe`,
+		"user_id":       "111111111111111111111111",
+		"source":        "Jane Doe",
 		"location":      "WIN-EXAMPLE-01",
-		"dhost":         "WIN-EXAMPLE-01",
+		"threat":        nil,
+		"origin":        nil,
 		"source_info":   utils.Dict{"ip": "10.1.2.3"},
 	}
 }

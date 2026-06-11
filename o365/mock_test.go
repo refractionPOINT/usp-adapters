@@ -82,17 +82,31 @@ func (s *captureSink) payloadCounts() map[string]int {
 
 // --- realistic record fixtures ------------------------------------------------
 
+// recordTypes maps a workload to a documented AuditLogRecordType value, per
+// https://learn.microsoft.com/en-us/office/office-365-management-api/office-365-management-activity-api-schema
+// (15 = AzureActiveDirectoryStsLogon, 2 = ExchangeItem, 6 =
+// SharePointFileOperation, 40 = SecurityComplianceAlerts).
+var recordTypes = map[string]int{
+	"AzureActiveDirectory":     15,
+	"Exchange":                 2,
+	"SharePoint":               6,
+	"SecurityComplianceCenter": 40,
+}
+
 // auditRecord returns a compact-JSON Management Activity audit record with the
 // documented common-schema fields (Id, RecordType, CreationTime, Operation,
 // OrganizationId, UserType, UserKey, Workload, ResultStatus, ObjectId, UserId,
-// ClientIP) plus an ExtendedProperties array. The returned string is the exact
-// byte sequence the mock serves inside a content blob, so tests can assert the
-// adapter ships it verbatim.
+// ClientIP). AzureActiveDirectory records additionally carry the
+// ExtendedProperties Name/Value array of the documented Entra ID base schema.
+// The returned string is the exact byte sequence the mock serves inside a
+// content blob, so tests can assert the adapter ships it verbatim.
 func auditRecord(t *testing.T, id, operation, workload, userID string, creationTime time.Time) string {
 	t.Helper()
+	recordType, ok := recordTypes[workload]
+	require.True(t, ok, "no documented RecordType mapped for workload %q", workload)
 	rec := map[string]interface{}{
 		"Id":             id,
-		"RecordType":     15,
+		"RecordType":     recordType,
 		"CreationTime":   creationTime.UTC().Format(aadTimeLayout),
 		"Operation":      operation,
 		"OrganizationId": testTenantID,
@@ -103,10 +117,12 @@ func auditRecord(t *testing.T, id, operation, workload, userID string, creationT
 		"ObjectId":       "Unknown",
 		"UserId":         userID,
 		"ClientIP":       "203.0.113.42",
-		"ExtendedProperties": []map[string]interface{}{
+	}
+	if workload == "AzureActiveDirectory" {
+		rec["ExtendedProperties"] = []map[string]interface{}{
 			{"Name": "UserAgent", "Value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
 			{"Name": "RequestType", "Value": "OAuth2:Authorize"},
-		},
+		}
 	}
 	b, err := json.Marshal(rec)
 	require.NoError(t, err)
@@ -134,8 +150,8 @@ type contentBlob struct {
 //     bearer token and a contentType / PublisherIdentifier query.
 //   - GET /api/v1.0/{tenant}/activity/feed/subscriptions/content: lists the
 //     blobs of a content type whose contentCreated falls inside the request's
-//     [startTime, endTime] window, paginating via the NextPageUri response
-//     header when listPageSize is set.
+//     window (startTime <= contentCreated < endTime, per the API reference),
+//     paginating via the NextPageUri response header when listPageSize is set.
 //   - GET /api/v1.0/{tenant}/activity/feed/audit/{contentId}: serves the
 //     blob's records as a JSON array.
 type mockO365 struct {
@@ -337,6 +353,11 @@ func (m *mockO365) handleStart(w http.ResponseWriter, r *http.Request) {
 	m.mu.Unlock()
 
 	if alreadyEnabled {
+		// Observed live behavior of subscriptions/start on an already-enabled
+		// subscription: HTTP 400 with code AF20024. The code/message is not in
+		// the official error table (MicrosoftDocs/office-365-management-api
+		// issue #387) but the message text is what the real API returns; the
+		// adapter matches on its "already enabled" substring.
 		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
 			"error": map[string]string{"code": "AF20024", "message": "The subscription is already enabled. No property change."},
 		})
@@ -391,8 +412,10 @@ func (m *mockO365) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 	var inWindow []contentBlob
 	for _, b := range m.blobs[ct] {
+		// The documented window is inclusive of startTime and exclusive of
+		// endTime: startTime <= contentCreated < endTime.
 		created := b.created.UTC()
-		if !created.Before(start) && !created.After(end) {
+		if !created.Before(start) && created.Before(end) {
 			inWindow = append(inWindow, b)
 		}
 	}

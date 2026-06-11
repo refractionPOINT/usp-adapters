@@ -72,8 +72,10 @@ type DefenderConfig struct {
 	AlertsURL string `json:"alerts_url" yaml:"alerts_url"`
 
 	// PollInterval overrides how long the adapter waits between polls of the
-	// alerts endpoint (default: 30s).
-	PollInterval time.Duration `json:"poll_interval" yaml:"poll_interval"`
+	// alerts endpoint (default: 30s). Not exposed in json/yaml configs
+	// (time.Duration does not deserialize meaningfully); it is a seam for
+	// tests, like in the other polling adapters.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 // tokenURL returns the token endpoint to use: the configured override, or the

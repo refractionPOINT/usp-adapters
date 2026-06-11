@@ -141,7 +141,7 @@ func (m *mockHubSpot) handler() http.HandlerFunc {
 
 		if r.Method != http.MethodGet {
 			w.WriteHeader(http.StatusMethodNotAllowed)
-			_, _ = w.Write([]byte(`{"status":"error","message":"Method not allowed","category":"VALIDATION_ERROR"}`))
+			_, _ = w.Write([]byte(`{"status":"error","message":"Method not allowed","category":"VALIDATION_ERROR","correlationId":"22222222-2222-2222-2222-222222222222"}`))
 			return
 		}
 		// HubSpot private-app auth: Authorization: Bearer <token>.
@@ -169,13 +169,13 @@ func (m *mockHubSpot) handler() http.HandlerFunc {
 		after, err := time.Parse(time.RFC3339, afterRaw)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"status":"error","message":"Invalid occurredAfter","category":"VALIDATION_ERROR"}`))
+			_, _ = w.Write([]byte(`{"status":"error","message":"Invalid occurredAfter","category":"VALIDATION_ERROR","correlationId":"33333333-3333-3333-3333-333333333333"}`))
 			return
 		}
 		before, err := time.Parse(time.RFC3339, beforeRaw)
 		if err != nil {
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"status":"error","message":"Invalid occurredBefore","category":"VALIDATION_ERROR"}`))
+			_, _ = w.Write([]byte(`{"status":"error","message":"Invalid occurredBefore","category":"VALIDATION_ERROR","correlationId":"44444444-4444-4444-4444-444444444444"}`))
 			return
 		}
 
@@ -243,12 +243,13 @@ func realisticAuditLog(id string, occurredAt time.Time) utils.Dict {
 	}
 }
 
-// realisticSecuritySettingsLog returns an audit-log entry of a different
-// category, to keep the dataset heterogeneous.
-func realisticSecuritySettingsLog(id string, occurredAt time.Time) utils.Dict {
+// realisticSecurityActivityLog returns an audit-log entry of a different
+// category ("Security Activity" in HubSpot's documented category list), to
+// keep the dataset heterogeneous.
+func realisticSecurityActivityLog(id string, occurredAt time.Time) utils.Dict {
 	return utils.Dict{
 		"id":             id,
-		"category":       "SECURITY_SETTINGS",
+		"category":       "SECURITY_ACTIVITY",
 		"subCategory":    "TWO_FACTOR_AUTHENTICATION",
 		"action":         "UPDATE",
 		"targetObjectId": "240375137",
@@ -301,7 +302,7 @@ func TestMockAuditLogsEndToEnd(t *testing.T) {
 	want := []utils.Dict{
 		realisticAuditLog("8392545957", now.Add(900*time.Millisecond)),
 		realisticAuditLog("8392545958", now.Add(950*time.Millisecond)),
-		realisticSecuritySettingsLog("8392545959", now.Add(1*time.Second)),
+		realisticSecurityActivityLog("8392545959", now.Add(1*time.Second)),
 	}
 	mock.setEvents(want)
 
@@ -382,7 +383,7 @@ func TestMockNewEventMidRunShipsOnce(t *testing.T) {
 		8*time.Second, 20*time.Millisecond)
 
 	// A new account activity occurs mid-run.
-	mock.addEvent(realisticSecuritySettingsLog("1000000003", time.Now().Add(700*time.Millisecond)))
+	mock.addEvent(realisticSecurityActivityLog("1000000003", time.Now().Add(700*time.Millisecond)))
 
 	require.Eventually(t, func() bool { return sink.count() == 3 },
 		8*time.Second, 20*time.Millisecond, "the new entry should ship")

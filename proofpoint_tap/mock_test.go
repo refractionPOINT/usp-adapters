@@ -23,9 +23,11 @@ import (
 // -- can be asserted.
 //
 // The mock reproduces the API as the adapter uses it: it authenticates the
-// Basic principal/secret pair, requires format=json, parses the
-// interval=<ISO8601>/<ISO8601> window parameter, filters the in-memory event
-// set by that window, and answers with the documented envelope
+// Basic principal/secret pair, requires the format=json the adapter always
+// sends, parses the interval=<ISO8601>/<ISO8601> window parameter and
+// enforces its documented limits (30s..1h wide, within the 7-day retention),
+// filters the in-memory event set by that window, and answers with the
+// documented envelope
 // {"queryEndTime": ..., "messagesDelivered": [...], "messagesBlocked": [...],
 // "clicksPermitted": [...], "clicksBlocked": [...]}.
 
@@ -151,12 +153,16 @@ func (m *mockProofpointTap) handler() http.HandlerFunc {
 		q := r.URL.Query()
 		m.lastFormat = q.Get("format")
 		if m.lastFormat != "json" {
+			// The real API defaults format to syslog; the mock only speaks
+			// JSON, which is what the adapter must always request.
 			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte("The request was missing a mandatory request parameter"))
+			_, _ = w.Write([]byte("mock only supports format=json"))
 			return
 		}
 
-		// interval=<ISO8601 start>/<ISO8601 end>, at most one hour wide.
+		// interval=<ISO8601 start>/<ISO8601 end>. Documented limits: at least
+		// 30 seconds wide, at most one hour wide, and no further than 7 days
+		// into the past.
 		parts := strings.SplitN(q.Get("interval"), "/", 2)
 		if len(parts) != 2 {
 			w.WriteHeader(http.StatusBadRequest)
@@ -178,6 +184,16 @@ func (m *mockProofpointTap) handler() http.HandlerFunc {
 		if end.Sub(start) > time.Hour {
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte("The requested interval is too wide"))
+			return
+		}
+		if end.Sub(start) < 30*time.Second {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("The requested interval is too narrow"))
+			return
+		}
+		if time.Since(start) > 7*24*time.Hour {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte("The requested interval is too far into the past"))
 			return
 		}
 		m.lastIntervalStart, m.lastIntervalEnd = start, end
@@ -524,8 +540,9 @@ func TestMockRejectsBadCredentialsShipsNothing(t *testing.T) {
 }
 
 // TestMockHourCapOnBacklog verifies that when the cursor is far in the past
-// the adapter requests at most a one-hour interval (59 minutes plus the
-// 2-minute overlap trim) and advances its cursor to the returned queryEndTime,
+// the adapter requests at most a one-hour interval (it asks for the 1-hour
+// cap minus a 1-minute trim, i.e. a 59-minute window starting at the
+// cursor-2min overlap) and advances its cursor to the returned queryEndTime,
 // rather than asking the API for an over-wide window it would reject.
 func TestMockHourCapOnBacklog(t *testing.T) {
 	mock := newMockProofpointTap(testPrincipal, testSecret)

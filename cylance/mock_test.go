@@ -38,11 +38,13 @@ import (
 //   - GET  /memoryprotection/v2 and /memoryprotection/v2/{id} -- as threats,
 //     keyed by "device_image_file_event_id" / "created".
 //
-// Time-filter fidelity: the real detections API documents the ?start query
-// parameter, so the mock honors it there. The real threats and memory
-// protection list APIs only document ?page and ?page_size -- the ?start_time
-// parameter the adapter sends is an unknown parameter the real server ignores,
-// so the mock ignores it too (the adapter filters by time client-side).
+// Time-filter fidelity: all three list APIs document a server-side start
+// filter -- ?start (ISO 8601) on detections, ?start_time/?end_time
+// ("YYYY-MM-DDThh:mm:ss.SSSZ") on threats and memory protection -- so the mock
+// honors it on all of them. The adapter sends threats/memory protection
+// timestamps in the zone-less "2006-01-02T15:04:05" variant; the mock accepts
+// that and interprets it as UTC, matching the zone-less timestamps those APIs
+// return.
 //
 // All list/detail endpoints require "Authorization: Bearer <issued token>".
 
@@ -214,13 +216,11 @@ func (m *mockCylance) handler() http.HandlerFunc {
 			id := strings.TrimSuffix(strings.TrimPrefix(path, detectionsEndpoint+"/"), "/details")
 			m.serveDetail(w, m.detectionDetails, id)
 		case path == threatsEndpoint:
-			// The real threats API has no time filter; start_time is ignored.
-			m.serveList(w, r, m.snapshotList(&m.threats), "last_found", legacyTimeFormat, "")
+			m.serveList(w, r, m.snapshotList(&m.threats), "last_found", legacyTimeFormat, "start_time")
 		case strings.HasPrefix(path, threatsEndpoint+"/"):
 			m.serveDetail(w, m.threatDetails, strings.TrimPrefix(path, threatsEndpoint+"/"))
 		case path == memoryProtectionEndpoint:
-			// Same: the real memory protection API has no time filter.
-			m.serveList(w, r, m.snapshotList(&m.memProtects), "created", legacyTimeFormat, "")
+			m.serveList(w, r, m.snapshotList(&m.memProtects), "created", legacyTimeFormat, "start_time")
 		case strings.HasPrefix(path, memoryProtectionEndpoint+"/"):
 			m.serveDetail(w, m.memProtectInfo, strings.TrimPrefix(path, memoryProtectionEndpoint+"/"))
 		default:
@@ -309,9 +309,9 @@ func (m *mockCylance) snapshotList(list *[]utils.Dict) []utils.Dict {
 }
 
 // serveList implements the paginated list endpoints: it filters records by the
-// caller's start-time query parameter (when the real endpoint supports one --
-// startParam is empty for endpoints that don't), slices the requested page and
-// wraps it in the Cylance page envelope.
+// caller's start-time query parameter (named startParam -- "start" on
+// detections, "start_time" on threats and memory protection), slices the
+// requested page and wraps it in the Cylance page envelope.
 func (m *mockCylance) serveList(w http.ResponseWriter, r *http.Request, records []utils.Dict, timeField, timeFormat, startParam string) {
 	q := r.URL.Query()
 	page := intParam(q.Get("page"), 1)
@@ -417,14 +417,18 @@ func fixtureDetectionDetail(id string, received time.Time) utils.Dict {
 		"Name":     "Powershell Download And Execute",
 		"Category": "Execution",
 	}
-	d["AssociatedIocs"] = []interface{}{
+	d["DetectionRule"].(utils.Dict)["Version"] = "1.2"
+	d["AssociatedArtifacts"] = []interface{}{
 		utils.Dict{
-			"Type":  "File",
-			"Value": `C:\Users\jdoe\AppData\Local\Temp\dropper.ps1`,
+			"Type": "File",
+			"Uid":  "99999999-9999-9999-9999-999999999901",
+			"File": utils.Dict{
+				"Path": `C:\Users\jdoe\AppData\Local\Temp\dropper.ps1`,
+			},
 		},
 	}
-	d["Tactics"] = []interface{}{"Execution", "Defense Evasion"}
-	d["Comments"] = []interface{}{}
+	d["Comment"] = ""
+	d["ZoneIds"] = []interface{}{}
 	return d
 }
 
@@ -460,17 +464,18 @@ func fixtureThreatDetail(sha256 string, lastFound time.Time) utils.Dict {
 	return d
 }
 
-// fixtureMemProtect is shaped like a GET /memoryprotection/v2 page item.
+// fixtureMemProtect is shaped like a GET /memoryprotection/v2 page item
+// (field names and types from the official Memory Protection API docs:
+// action and violation_type are numeric -- 3 is Terminate, 12 is LSASS read).
 func fixtureMemProtect(id string, created time.Time) utils.Dict {
 	return utils.Dict{
 		"device_image_file_event_id": id,
-		"tenant_id":                  testTenantID,
 		"device_id":                  "66666666-6666-6666-6666-666666666666",
-		"image_path":                 `C:\Users\jdoe\AppData\Local\Temp\injector.exe`,
-		"action":                     "Terminate",
-		"violation_type":             "LsassRead",
+		"image_name":                 `C:\Users\jdoe\AppData\Local\Temp\injector.exe`,
+		"action":                     3,
+		"violation_type":             12,
 		"process_id":                 4242,
-		"user_name":                  `EXAMPLE\jdoe`,
+		"username":                   `EXAMPLE\jdoe`,
 		"created":                    created.UTC().Format(legacyTimeFormat),
 	}
 }
@@ -479,7 +484,12 @@ func fixtureMemProtect(id string, created time.Time) utils.Dict {
 // GET /memoryprotection/v2/{id}.
 func fixtureMemProtectDetail(id string, created time.Time) utils.Dict {
 	d := fixtureMemProtect(id, created)
-	d["device_name"] = "WIN-EXAMPLE-02"
+	d["agent_event_id"] = "99999999-9999-9999-9999-999999999902"
+	d["file_hash_id"] = "2222222222222222222222222222222222222222222222222222222222222222"
+	d["dll_version"] = "3.1.1000.123"
+	d["file_version"] = "1.0.0.0"
+	d["groups"] = []interface{}{"Users"}
+	d["sid"] = "S-1-5-21-1111111111-2222222222-3333333333-1001"
 	return d
 }
 
@@ -665,22 +675,24 @@ func TestMockNewDetectionMidRunShipsOnce(t *testing.T) {
 
 // TestMockPaginationFullDataset verifies a dataset larger than one page
 // (page_size is a fixed 100) is walked to the last page and every record's
-// detail document is shipped exactly once. It uses the threats API: its real
-// server has no time filter, so the multi-page walk sees a stable dataset.
+// detail document is shipped exactly once.
 //
-// (The detections API cannot fully consume a multi-page poll: the adapter
-// advances the start filter to the newest record seen while also incrementing
-// the page number, so against a server that honors ?start -- as the real
-// detections API does -- later pages of the shrunken result set skip records.
-// That is existing adapter behavior, faithfully reproduced by this mock, not a
-// mock artifact.)
+// All records share one timestamp. That keeps the server-side result set
+// stable across the walk: the adapter advances its start filter to the newest
+// record seen *while also* incrementing the page number, so against the
+// documented server-side start filters (?start on detections,
+// ?start_time on threats and memory protection -- all honored by this mock),
+// a multi-page poll over records with distinct timestamps skips every record
+// that lands between the new filter position and the next page boundary.
+// That data loss is existing adapter behavior, not a mock artifact; this test
+// pins down the one shape of multi-page poll the adapter does fully consume.
 func TestMockPaginationFullDataset(t *testing.T) {
 	const total = 250 // 3 pages at the adapter's fixed page_size of 100
 
 	mock := newMockCylance(t)
 	base := time.Now().UTC().Truncate(time.Second).Add(-30 * time.Minute)
 	for i := 0; i < total; i++ {
-		mock.addThreat(fmt.Sprintf("%064d", i), base.Add(time.Duration(i)*time.Second))
+		mock.addThreat(fmt.Sprintf("%064d", i), base)
 	}
 
 	opts, _ := testClientOptions(t)

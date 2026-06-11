@@ -82,9 +82,17 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 //   - GET /v1.0/security/alerts_v2 -- the MS Graph security alerts endpoint.
 //     It validates the bearer token, honors the adapter's
 //     `$filter=createdDateTime ge <ts>` query parameter against an in-memory
-//     dataset (kept in ascending createdDateTime order, the order the adapter
-//     relies on), and returns the Graph envelope ({"@odata.context", "value",
+//     dataset, and returns the Graph envelope ({"@odata.context", "value",
 //     and "@odata.nextLink" when the page is truncated}).
+//
+// Ordering caveat: the mock serves alerts in ascending createdDateTime order
+// because the adapter's watermark logic (take the createdDateTime of the last
+// item processed as the next `since`) only makes forward progress under that
+// ordering. The official docs do NOT promise it: the List alerts_v2 page says
+// "The most recent alerts are displayed at the top of the list" (newest
+// first) and $orderby is not among the supported query parameters ($count,
+// $filter, $skip, $top). These tests pin the adapter's behavior, not a Graph
+// ordering guarantee.
 type mockMicrosoft struct {
 	mu sync.Mutex
 
@@ -104,8 +112,9 @@ func newMockMicrosoft() *mockMicrosoft {
 	return &mockMicrosoft{}
 }
 
-// appendAlert appends an alert at the end of the dataset (newest last), as a
-// createdDateTime-ascending Graph result would surface a new alert.
+// appendAlert appends an alert at the end of the dataset (newest last),
+// keeping the dataset in the ascending createdDateTime order the adapter's
+// watermark logic depends on (see the ordering caveat on mockMicrosoft).
 func (m *mockMicrosoft) appendAlert(alert map[string]interface{}) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -185,25 +194,39 @@ func (m *mockMicrosoft) handleToken(t *testing.T, w http.ResponseWriter, r *http
 
 	w.Header().Set("Content-Type", "application/json")
 
+	// Documented AAD error responses carry error/error_description/error_codes
+	// plus timestamp, trace_id, correlation_id and (when available) error_uri.
+	// All ids here are clearly fake; the adapter only cares that no
+	// access_token is present.
 	if form.Get("grant_type") != "client_credentials" ||
 		form.Get("scope") != "https://graph.microsoft.com/.default" ||
 		form.Get("client_id") != mockClientID {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":             "invalid_request",
-			"error_description": "AADSTS900144: The request body must contain the following parameter: 'client_id'.",
+			"error_description": "AADSTS900144: The request body must contain the following parameter: 'client_id'.\r\nTrace ID: 00000000-0000-0000-0000-000000000001\r\nCorrelation ID: 00000000-0000-0000-0000-000000000002\r\nTimestamp: 2024-01-01 00:00:00Z",
 			"error_codes":       []int{900144},
+			"timestamp":         "2024-01-01 00:00:00Z",
+			"trace_id":          "00000000-0000-0000-0000-000000000001",
+			"correlation_id":    "00000000-0000-0000-0000-000000000002",
+			"error_uri":         "https://login.microsoftonline.com/error?code=900144",
 		})
 		return
 	}
 	if form.Get("client_secret") != mockClientSecret {
-		// What AAD returns for a bad secret; the adapter only cares that no
-		// access_token is present.
+		// What AAD returns for a bad secret: error "invalid_client" with
+		// AADSTS7000215 ("Invalid client secret is provided" per the AADSTS
+		// error code reference). AAD serves invalid_client over HTTP 401,
+		// which RFC 6749 section 5.2 permits.
 		w.WriteHeader(http.StatusUnauthorized)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":             "invalid_client",
-			"error_description": "AADSTS7000215: Invalid client secret provided. Ensure the secret being sent in the request is the client secret value, not the client secret ID.",
+			"error_description": "AADSTS7000215: Invalid client secret provided. Ensure the secret being sent in the request is the client secret value, not the client secret ID, for a secret added to app '" + mockClientID + "'.\r\nTrace ID: 00000000-0000-0000-0000-000000000001\r\nCorrelation ID: 00000000-0000-0000-0000-000000000002\r\nTimestamp: 2024-01-01 00:00:00Z",
 			"error_codes":       []int{7000215},
+			"timestamp":         "2024-01-01 00:00:00Z",
+			"trace_id":          "00000000-0000-0000-0000-000000000001",
+			"correlation_id":    "00000000-0000-0000-0000-000000000002",
+			"error_uri":         "https://login.microsoftonline.com/error?code=7000215",
 		})
 		return
 	}
@@ -304,8 +327,8 @@ func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *htt
 // realisticAlert returns an alert shaped like a real MS Graph security
 // alerts_v2 record (microsoft.graph.security.alert): the documented top-level
 // fields plus an evidence array mixing deviceEvidence / fileEvidence /
-// processEvidence, nulls, ints, bools and nested objects. All identifiers are
-// clearly fake.
+// processEvidence, nulls, ints, arrays and nested objects. All identifiers
+// are clearly fake.
 func realisticAlert(id string, createdDateTime time.Time) map[string]interface{} {
 	created := createdDateTime.Format(graphTimestampLayout)
 	return map[string]interface{}{

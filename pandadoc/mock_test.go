@@ -22,6 +22,12 @@ import (
 // This file exercises the adapter end-to-end against a mock PandaDoc API
 // (GET /public/v1/logs), capturing the exact messages it ships so their
 // content -- timestamp and verbatim payload -- can be asserted.
+//
+// Note: PandaDoc marks /public/v1/logs deprecated (sunset 2027-02-04) in
+// favor of the identically-shaped /public/v2/logs
+// (https://developers.pandadoc.com/reference/list-api-logs,
+// https://developers.pandadoc.com/reference/listlogsv2); the adapter still
+// targets v1, so the mock does too.
 
 // mockPageSize mirrors the PandaDoc API's default page size of 100 records;
 // the adapter does not send a `count` parameter and assumes a short page
@@ -126,8 +132,10 @@ func (m *mockPandaDoc) maxPageSeen() int {
 }
 
 // checkAuth validates the Authorization header. The adapter sends
-// "Api-Key <key>"; PandaDoc documents the scheme as "API-Key", so the scheme is
-// matched case-insensitively while the key itself must match exactly.
+// "Api-Key <key>"; PandaDoc documents the scheme as "API-Key"
+// (https://developers.pandadoc.com/reference/api-key-authentication-process),
+// and HTTP auth schemes are case-insensitive (RFC 9110 §11.1), so the scheme
+// is matched case-insensitively while the key itself must match exactly.
 func (m *mockPandaDoc) checkAuth(header string) bool {
 	parts := strings.SplitN(header, " ", 2)
 	if len(parts) != 2 {
@@ -231,22 +239,26 @@ func writeJSONStatus(w http.ResponseWriter, status int, d utils.Dict) {
 
 // --- realistic log fixtures ---------------------------------------------------
 
-// auditLogEntry returns a record shaped like a real PandaDoc API log entry:
-// the documented id/url/status/request_time/response_time fields plus the
-// request metadata PandaDoc reports for an API call.
+// fixtureTimeLayout renders fixture timestamps with millisecond precision and
+// an explicit zone designator. PandaDoc's documented example timestamps
+// ("2024-07-15T18:59:38.000") carry millisecond precision but no zone; the
+// fixture appends one because the adapter parses request_time with
+// time.RFC3339Nano (see makeOneRequest in client.go), which requires it.
+const fixtureTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+
+// auditLogEntry returns a record shaped like a documented PandaDoc API log
+// list entry (https://developers.pandadoc.com/reference/list-api-logs):
+// exactly id, url, method, status, request_time and response_time. Richer
+// fields (request_body, token_type, application, ...) only appear on the log
+// details endpoint (/public/v1/logs/{id}), which the adapter never calls.
 func auditLogEntry(id string, requestTime time.Time) utils.Dict {
 	return utils.Dict{
 		"id":            id,
-		"url":           "/public/v1/documents?count=50&status=2",
+		"url":           "/public/v1/documents/00000000000000000000000/send",
 		"method":        "POST",
 		"status":        201,
-		"request_time":  requestTime.UTC().Format(time.RFC3339Nano),
-		"response_time": requestTime.Add(150 * time.Millisecond).UTC().Format(time.RFC3339Nano),
-		"token_type":    "api_key",
-		"application": utils.Dict{
-			"id":   "11111111-1111-1111-1111-111111111111",
-			"name": "Example Integration",
-		},
+		"request_time":  requestTime.UTC().Format(fixtureTimeLayout),
+		"response_time": requestTime.Add(150 * time.Millisecond).UTC().Format(fixtureTimeLayout),
 	}
 }
 
@@ -285,10 +297,10 @@ func shippedIDCounts(msgs []*protocol.DataMessage) map[string]int {
 // --- tests ---------------------------------------------------------------------
 
 // TestMockLogsEndToEnd drives the adapter against the mock API and asserts the
-// exact events shipped: the payload preserved verbatim (nested objects
-// included), TimestampMs stamped at ship time (the adapter's actual behavior --
-// it does not use the record's request_time for the message timestamp), no
-// EventType set, and that re-polling the same window does not re-ship.
+// exact events shipped: the payload preserved verbatim, TimestampMs stamped at
+// ship time (the adapter's actual behavior -- it does not use the record's
+// request_time for the message timestamp), no EventType set, and that
+// re-polling the same window does not re-ship.
 func TestMockLogsEndToEnd(t *testing.T) {
 	const apiKey = "fake-test-api-key-0000000000000000"
 
@@ -336,7 +348,7 @@ func TestMockLogsEndToEnd(t *testing.T) {
 		id := src["id"].(string)
 		msg := byID[id]
 		require.NotNil(t, msg, "record %s was not shipped", id)
-		// The payload is shipped verbatim -- nested objects included.
+		// The payload is shipped verbatim, every documented field intact.
 		assert.JSONEq(t, mustJSON(t, src), mustJSON(t, msg.JsonPayload),
 			"shipped payload must match the original PandaDoc log entry")
 	}

@@ -28,6 +28,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -472,8 +473,9 @@ func TestUDPWithTLSConfigRejected(t *testing.T) {
 	require.Nil(t, ch)
 }
 
-// TestConfigValidateRequiresPort pins Validate(): a zero port is rejected (the
-// general runner calls Validate before constructing the adapter).
+// TestConfigValidateRequiresPort pins Validate(): a zero port is rejected.
+// Note that NewSyslogAdapter does not call Validate itself (nothing in this
+// repo does), which is why the other tests can bind Port 0 directly.
 func TestConfigValidateRequiresPort(t *testing.T) {
 	t.Parallel()
 	conf := SyslogConfig{
@@ -547,6 +549,40 @@ func TestTCPCloseWhileClientConnected(t *testing.T) {
 	if len(got) == 2 {
 		require.Equal(t, lateLine, got[1])
 	}
+}
+
+// TestStreamTokenizerSingleCharLineQuirk pins a known quirk of the tokenizer
+// the TCP path feeds every read into (utils/stream_tokenizer.go): the
+// `i-1 > dataStart` guard in Add skips segments of exactly one byte, so a
+// one-character line whose byte and newline arrive in the SAME Add call comes
+// back as an empty chunk -- handleLine then drops it, so the line never ships.
+// The same line split across two Adds (byte in one read, newline in the next)
+// survives via the end-of-buffer branch. The tokenizer here is configured
+// exactly as handleConnection configures it (Token 0x0a).
+func TestStreamTokenizerSingleCharLineQuirk(t *testing.T) {
+	t.Parallel()
+
+	// Byte and newline in one Add: the 1-byte line is lost (empty chunk),
+	// surrounding lines are unaffected.
+	st := utils.StreamTokenizer{ExpectedSize: 1024 * 32, Token: 0x0a}
+	chunks, err := st.Add([]byte("<13>first line\nX\n<13>second line\n"))
+	require.NoError(t, err)
+	got := make([]string, 0, len(chunks))
+	for _, c := range chunks {
+		got = append(got, string(c))
+	}
+	require.Equal(t, []string{"<13>first line", "", "<13>second line"}, got,
+		"a 1-character line in a single read degrades to an empty chunk (dropped by handleLine)")
+
+	// The same 1-byte line split across two Adds is preserved.
+	st = utils.StreamTokenizer{ExpectedSize: 1024 * 32, Token: 0x0a}
+	chunks, err = st.Add([]byte("X"))
+	require.NoError(t, err)
+	require.Empty(t, chunks)
+	chunks, err = st.Add([]byte("\n"))
+	require.NoError(t, err)
+	require.Len(t, chunks, 1)
+	require.Equal(t, "X", string(chunks[0]))
 }
 
 // TestUDPCloseStopsShipping covers UDP shutdown: Close() closes the socket, so

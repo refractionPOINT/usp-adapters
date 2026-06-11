@@ -60,8 +60,9 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 // --- mock Mimecast API 2.0 ----------------------------------------------------
 
 // mimecastRequestTimeLayout is the format the adapter renders startDateTime /
-// endDateTime in ("2006-01-02T15:04:05-0700"), which is also what the real
-// Mimecast API accepts.
+// endDateTime in ("2006-01-02T15:04:05-0700"). It matches the documented
+// format for those fields, yyyy-MM-dd'T'HH:mm:ssZ with a colonless offset
+// (e.g. "2011-12-03T10:15:30+0000").
 const mimecastRequestTimeLayout = "2006-01-02T15:04:05-0700"
 
 // mockAccessToken is the bearer token the mock issues on a successful
@@ -128,7 +129,7 @@ func (m *mockMimecast) handler(t *testing.T) http.HandlerFunc {
 		case "/api/audit/get-audit-events":
 			m.handleAuditEvents(t, w, r)
 		default:
-			http.Error(w, `{"fail":[{"errors":[{"code":"err_not_found","message":"not found","retryable":false}]}]}`, http.StatusNotFound)
+			http.Error(w, `{"fail":[{"errors":[{"code":"endpoint_evaluation_failed_1","message":"Endpoint cannot be found","retryable":false}]}]}`, http.StatusNotFound)
 		}
 	}
 }
@@ -165,7 +166,7 @@ func (m *mockMimecast) handleToken(t *testing.T, w http.ResponseWriter, r *http.
 		form.Get("client_secret") != m.clientSecret {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"error":"invalid_client","error_description":"Client authentication failed"}`))
+		_, _ = w.Write([]byte(`{"fail":[{"errors":[{"code":"invalid_client_identifier","message":"Client credentials are invalid","retryable":false}]}]}`))
 		return
 	}
 
@@ -207,14 +208,14 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	if r.Header.Get("Authorization") != "Bearer "+mockAccessToken {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
-		_, _ = w.Write([]byte(`{"meta":{"status":401},"data":[],"fail":[{"errors":[{"code":"token_verification_failed","message":"Token verification failed","retryable":false}]}]}`))
+		_, _ = w.Write([]byte(`{"meta":{"status":401},"data":[],"fail":[{"errors":[{"code":"invalid_access_token","message":"Access token is invalid","retryable":false}]}]}`))
 		return
 	}
 
 	if forcedStatus != 0 {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(forcedStatus)
-		_, _ = w.Write([]byte(`{"meta":{"status":500},"data":[],"fail":[{"errors":[{"code":"err_internal","message":"internal error","retryable":true}]}]}`))
+		_, _ = w.Write([]byte(`{"meta":{"status":500},"data":[],"fail":[{"errors":[{"code":"internal_server_error_1","message":"Failed to handle request with requestId: fake-request-id","retryable":true}]}]}`))
 		return
 	}
 
@@ -262,7 +263,7 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 
 	pageSize := req.Meta.Pagination.PageSize
 	if pageSize <= 0 {
-		pageSize = 25 // the real API default
+		pageSize = 10 // the documented default when meta.pagination.pageSize is omitted
 	}
 	offset := 0
 	if tok := req.Meta.Pagination.PageToken; tok != "" {
@@ -306,10 +307,12 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 // /api/audit/get-audit-events record: the documented id, auditType, user,
 // eventTime, eventInfo and category fields. All identifiers are clearly fake.
 //
-// NOTE on eventTime format: the real API renders eventTime with a numeric
-// offset ("2026-06-11T10:00:00+0000"). The adapter parses eventTime with
-// time.RFC3339, which requires a colon in the offset (or "Z"); fixtures use
-// the RFC3339 "Z" form so the adapter's dedupe bookkeeping behaves as designed.
+// NOTE on eventTime format: the official API 2.0 spec documents eventTime as
+// ISO 8601 in the yyyy-MM-dd'T'HH:mm:ssZ pattern, i.e. a colonless numeric
+// offset like "2026-06-11T10:00:00+0000". The adapter parses eventTime with
+// time.RFC3339, which requires a colon in the offset (or "Z") and so rejects
+// the documented form; fixtures use the RFC3339 "Z" form so the adapter's
+// dedupe bookkeeping behaves as designed.
 func fakeAuditEvent(id, auditType, user, category, info string, eventTime time.Time) utils.Dict {
 	return utils.Dict{
 		"id":        id,

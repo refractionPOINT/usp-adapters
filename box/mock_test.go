@@ -72,7 +72,8 @@ const mockBoxBasePosition = int64(1152922976252290800)
 //     stream_position request returns events recorded after that position.
 //     Every response carries next_stream_position pointing past the last
 //     entry returned (or the unchanged position when there is nothing new),
-//     mirroring the real long-polling stream contract.
+//     mirroring the real stream paging contract
+//     (https://developer.box.com/reference/get-events/).
 type mockBox struct {
 	mu sync.Mutex
 
@@ -181,7 +182,7 @@ func (m *mockBox) handleToken(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":             "invalid_client",
-			"error_description": "The client credentials are invalid",
+			"error_description": "The client credentials are not valid",
 		})
 		return
 	}
@@ -224,6 +225,7 @@ func (m *mockBox) handleEvents(w http.ResponseWriter, r *http.Request) {
 
 	// Resolve where in the stream this request starts.
 	var idx int
+	usedCreatedAfter := false
 	switch {
 	case q.Get("stream_position") != "":
 		pos, err := strconv.ParseInt(q.Get("stream_position"), 10, 64)
@@ -244,6 +246,7 @@ func (m *mockBox) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	case q.Get("created_after") != "":
 		m.initRequests++
+		usedCreatedAfter = true
 		after, err := time.Parse(time.RFC3339, q.Get("created_after"))
 		if err != nil {
 			writeBoxError(w, http.StatusBadRequest, "bad_request", "invalid created_after")
@@ -272,11 +275,21 @@ func (m *mockBox) handleEvents(w http.ResponseWriter, r *http.Request) {
 		chunk = []utils.Dict{}
 	}
 
+	// next_stream_position is documented as anyOf string|integer
+	// (https://developer.box.com/reference/get-events/ -- the schema example is
+	// the string "1152922976252290886") and live responses use both forms, so
+	// serve the bootstrap (created_after) response as a string and in-stream
+	// responses as an integer to exercise the adapter against both.
+	var nextPos interface{} = mockBoxBasePosition + int64(end)
+	if usedCreatedAfter {
+		nextPos = strconv.FormatInt(mockBoxBasePosition+int64(end), 10)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"chunk_size":           len(chunk),
-		"next_stream_position": mockBoxBasePosition + int64(end),
+		"next_stream_position": nextPos,
 		"entries":              chunk,
 	})
 }
@@ -290,16 +303,19 @@ func writeBoxError(w http.ResponseWriter, status int, code, message string) {
 		"status":     status,
 		"code":       code,
 		"message":    message,
-		"help_url":   "http://developers.box.com/docs/#errors",
-		"request_id": "11111111111111111111",
+		"help_url":   "https://developer.box.com/guides/api-calls/permissions-and-errors/common-errors/",
+		"request_id": "abcdef123456",
 	})
 }
 
 // --- realistic fixtures -------------------------------------------------------
 
 // realisticBoxEvent returns an entry shaped like a real Box enterprise
-// (admin_logs) event: the documented top-level fields, a created_by user mini,
-// a nested source with a parent folder, and mixed scalar types. All
+// (admin_logs) event per the documented Event resource
+// (https://developer.box.com/reference/resources/event/): the documented
+// top-level fields, a created_by user mini, a nested event source with a
+// parent folder mini and owner, a freeform additional_details object with
+// mixed scalar types, and a null session_id (not all events populate it). All
 // identifiers are clearly fake. created_at must be recent (the adapter's
 // dedupe window is one hour).
 func realisticBoxEvent(eventID, eventType string, createdAt time.Time) utils.Dict {
@@ -316,7 +332,6 @@ func realisticBoxEvent(eventID, eventType string, createdAt time.Time) utils.Dic
 		"recorded_at": createdAt.UTC().Add(2 * time.Second).Format(time.RFC3339),
 		"event_type":  eventType,
 		"session_id":  nil,
-		"ip_address":  "203.0.113.10",
 		"source": utils.Dict{
 			"item_type": "file",
 			"item_id":   "1111111111111",

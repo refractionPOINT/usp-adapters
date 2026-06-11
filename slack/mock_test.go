@@ -21,6 +21,11 @@ import (
 // Logs API (https://api.slack.com/audit/v1/logs), capturing the exact messages
 // it ships so their content -- event type, timestamp and verbatim payload --
 // can be asserted without live Slack credentials.
+//
+// The API contract mocked here is taken from the official documentation:
+//   - https://docs.slack.dev/admins/audit-logs-api/ (auth, entry anatomy)
+//   - https://docs.slack.dev/reference/audit-logs-api/methods-actions-reference/
+//     (endpoint, query parameters, ordering, action names, error codes)
 
 // --- in-memory USP sink -----------------------------------------------------
 
@@ -64,11 +69,22 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 // documented by Slack, and cursors are opaque continuation tokens over a
 // snapshot of the filtered result set -- supplying a cursor resumes that
 // snapshot regardless of the other parameters, as with the real API.
+//
+// Ordering: the real API returns entries newest-first ("the default ordering
+// being descending (most to least recent)" per the methods reference). The
+// mock defaults to serving oldest-first -- the ordering under which the
+// adapter's "oldest" watermark never re-ships across pages -- and offers
+// newestFirst to reproduce the documented ordering; see
+// TestNewestFirstPaginationReships for the behavior difference that causes.
 type mockSlack struct {
 	mu       sync.Mutex
 	token    string
 	pageSize int
 	entries  []utils.Dict // ascending by date_create
+
+	// newestFirst serves fresh queries in the real API's documented order
+	// (descending date_create) instead of the default ascending order.
+	newestFirst bool
 
 	cursors   map[string][]utils.Dict // continuation token -> remaining entries
 	cursorSeq int
@@ -93,8 +109,8 @@ func newMockSlack(token string, pageSize int) *mockSlack {
 }
 
 // addEntry appends an audit log entry to the dataset. Entries must be added in
-// ascending date_create order (the order the adapter's incremental "oldest"
-// tracking requires to not re-ship).
+// ascending date_create order; serving order is then controlled by
+// newestFirst (the real API serves newest-first).
 func (m *mockSlack) addEntry(e utils.Dict) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -151,9 +167,15 @@ func (m *mockSlack) handler() http.HandlerFunc {
 			return
 		}
 		if r.Header.Get("Authorization") != "Bearer "+m.token {
+			// The live endpoint answers an invalid bearer token with a bare
+			// 401 and an empty body (Content-Type: application/json,
+			// Content-Length: 0); the documented error codes for this API
+			// are invalid_authentication / missing_authentication, but no
+			// body envelope is documented or observed. The adapter only
+			// looks at the status code.
 			m.authFailures++
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"ok":false,"error":"not_authed"}`))
 			return
 		}
 
@@ -167,8 +189,9 @@ func (m *mockSlack) handler() http.HandlerFunc {
 			m.pagedRequests++
 			remaining, ok := m.cursors[cur]
 			if !ok {
-				w.WriteHeader(http.StatusBadRequest)
-				_, _ = w.Write([]byte(`{"ok":false,"error":"invalid_cursor"}`))
+				// Mock-internal guard: the adapter should only ever echo
+				// back a cursor this mock handed out.
+				http.Error(w, "mock: unknown cursor", http.StatusBadRequest)
 				return
 			}
 			page, remaining = splitPage(remaining, m.pageSize)
@@ -189,6 +212,11 @@ func (m *mockSlack) handler() http.HandlerFunc {
 				ts, _ := e.GetInt("date_create")
 				if int64(ts) >= oldest {
 					matched = append(matched, e)
+				}
+			}
+			if m.newestFirst {
+				for i, j := 0, len(matched)-1; i < j; i, j = i+1, j-1 {
+					matched[i], matched[j] = matched[j], matched[i]
 				}
 			}
 			var remaining []utils.Dict
@@ -222,8 +250,10 @@ func splitPage(entries []utils.Dict, n int) ([]utils.Dict, []utils.Dict) {
 // --- fixtures ----------------------------------------------------------------
 
 // auditEntry builds a realistic Slack audit log entry, shaped like the real
-// API's payloads: a UUID id, an epoch date_create, an action, and nested
-// actor/entity/context objects.
+// API's payloads: a UUID id, an epoch-seconds date_create, an action, and
+// nested actor/entity/context objects, following the documented anatomy
+// (https://docs.slack.dev/admins/audit-logs-api/). All identifiers are
+// obviously-fake placeholders.
 func auditEntry(id string, dateCreate int64, action string) utils.Dict {
 	return utils.Dict{
 		"id":          id,
@@ -255,12 +285,11 @@ func auditEntry(id string, dateCreate int64, action string) utils.Dict {
 			},
 			"ua":         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ExampleAgent/1.0",
 			"ip_address": "198.51.100.1",
-			"session_id": 1111111111,
+			"session_id": "1111111111",
 		},
 		"details": utils.Dict{
 			"is_internal_integration": false,
 			"app_owner_id":            "W111AA111",
-			"md5":                     "11111111111111111111111111111111",
 		},
 	}
 }
@@ -438,7 +467,11 @@ func TestMidRunEntryShipsExactlyOnce(t *testing.T) {
 
 // TestMultiPagePaginationFullyConsumed verifies the adapter exhausts the
 // next_cursor chain: a dataset spanning several pages is fully shipped, each
-// entry exactly once, and stays shipped-once across later polls.
+// entry exactly once, and stays shipped-once across later polls. The mock
+// serves pages oldest-first here, the ordering under which the adapter's
+// last-page watermark is exact; see TestNewestFirstPaginationReships for the
+// documented (descending) ordering, where multi-page delivery degrades to
+// at-least-once.
 func TestMultiPagePaginationFullyConsumed(t *testing.T) {
 	const token = "xoxp-1111111111-fake-test-token"
 	base := time.Now().Unix() + 5
@@ -474,6 +507,65 @@ func TestMultiPagePaginationFullyConsumed(t *testing.T) {
 	require.Eventually(t, func() bool { return mock.requestCount() >= reqs+3 },
 		5*time.Second, 10*time.Millisecond)
 	assert.Equal(t, len(fixtures), sink.count())
+}
+
+// TestNewestFirstPaginationReships pins the adapter's behavior against the
+// documented Slack ordering: the real API returns entries newest-first
+// ("descending (most to least recent)" per
+// https://docs.slack.dev/reference/audit-logs-api/methods-actions-reference/).
+// Because the adapter's "oldest" watermark is the max date_create of the LAST
+// page it processed (+1 per cycle), a multi-page newest-first response leaves
+// the watermark anchored at the oldest chunk, so the newer pages re-ship on
+// subsequent polls until the watermark converges. With 5 entries (date_create
+// base..base+4) and a page size of 2 this is fully deterministic:
+//
+//	poll 1 (oldest<=base):  ships e5,e4 | e3,e2 | e1  -> watermark base+1
+//	poll 2 (oldest=base+1): ships e5,e4 | e3,e2       -> watermark base+3
+//	poll 3 (oldest=base+3): ships e5,e4               -> watermark base+5
+//	poll 4+ : nothing
+//
+// for a total of 11 ships: e1 once, e2/e3 twice, e4/e5 three times. Every
+// entry is eventually delivered (no loss), but multi-page responses are
+// at-least-once, not exactly-once.
+func TestNewestFirstPaginationReships(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	base := time.Now().Unix() + 5
+
+	mock := newMockSlack(token, 2)
+	mock.newestFirst = true
+	for i := 0; i < 5; i++ {
+		mock.addEntry(auditEntry(fixtureID(i+1), base+int64(i), "user_login"))
+	}
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _, err := newSlackAdapter(t.Context(), testConf(t, server.URL, token), sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// The ship count converges to exactly 11 (see trace above)...
+	require.Eventually(t, func() bool { return sink.count() >= 11 },
+		5*time.Second, 10*time.Millisecond, "expected the watermark to converge after re-ships")
+	// ... and stays there once the watermark has passed the newest entry.
+	reqs := mock.requestCount()
+	require.Eventually(t, func() bool { return mock.requestCount() >= reqs+3 },
+		5*time.Second, 10*time.Millisecond)
+	assert.Equal(t, 11, sink.count(), "ships must stop once the watermark converges")
+
+	shipsPerID := map[string]int{}
+	for _, m := range sink.snapshot() {
+		id, _ := m.JsonPayload["id"].(string)
+		require.NotEmpty(t, id)
+		shipsPerID[id]++
+	}
+	assert.Equal(t, map[string]int{
+		fixtureID(1): 1,
+		fixtureID(2): 2,
+		fixtureID(3): 2,
+		fixtureID(4): 3,
+		fixtureID(5): 3,
+	}, shipsPerID, "newest-first pagination re-ships newer pages until the watermark converges")
 }
 
 // TestBadTokenShipsNothing pins the adapter's actual behavior on auth failure:

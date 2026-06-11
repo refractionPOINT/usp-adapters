@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -138,7 +139,8 @@ func (m *mockOktaSystemLog) handler() http.HandlerFunc {
 			return
 		}
 		if r.URL.Path != logsURL {
-			oktaError(w, http.StatusNotFound, "E0000007", "Not found")
+			// E0000007 is "Not found: {0}" in Okta's error code reference.
+			oktaError(w, http.StatusNotFound, "E0000007", fmt.Sprintf("Not found: %s", r.URL.Path))
 			return
 		}
 		if r.Header.Get("Authorization") != "SSWS "+token {
@@ -146,19 +148,23 @@ func (m *mockOktaSystemLog) handler() http.HandlerFunc {
 			return
 		}
 
+		// A malformed timestamp gets Okta's documented validation error:
+		// HTTP 400 with errorCode E0000001 ("Api validation failed").
 		since, err := time.Parse(time.RFC3339, q.Get("since"))
 		if err != nil {
-			oktaError(w, http.StatusBadRequest, "E0000031", "The request was invalid: since")
+			oktaError(w, http.StatusBadRequest, "E0000001", "Api validation failed: 'since': The date format in your query is not recognized. Please enter dates using ISO8601 string format.")
 			return
 		}
 		until, err := time.Parse(time.RFC3339, q.Get("until"))
 		if err != nil {
-			oktaError(w, http.StatusBadRequest, "E0000031", "The request was invalid: until")
+			oktaError(w, http.StatusBadRequest, "E0000001", "Api validation failed: 'until': The date format in your query is not recognized. Please enter dates using ISO8601 string format.")
 			return
 		}
 
 		// A bounded query returns the events whose `published` falls inside
-		// the inclusive [since, until] window.
+		// the inclusive [since, until] window. Bounded requests are
+		// "guaranteed to be in order according to the published field"
+		// (default sortOrder is ASCENDING), so the mock sorts the page.
 		page := []utils.Dict{}
 		for _, e := range events {
 			published, perr := time.Parse(time.RFC3339, fmt.Sprintf("%v", e["published"]))
@@ -170,6 +176,9 @@ func (m *mockOktaSystemLog) handler() http.HandlerFunc {
 			}
 			page = append(page, e)
 		}
+		sort.SliceStable(page, func(i, j int) bool {
+			return fmt.Sprintf("%v", page[i]["published"]) < fmt.Sprintf("%v", page[j]["published"])
+		})
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Link", fmt.Sprintf("<http://%s%s?since=%s&until=%s>; rel=\"self\"", r.Host, logsURL, q.Get("since"), q.Get("until")))
@@ -181,13 +190,15 @@ func (m *mockOktaSystemLog) handler() http.HandlerFunc {
 // --- realistic fixtures ---------------------------------------------------------
 
 // systemLogEvent returns a record shaped like a real Okta System Log event:
-// uuid, published, eventType plus the actor/client/target/outcome/transaction/
-// debugContext structures the real API emits (nested objects, arrays, nulls
-// and mixed scalar types).
+// uuid, published, eventType plus the actor/client/request/target/outcome/
+// transaction/debugContext structures the real API emits (nested objects,
+// arrays, nulls and mixed scalar types).
 func systemLogEvent(uuid, eventType string, published time.Time) utils.Dict {
 	return utils.Dict{
-		"uuid":           uuid,
-		"published":      published.UTC().Format(time.RFC3339),
+		"uuid": uuid,
+		// The real API emits `published` at millisecond precision, e.g.
+		// "2017-09-31T22:23:07.777Z" in the official LogEvent example.
+		"published":      published.UTC().Format("2006-01-02T15:04:05.000Z"),
 		"eventType":      eventType,
 		"version":        "0",
 		"severity":       "INFO",

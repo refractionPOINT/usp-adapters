@@ -56,7 +56,8 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 // --- mock Bitwarden API -----------------------------------------------------
 
 // mockPageSize mirrors the real API, which returns at most 50 event logs per
-// page and a continuationToken when more are available.
+// page (the default PageOptions.PageSize in bitwarden/server) and a
+// continuationToken when more are available.
 const mockPageSize = 50
 
 // mockBitwarden is an in-memory stand-in for the two Bitwarden endpoints the
@@ -68,12 +69,19 @@ const mockPageSize = 50
 //     tokens, returning 400 invalid_client on a bad secret.
 //   - GET /public/events -- the Events API. It requires a previously issued
 //     bearer token, filters the in-memory dataset by the start/end query
-//     parameters, paginates with an opaque continuationToken, and returns the
-//     real {"object":"list","data":[...],"continuationToken":...} envelope.
+//     parameters (defaulting to the last 30 days when absent, as documented),
+//     paginates with an opaque continuationToken, and returns the documented
+//     {"object":"list","data":[...],"continuationToken":...} envelope.
 //
-// Time filtering treats the window as (start, end]: the adapter always sends
-// start equal to the end of its previous cycle, so half-open windows are what
-// make its checkpointing exactly-once.
+// Time filtering treats the window as [start, end], inclusive on both ends.
+// The official docs don't state boundary inclusivity, but both event-store
+// implementations in bitwarden/server filter Date >= start AND Date <= end
+// (SQL: Event_ReadPageByOrganizationId.sql; Azure Tables: reversed-tick
+// RowKey le/ge in TableStorage/EventRepository.cs). The adapter reuses each
+// cycle's end as the next start (truncated to whole seconds by RFC3339
+// formatting), so only an event stamped exactly on that whole-second boundary
+// could ever be returned in two windows; the sub-second fixture timestamps in
+// these tests never hit that edge.
 type mockBitwarden struct {
 	mu           sync.Mutex
 	clientID     string
@@ -205,9 +213,11 @@ func (m *mockBitwarden) handleEvents(w http.ResponseWriter, r *http.Request) {
 	authorized := m.issuedTokens[token] && !m.rejectBearer
 	m.mu.Unlock()
 	if !authorized {
+		// ErrorResponseModel shape; "Unauthorized." is the message the API's
+		// exception filter uses for 401s.
 		writeJSON(w, http.StatusUnauthorized, map[string]interface{}{
 			"object":  "error",
-			"message": "The current user is not authorized.",
+			"message": "Unauthorized.",
 		})
 		return
 	}
@@ -255,16 +265,24 @@ func (m *mockBitwarden) handleEvents(w http.ResponseWriter, r *http.Request) {
 			end, hasEnd = t, true
 		}
 
+		// "If no filters are provided, it will return the last 30 days of
+		// event for the organization" (official API reference). The server
+		// defaults to start = today-30d, end = end of today (UTC) whenever
+		// either bound is missing (EventFilterRequestModel.ToDateRange).
+		if !hasStart || !hasEnd {
+			today := time.Now().UTC().Truncate(24 * time.Hour)
+			start = today.AddDate(0, 0, -30)
+			end = today.AddDate(0, 0, 1).Add(-time.Millisecond)
+		}
+
 		m.mu.Lock()
 		for _, e := range m.events {
 			d, ok := eventDate(e)
 			if !ok {
 				continue
 			}
-			if hasStart && !d.After(start) {
-				continue // window is half-open: (start, end]
-			}
-			if hasEnd && d.After(end) {
+			// Inclusive on both ends, like the real event stores.
+			if d.Before(start) || d.After(end) {
 				continue
 			}
 			matched = append(matched, e)
@@ -313,23 +331,26 @@ func eventDate(e utils.Dict) (time.Time, bool) {
 // --- realistic event fixtures -------------------------------------------------
 
 // realisticBitwardenEvent returns a record shaped like a real Bitwarden
-// organization event: the documented field set with its mix of int enums
-// (type, device), strings (ids, ipAddress) and nulls, and the API's
-// sub-second-precision date format. All identifiers are clearly fake.
+// organization event: the documented EventResponseModel field set with its mix
+// of int enums (type, device), strings (uuids, ipAddress) and nulls, and a
+// sub-second-precision date. All identifiers are clearly fake.
 func realisticBitwardenEvent(eventType int, itemID string, date time.Time) utils.Dict {
 	return utils.Dict{
-		"object":         "event",
-		"type":           eventType, // e.g. 1000 user_loggedin, 1107 cipher_clientviewed
-		"itemId":         itemID,
-		"collectionId":   nil,
-		"groupId":        nil,
-		"policyId":       nil,
-		"memberId":       "11111111-1111-1111-1111-111111111111",
-		"actingUserId":   "22222222-2222-2222-2222-222222222222",
-		"installationId": nil,
-		"date":           date.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
-		"device":         9, // ChromeBrowser
-		"ipAddress":      "198.51.100.10",
+		"object":           "event",
+		"type":             eventType, // e.g. 1000 User_LoggedIn, 1107 Cipher_ClientViewed
+		"itemId":           itemID,
+		"collectionId":     nil,
+		"groupId":          nil,
+		"policyId":         nil,
+		"memberId":         "11111111-1111-1111-1111-111111111111",
+		"actingUserId":     "22222222-2222-2222-2222-222222222222",
+		"installationId":   nil,
+		"date":             date.UTC().Format("2006-01-02T15:04:05.999999999Z07:00"),
+		"device":           9, // DeviceType 9 = ChromeBrowser
+		"ipAddress":        "198.51.100.10",
+		"secretId":         nil,
+		"projectId":        nil,
+		"serviceAccountId": nil,
 	}
 }
 
@@ -373,8 +394,8 @@ func TestMockEventsEndToEnd(t *testing.T) {
 	require.Eventually(t, func() bool { return sink.count() == 3 },
 		5*time.Second, 20*time.Millisecond, "expected all 3 events to ship")
 
-	// Re-polling must not re-ship: later polls query (lastEnd, now] windows
-	// that exclude the already-collected events.
+	// Re-polling must not re-ship: later polls query [lastEnd, now] windows
+	// whose start is after the fixtures' dates.
 	require.Never(t, func() bool { return sink.count() != 3 },
 		400*time.Millisecond, 30*time.Millisecond, "events were re-shipped on a later poll")
 
@@ -547,7 +568,8 @@ func TestMockUnauthorizedEventsKeepsPolling(t *testing.T) {
 
 	// Once the token is honored again, the backlog ships: the checkpoint was
 	// never advanced by the failing polls, so the first successful poll still
-	// has no start/end window and collects everything.
+	// sends no start/end and gets the API's default last-30-days window,
+	// which covers the fixture.
 	mock.mu.Lock()
 	mock.rejectBearer = false
 	mock.mu.Unlock()

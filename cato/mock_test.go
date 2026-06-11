@@ -15,8 +15,9 @@ package usp_cato
 //   - The {"data":{"eventsFeed":{marker,fetchedCount,accounts:[{id,records:
 //     [{time,fieldsMap}]}]}}} envelope, with an opaque marker cursor that
 //     resumes the feed where the previous call left off.
-//   - GraphQL errors as {"errors":[{"message":...}]} (bad API key, bad
-//     account, rate limiting), which is how Cato reports failures.
+//   - GraphQL errors as HTTP 200 + {"errors":[{"message":...}]} (bad API key
+//     -- "permission denied" -- bad account, rate limiting), which is how
+//     Cato reports failures.
 
 import (
 	"compress/gzip"
@@ -161,14 +162,25 @@ func (m *mockCato) handler() http.HandlerFunc {
 		}
 		assert.Equal(m.t, "application/json", r.Header.Get("Content-Type"))
 
-		// Authentication: the x-api-key header. Cato reports a bad key as a
-		// GraphQL errors envelope, which the adapter detects via the "errors"
-		// key.
+		// Authentication: the x-api-key header. The real API answers a bad key
+		// with HTTP 200 and a GraphQL errors envelope -- verbatim:
+		// {"errors":[{"message":"permission denied","path":["eventsFeed"],
+		// "extensions":{"code":"Code104"}}],"data":{"eventsFeed":null}} --
+		// which the adapter detects via the "errors" key.
 		if r.Header.Get("x-api-key") != m.apiKey {
 			m.mu.Lock()
 			m.authFailures++
 			m.mu.Unlock()
-			writeGzipJSON(m.t, w, errorsEnvelope("Invalid authentication credentials"))
+			writeGzipJSON(m.t, w, map[string]interface{}{
+				"errors": []interface{}{
+					map[string]interface{}{
+						"message":    "permission denied",
+						"path":       []interface{}{"eventsFeed"},
+						"extensions": map[string]interface{}{"code": "Code104"},
+					},
+				},
+				"data": map[string]interface{}{"eventsFeed": nil},
+			})
 			return
 		}
 
@@ -300,7 +312,8 @@ func writeGzipRaw(t *testing.T, w http.ResponseWriter, b []byte) {
 
 // securityEvent returns a record shaped like a real Cato eventsFeed Security /
 // Internet Firewall event: the documented fieldsMap field names with clearly
-// fake values (example.com users, RFC 5737 addresses, all-1s account id).
+// fake values (example.com users, RFC 1918 / RFC 5737 addresses, all-1s
+// account id).
 func securityEvent(i int, ts string) catoRecord {
 	return catoRecord{
 		Time: ts,
@@ -489,9 +502,11 @@ func TestCatoRepollDoesNotReship(t *testing.T) {
 	require.Eventually(t, func() bool { return sink.count() == 3 },
 		5*time.Second, 10*time.Millisecond)
 
-	// Let at least three more polls complete.
-	base := mock.requestCount()
-	require.Eventually(t, func() bool { return mock.requestCount() >= base+3 },
+	// Let at least three more polls complete. Wait on the markers the mock
+	// recorded (not its raw request counter, which is incremented before the
+	// marker is parsed) so the snapshot below is guaranteed to include them.
+	base := len(mock.markers())
+	require.Eventually(t, func() bool { return len(mock.markers()) >= base+3 },
 		5*time.Second, 10*time.Millisecond, "the adapter should keep polling")
 
 	assert.Equal(t, 3, sink.count(), "re-polling must not re-ship events")
@@ -670,7 +685,11 @@ func TestCatoSendBadAPIKey(t *testing.T) {
 	ok, resp := a.send(eventsFeedQuery(mock.accountID, ""), mock.accountID, "wrong-api-key")
 
 	assert.False(t, ok, "a bad API key must fail the call")
-	require.Contains(t, resp, "errors")
+	errs, isList := resp["errors"].([]interface{})
+	require.True(t, isList, "errors must be the GraphQL error list, got %T", resp["errors"])
+	require.Len(t, errs, 1)
+	assert.Equal(t, "permission denied", errs[0].(map[string]interface{})["message"],
+		"the error details Cato returns for a bad key must be preserved")
 	assert.Equal(t, 1, mock.authFailureCount())
 	assert.Equal(t, 1, mock.requestCount(), "a credential rejection must not be retried")
 }

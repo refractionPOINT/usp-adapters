@@ -63,10 +63,15 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 //     auth.app.wiz.io/oauth/token performs (form-encoded, audience=wiz-api),
 //     returning a bearer token.
 //   - POST /graphql: the GraphQL endpoint (api.<region>.app.wiz.io/graphql in
-//     production). It validates the bearer token, parses the query/variables
-//     the adapter sends, and answers from an in-memory issue set, honoring
-//     the filterBy.<timeField>.after time filter the way the real API filters
-//     issues (strictly newer than "after", newest first).
+//     production, where <region> is the tenant's region such as us1 or eu1).
+//     It validates the bearer token, parses the query/variables the adapter
+//     sends, and answers from an in-memory issue set, applying the
+//     filterBy.<timeField>.after filter as strictly exclusive and returning
+//     nodes newest first. Wiz's full filter/ordering reference sits behind its
+//     auth-gated docs, so those two semantics are best-effort: they are what
+//     the adapter's watermark logic requires for exactly-once delivery (a real
+//     deployment must request a descending time order via the query's
+//     $orderBy/IssueOrder variables), so the mock pins them.
 type mockWiz struct {
 	mu sync.Mutex
 
@@ -308,9 +313,14 @@ func extractAfter(variables map[string]interface{}) string {
 
 // --- realistic fixtures -------------------------------------------------------
 
-// testIssuesQuery is shaped like the issues query Wiz documents for pulling
-// Issues over GraphQL. The adapter treats the query as an opaque string; the
-// mock captures it so tests can assert it is sent verbatim.
+// testIssuesQuery is shaped like the IssuesTable query Wiz publishes for
+// pulling Issues over GraphQL (the same issuesV2 alias, $filterBy/$first/
+// $after/$orderBy signature, node fields and pageInfo{hasNextPage endCursor}
+// appear in Wiz-maintained integrations). In the real schema sourceRule is an
+// interface queried via inline fragments; the flat {id name} selection here
+// is the simplified form some Wiz-published examples use. The adapter treats
+// the query as an opaque string; the mock captures it so tests can assert it
+// is sent verbatim.
 const testIssuesQuery = `query IssuesTable($filterBy: IssueFilters, $first: Int, $after: String, $orderBy: IssueOrder) {
   issues: issuesV2(filterBy: $filterBy, first: $first, after: $after, orderBy: $orderBy) {
     nodes {

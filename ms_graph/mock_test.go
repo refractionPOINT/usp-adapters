@@ -85,10 +85,21 @@ type graphRecord struct {
 // mockMsGraph is an in-memory stand-in for the Azure AD token endpoint and a
 // Microsoft Graph list endpoint. The token endpoint validates the
 // client_credentials exchange; the Graph endpoint validates the Bearer token,
-// honours the adapter's createdDateTime filter (inclusive `ge`, like OData),
-// returns records in ascending createdDateTime order inside the standard
-// {"value": [...]} envelope, and advertises @odata.nextLink when pageSize
-// truncates the result set.
+// honours the adapter's createdDateTime filter (`ge` is "greater than or
+// equal to" per https://learn.microsoft.com/en-us/graph/filter-query-parameter)
+// inside the standard {"value": [...]} envelope, and advertises
+// @odata.nextLink when pageSize truncates the result set
+// (https://learn.microsoft.com/en-us/graph/paging).
+//
+// The mock returns records in ascending createdDateTime order. That is a
+// deliberate modeling choice, not a Graph guarantee: the adapter sends no
+// $orderby (List alerts_v2 doesn't even offer one -- only $count, $filter,
+// $skip and $top are supported, and the official docs say "The most recent
+// alerts are displayed at the top of the list", i.e. newest first:
+// https://learn.microsoft.com/en-us/graph/api/security-list-alerts_v2).
+// Ascending order is the only ordering under which the adapter's
+// last-element watermark ships every record exactly once, which is the
+// behavior these tests pin.
 type mockMsGraph struct {
 	mu      sync.Mutex
 	baseURL string // set once the httptest server is up; used for nextLink
@@ -185,17 +196,17 @@ func (m *mockMsGraph) serveToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/x-www-form-urlencoded") {
-		writeJSON(w, http.StatusBadRequest, aadError("AADSTS900144", "the request body must be form-urlencoded"))
+		writeJSON(w, http.StatusBadRequest, aadError("invalid_request", 900144, "The request body must contain the following parameter: 'grant_type'."))
 		return
 	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, aadError("AADSTS900144", "unreadable body"))
+		writeJSON(w, http.StatusBadRequest, aadError("invalid_request", 900144, "The request body must contain the following parameter: 'grant_type'."))
 		return
 	}
 	form, err := url.ParseQuery(string(body))
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, aadError("AADSTS900144", "unparseable form body"))
+		writeJSON(w, http.StatusBadRequest, aadError("invalid_request", 900144, "The request body must contain the following parameter: 'grant_type'."))
 		return
 	}
 	m.mu.Lock()
@@ -203,21 +214,25 @@ func (m *mockMsGraph) serveToken(w http.ResponseWriter, r *http.Request) {
 	m.mu.Unlock()
 
 	if form.Get("grant_type") != "client_credentials" {
-		writeJSON(w, http.StatusBadRequest, aadError("AADSTS70003", "unsupported grant type"))
+		// AADSTS70003: UnsupportedGrantType.
+		writeJSON(w, http.StatusBadRequest, aadError("unsupported_grant_type", 70003, "The app returned an unsupported grant type."))
 		return
 	}
 	if form.Get("scope") != scope {
-		writeJSON(w, http.StatusBadRequest, aadError("AADSTS70011", "invalid scope"))
+		// AADSTS70011: InvalidScope.
+		writeJSON(w, http.StatusBadRequest, aadError("invalid_scope", 70011, "The provided value for the input parameter 'scope' is not valid."))
 		return
 	}
 	if form.Get("client_id") != testClientID {
-		writeJSON(w, http.StatusBadRequest, aadError("AADSTS700016", "application not found in the directory"))
+		// AADSTS700016: application not found in the directory/tenant.
+		writeJSON(w, http.StatusBadRequest, aadError("unauthorized_client", 700016, "Application with the given identifier was not found in the directory."))
 		return
 	}
 	if form.Get("client_secret") != testClientSecret {
-		// Like the real endpoint, a bad secret yields a 401 with no
+		// A bad secret yields AADSTS7000215 (invalid_client) with no
 		// access_token -- which is all the adapter's fetchToken looks at.
-		writeJSON(w, http.StatusUnauthorized, aadError("AADSTS7000215", "invalid client secret provided"))
+		// invalid_client uses HTTP 401 per RFC 6749 section 5.2.
+		writeJSON(w, http.StatusUnauthorized, aadError("invalid_client", 7000215, "Invalid client secret provided."))
 		return
 	}
 
@@ -302,7 +317,11 @@ func (m *mockMsGraph) serveGraph(w http.ResponseWriter, r *http.Request) {
 		"value":          page,
 	}
 	if truncated {
-		envelope["@odata.nextLink"] = baseURL + r.URL.Path + "?$skiptoken=fakeskiptoken1111"
+		// Per https://learn.microsoft.com/en-us/graph/paging the nextLink is
+		// an opaque URL carrying a $skiptoken (or $skip) plus the original
+		// query parameters.
+		envelope["@odata.nextLink"] = baseURL + r.URL.Path +
+			"?$filter=" + url.QueryEscape(filter) + "&$skiptoken=fakeskiptoken1111"
 	}
 	writeJSON(w, http.StatusOK, envelope)
 }
@@ -313,17 +332,39 @@ func writeJSON(w http.ResponseWriter, status int, body map[string]interface{}) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
-func aadError(code, description string) map[string]interface{} {
+// aadError mirrors the documented Microsoft identity platform token error
+// shape: an OAuth2 error string, an AADSTS-prefixed description, a list of
+// numeric STS error codes, and the diagnostic fields the real endpoint adds.
+// https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow#error-response
+// (AADSTS codes: https://learn.microsoft.com/en-us/entra/identity-platform/reference-error-codes)
+func aadError(oauthError string, stsCode int, description string) map[string]interface{} {
+	const fakeGUID = "11111111-1111-1111-1111-111111111111"
+	const fakeTime = "2026-01-01 00:00:00Z"
 	return map[string]interface{}{
-		"error":             "invalid_client",
-		"error_description": fmt.Sprintf("%s: %s", code, description),
-		"error_codes":       []interface{}{code},
+		"error": oauthError,
+		"error_description": fmt.Sprintf(
+			"AADSTS%d: %s\r\nTrace ID: %s\r\nCorrelation ID: %s\r\nTimestamp: %s",
+			stsCode, description, fakeGUID, fakeGUID, fakeTime),
+		"error_codes":    []interface{}{stsCode},
+		"timestamp":      fakeTime,
+		"trace_id":       fakeGUID,
+		"correlation_id": fakeGUID,
 	}
 }
 
+// graphError mirrors the documented Microsoft Graph error envelope:
+// a single "error" object with code, message and an optional innerError.
+// https://learn.microsoft.com/en-us/graph/errors
 func graphError(code, message string) map[string]interface{} {
 	return map[string]interface{}{
-		"error": map[string]interface{}{"code": code, "message": message},
+		"error": map[string]interface{}{
+			"code":    code,
+			"message": message,
+			"innerError": map[string]interface{}{
+				"request-id": "11111111-1111-1111-1111-111111111111",
+				"date":       "2026-01-01T00:00:00",
+			},
+		},
 	}
 }
 
@@ -343,39 +384,79 @@ func fixtureBase() time.Time {
 	return time.Now().UTC().Add(24 * time.Hour)
 }
 
-// graphSecurityAlert is shaped like a real Graph security alerts_v2 record:
-// the documented top-level fields plus nested objects and arrays, with clearly
-// fake identifiers.
+// graphSecurityAlert is shaped like a real Graph security alerts_v2 record
+// (microsoft.graph.security.alert), mirroring the documented properties and
+// example response with clearly fake identifiers:
+//   - https://learn.microsoft.com/en-us/graph/api/resources/security-alert?view=graph-rest-1.0
+//   - https://learn.microsoft.com/en-us/graph/api/security-list-alerts_v2?view=graph-rest-1.0
+//   - https://learn.microsoft.com/en-us/graph/api/resources/security-processevidence?view=graph-rest-1.0
 func graphSecurityAlert(id string, createdDateTime string) map[string]interface{} {
 	return map[string]interface{}{
-		"id":                 id,
-		"providerAlertId":    "11111111-1111-1111-1111-111111111111",
-		"incidentId":         "1111",
-		"status":             "new",
-		"severity":           "high",
-		"classification":     nil,
-		"determination":      nil,
-		"serviceSource":      "microsoftDefenderForEndpoint",
-		"detectionSource":    "antivirus",
-		"detectorId":         "11111111-1111-1111-1111-111111111111",
-		"tenantId":           testTenantID,
-		"title":              "Suspicious process injection observed",
-		"description":        "A process injected code into another process.",
-		"category":           "DefenseEvasion",
-		"createdDateTime":    createdDateTime,
-		"lastUpdateDateTime": createdDateTime,
-		"mitreTechniques":    []interface{}{"T1055", "T1055.001"},
-		"vendorInformation": map[string]interface{}{
-			"provider": "Microsoft 365 Defender",
-			"vendor":   "Microsoft",
-		},
+		"@odata.type":           "#microsoft.graph.security.alert",
+		"id":                    id,
+		"providerAlertId":       id,
+		"incidentId":            "1111",
+		"status":                "new",
+		"severity":              "high",
+		"classification":        "unknown",
+		"determination":         "unknown",
+		"serviceSource":         "microsoftDefenderForEndpoint",
+		"detectionSource":       "antivirus",
+		"detectorId":            "11111111-1111-1111-1111-111111111111",
+		"tenantId":              testTenantID,
+		"title":                 "Suspicious process injection observed",
+		"description":           "A process injected code into another process.",
+		"recommendedActions":    "Isolate the device and investigate the process tree.",
+		"category":              "DefenseEvasion",
+		"assignedTo":            nil,
+		"alertWebUrl":           "https://security.microsoft.com/alerts/" + id + "?tid=" + testTenantID,
+		"incidentWebUrl":        "https://security.microsoft.com/incidents/1111?tid=" + testTenantID,
+		"actorDisplayName":      nil,
+		"threatDisplayName":     nil,
+		"threatFamilyName":      nil,
+		"mitreTechniques":       []interface{}{"T1055", "T1055.001"},
+		"createdDateTime":       createdDateTime,
+		"lastUpdateDateTime":    createdDateTime,
+		"resolvedDateTime":      nil,
+		"firstActivityDateTime": createdDateTime,
+		"lastActivityDateTime":  createdDateTime,
+		"comments":              []interface{}{},
+		"systemTags":            []interface{}{},
 		"evidence": []interface{}{
 			map[string]interface{}{
-				"@odata.type":     "#microsoft.graph.security.processEvidence",
-				"processId":       4242,
-				"imageFile":       map[string]interface{}{"fileName": "evil.exe", "filePath": `C:\Users\jdoe\Downloads`},
-				"userAccount":     map[string]interface{}{"accountName": "jdoe", "userPrincipalName": "jdoe@example.com"},
-				"detectionStatus": "detected",
+				"@odata.type":                   "#microsoft.graph.security.processEvidence",
+				"createdDateTime":               createdDateTime,
+				"verdict":                       "suspicious",
+				"remediationStatus":             "none",
+				"remediationStatusDetails":      nil,
+				"processId":                     4242,
+				"parentProcessId":               668,
+				"processCommandLine":            `"evil.exe" --inject`,
+				"processCreationDateTime":       createdDateTime,
+				"parentProcessCreationDateTime": createdDateTime,
+				"detectionStatus":               "detected",
+				"mdeDeviceId":                   "1111111111111111111111111111111111111111",
+				"roles":                         []interface{}{},
+				"detailedRoles":                 []interface{}{},
+				"tags":                          []interface{}{},
+				"imageFile": map[string]interface{}{
+					"sha1":          "1111111111111111111111111111111111111111",
+					"sha256":        "1111111111111111111111111111111111111111111111111111111111111111",
+					"fileName":      "evil.exe",
+					"filePath":      `C:\Users\jdoe\Downloads`,
+					"fileSize":      123456,
+					"filePublisher": nil,
+					"signer":        nil,
+					"issuer":        nil,
+				},
+				"userAccount": map[string]interface{}{
+					"accountName":       "jdoe",
+					"domainName":        "EXAMPLE",
+					"userSid":           "S-1-5-21-1111111111-1111111111-1111111111-1111",
+					"azureAdUserId":     nil,
+					"userPrincipalName": "jdoe@example.com",
+					"displayName":       "Jane Doe",
+				},
 			},
 		},
 	}

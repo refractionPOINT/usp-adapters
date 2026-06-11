@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,11 +87,19 @@ type recordedRequest struct {
 // mockVisionOne is an in-memory stand-in for the Vision One Workbench alerts
 // API as the adapter consumes it: a GET on /v3.0/workbench/alerts authenticated
 // with "Authorization: Bearer <token>", filtered by the startDateTime /
-// endDateTime query params (compared against each alert's createdDateTime,
-// boundaries inclusive, like the real API's default dateTimeTarget), returning
-// an {"items": [...], "count": N, "totalCount": M} envelope with a full
+// endDateTime query params (compared against each alert's createdDateTime, the
+// documented default dateTimeTarget), returning an
+// {"items": [...], "count": N, "totalCount": M} envelope with a full
 // "nextLink" URL when more pages remain (continuation via a skipToken query
-// param, which the adapter follows verbatim).
+// param embedded in nextLink, which the adapter follows verbatim -- the real
+// token is opaque). Items are returned newest-first, the documented default
+// orderBy ("createdDateTime desc").
+//
+// The official docs do not state whether the window boundaries are inclusive;
+// the mock treats both as inclusive, the conservative assumption for duplicate
+// delivery. Note the real endpoint has no "top" parameter and serves at most
+// 10 entries per page; pageSize here is a knob so tests can choose between
+// exercising pagination and keeping a single page.
 type mockVisionOne struct {
 	mu        sync.Mutex
 	token     string
@@ -183,10 +192,15 @@ func (m *mockVisionOne) handler(t *testing.T) http.HandlerFunc {
 			skip = v
 		}
 
-		// Filter on createdDateTime within [startDateTime, endDateTime], both
-		// boundaries inclusive (the real API's documented default target is
-		// the alert creation time).
-		filtered := []utils.Dict{}
+		// Filter on createdDateTime within [startDateTime, endDateTime] (the
+		// documented default dateTimeTarget is createdDateTime; boundary
+		// inclusivity is not documented, so the mock takes the inclusive,
+		// duplicate-prone reading).
+		type datedAlert struct {
+			created time.Time
+			alert   utils.Dict
+		}
+		dated := []datedAlert{}
 		for _, a := range alerts {
 			cs, _ := a["createdDateTime"].(string)
 			c, err := time.Parse(time.RFC3339, cs)
@@ -194,8 +208,14 @@ func (m *mockVisionOne) handler(t *testing.T) http.HandlerFunc {
 				continue
 			}
 			if !c.Before(start) && !c.After(end) {
-				filtered = append(filtered, a)
+				dated = append(dated, datedAlert{created: c, alert: a})
 			}
+		}
+		// Newest first: the documented default orderBy is "createdDateTime desc".
+		sort.SliceStable(dated, func(i, j int) bool { return dated[i].created.After(dated[j].created) })
+		filtered := make([]utils.Dict, 0, len(dated))
+		for _, d := range dated {
+			filtered = append(filtered, d.alert)
 		}
 
 		if skip > len(filtered) {
@@ -262,10 +282,13 @@ func visionOneAlert(id string, created time.Time) utils.Dict {
 		"updatedDateTime":     ts,
 		"description":         "A high-privilege process accessed credential storage on an endpoint.",
 		"impactScope": utils.Dict{
-			"desktopCount":      1,
-			"serverCount":       0,
-			"accountCount":      1,
-			"emailAddressCount": 0,
+			"desktopCount":       1,
+			"serverCount":        0,
+			"accountCount":       1,
+			"emailAddressCount":  0,
+			"containerCount":     0,
+			"cloudIdentityCount": 0,
+			"cloudWorkloadCount": 0,
 			"entities": []interface{}{
 				utils.Dict{
 					"entityType":          "account",
@@ -309,7 +332,7 @@ func visionOneAlert(id string, created time.Time) utils.Dict {
 						"id":                "33333333-3333-3333-3333-333333333333",
 						"name":              "Credential Dumping via Memory Access",
 						"matchedDateTime":   ts,
-						"mitreTechniqueIds": []interface{}{"V9013.T1003.001"},
+						"mitreTechniqueIds": []interface{}{"T1003.001"},
 						"matchedEvents": []interface{}{
 							utils.Dict{
 								"uuid":            "55555555-5555-5555-5555-555555555555",
@@ -422,13 +445,15 @@ func TestMockAlertsEndToEnd(t *testing.T) {
 // window then stops it from being shipped over and over.
 //
 // The adapter has no deduplication: its only re-ship protection is the
-// server-side startDateTime/endDateTime window, whose boundaries the real API
-// treats inclusively at one-second granularity. An alert whose createdDateTime
-// second coincides with a window boundary can therefore legitimately ship
-// twice (against the real API too). The poll interval here is kept above one
-// second so window starts strictly advance each poll, bounding the new alert
-// at one possible boundary duplicate; the test pins "at least once, at most
-// twice, then never again".
+// server-side startDateTime/endDateTime window. The API's timestamps have
+// one-second granularity (documented format yyyy-MM-ddThh:mm:ssZ) and the
+// official docs do not say whether the boundaries are inclusive; the mock
+// assumes inclusive, the worst case for duplicates. Under that reading an
+// alert whose createdDateTime second coincides with a window boundary can
+// legitimately ship twice. The poll interval here is kept above one second so
+// window starts strictly advance each poll, bounding the new alert at one
+// possible boundary duplicate; the test pins "at least once, at most twice,
+// then never again".
 func TestMockNewAlertMidRun(t *testing.T) {
 	const token = "tmv1-fake-token-0000000000000000"
 	const newID = "WB-9002-20260611-00099"

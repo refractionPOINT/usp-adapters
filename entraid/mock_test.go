@@ -145,7 +145,9 @@ type mockMicrosoft struct {
 	detections []map[string]interface{}
 
 	// pageSize, when > 0, caps how many detections a single response carries;
-	// truncated responses include an @odata.nextLink, like the real Graph API.
+	// truncated responses include an @odata.nextLink, like the real Graph API
+	// (the documented default page size for this endpoint is 20 objects, and
+	// the maximum with $top is 500; tests use a tiny page to force paging).
 	pageSize int
 
 	// revokeGraphAccess makes the Graph endpoint reject every bearer token
@@ -323,8 +325,12 @@ func (m *mockMicrosoft) handleRiskDetections(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// "ge" is inclusive, and Graph returns risk detections ordered by
-	// activityDateTime ascending when filtered this way.
+	// "ge" is inclusive (greater than or equal, as OData defines it). The
+	// mock returns matches ordered by activityDateTime ascending: the
+	// official docs make no ordering guarantee for this endpoint, but the
+	// adapter's cursor -- it advances "since" to the activityDateTime of the
+	// last item in the response -- only makes progress when responses are
+	// ascending, so the mock keeps them deterministic.
 	matched := make([]map[string]interface{}, 0, len(detections))
 	for _, d := range detections {
 		at, err := time.Parse(time.RFC3339, d["activityDateTime"].(string))
@@ -346,8 +352,12 @@ func (m *mockMicrosoft) handleRiskDetections(w http.ResponseWriter, r *http.Requ
 	}
 	if pageSize > 0 && len(matched) > pageSize {
 		matched = matched[:pageSize]
+		// Like the real API, the nextLink carries the query parameters of the
+		// original request plus a $skiptoken (see
+		// https://learn.microsoft.com/en-us/graph/paging).
 		envelope["@odata.nextLink"] = serverURL +
-			"/v1.0/identityProtection/riskDetections?$skiptoken=fake-skip-token-1111"
+			"/v1.0/identityProtection/riskDetections?" + r.URL.RawQuery +
+			"&$skiptoken=fake-skip-token-1111"
 	}
 	envelope["value"] = matched
 
@@ -411,7 +421,7 @@ func realisticRiskDetection(seq int, riskEventType, upn, activityDateTime string
 		"riskState":           "atRisk",
 		"riskLevel":           "medium",
 		"riskDetail":          "none",
-		"source":              "IdentityProtection",
+		"source":              "activeDirectory",
 		"detectionTimingType": "realtime",
 		"activity":            "signin",
 		"tokenIssuerType":     "AzureAD",
@@ -422,7 +432,9 @@ func realisticRiskDetection(seq int, riskEventType, upn, activityDateTime string
 		"userId":              "11111111-1111-1111-1111-111111111111",
 		"userDisplayName":     "Jane Doe",
 		"userPrincipalName":   upn,
-		"additionalInfo":      `[{"Key":"riskReasons","Value":["Anonymous IP address"]}]`,
+		// additionalInfo is a JSON-formatted *string*, not a nested object;
+		// this is the example value from the official riskDetection docs.
+		"additionalInfo": `[{"Key":"userAgent","Value":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36"}]`,
 		"location": map[string]interface{}{
 			"city":            "Springfield",
 			"state":           "Illinois",

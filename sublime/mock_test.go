@@ -56,10 +56,12 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 // --- mock Sublime platform API -----------------------------------------------
 
 // mockSublime is an in-memory stand-in for the Sublime Security platform API's
-// audit log listing. It honours the contract the adapter relies on: a GET on
-// /v0/audit-log/events authenticated with a Bearer API key, offset/limit query
-// pagination (limit capped at 500 by the real API), and an object envelope
-// {"events": [...], "count": N} around the page.
+// audit log listing (https://docs.sublime.security/reference/listeventsinauditlog).
+// It honours the contract the adapter relies on: a GET on /v0/audit-log/events
+// authenticated with a Bearer API key, offset/limit query pagination (limit
+// capped at 500 by the real API), and an object envelope
+// {"events": [...], "count": N, "total": M} around the page (count is the
+// number of results on the current page, total the number available).
 type mockSublime struct {
 	mu     sync.Mutex
 	apiKey string
@@ -157,6 +159,7 @@ func (m *mockSublime) handler() http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"events": page,
 			"count":  len(page),
+			"total":  len(m.events),
 		})
 	}
 }
@@ -164,8 +167,10 @@ func (m *mockSublime) handler() http.HandlerFunc {
 // --- realistic event fixtures -------------------------------------------------
 
 // realisticAuditEvent returns an event shaped like a real Sublime Security
-// audit log entry: id/type/created_at plus the created_by user object and the
-// data.request details of the action recorded. All identifiers are fake.
+// audit log entry (per the example in
+// https://docs.sublime.security/docs/export-audit-logs-and-message-events):
+// id/type/created_at plus the created_by user object and the data.request
+// details of the action recorded. All identifiers are fake.
 func realisticAuditEvent(id, eventType, createdAt string) utils.Dict {
 	return utils.Dict{
 		"id":         id,
@@ -187,12 +192,12 @@ func realisticAuditEvent(id, eventType, createdAt string) utils.Dict {
 			"request": utils.Dict{
 				"id":                    "22222222-2222-2222-2222-222222222222",
 				"method":                "POST",
-				"path":                  "/v0/message-groups/33333333-3333-3333-3333-333333333333/review",
+				"path":                  "/v1/messages/groups/33333333-3333-3333-3333-333333333333/trash",
 				"user_agent":            "Mozilla/5.0 (X11; Linux x86_64) Example/1.0",
-				"ip":                    "203.0.113.10",
+				"ip":                    "203.0.113.10/32",
 				"authentication_method": "user_session",
 				"query":                 utils.Dict{},
-				"body":                  nil,
+				"body":                  "",
 			},
 			"message": utils.Dict{
 				"id":          "44444444-4444-4444-4444-444444444444",
@@ -253,9 +258,9 @@ func TestMockAuditLogEndToEnd(t *testing.T) {
 
 	mock := newMockSublime(apiKey)
 	want := []utils.Dict{
-		realisticAuditEvent("aaaaaaaa-1111-1111-1111-111111111111", "message_group.review", futureTS(1*time.Hour)),
+		realisticAuditEvent("aaaaaaaa-1111-1111-1111-111111111111", "message_group.quarantine", futureTS(1*time.Hour)),
 		realisticAuditEvent("aaaaaaaa-2222-2222-2222-222222222222", "message.view_contents", futureTS(1*time.Hour+1*time.Minute)),
-		realisticAuditEvent("aaaaaaaa-3333-3333-3333-333333333333", "user.session.create", futureTS(1*time.Hour+2*time.Minute)),
+		realisticAuditEvent("aaaaaaaa-3333-3333-3333-333333333333", "message.access_justification", futureTS(1*time.Hour+2*time.Minute)),
 	}
 	mock.setEvents(want)
 
@@ -319,8 +324,8 @@ func TestMockNewEventMidRunShipsOnce(t *testing.T) {
 
 	mock := newMockSublime(apiKey)
 	mock.setEvents([]utils.Dict{
-		realisticAuditEvent("bbbbbbbb-1111-1111-1111-111111111111", "message_group.review", futureTS(1*time.Hour)),
-		realisticAuditEvent("bbbbbbbb-2222-2222-2222-222222222222", "rule.update", futureTS(1*time.Hour+1*time.Minute)),
+		realisticAuditEvent("bbbbbbbb-1111-1111-1111-111111111111", "message_group.trash", futureTS(1*time.Hour)),
+		realisticAuditEvent("bbbbbbbb-2222-2222-2222-222222222222", "message.flagged", futureTS(1*time.Hour+1*time.Minute)),
 	})
 
 	server := httptest.NewServer(mock.handler())
@@ -335,7 +340,7 @@ func TestMockNewEventMidRunShipsOnce(t *testing.T) {
 
 	// A new event occurs mid-run, later than everything already seen.
 	mock.appendEvent(realisticAuditEvent(
-		"bbbbbbbb-3333-3333-3333-333333333333", "user.session.create", futureTS(2*time.Hour)))
+		"bbbbbbbb-3333-3333-3333-333333333333", "message_group.quarantine", futureTS(2*time.Hour)))
 
 	require.Eventually(t, func() bool { return sink.count() == 3 },
 		5*time.Second, 10*time.Millisecond, "the new event should ship")
@@ -398,9 +403,9 @@ func TestMockEventsBeforeStartDoNotShip(t *testing.T) {
 
 	mock := newMockSublime(apiKey)
 	mock.setEvents([]utils.Dict{
-		realisticAuditEvent("dddddddd-1111-1111-1111-111111111111", "rule.create", time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339Nano)),
-		realisticAuditEvent("dddddddd-2222-2222-2222-222222222222", "rule.update", time.Now().Add(-1*time.Hour).UTC().Format(time.RFC3339Nano)),
-		realisticAuditEvent("dddddddd-3333-3333-3333-333333333333", "message_group.review", futureTS(1*time.Hour)),
+		realisticAuditEvent("dddddddd-1111-1111-1111-111111111111", "message.view_contents", time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339Nano)),
+		realisticAuditEvent("dddddddd-2222-2222-2222-222222222222", "message_group.trash", time.Now().Add(-1*time.Hour).UTC().Format(time.RFC3339Nano)),
+		realisticAuditEvent("dddddddd-3333-3333-3333-333333333333", "message_group.quarantine", futureTS(1*time.Hour)),
 	})
 
 	server := httptest.NewServer(mock.handler())
@@ -429,7 +434,7 @@ func TestMockEventsBeforeStartDoNotShip(t *testing.T) {
 func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 	mock := newMockSublime("the-correct-api-key")
 	mock.setEvents([]utils.Dict{
-		realisticAuditEvent("eeeeeeee-1111-1111-1111-111111111111", "rule.create", futureTS(1*time.Hour)),
+		realisticAuditEvent("eeeeeeee-1111-1111-1111-111111111111", "message.flagged", futureTS(1*time.Hour)),
 	})
 
 	server := httptest.NewServer(mock.handler())
