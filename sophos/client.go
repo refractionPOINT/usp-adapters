@@ -20,7 +20,24 @@ import (
 
 const (
 	eventsURL = "/siem/v1/events"
+
+	// defaultAuthURL is the Sophos Central OAuth2 token endpoint used when the
+	// config does not override it.
+	defaultAuthURL = "https://id.sophos.com/api/v2/oauth2/token"
+
+	// defaultPollInterval is how long fetchEvents idles between polls of the
+	// SIEM events endpoint.
+	defaultPollInterval = 30 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type opRequest struct {
 	Limit     int    `json:"page[size],omitempty"`
@@ -30,8 +47,11 @@ type opRequest struct {
 
 type SophosAdapter struct {
 	conf       SophosConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	authURL      string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -46,6 +66,15 @@ type SophosConfig struct {
 	ClientSecret  string                  `json:"clientsecret" yaml:"clientsecret"`
 	TenantId      string                  `json:"tenantid" yaml:"tenantid"`
 	URL           string                  `json:"url" yaml:"url"`
+
+	// AuthURL overrides the Sophos Central OAuth2 token endpoint. Defaults to
+	// https://id.sophos.com/api/v2/oauth2/token when empty.
+	AuthURL string `json:"auth_url" yaml:"auth_url"`
+
+	// PollInterval overrides the wait between polls of the SIEM events
+	// endpoint (default 30s). It is not settable through a config file; it
+	// exists as a seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *SophosConfig) Validate() error {
@@ -68,16 +97,36 @@ func (c *SophosConfig) Validate() error {
 }
 
 func NewSophosAdapter(ctx context.Context, conf SophosConfig) (*SophosAdapter, chan struct{}, error) {
-	var err error
+	return newSophosAdapter(ctx, conf, nil)
+}
+
+// newSophosAdapter is the implementation behind NewSophosAdapter. When sink is
+// non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newSophosAdapter(ctx context.Context, conf SophosConfig, sink uspSink) (*SophosAdapter, chan struct{}, error) {
 	a := &SophosAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	a.authURL = conf.AuthURL
+	if a.authURL == "" {
+		a.authURL = defaultAuthURL
+	}
+	a.pollInterval = conf.PollInterval
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -123,7 +172,7 @@ func (a *SophosAdapter) fetchEvents(url string) {
 
 	lastCursor := ""
 	has_more := "false"
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newCursor, has_more_resp := a.makeOneRequest(url, lastCursor, has_more)
@@ -156,7 +205,7 @@ func (a *SophosAdapter) fetchEvents(url string) {
 
 func (a *SophosAdapter) getJwt() string {
 
-	auth_url := "https://id.sophos.com/api/v2/oauth2/token"
+	auth_url := a.authURL
 	method := "POST"
 
 	payload := strings.NewReader(fmt.Sprintf("grant_type=client_credentials&scope=token&client_id=%s&client_secret=%s", a.conf.ClientId, a.conf.ClientSecret))

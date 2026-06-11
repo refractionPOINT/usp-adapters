@@ -17,15 +17,25 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://platform.sublime.security"
-	logsPath       = "/v0/audit-log/events"
-	overlapPeriod  = 30 * time.Second
-	pageLimit      = 500
+	defaultBaseURL      = "https://platform.sublime.security"
+	logsPath            = "/v0/audit-log/events"
+	overlapPeriod       = 30 * time.Second
+	pageLimit           = 500
+	defaultPollInterval = 30 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type SublimeAdapter struct {
 	conf       SublimeConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
 	chStopped chan struct{}
@@ -40,6 +50,11 @@ type SublimeConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"api_key" yaml:"api_key"`
 	BaseURL       string                  `json:"base_url" yaml:"base_url"`
+
+	// PollInterval overrides the fixed wait between polls of the audit log
+	// API. It is not settable through a config file; it exists as a seam for
+	// tests (the production interval stays the historical 30 seconds).
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *SublimeConfig) Validate() error {
@@ -52,11 +67,20 @@ func (c *SublimeConfig) Validate() error {
 	if c.BaseURL == "" {
 		c.BaseURL = defaultBaseURL
 	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = defaultPollInterval
+	}
 	return nil
 }
 
 func NewSublimeAdapter(ctx context.Context, conf SublimeConfig) (*SublimeAdapter, chan struct{}, error) {
-	var err error
+	return newSublimeAdapter(ctx, conf, nil)
+}
+
+// newSublimeAdapter is the implementation behind NewSublimeAdapter. When sink
+// is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newSublimeAdapter(ctx context.Context, conf SublimeConfig, sink uspSink) (*SublimeAdapter, chan struct{}, error) {
 	a := &SublimeAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
@@ -64,9 +88,21 @@ func NewSublimeAdapter(ctx context.Context, conf SublimeConfig) (*SublimeAdapter
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	// The general adapter runner constructs the adapter without calling
+	// Validate(), so backfill the poll interval default here as well --
+	// otherwise the poll loop would spin on WaitFor(0).
+	if a.conf.PollInterval <= 0 {
+		a.conf.PollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -108,7 +144,7 @@ func (a *SublimeAdapter) fetchEvents() {
 
 	since := time.Now()
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.conf.PollInterval) {
 		items, newSince, _ := a.makeOneRequest(since)
 		since = newSince
 		if items == nil {

@@ -20,13 +20,26 @@ import (
 
 const scope = "https://graph.microsoft.com/.default"
 const URLPrefix = "https://graph.microsoft.com/v1.0/"
+const defaultLoginEndpoint = "https://login.microsoftonline.com"
+const defaultPollInterval = 30 * time.Second
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type MsGraphAdapter struct {
 	conf       MsGraphConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
-	endpoint string
+	endpoint      string
+	loginEndpoint string
+	pollInterval  time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -41,6 +54,20 @@ type MsGraphConfig struct {
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
 	URL           string                  `json:"url" yaml:"url"`
+
+	// LoginEndpoint overrides the Azure AD authority used for the OAuth2
+	// client_credentials token exchange. Empty means the public cloud
+	// endpoint (https://login.microsoftonline.com).
+	LoginEndpoint string `json:"login_endpoint" yaml:"login_endpoint"`
+
+	// GraphEndpoint overrides the Microsoft Graph API root the relative URL
+	// is appended to. Empty means the public cloud v1.0 root
+	// (https://graph.microsoft.com/v1.0/).
+	GraphEndpoint string `json:"graph_endpoint" yaml:"graph_endpoint"`
+
+	// PollInterval is the wait between polls of the Graph endpoint. It is
+	// not settable through a config file; it exists as a seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *MsGraphConfig) Validate() error {
@@ -63,16 +90,36 @@ func (c *MsGraphConfig) Validate() error {
 }
 
 func NewMsGraphAdapter(ctx context.Context, conf MsGraphConfig) (*MsGraphAdapter, chan struct{}, error) {
-	var err error
+	return newMsGraphAdapter(ctx, conf, nil)
+}
+
+// newMsGraphAdapter is the implementation behind NewMsGraphAdapter. When sink
+// is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*MsGraphAdapter, chan struct{}, error) {
 	a := &MsGraphAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	a.loginEndpoint = strings.TrimSuffix(conf.LoginEndpoint, "/")
+	if a.loginEndpoint == "" {
+		a.loginEndpoint = defaultLoginEndpoint
+	}
+	a.pollInterval = conf.PollInterval
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -86,13 +133,21 @@ func NewMsGraphAdapter(ctx context.Context, conf MsGraphConfig) (*MsGraphAdapter
 
 	a.chStopped = make(chan struct{})
 
+	graphRoot := a.conf.GraphEndpoint
+	if graphRoot == "" {
+		graphRoot = URLPrefix
+	}
+	if !strings.HasSuffix(graphRoot, "/") {
+		graphRoot += "/"
+	}
+
 	// Strip the / prefix if in the URL.
 	url := strings.TrimPrefix(a.conf.URL, "/")
 
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts from %s", URLPrefix+url))
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts from %s", graphRoot+url))
 
 	a.wgSenders.Add(1)
-	go a.fetchEvents(URLPrefix + url)
+	go a.fetchEvents(graphRoot + url)
 
 	go func() {
 		a.wgSenders.Wait()
@@ -119,7 +174,7 @@ func (a *MsGraphAdapter) Close() error {
 
 func (a *MsGraphAdapter) fetchToken() (string, error) {
 
-	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.conf.TenantID)
+	url := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
 	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
@@ -163,7 +218,7 @@ func (a *MsGraphAdapter) fetchEvents(url string) {
 	// since := time.Date(2022, time.June, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000000Z")
 	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newSince, eventId, _ := a.makeOneListRequest(url, since, lastEventId)

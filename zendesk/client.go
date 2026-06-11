@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,7 +21,19 @@ import (
 const (
 	logsEndpoint  = "/api/v2/audit_logs"
 	overlapPeriod = 30 * time.Second
+
+	// defaultPollInterval is how long fetchEvents idles between polling ticks.
+	defaultPollInterval = 30 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type opRequest struct {
 	Limit     int    `json:"page[size],omitempty"`
@@ -30,8 +43,11 @@ type opRequest struct {
 
 type ZendeskAdapter struct {
 	conf       ZendeskConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	baseURL      string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -47,6 +63,15 @@ type ZendeskConfig struct {
 	ApiToken      string                  `json:"api_token" yaml:"api_token"`
 	ZendeskDomain string                  `json:"zendesk_domain" yaml:"zendesk_domain"`
 	ZendeskEmail  string                  `json:"zendesk_email" yaml:"zendesk_email"`
+
+	// BaseURL overrides the scheme and host used to reach the Zendesk API.
+	// Empty means "https://" + ZendeskDomain.
+	BaseURL string `json:"base_url" yaml:"base_url"`
+
+	// PollInterval overrides the wait between polls of the audit logs
+	// endpoint (default 30s). It is not settable through a config file; it
+	// exists as a seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *ZendeskConfig) Validate() error {
@@ -67,7 +92,13 @@ func (c *ZendeskConfig) Validate() error {
 }
 
 func NewZendeskAdapter(ctx context.Context, conf ZendeskConfig) (*ZendeskAdapter, chan struct{}, error) {
-	var err error
+	return newZendeskAdapter(ctx, conf, nil)
+}
+
+// newZendeskAdapter is the implementation behind NewZendeskAdapter. When sink
+// is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newZendeskAdapter(ctx context.Context, conf ZendeskConfig, sink uspSink) (*ZendeskAdapter, chan struct{}, error) {
 	a := &ZendeskAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
@@ -75,9 +106,23 @@ func NewZendeskAdapter(ctx context.Context, conf ZendeskConfig) (*ZendeskAdapter
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	a.baseURL = strings.TrimSuffix(conf.BaseURL, "/")
+	if a.baseURL == "" {
+		a.baseURL = fmt.Sprintf("https://%s", conf.ZendeskDomain)
+	}
+	a.pollInterval = conf.PollInterval
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -123,7 +168,7 @@ func (a *ZendeskAdapter) fetchEvents() {
 
 	since := time.Now()
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newSince, _ := a.makeOneRequest(since)
@@ -168,8 +213,8 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 
 	for {
 		// Prepare the request.
-		req, err := http.NewRequest("GET", fmt.Sprintf("https://%s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.conf.ZendeskDomain, logsEndpoint, start, until), nil)
-		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from https://%s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.conf.ZendeskDomain, logsEndpoint, start, until))
+		req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.baseURL, logsEndpoint, start, until), nil)
+		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.baseURL, logsEndpoint, start, until))
 		if err != nil {
 			a.doStop.Set()
 			return nil, lastDetectionTime, err

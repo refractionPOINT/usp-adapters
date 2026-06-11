@@ -19,7 +19,20 @@ import (
 const (
 	logsURL       = "/api/v1/logs"
 	overlapPeriod = 30 * time.Minute
+
+	// defaultPollInterval is how long fetchEvents idles between polls of the
+	// System Log endpoint.
+	defaultPollInterval = 30 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type opRequest struct {
 	Limit     int    `json:"page[size],omitempty"`
@@ -29,8 +42,10 @@ type opRequest struct {
 
 type OktaAdapter struct {
 	conf       OktaConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -45,6 +60,11 @@ type OktaConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"apikey" yaml:"apikey"`
 	URL           string                  `json:"url" yaml:"url"`
+
+	// PollInterval overrides the wait between polls of the System Log endpoint
+	// (default 30s). It is not settable through a config file; it exists as a
+	// seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *OktaConfig) Validate() error {
@@ -61,7 +81,13 @@ func (c *OktaConfig) Validate() error {
 }
 
 func NewOktaAdapter(ctx context.Context, conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
-	var err error
+	return newOktaAdapter(ctx, conf, nil)
+}
+
+// newOktaAdapter is the implementation behind NewOktaAdapter. When sink is
+// non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newOktaAdapter(ctx context.Context, conf OktaConfig, sink uspSink) (*OktaAdapter, chan struct{}, error) {
 	a := &OktaAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
@@ -69,9 +95,19 @@ func NewOktaAdapter(ctx context.Context, conf OktaConfig) (*OktaAdapter, chan st
 		dedupe: make(map[string]int64),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	a.pollInterval = conf.PollInterval
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -116,7 +152,7 @@ func (a *OktaAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	adapterStart := time.Now()
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items := a.makeOneRequest(url, adapterStart)

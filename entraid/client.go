@@ -23,12 +23,28 @@ var URL = map[string]string{
 	"get_alerts": "https://graph.microsoft.com/v1.0/identityProtection/riskDetections",
 }
 
+const (
+	defaultLoginEndpoint = "https://login.microsoftonline.com"
+	defaultGraphEndpoint = "https://graph.microsoft.com"
+	defaultPollInterval  = 30 * time.Second
+)
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type EntraIDAdapter struct {
 	conf       EntraIDConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
-	endpoint string
+	endpoint     string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -42,6 +58,49 @@ type EntraIDConfig struct {
 	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
+
+	// LoginEndpoint overrides the base URL of the Microsoft identity platform
+	// used for the OAuth2 client_credentials token exchange. Defaults to
+	// https://login.microsoftonline.com when empty.
+	LoginEndpoint string `json:"login_endpoint,omitempty" yaml:"login_endpoint,omitempty"`
+
+	// GraphEndpoint overrides the base URL of the Microsoft Graph API the risk
+	// detections are fetched from. Defaults to https://graph.microsoft.com
+	// when empty.
+	GraphEndpoint string `json:"graph_endpoint,omitempty" yaml:"graph_endpoint,omitempty"`
+
+	// PollInterval overrides the wait between polls of the riskDetections
+	// endpoint (default 30s). It is not settable through a config file; it
+	// exists as a seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
+}
+
+// loginEndpoint returns the Microsoft identity platform base URL to use,
+// defaulting to the public endpoint when no override is configured.
+func (c EntraIDConfig) loginEndpoint() string {
+	if c.LoginEndpoint != "" {
+		return strings.TrimRight(c.LoginEndpoint, "/")
+	}
+	return defaultLoginEndpoint
+}
+
+// graphEndpoint returns the Microsoft Graph base URL to use, defaulting to the
+// public endpoint when no override is configured.
+func (c EntraIDConfig) graphEndpoint() string {
+	if c.GraphEndpoint != "" {
+		return strings.TrimRight(c.GraphEndpoint, "/")
+	}
+	return defaultGraphEndpoint
+}
+
+// tokenURL is the OAuth2 client_credentials token endpoint for the tenant.
+func (c EntraIDConfig) tokenURL() string {
+	return fmt.Sprintf("%s/%s/oauth2/v2.0/token", c.loginEndpoint(), c.TenantID)
+}
+
+// riskDetectionsURL is the Identity Protection risk detections endpoint.
+func (c EntraIDConfig) riskDetectionsURL() string {
+	return c.graphEndpoint() + "/v1.0/identityProtection/riskDetections"
 }
 
 func (c *EntraIDConfig) Validate() error {
@@ -61,16 +120,31 @@ func (c *EntraIDConfig) Validate() error {
 }
 
 func NewEntraIDAdapter(ctx context.Context, conf EntraIDConfig) (*EntraIDAdapter, chan struct{}, error) {
-	var err error
+	return newEntraIDAdapter(ctx, conf, nil)
+}
+
+// newEntraIDAdapter is the implementation behind NewEntraIDAdapter. When sink
+// is non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newEntraIDAdapter(ctx context.Context, conf EntraIDConfig, sink uspSink) (*EntraIDAdapter, chan struct{}, error) {
 	a := &EntraIDAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		pollInterval: conf.PollInterval,
+	}
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -87,7 +161,7 @@ func NewEntraIDAdapter(ctx context.Context, conf EntraIDConfig) (*EntraIDAdapter
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts"))
 
 	a.wgSenders.Add(1)
-	go a.fetchEvents(URL["get_alerts"])
+	go a.fetchEvents(a.conf.riskDetectionsURL())
 
 	go func() {
 		a.wgSenders.Wait()
@@ -114,7 +188,7 @@ func (a *EntraIDAdapter) Close() error {
 
 func (a *EntraIDAdapter) fetchToken() (string, error) {
 
-	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.conf.TenantID)
+	url := a.conf.tokenURL()
 	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
@@ -157,7 +231,7 @@ func (a *EntraIDAdapter) fetchEvents(url string) {
 	lastEventId := ""
 	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newSince, eventId, _ := a.makeOneListRequest(url, since, lastEventId)

@@ -25,6 +25,18 @@ const (
 	eventsBaseURLEU = "https://api.bitwarden.eu"
 )
 
+// defaultPollInterval is how long fetchEvents idles between polling cycles.
+const defaultPollInterval = 30 * time.Second
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type BitwardenConfig struct {
 	ClientOptions    uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ClientID         string                  `json:"client_id" yaml:"client_id"`
@@ -75,7 +87,7 @@ func (c *BitwardenConfig) Validate() error {
 
 type BitwardenAdapter struct {
 	conf          BitwardenConfig
-	uspClient     *uspclient.Client
+	uspClient     uspSink
 	httpClient    *http.Client
 	chStopped     chan struct{}
 	wgSenders     sync.WaitGroup
@@ -87,19 +99,27 @@ type BitwardenAdapter struct {
 	eventsBaseURL string
 	tokenEndpoint string
 	lastStartDate *time.Time
+	pollInterval  time.Duration
 }
 
 func NewBitwardenAdapter(ctx context.Context, conf BitwardenConfig) (*BitwardenAdapter, chan struct{}, error) {
+	return newBitwardenAdapter(ctx, conf, nil)
+}
+
+// newBitwardenAdapter is the implementation behind NewBitwardenAdapter. When
+// sink is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newBitwardenAdapter(ctx context.Context, conf BitwardenConfig, sink uspSink) (*BitwardenAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
 
-	var err error
 	a := &BitwardenAdapter{
-		conf:      conf,
-		ctx:       context.Background(),
-		doStop:    utils.NewEvent(),
-		chStopped: make(chan struct{}),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		chStopped:    make(chan struct{}),
+		pollInterval: defaultPollInterval,
 	}
 
 	// Set URLs: use custom URLs if provided, otherwise use region-specific URLs
@@ -114,9 +134,14 @@ func NewBitwardenAdapter(ctx context.Context, conf BitwardenConfig) (*BitwardenA
 		a.tokenEndpoint = tokenEndpointUS
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -224,7 +249,7 @@ func (a *BitwardenAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog("Bitwarden event collection stopping")
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// Capture end time before fetching to avoid gaps
 		endTime := time.Now()
 

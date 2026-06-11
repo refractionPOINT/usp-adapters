@@ -36,11 +36,25 @@ type CylanceConfig struct {
 	AppID          string                  `json:"app_id" yaml:"app_id"`
 	AppSecret      string                  `json:"app_secret" yaml:"app_secret"`
 	LoggingBaseURL string                  `json:"logging_base_url" yaml:"logging_base_url"`
+
+	// PollInterval overrides the fixed wait between polls of the Cylance APIs.
+	// It is not settable through a config file; it exists as a seam for tests
+	// (the production interval stays the historical 60 seconds).
+	PollInterval time.Duration `json:"-" yaml:"-"`
+}
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
 }
 
 type CylanceAdapter struct {
 	conf       CylanceConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 	chStopped  chan struct{}
 
@@ -58,6 +72,13 @@ type CylanceAdapter struct {
 }
 
 func NewCylanceAdapter(ctx context.Context, conf CylanceConfig) (*CylanceAdapter, chan struct{}, error) {
+	return newCylanceAdapter(ctx, conf, nil)
+}
+
+// newCylanceAdapter is the implementation behind NewCylanceAdapter. When sink
+// is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newCylanceAdapter(ctx context.Context, conf CylanceConfig, sink uspSink) (*CylanceAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -73,10 +94,14 @@ func NewCylanceAdapter(ctx context.Context, conf CylanceConfig) (*CylanceAdapter
 	a.ctx = rootCtx
 	a.cancel = cancel
 
-	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -113,6 +138,9 @@ func (c *CylanceConfig) Validate() error {
 	}
 	if c.LoggingBaseURL == "" {
 		c.LoggingBaseURL = defaultLoggingBaseURL
+	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = queryInterval * time.Second
 	}
 	return nil
 }
@@ -182,7 +210,7 @@ func (a *CylanceAdapter) fetchEvents() {
 		},
 	}
 
-	ticker := time.NewTicker(queryInterval * time.Second)
+	ticker := time.NewTicker(a.conf.PollInterval)
 	defer ticker.Stop()
 
 	for {
