@@ -23,6 +23,15 @@ const (
 	udpBufferSize       = 64 * 1024
 )
 
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type SyslogAdapter struct {
 	conf         SyslogConfig
 	listener     net.Listener
@@ -30,7 +39,7 @@ type SyslogAdapter struct {
 	connMutex    sync.Mutex
 	wg           sync.WaitGroup
 	isRunning    uint32
-	uspClient    *uspclient.Client
+	uspClient    uspSink
 	writeTimeout time.Duration
 }
 
@@ -56,6 +65,13 @@ func (c *SyslogConfig) Validate() error {
 }
 
 func NewSyslogAdapter(ctx context.Context, conf SyslogConfig) (*SyslogAdapter, chan struct{}, error) {
+	return newSyslogAdapter(ctx, conf, nil)
+}
+
+// newSyslogAdapter is the implementation behind NewSyslogAdapter. When sink is
+// non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newSyslogAdapter(ctx context.Context, conf SyslogConfig, sink uspSink) (*SyslogAdapter, chan struct{}, error) {
 	a := &SyslogAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -113,14 +129,20 @@ func NewSyslogAdapter(ctx context.Context, conf SyslogConfig) (*SyslogAdapter, c
 		return nil, nil, err
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		if l != nil {
-			l.Close()
-		} else {
-			ul.Close()
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		var uspClient *uspclient.Client
+		uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			if l != nil {
+				l.Close()
+			} else {
+				ul.Close()
+			}
+			return nil, nil, err
 		}
-		return nil, nil, err
+		a.uspClient = uspClient
 	}
 
 	a.listener = l

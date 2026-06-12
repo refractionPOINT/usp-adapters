@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,14 +19,27 @@ import (
 )
 
 const (
-	baseURL       = "https://api.services.mimecast.com"
-	overlapPeriod = 30 * time.Second
+	defaultBaseURL      = "https://api.services.mimecast.com"
+	overlapPeriod       = 30 * time.Second
+	defaultPollInterval = 30 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type MimecastAdapter struct {
 	conf       MimecastConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	baseURL      string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -89,6 +103,15 @@ type MimecastConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ClientId      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
+
+	// BaseURL overrides the Mimecast API root. Empty means the global API
+	// gateway (https://api.services.mimecast.com).
+	BaseURL string `json:"base_url" yaml:"base_url"`
+
+	// PollInterval overrides the wait between polls of the audit events
+	// endpoint. It is not settable through a config file; it exists as a seam
+	// for tests. Defaults to 30 seconds.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *MimecastConfig) Validate() error {
@@ -106,17 +129,36 @@ func (c *MimecastConfig) Validate() error {
 }
 
 func NewMimecastAdapter(ctx context.Context, conf MimecastConfig) (*MimecastAdapter, chan struct{}, error) {
-	var err error
+	return newMimecastAdapter(ctx, conf, nil)
+}
+
+// newMimecastAdapter is the implementation behind NewMimecastAdapter. When
+// sink is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink) (*MimecastAdapter, chan struct{}, error) {
 	a := &MimecastAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
-		dedupe: make(map[string]int64),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		dedupe:       make(map[string]int64),
+		baseURL:      defaultBaseURL,
+		pollInterval: defaultPollInterval,
+	}
+	if conf.BaseURL != "" {
+		a.baseURL = strings.TrimRight(conf.BaseURL, "/")
+	}
+	if conf.PollInterval > 0 {
+		a.pollInterval = conf.PollInterval
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -158,11 +200,11 @@ func (a *MimecastAdapter) Close() error {
 
 func (a *MimecastAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", baseURL))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.baseURL))
 
 	since := time.Now().Add(-400 * time.Hour)
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newSince, _ := a.makeOneRequest(since)
@@ -206,7 +248,7 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 	end := currentTime.UTC().Format("2006-01-02T15:04:05-0700")
 
 	pageToken := ""
-	url := baseURL + "/api/audit/get-audit-events"
+	url := a.baseURL + "/api/audit/get-audit-events"
 
 	for {
 		// Prepare the request.
@@ -322,7 +364,7 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 }
 
 func (a *MimecastAdapter) getAuthToken() (string, error) {
-	url := baseURL + "/oauth/token"
+	url := a.baseURL + "/oauth/token"
 	body := "grant_type=client_credentials&client_id=" + a.conf.ClientId + "&client_secret=" + a.conf.ClientSecret
 
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer([]byte(body)))
