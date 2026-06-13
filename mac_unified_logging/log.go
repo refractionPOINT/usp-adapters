@@ -52,14 +52,26 @@ const (
 	// data anyway and can leave the long-lived `log stream` process in a
 	// degraded state that persists until it is restarted.
 	logChannelBuffer = 4096
-	// restartBackoff is the delay between `log stream` subprocess
-	// restarts (subprocess exit, persistent decode failure, ...). Long
-	// enough to avoid a tight respawn loop if `log` is unrunnable, short
-	// enough to not lose meaningful coverage.
-	restartBackoff = 5 * time.Second
 	// dropReportInterval is how often a non-zero shed count is reported.
 	dropReportInterval = 60 * time.Second
 )
+
+// restartBackoff is the delay between `log stream` subprocess restarts
+// (subprocess exit, persistent decode failure, ...). Long enough to avoid a
+// tight respawn loop if `log` is unrunnable, short enough to not lose
+// meaningful coverage. A var (not const) so tests can shorten it.
+var restartBackoff = 5 * time.Second
+
+// streamCommand builds the `log stream` subprocess. It is a package var so
+// tests can substitute a fake stream without a real macOS `log` binary
+// (log.go is not build-constrained, only client.go/noop.go are).
+var streamCommand = func(predicate string) *exec.Cmd {
+	args := []string{"stream", "--color=none", "--style=ndjson"}
+	if predicate != "" {
+		args = append(args, "--predicate", predicate)
+	}
+	return exec.Command("log", args...)
+}
 
 type Logs struct {
 	// Channel delivers parsed log entries. It is closed when gathering
@@ -140,11 +152,7 @@ func (logs *Logs) StartGathering(predicate string, onWarning func(string)) error
 // runOnce runs a single `log stream` subprocess until it exits, its output
 // desyncs, or StopGathering is called.
 func (logs *Logs) runOnce() {
-	args := []string{"stream", "--color=none", "--style=ndjson"}
-	if logs.predicate != "" {
-		args = append(args, "--predicate", logs.predicate)
-	}
-	cmd := exec.Command("log", args...)
+	cmd := streamCommand(logs.predicate)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -210,6 +218,13 @@ func (logs *Logs) runOnce() {
 
 		entry := Log{}
 		if err := dec.Decode(&entry); err != nil {
+			// On a stop request the subprocess was killed on purpose, so
+			// the decode error is expected — exit quietly.
+			select {
+			case <-logs.chStop:
+				return
+			default:
+			}
 			// A json.Decoder does not resync after garbage and EOF means
 			// the subprocess is gone; either way this stream is done.
 			// Return and let the supervisor restart the subprocess.
