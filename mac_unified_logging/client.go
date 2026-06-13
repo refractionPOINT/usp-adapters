@@ -23,11 +23,10 @@ const (
 
 type MacUnifiedLoggingAdapter struct {
 	conf         MacUnifiedLoggingConfig
-	wg           sync.WaitGroup
-	isRunning    uint32
-	mRunning     sync.RWMutex
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
+
+	logs *Logs
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -37,8 +36,8 @@ type MacUnifiedLoggingAdapter struct {
 
 func NewMacUnifiedLoggingAdapter(ctx context.Context, conf MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
 	a := &MacUnifiedLoggingAdapter{
-		conf:      conf,
-		isRunning: 1,
+		conf: conf,
+		ctx:  ctx,
 	}
 
 	if a.conf.WriteTimeoutSec == 0 {
@@ -52,10 +51,27 @@ func NewMacUnifiedLoggingAdapter(ctx context.Context, conf MacUnifiedLoggingConf
 		return nil, nil, err
 	}
 
+	a.logs = NewLogs()
+	if err := a.logs.StartGathering(a.conf.Predicate, a.conf.ClientOptions.OnWarning); err != nil {
+		a.uspClient.Close()
+		return nil, nil, err
+	}
+
+	// Make sure the `log stream` subprocess does not outlive us if the
+	// process is signaled: stop gathering (which kills the subprocess)
+	// before exiting.
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalChannel
+		a.logs.StopGathering()
+		os.Exit(0)
+	}()
+
 	a.chStopped = make(chan struct{})
 
 	a.wgSenders.Add(1)
-	go a.handleEvent(a.conf.Predicate)
+	go a.handleEvents()
 
 	go func() {
 		a.wgSenders.Wait()
@@ -68,12 +84,10 @@ func NewMacUnifiedLoggingAdapter(ctx context.Context, conf MacUnifiedLoggingConf
 func (a *MacUnifiedLoggingAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 
-	a.mRunning.Lock()
-	a.isRunning = 0
-	a.mRunning.Unlock()
-
-	a.wg.Done()
-	a.wg.Wait()
+	// Stops the subprocess and supervisor; this closes logs.Channel,
+	// which winds down handleEvents.
+	a.logs.StopGathering()
+	a.wgSenders.Wait()
 
 	_, err := a.uspClient.Close()
 	if err != nil {
@@ -97,23 +111,12 @@ func (a *MacUnifiedLoggingAdapter) convertStructToMap(obj interface{}) map[strin
 	return mapRepresentation
 }
 
-func (a *MacUnifiedLoggingAdapter) handleEvent(predicate string) uintptr {
+func (a *MacUnifiedLoggingAdapter) handleEvents() {
+	defer a.wgSenders.Done()
 
-	logs := NewLogs()
-
-	signalChannel := make(chan os.Signal)
-	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-signalChannel
-		logs.StopGathering()
-		os.Exit(0)
-	}()
-
-	if err := logs.StartGathering(predicate); err != nil {
-		panic(err)
-	}
-
-	for log := range logs.Channel {
+	// The channel is closed by StopGathering once the gatherer has fully
+	// wound down, so this loop is guaranteed to exit on shutdown.
+	for log := range a.logs.Channel {
 		msg := &protocol.DataMessage{
 			JsonPayload: a.convertStructToMap(log),
 			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
@@ -127,6 +130,4 @@ func (a *MacUnifiedLoggingAdapter) handleEvent(predicate string) uintptr {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
 	}
-
-	return 0
 }
