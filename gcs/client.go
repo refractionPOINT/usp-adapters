@@ -50,6 +50,7 @@ func (c *GCSConfig) Validate() error {
 	if c.BucketName == "" {
 		return errors.New("missing bucket_name")
 	}
+	c.ServiceAccountCreds = strings.TrimSpace(c.ServiceAccountCreds)
 	return nil
 }
 
@@ -206,10 +207,17 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 			}
 		}
 
-		isCompressed := false
-
-		if strings.HasSuffix(attrs.Name, ".gz") {
-			isCompressed = true
+		// PrepareBundleData routes through the parquet decoder when
+		// needed (including gzipped parquet) and otherwise returns the
+		// bytes untouched.
+		objData, isCompressed, err := utils.PrepareBundleData(attrs.Name, objData)
+		if err != nil {
+			a.conf.ClientOptions.OnError(err)
+			return &gcsLocalFile{
+				Obj:  obj,
+				Data: nil,
+				Err:  err,
+			}
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", attrs.Name, time.Since(startTime), attrs.Size))

@@ -23,12 +23,32 @@ var URL = map[string]string{
 	"get_alerts": "https://graph.microsoft.com/v1.0/security/alerts_v2",
 }
 
+const (
+	// defaultTokenURLTemplate is the Microsoft identity platform token endpoint,
+	// parameterized by tenant id.
+	defaultTokenURLTemplate = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"
+
+	// defaultPollInterval is how long the adapter waits between polls of the
+	// alerts endpoint.
+	defaultPollInterval = 30 * time.Second
+)
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type DefenderAdapter struct {
 	conf       DefenderConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
-	endpoint string
+	endpoint     string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -42,6 +62,38 @@ type DefenderConfig struct {
 	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
+
+	// TokenURL overrides the Microsoft identity platform token endpoint
+	// (default: https://login.microsoftonline.com/<tenant_id>/oauth2/v2.0/token).
+	TokenURL string `json:"token_url" yaml:"token_url"`
+
+	// AlertsURL overrides the MS Graph security alerts endpoint
+	// (default: https://graph.microsoft.com/v1.0/security/alerts_v2).
+	AlertsURL string `json:"alerts_url" yaml:"alerts_url"`
+
+	// PollInterval overrides how long the adapter waits between polls of the
+	// alerts endpoint (default: 30s). Not exposed in json/yaml configs
+	// (time.Duration does not deserialize meaningfully); it is a seam for
+	// tests, like in the other polling adapters.
+	PollInterval time.Duration `json:"-" yaml:"-"`
+}
+
+// tokenURL returns the token endpoint to use: the configured override, or the
+// default Microsoft identity platform endpoint for the configured tenant.
+func (c *DefenderConfig) tokenURL() string {
+	if c.TokenURL != "" {
+		return c.TokenURL
+	}
+	return fmt.Sprintf(defaultTokenURLTemplate, c.TenantID)
+}
+
+// alertsURL returns the alerts endpoint to use: the configured override, or
+// the default MS Graph security alerts endpoint.
+func (c *DefenderConfig) alertsURL() string {
+	if c.AlertsURL != "" {
+		return c.AlertsURL
+	}
+	return URL["get_alerts"]
 }
 
 func (c *DefenderConfig) Validate() error {
@@ -61,16 +113,31 @@ func (c *DefenderConfig) Validate() error {
 }
 
 func NewDefenderAdapter(ctx context.Context, conf DefenderConfig) (*DefenderAdapter, chan struct{}, error) {
+	return newDefenderAdapter(ctx, conf, nil)
+}
+
+// newDefenderAdapter is the implementation behind NewDefenderAdapter. When
+// sink is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newDefenderAdapter(ctx context.Context, conf DefenderConfig, sink uspSink) (*DefenderAdapter, chan struct{}, error) {
 	var err error
 	a := &DefenderAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		pollInterval: conf.PollInterval,
+	}
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	a.httpClient = &http.Client{
@@ -87,7 +154,7 @@ func NewDefenderAdapter(ctx context.Context, conf DefenderConfig) (*DefenderAdap
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts"))
 
 	a.wgSenders.Add(1)
-	go a.fetchEvents(URL["get_alerts"])
+	go a.fetchEvents(a.conf.alertsURL())
 
 	go func() {
 		a.wgSenders.Wait()
@@ -114,7 +181,7 @@ func (a *DefenderAdapter) Close() error {
 
 func (a *DefenderAdapter) fetchToken() (string, error) {
 
-	url := fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", a.conf.TenantID)
+	url := a.conf.tokenURL()
 	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
@@ -158,7 +225,7 @@ func (a *DefenderAdapter) fetchEvents(url string) {
 	// since := time.Date(2022, time.June, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000000Z")
 	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newSince, eventId, _ := a.makeOneListRequest(url, since, lastEventId)

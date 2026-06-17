@@ -19,6 +19,8 @@ import (
 const (
 	logsURL = "/logs"
 	URL     = "https://api.itglue.com"
+
+	defaultPollInterval = 30 * time.Second
 )
 
 type opRequest struct {
@@ -27,10 +29,22 @@ type opRequest struct {
 	Sort      string `json:"sort,omitempty"`
 }
 
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type ITGlueAdapter struct {
 	conf       ITGlueConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	baseURL      string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -42,6 +56,15 @@ type ITGlueAdapter struct {
 type ITGlueConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
+
+	// BaseURL overrides the IT Glue API root. Empty means the public API:
+	// https://api.itglue.com
+	BaseURL string `json:"base_url" yaml:"base_url"`
+
+	// PollInterval overrides the wait between polls of the logs endpoint
+	// (default 30s). It is not settable through a config file; it exists as a
+	// seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *ITGlueConfig) Validate() error {
@@ -55,16 +78,36 @@ func (c *ITGlueConfig) Validate() error {
 }
 
 func NewITGlueAdapter(ctx context.Context, conf ITGlueConfig) (*ITGlueAdapter, chan struct{}, error) {
-	var err error
+	return newITGlueAdapter(ctx, conf, nil)
+}
+
+// newITGlueAdapter is the implementation behind NewITGlueAdapter. When sink is
+// non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newITGlueAdapter(ctx context.Context, conf ITGlueConfig, sink uspSink) (*ITGlueAdapter, chan struct{}, error) {
 	a := &ITGlueAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	a.baseURL = conf.BaseURL
+	if a.baseURL == "" {
+		a.baseURL = URL
+	}
+	a.pollInterval = conf.PollInterval
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -109,7 +152,7 @@ func (a *ITGlueAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastCursor := ""
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newCursor := a.makeOneRequest(url, lastCursor)
@@ -156,7 +199,7 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 	formattedTime := thirtySecondsAgo.Format(timeFormat)
 
 	// Prepare the request.
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", URL, url, formattedTime), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", a.baseURL, url, formattedTime), nil)
 	//debugTimestamp := formattedTime
 	if lastCursor != "" {
 		req, err = http.NewRequest("GET", fmt.Sprintf("%s", lastCursor), nil)

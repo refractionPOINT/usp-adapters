@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	boxBaseURL    = "https://api.box.com/2.0/events"
-	tokenEndpoint = "https://api.box.com/oauth2/token"
+	defaultBoxEventsURL = "https://api.box.com/2.0/events"
+	defaultBoxTokenURL  = "https://api.box.com/oauth2/token"
+	defaultPollInterval = 30 * time.Second
 )
 
 type BoxConfig struct {
@@ -28,6 +29,19 @@ type BoxConfig struct {
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
 	SubjectID     string                  `json:"subject_id" yaml:"subject_id"`
+
+	// EventsURL overrides the Box enterprise events endpoint. Empty means the
+	// public API: https://api.box.com/2.0/events
+	EventsURL string `json:"events_url" yaml:"events_url"`
+
+	// TokenURL overrides the Box OAuth2 token endpoint. Empty means the
+	// public endpoint: https://api.box.com/oauth2/token
+	TokenURL string `json:"token_url" yaml:"token_url"`
+
+	// PollInterval overrides the wait between polls of the events endpoint
+	// (default 30s). It is not settable through a config file; it exists as a
+	// seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *BoxConfig) Validate() error {
@@ -41,10 +55,22 @@ func (c *BoxConfig) Validate() error {
 	return nil
 }
 
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type BoxAdapter struct {
 	conf           BoxConfig
-	uspClient      *uspclient.Client
+	uspClient      uspSink
 	httpClient     *http.Client
+	eventsURL      string
+	tokenURL       string
+	pollInterval   time.Duration
 	chStopped      chan struct{}
 	wgSenders      sync.WaitGroup
 	doStop         *utils.Event
@@ -55,7 +81,13 @@ type BoxAdapter struct {
 }
 
 func NewBoxAdapter(ctx context.Context, conf BoxConfig) (*BoxAdapter, chan struct{}, error) {
-	var err error
+	return newBoxAdapter(ctx, conf, nil)
+}
+
+// newBoxAdapter is the implementation behind NewBoxAdapter. When sink is
+// non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newBoxAdapter(ctx context.Context, conf BoxConfig, sink uspSink) (*BoxAdapter, chan struct{}, error) {
 	a := &BoxAdapter{
 		conf:           conf,
 		ctx:            context.Background(),
@@ -65,9 +97,27 @@ func NewBoxAdapter(ctx context.Context, conf BoxConfig) (*BoxAdapter, chan struc
 		initialized:    false,
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	a.eventsURL = conf.EventsURL
+	if a.eventsURL == "" {
+		a.eventsURL = defaultBoxEventsURL
+	}
+	a.tokenURL = conf.TokenURL
+	if a.tokenURL == "" {
+		a.tokenURL = defaultBoxTokenURL
+	}
+	a.pollInterval = conf.PollInterval
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -113,7 +163,7 @@ func (a *BoxAdapter) getAccessToken() (string, error) {
 	data.Set("box_subject_type", "enterprise")
 	data.Set("box_subject_id", fmt.Sprintf("%v", a.conf.SubjectID))
 
-	req, err := http.NewRequest("POST", tokenEndpoint, bytes.NewBufferString(data.Encode()))
+	req, err := http.NewRequest("POST", a.tokenURL, bytes.NewBufferString(data.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -155,7 +205,7 @@ func (a *BoxAdapter) fetchEvents() {
 		_ = items // discard
 	}
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		items, newStreamPosition, _ := a.makeOneRequest(a.streamPosition)
 		if newStreamPosition != "" {
 			a.streamPosition = newStreamPosition
@@ -193,7 +243,7 @@ func (a *BoxAdapter) makeOneRequest(streamPosition string) ([]utils.Dict, string
 		return nil, streamPosition, err
 	}
 
-	reqUrl := boxBaseURL + "?stream_type=admin_logs"
+	reqUrl := a.eventsURL + "?stream_type=admin_logs"
 	if streamPosition == "now" || streamPosition == "0" {
 		createdAfter := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
 		reqUrl += "&created_after=" + createdAfter

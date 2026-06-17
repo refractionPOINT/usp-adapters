@@ -22,6 +22,19 @@ import (
 	"golang.org/x/oauth2/clientcredentials"
 )
 
+// defaultPollInterval is how long fetchEvents waits between polling cycles
+// once all immediately-available pages have been consumed.
+const defaultPollInterval = 5 * time.Minute
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type listItem struct {
 	ContentType       string `json:"contentType,omitempty"`
 	ContentID         string `json:"contentId,omitempty"`
@@ -62,7 +75,7 @@ var ResourceScope = map[string]string{
 
 type Office365Adapter struct {
 	conf       Office365Config
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
 	endpoint     string
@@ -86,7 +99,18 @@ type Office365Config struct {
 	ContentTypes  string                  `json:"content_types" yaml:"content_types"`
 	StartTime     string                  `json:"start_time" yaml:"start_time"`
 
+	// TokenURL, when set, fully overrides the OAuth2 token endpoint URL. When
+	// empty (the default), the token endpoint is derived from Endpoint /
+	// Domain / TenantID as usual. It exists for tests and for private cloud
+	// deployments fronting their own AAD endpoint.
+	TokenURL string `json:"token_url" yaml:"token_url"`
+
 	Deduper utils.Deduper `json:"-" yaml:"-"`
+
+	// PollInterval is how long to wait between polling cycles. It is not
+	// settable through a config file; it exists as a seam for tests. Defaults
+	// to 5 minutes.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *Office365Config) Validate() error {
@@ -112,14 +136,32 @@ func (c *Office365Config) Validate() error {
 		return errors.New("missing endpoint")
 	}
 	_, ok := URL[c.Endpoint]
-	if !strings.HasPrefix(c.Endpoint, "https://") && !ok {
+	if !isURLEndpoint(c.Endpoint) && !ok {
 		return fmt.Errorf("invalid endpoint, not https or in %v", URL)
 	}
 	return nil
 }
 
+// isURLEndpoint reports whether the configured endpoint is an explicit URL
+// rather than one of the named environments. http is accepted (in addition to
+// https) so local mocks/tests can stand in for the Management API.
+func isURLEndpoint(endpoint string) bool {
+	return strings.HasPrefix(endpoint, "https://") || strings.HasPrefix(endpoint, "http://")
+}
+
 func NewOffice365Adapter(ctx context.Context, conf Office365Config) (*Office365Adapter, chan struct{}, error) {
+	return newOffice365Adapter(ctx, conf, nil)
+}
+
+// newOffice365Adapter is the implementation behind NewOffice365Adapter. When
+// sink is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink) (*Office365Adapter, chan struct{}, error) {
 	var err error
+
+	if conf.PollInterval <= 0 {
+		conf.PollInterval = defaultPollInterval
+	}
 
 	// If no deduper is provided, use a local one.
 	if conf.Deduper == nil {
@@ -135,7 +177,7 @@ func NewOffice365Adapter(ctx context.Context, conf Office365Config) (*Office365A
 		doStop: utils.NewEvent(),
 	}
 
-	if strings.HasPrefix(conf.Endpoint, "https://") {
+	if isURLEndpoint(conf.Endpoint) {
 		a.endpoint = conf.Endpoint
 		a.endpointType = "custom"
 	} else if v, ok := URL[conf.Endpoint]; ok {
@@ -145,9 +187,13 @@ func NewOffice365Adapter(ctx context.Context, conf Office365Config) (*Office365A
 		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	a.httpClient = &http.Client{
@@ -232,7 +278,7 @@ func (a *Office365Adapter) fetchEvents(url string) {
 
 	nextPage := ""
 	isFirstRun := true
-	for isFirstRun || (nextPage != "" && !a.doStop.IsSet()) || !a.doStop.WaitFor(5*time.Minute) {
+	for isFirstRun || (nextPage != "" && !a.doStop.IsSet()) || !a.doStop.WaitFor(a.conf.PollInterval) {
 		if nextPage == "" {
 			now := time.Now().UTC()
 			start := a.conf.StartTime
@@ -327,6 +373,11 @@ func (a *Office365Adapter) updateBearerToken() error {
 		// Fallback to enterprise settings
 		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
 		resourceScope = "https://manage.office.com"
+	}
+
+	// An explicit token_url overrides whatever was derived above.
+	if a.conf.TokenURL != "" {
+		tokenURL = a.conf.TokenURL
 	}
 
 	var conf *clientcredentials.Config

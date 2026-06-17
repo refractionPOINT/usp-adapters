@@ -17,6 +17,8 @@ import (
 	"github.com/refractionPOINT/usp-adapters/falconcloud"
 	"github.com/refractionPOINT/usp-adapters/file"
 	"github.com/refractionPOINT/usp-adapters/gcs"
+	"github.com/refractionPOINT/usp-adapters/gmail"
+	"github.com/refractionPOINT/usp-adapters/harmony"
 	"github.com/refractionPOINT/usp-adapters/hubspot"
 	"github.com/refractionPOINT/usp-adapters/imap"
 	"github.com/refractionPOINT/usp-adapters/itglue"
@@ -31,6 +33,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
 	"github.com/refractionPOINT/usp-adapters/sentinelone"
+	"github.com/refractionPOINT/usp-adapters/servicenow"
 	"github.com/refractionPOINT/usp-adapters/simulator"
 	"github.com/refractionPOINT/usp-adapters/slack"
 	"github.com/refractionPOINT/usp-adapters/sophos"
@@ -39,6 +42,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
 	"github.com/refractionPOINT/usp-adapters/syslog"
+	"github.com/refractionPOINT/usp-adapters/threatlocker"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
 	"github.com/refractionPOINT/usp-adapters/wel"
 	"github.com/refractionPOINT/usp-adapters/wiz"
@@ -77,8 +81,10 @@ type GeneralConfigs struct {
 	K8sPods           usp_k8s_pods.K8sPodsConfig                      `json:"k8s_pods" yaml:"k8s_pods"`
 	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
 	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
+	Gmail             usp_gmail.GmailConfig                           `json:"gmail" yaml:"gmail"`
 	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
 	FalconCloud       usp_falconcloud.FalconCloudConfig               `json:"falconcloud" yaml:"falconcloud"`
+	Harmony           usp_harmony.HarmonyConfig                       `json:"harmony" yaml:"harmony"`
 	Mimecast          usp_mimecast.MimecastConfig                     `json:"mimecast" yaml:"mimecast"`
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
@@ -87,6 +93,8 @@ type GeneralConfigs struct {
 	Box               usp_box.BoxConfig                               `json:"box" yaml:"box"`
 	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
+	ServiceNow        usp_servicenow.ServiceNowConfig                 `json:"servicenow" yaml:"servicenow"`
+	ThreatLocker      usp_threatlocker.ThreatLockerConfig             `json:"threatlocker" yaml:"threatlocker"`
 	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
 }
