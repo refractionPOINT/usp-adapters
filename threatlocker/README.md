@@ -117,7 +117,20 @@ the result set is exhausted (a short or empty page) or the feed's `max_pages`
 cap is reached. An in-memory deduper, keyed per feed, guarantees each record is
 shipped to LimaCharlie exactly once even though pages are re-fetched on every
 poll. Transient API failures (HTTP 5xx, 429, network errors) are retried with
-exponential backoff; an authentication failure (401/403) stops the adapter.
+exponential backoff.
+
+Errors coming back from the ThreatLocker API — including persistent 5xx, a
+malformed response, or an authentication failure (401/403) — are **logged as
+warnings and never stop the adapter**. The failing feed simply skips that poll
+and tries again on the next interval, while the other feeds keep running. This
+is deliberate: a problem on ThreatLocker's side cannot be fixed by restarting
+the collector, so the adapter does not treat it as fatal (which, in the hosted
+cloud-adapter environment, would tear the whole adapter down and eventually
+disable it). A token or endpoint that is fixed on the ThreatLocker side
+therefore recovers on its own, with no operator action. Only a failure
+*delivering* events to LimaCharlie is fatal, because there a restart re-establishes
+the connection. If a feed is known to be permanently broken for your tenant, turn
+it off with the matching `collect_*` option rather than leaving it to warn each poll.
 
 The adapter deliberately re-walks every page rather than stopping early at the
 first page of already-seen records: the API paginates by offset over a live,

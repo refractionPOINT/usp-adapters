@@ -575,7 +575,18 @@ func (a *ThreatLockerAdapter) pollFeed(feed ThreatLockerFeed) {
 
 // fetchPage requests one page of a feed, retrying transient failures with
 // exponential backoff. The bool result is false when the poll should be
-// abandoned (a permanent error, or the adapter is stopping).
+// abandoned (any source-side error, or the adapter is stopping).
+//
+// Source-side errors (anything that comes back from the ThreatLocker API:
+// 4xx/5xx, auth failures, network blips, malformed responses) are reported via
+// OnWarning and NEVER stop the adapter. This is deliberate: the cloud-sensor
+// host treats any adapter OnError as fatal to the instance -- it tears the
+// adapter down and relaunches it, and after enough failures disables it
+// entirely. Restarting cannot fix a problem on ThreatLocker's side, and it
+// would take the adapter's healthy feeds down along with the broken one. So we
+// log, skip just this poll, and let the feed try again next interval; a
+// recovered token or endpoint then heals on its own. Only a failure delivering
+// to LimaCharlie (see ship) is fatal, since a relaunch reconnects the backend.
 func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) ([]utils.Dict, bool) {
 	body := a.buildRequestBody(feed, pageNumber)
 
@@ -592,11 +603,11 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 		}
 
 		if !isTransientError(err) {
-			a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: feed %q request failed: %v", feed.Name, err))
-			// An authentication/authorization failure affects every feed, so
-			// stop the whole adapter rather than spin uselessly. Other
-			// permanent errors (e.g. a misconfigured feed URL) are isolated to
-			// this feed: abandon the poll but keep the adapter alive.
+			// A permanent source-side error (bad request, auth failure, a
+			// misconfigured feed URL, ...). Reported as a warning, not a fatal
+			// OnError -- see the function doc for why we never stop on a
+			// source-side problem.
+			msg := fmt.Sprintf("threatlocker: feed %q request failed (skipping this poll): %v", feed.Name, err)
 			var httpErr *HTTPError
 			if errors.As(err, &httpErr) &&
 				(httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
@@ -606,13 +617,13 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 				// not chase a token rotation when the real fix is to flip
 				// `instance` to the letter their portal shows next to
 				// "ThreatLocker Access" under the Help menu.
-				a.conf.ClientOptions.OnError(fmt.Errorf(
-					"threatlocker: HTTP %d -- token rejected. If the token is known to be active, "+
-						"verify `instance` matches the letter shown in the ThreatLocker Portal "+
-						"(Help > 'ThreatLocker Access (X)'); a token from a different instance "+
-						"is reported as TOKEN_REVOKED.", httpErr.StatusCode))
-				a.doStop.Set()
+				msg = fmt.Sprintf(
+					"threatlocker: feed %q -- HTTP %d, token rejected. If the token is known to be "+
+						"active, verify `instance` matches the letter shown in the ThreatLocker Portal "+
+						"(Help > 'ThreatLocker Access (X)'); a token from a different instance is "+
+						"reported as TOKEN_REVOKED.", feed.Name, httpErr.StatusCode)
 			}
+			a.conf.ClientOptions.OnWarning(msg)
 			return nil, false
 		}
 
@@ -631,14 +642,19 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 		}
 	}
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf(
-			"threatlocker: feed %q failed after %d attempts: %v", feed.Name, a.conf.MaxRetryAttempts, err))
+		// Transient failures persisted across every retry. Log and skip this
+		// poll (a warning, not a fatal OnError -- see the function doc); the
+		// next interval tries again.
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+			"threatlocker: feed %q failed after %d attempts (skipping this poll): %v",
+			feed.Name, a.conf.MaxRetryAttempts, err))
 		return nil, false
 	}
 
 	items, err := extractItems(raw, feed.ItemsPath)
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: feed %q response parse error: %v", feed.Name, err))
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+			"threatlocker: feed %q response parse error (skipping this poll): %v", feed.Name, err))
 		return nil, false
 	}
 	return items, true
