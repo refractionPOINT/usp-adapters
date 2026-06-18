@@ -53,6 +53,27 @@ Access** (e.g. `ThreatLocker Access (C)` → `instance: c`).
 > `TOKEN_REVOKED`, double-check the instance before assuming the token was
 > revoked.
 
+## Parent-organization tokens
+
+ThreatLocker scopes every query to the **currently managed organization** — the
+organization that minted the token (or the one named by the
+`managed_organization_id` header). By default the feeds ask only for *that*
+organization's own records (`showChildOrganizations` / `viewChildOrganizations`
+are `false`).
+
+This is correct for a token scoped to a single (leaf) organization. It is **not**
+what you want for a token scoped to a parent/master organization: a parent has no
+endpoints of its own, so with the child-org flags off you will see
+
+- no `approval_request` events (the parent has no pending approvals of its own),
+- `system_audit` events that are mostly the adapter's *own* API polling, and
+- an HTTP 500 from the `unified_audit` (`ActionLog`) endpoint.
+
+For a parent/master token, set **`include_child_organizations: true`**. The
+default feeds then flip their child-org flags on and return the parent's children
+(and grandchildren) too. Alternatively, set `managed_organization_id` to a
+specific child's GUID to scope every request down to that one child.
+
 ## Configuration
 
 | Key | Required | Description |
@@ -62,6 +83,7 @@ Access** (e.g. `ThreatLocker Access (C)` → `instance: c`).
 | `instance` | yes* | ThreatLocker instance identifier (e.g. `g`). *Required unless `base_url` is set. |
 | `base_url` | no | Full API root override, e.g. `https://portalapi.g.threatlocker.com/portalapi`. |
 | `managed_organization_id` | no | Scopes every request to that organization via the `managedOrganizationId` header. |
+| `include_child_organizations` | no | When `true`, the default feeds include child (and grandchild) organizations in their results. **Set this when the token is scoped to a parent/master organization** — see [Parent-organization tokens](#parent-organization-tokens). Default `false`. Only affects the default feeds; with custom `feeds`, set the flags in each feed's `parameters` yourself. |
 | `feeds` | no | List of feeds to poll. Defaults to the three feeds listed under [Out of the box](#out-of-the-box). |
 | `page_size` | no | Records per page. Default `100` (max `1000`). |
 | `poll_interval` | no | Wait between polls, as a Go duration in nanoseconds. Default `60000000000` (1 minute). |

@@ -148,6 +148,19 @@ type ThreatLockerConfig struct {
 	// organizations querying a specific child).
 	ManagedOrganizationID string `json:"managed_organization_id" yaml:"managed_organization_id"`
 
+	// IncludeChildOrganizations, when true, makes the default feeds include
+	// child (and grandchild) organizations in their results by flipping on the
+	// per-endpoint child-org flags (showChildOrganizations / viewChildOrganizations).
+	//
+	// Set this when the API token is scoped to a parent/master organization and
+	// you want to collect the children's data: a parent has no endpoints of its
+	// own, so with this off the approval-request feed is empty, the system-audit
+	// feed carries only the adapter's own API activity, and the unified-audit
+	// (ActionLog) feed can fail with HTTP 500. This only affects the default
+	// feeds; when you supply your own `feeds`, set the flags in each feed's
+	// `parameters` yourself.
+	IncludeChildOrganizations bool `json:"include_child_organizations" yaml:"include_child_organizations"`
+
 	// Feeds is the set of ThreatLocker endpoints to poll. When empty, the
 	// adapter defaults to a single feed of pending Application Control
 	// approval requests.
@@ -190,7 +203,18 @@ type ThreatLockerConfig struct {
 // the adapter's Window mechanism rewrites startDate/endDate on each poll, and
 // the deduper suppresses re-shipping records that fall into successive
 // overlapping windows.
-func defaultFeeds() []ThreatLockerFeed {
+//
+// includeChildOrgs controls organization scope. ThreatLocker queries are scoped
+// to the "currently managed organization" -- the org that minted the token (or
+// the one named by the managedOrganizationId header). When false, each feed
+// returns only that org's own records. When true, the child-organization flags
+// are flipped on, so a parent/master org sees its children's records too.
+//
+// This matters for parent-org tokens: a parent has no endpoints of its own, so
+// with the flags off `approval_request` returns nothing, `system_audit` returns
+// only the adapter's own API activity, and `ActionLog` can fail outright (HTTP
+// 500). Flipping the flags on is what makes a parent-org token usable.
+func defaultFeeds(includeChildOrgs bool) []ThreatLockerFeed {
 	return []ThreatLockerFeed{
 		{
 			Name: "approval_request",
@@ -198,7 +222,7 @@ func defaultFeeds() []ThreatLockerFeed {
 			Parameters: utils.Dict{
 				// statusId 1 == pending (awaiting an approve/deny decision).
 				"statusId":               1,
-				"showChildOrganizations": false,
+				"showChildOrganizations": includeChildOrgs,
 				"showCurrentTierOnly":    false,
 			},
 			OrderBy:        defaultOrderBy,
@@ -217,7 +241,7 @@ func defaultFeeds() []ThreatLockerFeed {
 				"groupBys":               []any{},
 				"exportMode":             false,
 				"showTotalCount":         false,
-				"showChildOrganizations": false,
+				"showChildOrganizations": includeChildOrgs,
 				"onlyTrueDenies":         false,
 				"simulateDeny":           false,
 			},
@@ -230,7 +254,7 @@ func defaultFeeds() []ThreatLockerFeed {
 			Name: "system_audit",
 			URL:  "SystemAudit/SystemAuditGetByParameters",
 			Parameters: utils.Dict{
-				"viewChildOrganizations": false,
+				"viewChildOrganizations": includeChildOrgs,
 			},
 			OrderBy:        defaultOrderBy,
 			TimestampField: defaultTimestampField,
@@ -277,7 +301,7 @@ func (c *ThreatLockerConfig) Validate() error {
 	}
 
 	if len(c.Feeds) == 0 {
-		c.Feeds = defaultFeeds()
+		c.Feeds = defaultFeeds(c.IncludeChildOrganizations)
 	}
 	seenNames := make(map[string]struct{}, len(c.Feeds))
 	for i := range c.Feeds {

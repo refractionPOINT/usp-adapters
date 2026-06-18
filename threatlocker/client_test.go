@@ -366,6 +366,32 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	t.Run("include_child_organizations toggles the child-org flags in the default feeds", func(t *testing.T) {
+		// Off (the default): every child-org flag is false.
+		off := ThreatLockerConfig{ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g"}
+		require.NoError(t, off.Validate())
+		for _, f := range off.Feeds {
+			switch f.Name {
+			case "approval_request", "unified_audit":
+				assert.Equal(t, false, f.Parameters["showChildOrganizations"], "feed %q", f.Name)
+			case "system_audit":
+				assert.Equal(t, false, f.Parameters["viewChildOrganizations"], "feed %q", f.Name)
+			}
+		}
+
+		// On: the flags flip to true so a parent-org token sees its children.
+		on := ThreatLockerConfig{ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g", IncludeChildOrganizations: true}
+		require.NoError(t, on.Validate())
+		for _, f := range on.Feeds {
+			switch f.Name {
+			case "approval_request", "unified_audit":
+				assert.Equal(t, true, f.Parameters["showChildOrganizations"], "feed %q", f.Name)
+			case "system_audit":
+				assert.Equal(t, true, f.Parameters["viewChildOrganizations"], "feed %q", f.Name)
+			}
+		}
+	})
+
 	t.Run("rejects feed without url", func(t *testing.T) {
 		c := ThreatLockerConfig{
 			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
