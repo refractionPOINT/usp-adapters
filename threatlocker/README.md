@@ -26,9 +26,11 @@ on every request; the adapter rewrites those fields automatically (see the
 `window` feed setting below). At-least-once delivery is preserved by the
 per-feed deduper.
 
-Override `feeds` in your config to add custom feeds (e.g. denied approval
-requests, child-organization-scoped queries) or to replace the defaults
-entirely.
+Each default feed can be turned off individually with `collect_approval_requests`
+/ `collect_unified_audit` / `collect_system_audit` (all default `true`) without
+having to re-declare the others. Override `feeds` in your config to add custom
+feeds (e.g. denied approval requests, child-organization-scoped queries) or to
+replace the defaults entirely.
 
 ## Authentication
 
@@ -53,6 +55,27 @@ Access** (e.g. `ThreatLocker Access (C)` → `instance: c`).
 > `TOKEN_REVOKED`, double-check the instance before assuming the token was
 > revoked.
 
+## Parent-organization tokens
+
+ThreatLocker scopes every query to the **currently managed organization** — the
+organization that minted the token (or the one named by the
+`managed_organization_id` header). By default the feeds ask only for *that*
+organization's own records (`showChildOrganizations` / `viewChildOrganizations`
+are `false`).
+
+This is correct for a token scoped to a single (leaf) organization. It is **not**
+what you want for a token scoped to a parent/master organization: a parent has no
+endpoints of its own, so with the child-org flags off you will see
+
+- no `approval_request` events (the parent has no pending approvals of its own),
+- `system_audit` events that are mostly the adapter's *own* API polling, and
+- an HTTP 500 from the `unified_audit` (`ActionLog`) endpoint.
+
+For a parent/master token, set **`include_child_organizations: true`**. The
+default feeds then flip their child-org flags on and return the parent's children
+(and grandchildren) too. Alternatively, set `managed_organization_id` to a
+specific child's GUID to scope every request down to that one child.
+
 ## Configuration
 
 | Key | Required | Description |
@@ -62,7 +85,11 @@ Access** (e.g. `ThreatLocker Access (C)` → `instance: c`).
 | `instance` | yes* | ThreatLocker instance identifier (e.g. `g`). *Required unless `base_url` is set. |
 | `base_url` | no | Full API root override, e.g. `https://portalapi.g.threatlocker.com/portalapi`. |
 | `managed_organization_id` | no | Scopes every request to that organization via the `managedOrganizationId` header. |
-| `feeds` | no | List of feeds to poll. Defaults to the three feeds listed under [Out of the box](#out-of-the-box). |
+| `include_child_organizations` | no | When `true`, the default feeds include child (and grandchild) organizations in their results. **Set this when the token is scoped to a parent/master organization** — see [Parent-organization tokens](#parent-organization-tokens). Default `false`. Only affects the default feeds; with custom `feeds`, set the flags in each feed's `parameters` yourself. |
+| `collect_approval_requests` | no | Whether to run the `approval_request` default feed. Default `true`. |
+| `collect_unified_audit` | no | Whether to run the `unified_audit` default feed. Default `true`. |
+| `collect_system_audit` | no | Whether to run the `system_audit` default feed. Default `true`. |
+| `feeds` | no | List of feeds to poll. Defaults to the three feeds listed under [Out of the box](#out-of-the-box). When set, it replaces the defaults entirely and the `collect_*` / `include_child_organizations` options no longer apply. |
 | `page_size` | no | Records per page. Default `100` (max `1000`). |
 | `poll_interval` | no | Wait between polls, as a Go duration in nanoseconds. Default `60000000000` (1 minute). |
 | `dedupe_ttl` | no | How long a record id is remembered to suppress re-shipping. Default 7 days. |
@@ -90,7 +117,20 @@ the result set is exhausted (a short or empty page) or the feed's `max_pages`
 cap is reached. An in-memory deduper, keyed per feed, guarantees each record is
 shipped to LimaCharlie exactly once even though pages are re-fetched on every
 poll. Transient API failures (HTTP 5xx, 429, network errors) are retried with
-exponential backoff; an authentication failure (401/403) stops the adapter.
+exponential backoff.
+
+Errors coming back from the ThreatLocker API — including persistent 5xx, a
+malformed response, or an authentication failure (401/403) — are **logged as
+warnings and never stop the adapter**. The failing feed simply skips that poll
+and tries again on the next interval, while the other feeds keep running. This
+is deliberate: a problem on ThreatLocker's side cannot be fixed by restarting
+the collector, so the adapter does not treat it as fatal (which, in the hosted
+cloud-adapter environment, would tear the whole adapter down and eventually
+disable it). A token or endpoint that is fixed on the ThreatLocker side
+therefore recovers on its own, with no operator action. Only a failure
+*delivering* events to LimaCharlie is fatal, because there a restart re-establishes
+the connection. If a feed is known to be permanently broken for your tenant, turn
+it off with the matching `collect_*` option rather than leaving it to warn each poll.
 
 The adapter deliberately re-walks every page rather than stopping early at the
 first page of already-seen records: the API paginates by offset over a live,

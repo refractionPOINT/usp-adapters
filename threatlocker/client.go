@@ -52,6 +52,12 @@ const (
 	// rolling-window dates into ThreatLocker request bodies. ThreatLocker's API
 	// accepts RFC 3339 with a Z suffix and millisecond precision.
 	windowTimestampLayout = "2006-01-02T15:04:05.000Z"
+
+	// Names of the three default feeds. Used both to build the default feed set
+	// and to select among it from the per-feed enable options.
+	feedApprovalRequest = "approval_request"
+	feedUnifiedAudit    = "unified_audit"
+	feedSystemAudit     = "system_audit"
 )
 
 // itemsArrayKeys are the keys the adapter probes, in order, to locate the list
@@ -148,6 +154,29 @@ type ThreatLockerConfig struct {
 	// organizations querying a specific child).
 	ManagedOrganizationID string `json:"managed_organization_id" yaml:"managed_organization_id"`
 
+	// IncludeChildOrganizations, when true, makes the default feeds include
+	// child (and grandchild) organizations in their results by flipping on the
+	// per-endpoint child-org flags (showChildOrganizations / viewChildOrganizations).
+	//
+	// Set this when the API token is scoped to a parent/master organization and
+	// you want to collect the children's data: a parent has no endpoints of its
+	// own, so with this off the approval-request feed is empty, the system-audit
+	// feed carries only the adapter's own API activity, and the unified-audit
+	// (ActionLog) feed can fail with HTTP 500. This only affects the default
+	// feeds; when you supply your own `feeds`, set the flags in each feed's
+	// `parameters` yourself.
+	IncludeChildOrganizations bool `json:"include_child_organizations" yaml:"include_child_organizations"`
+
+	// CollectApprovalRequests / CollectUnifiedAudit / CollectSystemAudit select
+	// which of the three default feeds run. A nil (absent) value means enabled,
+	// so the zero-config default collects all three. Set one to false to drop
+	// that feed. These are ignored when a custom `feeds` list is supplied (in
+	// that case the list itself is authoritative). At least one default feed
+	// must remain enabled.
+	CollectApprovalRequests *bool `json:"collect_approval_requests" yaml:"collect_approval_requests"`
+	CollectUnifiedAudit     *bool `json:"collect_unified_audit" yaml:"collect_unified_audit"`
+	CollectSystemAudit      *bool `json:"collect_system_audit" yaml:"collect_system_audit"`
+
 	// Feeds is the set of ThreatLocker endpoints to poll. When empty, the
 	// adapter defaults to a single feed of pending Application Control
 	// approval requests.
@@ -190,15 +219,26 @@ type ThreatLockerConfig struct {
 // the adapter's Window mechanism rewrites startDate/endDate on each poll, and
 // the deduper suppresses re-shipping records that fall into successive
 // overlapping windows.
-func defaultFeeds() []ThreatLockerFeed {
+//
+// includeChildOrgs controls organization scope. ThreatLocker queries are scoped
+// to the "currently managed organization" -- the org that minted the token (or
+// the one named by the managedOrganizationId header). When false, each feed
+// returns only that org's own records. When true, the child-organization flags
+// are flipped on, so a parent/master org sees its children's records too.
+//
+// This matters for parent-org tokens: a parent has no endpoints of its own, so
+// with the flags off `approval_request` returns nothing, `system_audit` returns
+// only the adapter's own API activity, and `ActionLog` can fail outright (HTTP
+// 500). Flipping the flags on is what makes a parent-org token usable.
+func defaultFeeds(includeChildOrgs bool) []ThreatLockerFeed {
 	return []ThreatLockerFeed{
 		{
-			Name: "approval_request",
+			Name: feedApprovalRequest,
 			URL:  "ApprovalRequest/ApprovalRequestGetByParameters",
 			Parameters: utils.Dict{
 				// statusId 1 == pending (awaiting an approve/deny decision).
 				"statusId":               1,
-				"showChildOrganizations": false,
+				"showChildOrganizations": includeChildOrgs,
 				"showCurrentTierOnly":    false,
 			},
 			OrderBy:        defaultOrderBy,
@@ -206,7 +246,7 @@ func defaultFeeds() []ThreatLockerFeed {
 			IDField:        "approvalRequestId",
 		},
 		{
-			Name: "unified_audit",
+			Name: feedUnifiedAudit,
 			URL:  "ActionLog/ActionLogGetByParametersV2",
 			// These body fields are documented as optional in the OpenAPI
 			// spec but ThreatLocker's own Postman example sends every one --
@@ -217,7 +257,7 @@ func defaultFeeds() []ThreatLockerFeed {
 				"groupBys":               []any{},
 				"exportMode":             false,
 				"showTotalCount":         false,
-				"showChildOrganizations": false,
+				"showChildOrganizations": includeChildOrgs,
 				"onlyTrueDenies":         false,
 				"simulateDeny":           false,
 			},
@@ -227,16 +267,33 @@ func defaultFeeds() []ThreatLockerFeed {
 			Window:         defaultWindow,
 		},
 		{
-			Name: "system_audit",
+			Name: feedSystemAudit,
 			URL:  "SystemAudit/SystemAuditGetByParameters",
 			Parameters: utils.Dict{
-				"viewChildOrganizations": false,
+				"viewChildOrganizations": includeChildOrgs,
 			},
 			OrderBy:        defaultOrderBy,
 			TimestampField: defaultTimestampField,
 			IDField:        "systemAuditId",
 			Window:         defaultWindow,
 		},
+	}
+}
+
+// feedEnabled reports whether a named default feed should run, given the
+// per-feed Collect* toggles. A nil toggle (absent from config) means enabled,
+// so the zero-config default runs every feed. An unrecognized name is enabled.
+func (c *ThreatLockerConfig) feedEnabled(name string) bool {
+	on := func(b *bool) bool { return b == nil || *b }
+	switch name {
+	case feedApprovalRequest:
+		return on(c.CollectApprovalRequests)
+	case feedUnifiedAudit:
+		return on(c.CollectUnifiedAudit)
+	case feedSystemAudit:
+		return on(c.CollectSystemAudit)
+	default:
+		return true
 	}
 }
 
@@ -277,7 +334,17 @@ func (c *ThreatLockerConfig) Validate() error {
 	}
 
 	if len(c.Feeds) == 0 {
-		c.Feeds = defaultFeeds()
+		feeds := make([]ThreatLockerFeed, 0, 3)
+		for _, f := range defaultFeeds(c.IncludeChildOrganizations) {
+			if !c.feedEnabled(f.Name) {
+				continue
+			}
+			feeds = append(feeds, f)
+		}
+		if len(feeds) == 0 {
+			return errors.New("all default feeds are disabled; enable at least one (collect_*) or supply custom feeds")
+		}
+		c.Feeds = feeds
 	}
 	seenNames := make(map[string]struct{}, len(c.Feeds))
 	for i := range c.Feeds {
@@ -508,7 +575,18 @@ func (a *ThreatLockerAdapter) pollFeed(feed ThreatLockerFeed) {
 
 // fetchPage requests one page of a feed, retrying transient failures with
 // exponential backoff. The bool result is false when the poll should be
-// abandoned (a permanent error, or the adapter is stopping).
+// abandoned (any source-side error, or the adapter is stopping).
+//
+// Source-side errors (anything that comes back from the ThreatLocker API:
+// 4xx/5xx, auth failures, network blips, malformed responses) are reported via
+// OnWarning and NEVER stop the adapter. This is deliberate: the cloud-sensor
+// host treats any adapter OnError as fatal to the instance -- it tears the
+// adapter down and relaunches it, and after enough failures disables it
+// entirely. Restarting cannot fix a problem on ThreatLocker's side, and it
+// would take the adapter's healthy feeds down along with the broken one. So we
+// log, skip just this poll, and let the feed try again next interval; a
+// recovered token or endpoint then heals on its own. Only a failure delivering
+// to LimaCharlie (see ship) is fatal, since a relaunch reconnects the backend.
 func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) ([]utils.Dict, bool) {
 	body := a.buildRequestBody(feed, pageNumber)
 
@@ -525,11 +603,11 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 		}
 
 		if !isTransientError(err) {
-			a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: feed %q request failed: %v", feed.Name, err))
-			// An authentication/authorization failure affects every feed, so
-			// stop the whole adapter rather than spin uselessly. Other
-			// permanent errors (e.g. a misconfigured feed URL) are isolated to
-			// this feed: abandon the poll but keep the adapter alive.
+			// A permanent source-side error (bad request, auth failure, a
+			// misconfigured feed URL, ...). Reported as a warning, not a fatal
+			// OnError -- see the function doc for why we never stop on a
+			// source-side problem.
+			msg := fmt.Sprintf("threatlocker: feed %q request failed (skipping this poll): %v", feed.Name, err)
 			var httpErr *HTTPError
 			if errors.As(err, &httpErr) &&
 				(httpErr.StatusCode == http.StatusUnauthorized || httpErr.StatusCode == http.StatusForbidden) {
@@ -539,13 +617,13 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 				// not chase a token rotation when the real fix is to flip
 				// `instance` to the letter their portal shows next to
 				// "ThreatLocker Access" under the Help menu.
-				a.conf.ClientOptions.OnError(fmt.Errorf(
-					"threatlocker: HTTP %d -- token rejected. If the token is known to be active, "+
-						"verify `instance` matches the letter shown in the ThreatLocker Portal "+
-						"(Help > 'ThreatLocker Access (X)'); a token from a different instance "+
-						"is reported as TOKEN_REVOKED.", httpErr.StatusCode))
-				a.doStop.Set()
+				msg = fmt.Sprintf(
+					"threatlocker: feed %q -- HTTP %d, token rejected. If the token is known to be "+
+						"active, verify `instance` matches the letter shown in the ThreatLocker Portal "+
+						"(Help > 'ThreatLocker Access (X)'); a token from a different instance is "+
+						"reported as TOKEN_REVOKED.", feed.Name, httpErr.StatusCode)
 			}
+			a.conf.ClientOptions.OnWarning(msg)
 			return nil, false
 		}
 
@@ -564,14 +642,19 @@ func (a *ThreatLockerAdapter) fetchPage(feed ThreatLockerFeed, pageNumber int) (
 		}
 	}
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf(
-			"threatlocker: feed %q failed after %d attempts: %v", feed.Name, a.conf.MaxRetryAttempts, err))
+		// Transient failures persisted across every retry. Log and skip this
+		// poll (a warning, not a fatal OnError -- see the function doc); the
+		// next interval tries again.
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+			"threatlocker: feed %q failed after %d attempts (skipping this poll): %v",
+			feed.Name, a.conf.MaxRetryAttempts, err))
 		return nil, false
 	}
 
 	items, err := extractItems(raw, feed.ItemsPath)
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: feed %q response parse error: %v", feed.Name, err))
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+			"threatlocker: feed %q response parse error (skipping this poll): %v", feed.Name, err))
 		return nil, false
 	}
 	return items, true

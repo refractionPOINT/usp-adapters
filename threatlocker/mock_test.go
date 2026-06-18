@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -482,8 +483,13 @@ func TestMockRejectsBadToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
+	var warnings, fatalErrors atomic.Int32
+	opts := testClientOptions(t)
+	opts.OnWarning = func(msg string) { warnings.Add(1); t.Logf("WRN: %s", msg) }
+	opts.OnError = func(err error) { fatalErrors.Add(1); t.Logf("ERR: %v", err) }
+
 	conf := ThreatLockerConfig{
-		ClientOptions: testClientOptions(t),
+		ClientOptions: opts,
 		APIKey:        "wrong-token",
 		BaseURL:       server.URL,
 		PollInterval:  50 * time.Millisecond,
@@ -492,12 +498,21 @@ func TestMockRejectsBadToken(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
+	// A rejected token is a source-side problem: the adapter warns and keeps
+	// running (retrying each poll) rather than stopping. Stopping would make the
+	// cloud-sensor host tear it down, relaunch and eventually disable it -- a
+	// restart cannot fix a bad token, and an operator fixing the token should
+	// see the adapter recover on its own.
+	require.Eventually(t, func() bool { return warnings.Load() > 0 },
+		3*time.Second, 20*time.Millisecond, "expected a warning when the token is rejected")
+
 	select {
 	case <-chStopped:
-		// Expected: a rejected token stops the adapter.
-	case <-time.After(3 * time.Second):
-		t.Fatal("adapter should stop when the API rejects the token")
+		t.Fatal("adapter must not stop when the API rejects the token")
+	case <-time.After(300 * time.Millisecond):
 	}
+	assert.False(t, adapter.doStop.IsSet(), "doStop must not be set on a rejected token")
+	assert.Equal(t, int32(0), fatalErrors.Load(), "a rejected token must warn, not fatally error")
 	assert.Equal(t, 0, sink.count(), "nothing should ship when authentication fails")
 	assert.GreaterOrEqual(t, mock.requestCount(), 1, "the adapter should have called the API")
 }

@@ -366,6 +366,73 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	t.Run("include_child_organizations toggles the child-org flags in the default feeds", func(t *testing.T) {
+		// Off (the default): every child-org flag is false.
+		off := ThreatLockerConfig{ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g"}
+		require.NoError(t, off.Validate())
+		for _, f := range off.Feeds {
+			switch f.Name {
+			case "approval_request", "unified_audit":
+				assert.Equal(t, false, f.Parameters["showChildOrganizations"], "feed %q", f.Name)
+			case "system_audit":
+				assert.Equal(t, false, f.Parameters["viewChildOrganizations"], "feed %q", f.Name)
+			}
+		}
+
+		// On: the flags flip to true so a parent-org token sees its children.
+		on := ThreatLockerConfig{ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g", IncludeChildOrganizations: true}
+		require.NoError(t, on.Validate())
+		for _, f := range on.Feeds {
+			switch f.Name {
+			case "approval_request", "unified_audit":
+				assert.Equal(t, true, f.Parameters["showChildOrganizations"], "feed %q", f.Name)
+			case "system_audit":
+				assert.Equal(t, true, f.Parameters["viewChildOrganizations"], "feed %q", f.Name)
+			}
+		}
+	})
+
+	t.Run("collect_* toggles select which default feeds run", func(t *testing.T) {
+		feedNames := func(c ThreatLockerConfig) []string {
+			require.NoError(t, c.Validate())
+			names := make([]string, 0, len(c.Feeds))
+			for _, f := range c.Feeds {
+				names = append(names, f.Name)
+			}
+			return names
+		}
+		falsePtr := false
+
+		// Dropping one feed leaves the other two.
+		got := feedNames(ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectSystemAudit: &falsePtr,
+		})
+		assert.ElementsMatch(t, []string{"approval_request", "unified_audit"}, got)
+
+		// Dropping two leaves exactly one.
+		got = feedNames(ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectUnifiedAudit: &falsePtr, CollectSystemAudit: &falsePtr,
+		})
+		assert.ElementsMatch(t, []string{"approval_request"}, got)
+
+		// Disabling all default feeds is an error.
+		all := ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectApprovalRequests: &falsePtr, CollectUnifiedAudit: &falsePtr, CollectSystemAudit: &falsePtr,
+		}
+		assert.Error(t, all.Validate())
+
+		// The toggles do not apply when a custom feeds list is supplied.
+		custom := ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectApprovalRequests: &falsePtr, CollectUnifiedAudit: &falsePtr, CollectSystemAudit: &falsePtr,
+			Feeds: []ThreatLockerFeed{{Name: "custom", URL: "X/XGetByParameters"}},
+		}
+		assert.Equal(t, []string{"custom"}, feedNames(custom))
+	})
+
 	t.Run("rejects feed without url", func(t *testing.T) {
 		c := ThreatLockerConfig{
 			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
@@ -684,9 +751,14 @@ func TestTransientErrorRetry(t *testing.T) {
 	assert.False(t, adapter.doStop.IsSet())
 }
 
-// TestPermanentAuthErrorStops verifies a 401/403 stops the whole adapter.
-func TestPermanentAuthErrorStops(t *testing.T) {
-	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+// TestPermanentSourceErrorDoesNotStop verifies that a permanent source-side
+// error (401/403/500 from ThreatLocker) is reported as a warning and does NOT
+// stop the adapter. The cloud-sensor host treats any fatal OnError as a reason
+// to tear down, relaunch and eventually disable the whole adapter, so a problem
+// on ThreatLocker's side (which a restart cannot fix) must stay non-fatal and
+// let the feed retry on the next poll.
+func TestPermanentSourceErrorDoesNotStop(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusInternalServerError} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(status)
@@ -697,24 +769,38 @@ func TestPermanentAuthErrorStops(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
 
+			var warnings, fatalErrors atomic.Int32
+			opts := testClientOptions(t)
+			opts.OnWarning = func(msg string) { warnings.Add(1); t.Logf("WRN: %s", msg) }
+			opts.OnError = func(err error) { fatalErrors.Add(1); t.Logf("ERR: %v", err) }
+
 			conf := ThreatLockerConfig{
-				ClientOptions: testClientOptions(t),
-				APIKey:        "bad-key",
-				BaseURL:       server.URL,
-				PollInterval:  100 * time.Millisecond,
-				Feeds:         approvalRequestFeed(),
+				ClientOptions:  opts,
+				APIKey:         "bad-key",
+				BaseURL:        server.URL,
+				PollInterval:   100 * time.Millisecond,
+				RetryBaseDelay: 10 * time.Millisecond,
+				MaxRetryDelay:  20 * time.Millisecond,
+				Feeds:          approvalRequestFeed(),
 			}
 			adapter, chStopped, err := NewThreatLockerAdapter(ctx, conf)
 			require.NoError(t, err)
 			defer adapter.Close()
 
+			// The feed should warn about the failure...
+			require.Eventually(t, func() bool { return warnings.Load() > 0 },
+				3*time.Second, 20*time.Millisecond, "expected a warning for the source error")
+
+			// ...but the adapter must keep running and never escalate to a fatal
+			// OnError or stop itself.
 			select {
 			case <-chStopped:
-				// Expected: an auth failure terminates the adapter.
-			case <-time.After(3 * time.Second):
-				t.Fatalf("adapter should have stopped on HTTP %d", status)
+				t.Fatalf("adapter stopped on HTTP %d - source errors must be non-fatal", status)
+			case <-time.After(300 * time.Millisecond):
 			}
-			assert.True(t, adapter.doStop.IsSet())
+			assert.False(t, adapter.doStop.IsSet(), "doStop must not be set on a source error")
+			assert.Equal(t, int32(0), fatalErrors.Load(),
+				"source errors must be warnings, not fatal OnError")
 		})
 	}
 }
