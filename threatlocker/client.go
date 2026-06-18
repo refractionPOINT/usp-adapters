@@ -52,6 +52,12 @@ const (
 	// rolling-window dates into ThreatLocker request bodies. ThreatLocker's API
 	// accepts RFC 3339 with a Z suffix and millisecond precision.
 	windowTimestampLayout = "2006-01-02T15:04:05.000Z"
+
+	// Names of the three default feeds. Used both to build the default feed set
+	// and to select among it from the per-feed enable options.
+	feedApprovalRequest = "approval_request"
+	feedUnifiedAudit    = "unified_audit"
+	feedSystemAudit     = "system_audit"
 )
 
 // itemsArrayKeys are the keys the adapter probes, in order, to locate the list
@@ -161,6 +167,16 @@ type ThreatLockerConfig struct {
 	// `parameters` yourself.
 	IncludeChildOrganizations bool `json:"include_child_organizations" yaml:"include_child_organizations"`
 
+	// CollectApprovalRequests / CollectUnifiedAudit / CollectSystemAudit select
+	// which of the three default feeds run. A nil (absent) value means enabled,
+	// so the zero-config default collects all three. Set one to false to drop
+	// that feed. These are ignored when a custom `feeds` list is supplied (in
+	// that case the list itself is authoritative). At least one default feed
+	// must remain enabled.
+	CollectApprovalRequests *bool `json:"collect_approval_requests" yaml:"collect_approval_requests"`
+	CollectUnifiedAudit     *bool `json:"collect_unified_audit" yaml:"collect_unified_audit"`
+	CollectSystemAudit      *bool `json:"collect_system_audit" yaml:"collect_system_audit"`
+
 	// Feeds is the set of ThreatLocker endpoints to poll. When empty, the
 	// adapter defaults to a single feed of pending Application Control
 	// approval requests.
@@ -217,7 +233,7 @@ type ThreatLockerConfig struct {
 func defaultFeeds(includeChildOrgs bool) []ThreatLockerFeed {
 	return []ThreatLockerFeed{
 		{
-			Name: "approval_request",
+			Name: feedApprovalRequest,
 			URL:  "ApprovalRequest/ApprovalRequestGetByParameters",
 			Parameters: utils.Dict{
 				// statusId 1 == pending (awaiting an approve/deny decision).
@@ -230,7 +246,7 @@ func defaultFeeds(includeChildOrgs bool) []ThreatLockerFeed {
 			IDField:        "approvalRequestId",
 		},
 		{
-			Name: "unified_audit",
+			Name: feedUnifiedAudit,
 			URL:  "ActionLog/ActionLogGetByParametersV2",
 			// These body fields are documented as optional in the OpenAPI
 			// spec but ThreatLocker's own Postman example sends every one --
@@ -251,7 +267,7 @@ func defaultFeeds(includeChildOrgs bool) []ThreatLockerFeed {
 			Window:         defaultWindow,
 		},
 		{
-			Name: "system_audit",
+			Name: feedSystemAudit,
 			URL:  "SystemAudit/SystemAuditGetByParameters",
 			Parameters: utils.Dict{
 				"viewChildOrganizations": includeChildOrgs,
@@ -261,6 +277,23 @@ func defaultFeeds(includeChildOrgs bool) []ThreatLockerFeed {
 			IDField:        "systemAuditId",
 			Window:         defaultWindow,
 		},
+	}
+}
+
+// feedEnabled reports whether a named default feed should run, given the
+// per-feed Collect* toggles. A nil toggle (absent from config) means enabled,
+// so the zero-config default runs every feed. An unrecognized name is enabled.
+func (c *ThreatLockerConfig) feedEnabled(name string) bool {
+	on := func(b *bool) bool { return b == nil || *b }
+	switch name {
+	case feedApprovalRequest:
+		return on(c.CollectApprovalRequests)
+	case feedUnifiedAudit:
+		return on(c.CollectUnifiedAudit)
+	case feedSystemAudit:
+		return on(c.CollectSystemAudit)
+	default:
+		return true
 	}
 }
 
@@ -301,7 +334,17 @@ func (c *ThreatLockerConfig) Validate() error {
 	}
 
 	if len(c.Feeds) == 0 {
-		c.Feeds = defaultFeeds(c.IncludeChildOrganizations)
+		feeds := make([]ThreatLockerFeed, 0, 3)
+		for _, f := range defaultFeeds(c.IncludeChildOrganizations) {
+			if !c.feedEnabled(f.Name) {
+				continue
+			}
+			feeds = append(feeds, f)
+		}
+		if len(feeds) == 0 {
+			return errors.New("all default feeds are disabled; enable at least one (collect_*) or supply custom feeds")
+		}
+		c.Feeds = feeds
 	}
 	seenNames := make(map[string]struct{}, len(c.Feeds))
 	for i := range c.Feeds {

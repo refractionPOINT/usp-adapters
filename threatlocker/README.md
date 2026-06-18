@@ -26,9 +26,11 @@ on every request; the adapter rewrites those fields automatically (see the
 `window` feed setting below). At-least-once delivery is preserved by the
 per-feed deduper.
 
-Override `feeds` in your config to add custom feeds (e.g. denied approval
-requests, child-organization-scoped queries) or to replace the defaults
-entirely.
+Each default feed can be turned off individually with `collect_approval_requests`
+/ `collect_unified_audit` / `collect_system_audit` (all default `true`) without
+having to re-declare the others. Override `feeds` in your config to add custom
+feeds (e.g. denied approval requests, child-organization-scoped queries) or to
+replace the defaults entirely.
 
 ## Authentication
 
@@ -84,7 +86,10 @@ specific child's GUID to scope every request down to that one child.
 | `base_url` | no | Full API root override, e.g. `https://portalapi.g.threatlocker.com/portalapi`. |
 | `managed_organization_id` | no | Scopes every request to that organization via the `managedOrganizationId` header. |
 | `include_child_organizations` | no | When `true`, the default feeds include child (and grandchild) organizations in their results. **Set this when the token is scoped to a parent/master organization** — see [Parent-organization tokens](#parent-organization-tokens). Default `false`. Only affects the default feeds; with custom `feeds`, set the flags in each feed's `parameters` yourself. |
-| `feeds` | no | List of feeds to poll. Defaults to the three feeds listed under [Out of the box](#out-of-the-box). |
+| `collect_approval_requests` | no | Whether to run the `approval_request` default feed. Default `true`. |
+| `collect_unified_audit` | no | Whether to run the `unified_audit` default feed. Default `true`. |
+| `collect_system_audit` | no | Whether to run the `system_audit` default feed. Default `true`. |
+| `feeds` | no | List of feeds to poll. Defaults to the three feeds listed under [Out of the box](#out-of-the-box). When set, it replaces the defaults entirely and the `collect_*` / `include_child_organizations` options no longer apply. |
 | `page_size` | no | Records per page. Default `100` (max `1000`). |
 | `poll_interval` | no | Wait between polls, as a Go duration in nanoseconds. Default `60000000000` (1 minute). |
 | `dedupe_ttl` | no | How long a record id is remembered to suppress re-shipping. Default 7 days. |

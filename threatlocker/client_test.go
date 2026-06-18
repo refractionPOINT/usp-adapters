@@ -392,6 +392,47 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	t.Run("collect_* toggles select which default feeds run", func(t *testing.T) {
+		feedNames := func(c ThreatLockerConfig) []string {
+			require.NoError(t, c.Validate())
+			names := make([]string, 0, len(c.Feeds))
+			for _, f := range c.Feeds {
+				names = append(names, f.Name)
+			}
+			return names
+		}
+		falsePtr := false
+
+		// Dropping one feed leaves the other two.
+		got := feedNames(ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectSystemAudit: &falsePtr,
+		})
+		assert.ElementsMatch(t, []string{"approval_request", "unified_audit"}, got)
+
+		// Dropping two leaves exactly one.
+		got = feedNames(ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectUnifiedAudit: &falsePtr, CollectSystemAudit: &falsePtr,
+		})
+		assert.ElementsMatch(t, []string{"approval_request"}, got)
+
+		// Disabling all default feeds is an error.
+		all := ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectApprovalRequests: &falsePtr, CollectUnifiedAudit: &falsePtr, CollectSystemAudit: &falsePtr,
+		}
+		assert.Error(t, all.Validate())
+
+		// The toggles do not apply when a custom feeds list is supplied.
+		custom := ThreatLockerConfig{
+			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
+			CollectApprovalRequests: &falsePtr, CollectUnifiedAudit: &falsePtr, CollectSystemAudit: &falsePtr,
+			Feeds: []ThreatLockerFeed{{Name: "custom", URL: "X/XGetByParameters"}},
+		}
+		assert.Equal(t, []string{"custom"}, feedNames(custom))
+	})
+
 	t.Run("rejects feed without url", func(t *testing.T) {
 		c := ThreatLockerConfig{
 			ClientOptions: testClientOptions(t), APIKey: "k", Instance: "g",
