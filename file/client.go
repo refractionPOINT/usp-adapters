@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -98,16 +97,6 @@ type FileAdapter struct {
 	// default const". Tests set this to a small value to exercise the
 	// cap without writing 1 GiB of data to disk.
 	parquetMaxSize int64
-}
-
-func (c *FileConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.FilePath == "" {
-		return errors.New("file_path missing")
-	}
-	return nil
 }
 
 func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan struct{}, error) {
