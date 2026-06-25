@@ -22,6 +22,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	"github.com/refractionPOINT/usp-adapters/cortex_xsoar"
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -510,6 +511,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ThreatLocker
 		client, chRunning, err = usp_threatlocker.NewThreatLockerAdapter(ctx, configs.ThreatLocker)
+	} else if method == "cortex_xsoar" {
+		configs.CortexXSOAR.ClientOptions = applyLogging(configs.CortexXSOAR.ClientOptions)
+		configs.CortexXSOAR.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.CortexXSOAR
+		client, chRunning, err = usp_cortex_xsoar.NewXSOARAdapter(ctx, configs.CortexXSOAR)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
