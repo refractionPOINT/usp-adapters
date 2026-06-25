@@ -362,6 +362,12 @@ func (a *XSOARAdapter) run() {
 	isFirstRun := true
 	for isFirstRun || !a.doStop.WaitFor(a.conf.PollInterval) {
 		isFirstRun = false
+		// Stop if the parent context is cancelled, not only on Close(): otherwise
+		// every poll would fail fast (context.Canceled is non-transient) and the
+		// loop would spin once per interval until Close() is eventually called.
+		if a.ctx.Err() != nil {
+			return
+		}
 		a.poll()
 	}
 }
@@ -385,13 +391,13 @@ func (a *XSOARAdapter) poll() {
 			break
 		}
 
-		incidents, total, ok := a.fetchPage(query, page)
+		incidents, total, pageLen, ok := a.fetchPage(query, page)
 		if !ok {
 			// The error has already been reported; abandon this poll (cursor
 			// unchanged) and try again on the next interval.
 			return
 		}
-		if len(incidents) == 0 {
+		if pageLen == 0 {
 			break
 		}
 
@@ -409,9 +415,12 @@ func (a *XSOARAdapter) poll() {
 			}
 		}
 
-		nCollected += len(incidents)
+		// Paginate on the raw page length (pageLen), not len(incidents): a record
+		// dropped as malformed must not make a full page look short and end the
+		// walk early.
+		nCollected += pageLen
 		// A short page is the end of the result set.
-		if len(incidents) < a.conf.PageSize {
+		if pageLen < a.conf.PageSize {
 			break
 		}
 		// Or we have collected everything the server says matched.
@@ -422,7 +431,14 @@ func (a *XSOARAdapter) poll() {
 
 	// Advance the cursor forward only. Using the newest modified time seen (with a
 	// >= query and id+modified dedup) means same-millisecond boundary incidents
-	// are re-queried next poll but not re-shipped, so none are skipped.
+	// are re-queried next poll but not re-shipped, so none are skipped. Cap at now:
+	// a single incident with a future-dated "modified" (clock skew, a bad record)
+	// must not jump the cursor ahead and starve collection of everything between
+	// now and that future time.
+	now := time.Now().UTC()
+	if maxModified.After(now) {
+		maxModified = now
+	}
 	if maxModified.After(a.cursor) {
 		a.cursor = maxModified
 	}
@@ -446,14 +462,14 @@ func (a *XSOARAdapter) poll() {
 // again; a fixed key or healed instance then recovers on its own. Only a failure
 // delivering to LimaCharlie (see ship) is fatal, since a relaunch reconnects the
 // backend.
-func (a *XSOARAdapter) fetchPage(query string, page int) ([]utils.Dict, int, bool) {
+func (a *XSOARAdapter) fetchPage(query string, page int) (incidents []utils.Dict, total, pageLen int, ok bool) {
 	body := buildRequestBody(query, page, a.conf.PageSize)
 
 	var raw []byte
 	var err error
 	for attempt := 0; attempt < a.conf.MaxRetryAttempts; attempt++ {
 		if a.doStop.IsSet() {
-			return nil, 0, false
+			return nil, 0, 0, false
 		}
 
 		raw, err = a.client.Post(a.ctx, searchIncidentsPath, body)
@@ -473,7 +489,7 @@ func (a *XSOARAdapter) fetchPage(query string, page int) ([]utils.Dict, int, boo
 						"is time-validated).", httpErr.StatusCode)
 			}
 			a.conf.ClientOptions.OnWarning(msg)
-			return nil, 0, false
+			return nil, 0, 0, false
 		}
 
 		if attempt+1 >= a.conf.MaxRetryAttempts {
@@ -487,23 +503,23 @@ func (a *XSOARAdapter) fetchPage(query string, page int) ([]utils.Dict, int, boo
 			"cortex_xsoar: transient error (attempt %d/%d), retrying in %v: %v",
 			attempt+1, a.conf.MaxRetryAttempts, delay, err))
 		if a.doStop.WaitFor(delay) {
-			return nil, 0, false
+			return nil, 0, 0, false
 		}
 	}
 	if err != nil {
 		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
 			"cortex_xsoar: incident search failed after %d attempts (skipping this poll): %v",
 			a.conf.MaxRetryAttempts, err))
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
 
-	incidents, total, err := extractIncidents(raw)
+	incidents, total, pageLen, err = extractIncidents(raw)
 	if err != nil {
 		a.conf.ClientOptions.OnWarning(fmt.Sprintf(
 			"cortex_xsoar: response parse error (skipping this poll): %v", err))
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
-	return incidents, total, true
+	return incidents, total, pageLen, true
 }
 
 // ship forwards a single incident to LimaCharlie. It returns false if the adapter
@@ -615,23 +631,29 @@ func buildRequestBody(query string, page, size int) utils.Dict {
 	}
 }
 
-// extractIncidents parses a /incidents/search response into the incident slice
-// and the reported total. The documented envelope is {"data": [...], "total": N};
-// a bare array is also accepted defensively.
-func extractIncidents(raw []byte) ([]utils.Dict, int, error) {
+// extractIncidents parses a /incidents/search response into the incident slice,
+// the reported total, and the number of raw records in the page. The documented
+// envelope is {"data": [...], "total": N}; a bare array is also accepted
+// defensively.
+//
+// pageLen is the count of records the server returned, BEFORE any are dropped as
+// malformed. The caller paginates on pageLen (not len(incidents)) so a single
+// unparseable record on an otherwise-full page does not look like a short page
+// and prematurely end the walk.
+func extractIncidents(raw []byte) (items []utils.Dict, total, pageLen int, err error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 
 	switch trimmed[0] {
 	case '[':
 		var arr []json.RawMessage
 		if err := json.Unmarshal([]byte(trimmed), &arr); err != nil {
-			return nil, 0, fmt.Errorf("invalid JSON array: %v", err)
+			return nil, 0, 0, fmt.Errorf("invalid JSON array: %v", err)
 		}
 		items := rawMessagesToDicts(arr)
-		return items, len(items), nil
+		return items, len(arr), len(arr), nil
 
 	case '{':
 		var obj struct {
@@ -639,12 +661,12 @@ func extractIncidents(raw []byte) ([]utils.Dict, int, error) {
 			Total int               `json:"total"`
 		}
 		if err := json.Unmarshal([]byte(trimmed), &obj); err != nil {
-			return nil, 0, fmt.Errorf("invalid JSON object: %v", err)
+			return nil, 0, 0, fmt.Errorf("invalid JSON object: %v", err)
 		}
-		return rawMessagesToDicts(obj.Data), obj.Total, nil
+		return rawMessagesToDicts(obj.Data), obj.Total, len(obj.Data), nil
 
 	default:
-		return nil, 0, errors.New("response is neither a JSON array nor a JSON object")
+		return nil, 0, 0, errors.New("response is neither a JSON array nor a JSON object")
 	}
 }
 

@@ -128,41 +128,45 @@ func TestBuildRequestBody(t *testing.T) {
 
 func TestExtractIncidents(t *testing.T) {
 	t.Run("documented envelope with total", func(t *testing.T) {
-		items, total, err := extractIncidents([]byte(`{"data":[{"id":"1"},{"id":"2"}],"total":57}`))
+		items, total, pageLen, err := extractIncidents([]byte(`{"data":[{"id":"1"},{"id":"2"}],"total":57}`))
 		require.NoError(t, err)
 		require.Len(t, items, 2)
 		assert.Equal(t, 57, total)
+		assert.Equal(t, 2, pageLen)
 		assert.Equal(t, "1", items[0].FindOneString("id"))
 	})
 
 	t.Run("empty data array", func(t *testing.T) {
-		items, total, err := extractIncidents([]byte(`{"data":[],"total":0}`))
+		items, total, pageLen, err := extractIncidents([]byte(`{"data":[],"total":0}`))
 		require.NoError(t, err)
 		assert.Empty(t, items)
 		assert.Equal(t, 0, total)
+		assert.Equal(t, 0, pageLen)
 	})
 
 	t.Run("bare array fallback", func(t *testing.T) {
-		items, total, err := extractIncidents([]byte(`[{"id":"1"}]`))
+		items, total, pageLen, err := extractIncidents([]byte(`[{"id":"1"}]`))
 		require.NoError(t, err)
 		require.Len(t, items, 1)
 		assert.Equal(t, 1, total)
+		assert.Equal(t, 1, pageLen)
 	})
 
 	t.Run("empty body yields nothing", func(t *testing.T) {
-		items, total, err := extractIncidents([]byte("   "))
+		items, total, pageLen, err := extractIncidents([]byte("   "))
 		require.NoError(t, err)
 		assert.Empty(t, items)
 		assert.Equal(t, 0, total)
+		assert.Equal(t, 0, pageLen)
 	})
 
 	t.Run("non-json errors", func(t *testing.T) {
-		_, _, err := extractIncidents([]byte(`not json`))
+		_, _, _, err := extractIncidents([]byte(`not json`))
 		assert.Error(t, err)
 	})
 
 	t.Run("large integers keep precision", func(t *testing.T) {
-		items, _, err := extractIncidents([]byte(`{"data":[{"autime":1601389784162034000}],"total":1}`))
+		items, _, _, err := extractIncidents([]byte(`{"data":[{"autime":1601389784162034000}],"total":1}`))
 		require.NoError(t, err)
 		require.Len(t, items, 1)
 		v, ok := items[0].GetInt("autime")
@@ -170,10 +174,15 @@ func TestExtractIncidents(t *testing.T) {
 		assert.Equal(t, uint64(1601389784162034000), v)
 	})
 
-	t.Run("non-object records are skipped, valid ones kept", func(t *testing.T) {
-		items, _, err := extractIncidents([]byte(`{"data":[{"id":"a"},"junk",123,null,{"id":"b"}],"total":5}`))
+	t.Run("non-object records are skipped but counted in pageLen", func(t *testing.T) {
+		// pageLen reflects the raw record count (5), so a dropped record does not
+		// make a full page look short and end pagination early; len(items) is the
+		// kept count (2).
+		items, total, pageLen, err := extractIncidents([]byte(`{"data":[{"id":"a"},"junk",123,null,{"id":"b"}],"total":5}`))
 		require.NoError(t, err)
 		require.Len(t, items, 2)
+		assert.Equal(t, 5, pageLen, "pageLen must count raw records, not just the kept ones")
+		assert.Equal(t, 5, total)
 		assert.Equal(t, "a", items[0].FindOneString("id"))
 		assert.Equal(t, "b", items[1].FindOneString("id"))
 	})

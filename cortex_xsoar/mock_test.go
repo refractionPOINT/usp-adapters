@@ -590,6 +590,110 @@ func TestMockXSOAR8PathAndAuthID(t *testing.T) {
 	assert.Equal(t, keyID, mock.lastAuth, "XSOAR 8 requests must carry x-xdr-auth-id")
 }
 
+// TestMockPaginationNotTruncatedByMalformedRecord verifies that a malformed
+// (non-object) record on an otherwise-full page does not make the page look
+// short and end the walk early: pagination continues and every valid incident on
+// later pages still ships. Regression test for paginating on the raw page length.
+func TestMockPaginationNotTruncatedByMalformedRecord(t *testing.T) {
+	const apiKey = "k"
+	// page_size 3. Page 0 carries 3 raw records but one is junk (2 kept); without
+	// raw-length pagination the 2 kept would look like a short page and stop the
+	// walk, dropping pages 1+.
+	inc := func(id, modified string) string { return mustJSON(t, realisticIncident(id, modified)) }
+	pages := map[int]string{
+		0: fmt.Sprintf(`{"data":[%s,"junk-not-an-object",%s],"total":5}`,
+			inc("a", "2026-05-21T10:00:00Z"), inc("b", "2026-05-21T10:01:00Z")),
+		1: fmt.Sprintf(`{"data":[%s,%s,%s],"total":5}`,
+			inc("c", "2026-05-21T10:02:00Z"), inc("d", "2026-05-21T10:03:00Z"), inc("e", "2026-05-21T10:04:00Z")),
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != apiKey {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		body := decodeRequestBody(t, r)
+		filter, _ := body["filter"].(map[string]interface{})
+		page := 0
+		if v, ok := filter["page"].(float64); ok {
+			page = int(v)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if resp, ok := pages[page]; ok {
+			_, _ = io.WriteString(w, resp)
+			return
+		}
+		_, _ = io.WriteString(w, `{"data":[],"total":5}`)
+	}))
+	defer server.Close()
+
+	sink := &captureSink{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conf := baseConf(t, server.URL, apiKey)
+	conf.PageSize = 3
+	adapter, _, err := newXSOARAdapter(ctx, conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// All 5 valid incidents (across both pages) must ship; the junk record on the
+	// full first page must not have ended the walk.
+	require.Eventually(t, func() bool { return sink.count() == 5 },
+		5*time.Second, 20*time.Millisecond, "all valid incidents across pages should ship despite a malformed record")
+	require.Never(t, func() bool { return sink.count() != 5 },
+		300*time.Millisecond, 30*time.Millisecond)
+
+	ids := map[string]bool{}
+	for _, msg := range sink.snapshot() {
+		ids[payload(msg).FindOneString("id")] = true
+	}
+	assert.Equal(t, map[string]bool{"a": true, "b": true, "c": true, "d": true, "e": true}, ids)
+}
+
+// TestMockFutureDatedIncidentDoesNotStallCursor verifies the cursor is capped at
+// "now": a single incident with a far-future "modified" must not jump the cursor
+// ahead and starve collection of normal incidents that arrive afterward.
+func TestMockFutureDatedIncidentDoesNotStallCursor(t *testing.T) {
+	const apiKey = "k"
+
+	mock := newMockXSOAR(apiKey)
+	// A bad/clock-skewed incident dated a year in the future.
+	mock.setIncidents([]utils.Dict{
+		realisticIncident("future", time.Now().UTC().Add(365*24*time.Hour).Format(time.RFC3339)),
+	})
+
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	sink := &captureSink{}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	adapter, _, err := newXSOARAdapter(ctx, baseConf(t, server.URL, apiKey), sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 1 },
+		5*time.Second, 20*time.Millisecond, "the future-dated incident ships once")
+
+	// A normal incident arrives shortly after, dated slightly ahead of now (but
+	// far before the future one). With the cursor capped at now it is collected;
+	// without the cap the cursor would sit a year ahead and this would be skipped.
+	mock.appendIncident(realisticIncident("normal", time.Now().UTC().Add(10*time.Minute).Format(time.RFC3339)))
+
+	require.Eventually(t, func() bool { return sink.count() == 2 },
+		5*time.Second, 20*time.Millisecond, "a normal incident must still be collected after a future-dated one")
+	require.Never(t, func() bool { return sink.count() > 2 },
+		300*time.Millisecond, 30*time.Millisecond)
+
+	ids := map[string]bool{}
+	for _, msg := range sink.snapshot() {
+		ids[payload(msg).FindOneString("id")] = true
+	}
+	assert.Equal(t, map[string]bool{"future": true, "normal": true}, ids)
+}
+
 // TestMockRejectsBadKey verifies the adapter warns, ships nothing, and does NOT
 // stop when the API rejects the key. A rejected key is a source-side problem a
 // restart cannot fix, so the adapter must stay up and retry (an operator fixing
