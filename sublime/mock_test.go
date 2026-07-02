@@ -74,6 +74,8 @@ type mockSublime struct {
 	lastPath      string
 	lastAccept    string
 	lastLimit     int
+	lastGTE       string
+	sawGTE        bool
 }
 
 func newMockSublime(apiKey string) *mockSublime {
@@ -103,6 +105,18 @@ func (m *mockSublime) authFailureCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.authFailures
+}
+
+func (m *mockSublime) sawTimeFilter() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sawGTE
+}
+
+func (m *mockSublime) maxOffset() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxOffsetSeen
 }
 
 func (m *mockSublime) handler() http.HandlerFunc {
@@ -145,13 +159,40 @@ func (m *mockSublime) handler() http.HandlerFunc {
 			m.maxOffsetSeen = offset
 		}
 
-		page := []utils.Dict{}
-		if offset < len(m.events) {
-			end := offset + limit
-			if end > len(m.events) {
-				end = len(m.events)
+		// Honour the created_at[gte] server-side filter the real API supports
+		// (inclusive lower bound, ISO 8601 UTC). The adapter relies on this to
+		// avoid re-scanning the whole audit log every poll, so the mock must
+		// apply it before offset/limit -- exactly as the real API does.
+		m.lastGTE = r.URL.Query().Get("created_at[gte]")
+		var gte time.Time
+		if m.lastGTE != "" {
+			m.sawGTE = true
+			if parsed, err := time.Parse(time.RFC3339Nano, m.lastGTE); err == nil {
+				gte = parsed
 			}
-			page = m.events[offset:end]
+		}
+
+		filtered := m.events
+		if !gte.IsZero() {
+			filtered = filtered[:0:0]
+			for _, e := range m.events {
+				createdAt, err := time.Parse(time.RFC3339Nano, fmt.Sprint(e["created_at"]))
+				if err != nil {
+					continue
+				}
+				if !createdAt.Before(gte) { // created_at >= gte
+					filtered = append(filtered, e)
+				}
+			}
+		}
+
+		page := []utils.Dict{}
+		if offset < len(filtered) {
+			end := offset + limit
+			if end > len(filtered) {
+				end = len(filtered)
+			}
+			page = filtered[offset:end]
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -159,7 +200,7 @@ func (m *mockSublime) handler() http.HandlerFunc {
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"events": page,
 			"count":  len(page),
-			"total":  len(m.events),
+			"total":  len(filtered),
 		})
 	}
 }
@@ -426,6 +467,72 @@ func TestMockEventsBeforeStartDoNotShip(t *testing.T) {
 
 	assert.Equal(t, map[string]int{"dddddddd-3333-3333-3333-333333333333": 1},
 		shippedIDs(sink.snapshot()))
+}
+
+// TestMockHighVolumeUsesTimeFilter is the regression test for the reported
+// `context deadline exceeded` on busy tenants. A large backlog of events that
+// predate the adapter's start must NOT be walked page by page: the adapter
+// constrains each poll with created_at[gte], so the server returns an empty
+// window and pagination never advances past offset 0. Before the fix the
+// adapter re-scanned the entire backlog (offset 0, 500, ... hundreds of pages)
+// on every poll, which is what eventually blew the HTTP timeout.
+func TestMockHighVolumeUsesTimeFilter(t *testing.T) {
+	const apiKey = "sublime-test-api-key-000000000000"
+	const backlog = 100000 // far more than one page; all created before start
+
+	mock := newMockSublime(apiKey)
+	events := make([]utils.Dict, backlog)
+	base := time.Now().Add(-2 * time.Hour)
+	for i := 0; i < backlog; i++ {
+		events[i] = realisticAuditEvent(
+			fmt.Sprintf("ffffffff-0000-0000-0000-%012d", i),
+			"message.view_contents",
+			base.Add(time.Duration(i)*time.Millisecond).UTC().Format(time.RFC3339Nano))
+	}
+	mock.setEvents(events)
+
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	defer adapter.Close()
+
+	// Let several full polls happen against the large backlog.
+	require.Eventually(t, func() bool { return mock.requestCount() >= 4 },
+		5*time.Second, 10*time.Millisecond, "the adapter should keep polling")
+
+	// The historical backlog is before the start watermark, so nothing ships...
+	require.Never(t, func() bool { return sink.count() != 0 },
+		300*time.Millisecond, 25*time.Millisecond, "pre-start backlog must not ship")
+
+	// ...and, crucially, the adapter never deep-paginates the backlog: with the
+	// created_at[gte] filter the recent window is empty, so every poll is a
+	// single offset=0 request.
+	assert.True(t, mock.sawTimeFilter(), "the adapter must send a created_at[gte] filter")
+	assert.Equal(t, 0, mock.maxOffset(),
+		"the adapter must not walk the backlog by offset; it should stay at offset 0")
+}
+
+// TestBaseURLDefaultBackfilled is the regression test for the reported
+// `unsupported protocol scheme ""`. The production runner builds the adapter
+// without calling Validate(), so the constructor itself must backfill the
+// North America default base URL when none is configured.
+func TestBaseURLDefaultBackfilled(t *testing.T) {
+	conf := SublimeConfig{
+		ClientOptions: testClientOptions(t),
+		ApiKey:        "sublime-test-api-key-000000000000",
+		// BaseURL intentionally left empty, as in the failing customer config.
+	}
+	sink := &captureSink{}
+	adapter, _, err := newSublimeAdapter(t.Context(), conf, sink)
+	require.NoError(t, err)
+	// Close immediately: the poll loop waits PollInterval before its first
+	// request, so no network call is made against the real default host.
+	defer adapter.Close()
+
+	assert.Equal(t, defaultBaseURL, adapter.conf.BaseURL,
+		"the constructor must backfill the default base URL when none is set")
 }
 
 // TestMockBadAPIKeyShipsNothing pins the adapter's behavior on auth failure:

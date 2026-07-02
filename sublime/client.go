@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -22,6 +23,12 @@ const (
 	overlapPeriod       = 30 * time.Second
 	pageLimit           = 500
 	defaultPollInterval = 30 * time.Second
+
+	// maxPagesPerPoll caps how deep a single poll will paginate. With the
+	// created_at[gte] server-side filter a poll only ever walks the recent
+	// window, so this is a safety backstop against a misbehaving API that
+	// keeps returning full pages -- it prevents an unbounded offset walk.
+	maxPagesPerPoll = 1000
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -89,8 +96,13 @@ func newSublimeAdapter(ctx context.Context, conf SublimeConfig, sink uspSink) (*
 	}
 
 	// The general adapter runner constructs the adapter without calling
-	// Validate(), so backfill the poll interval default here as well --
-	// otherwise the poll loop would spin on WaitFor(0).
+	// Validate(), so backfill the defaults here as well. Without the base URL
+	// default, an unset base_url produces a schemeless request URL and every
+	// poll fails with `unsupported protocol scheme ""`; without the poll
+	// interval default the loop would spin on WaitFor(0).
+	if a.conf.BaseURL == "" {
+		a.conf.BaseURL = defaultBaseURL
+	}
 	if a.conf.PollInterval <= 0 {
 		a.conf.PollInterval = defaultPollInterval
 	}
@@ -175,13 +187,23 @@ func (a *SublimeAdapter) fetchEvents() {
 func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Time, error) {
 	var allItems []utils.Dict
 	var offset int
+	var pages int
 	lastDetectionTime := since
 
-	for {
-		url := fmt.Sprintf("%s%s?limit=%d&offset=%d", a.conf.BaseURL, logsPath, pageLimit, offset)
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
+	// Only ask the API for events in the recent window instead of walking the
+	// entire audit log from offset 0 on every poll. The overlap is re-fetched
+	// each time and the dedupe map suppresses re-shipping, so no event that the
+	// old full-scan would have shipped is missed. Without this filter a large
+	// backlog forces hundreds of ever-deeper offset pages per poll, which is
+	// what makes a single request exceed the HTTP timeout on busy tenants.
+	gteFilter := since.Add(-overlapPeriod).UTC().Format(time.RFC3339Nano)
 
-		req, err := http.NewRequest("GET", url, nil)
+	for {
+		reqURL := fmt.Sprintf("%s%s?limit=%d&offset=%d&created_at[gte]=%s",
+			a.conf.BaseURL, logsPath, pageLimit, offset, url.QueryEscape(gteFilter))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", reqURL))
+
+		req, err := http.NewRequest("GET", reqURL, nil)
 		if err != nil {
 			a.doStop.Set()
 			return nil, lastDetectionTime, err
@@ -199,7 +221,8 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
-			a.conf.ClientOptions.OnError(fmt.Errorf("sublime api non-200: %s\nRESPONSE: %s", resp.Status, string(body)))
+			err = fmt.Errorf("sublime api non-200: %s\nRESPONSE: %s", resp.Status, string(body))
+			a.conf.ClientOptions.OnError(err)
 			return nil, lastDetectionTime, err
 		}
 
@@ -244,6 +267,11 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 		allItems = append(allItems, newItems...)
 
 		if len(response.Events) < pageLimit {
+			break
+		}
+		pages++
+		if pages >= maxPagesPerPoll {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("sublime: stopping pagination after %d pages (offset=%d); remaining events will be picked up on the next poll", pages, offset))
 			break
 		}
 		offset += pageLimit
