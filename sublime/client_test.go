@@ -69,6 +69,17 @@ func TestValidate(t *testing.T) {
 		assert.Equal(t, "https://sublime.example.com", c.BaseURL)
 		assert.Equal(t, 5*time.Second, c.PollInterval)
 	})
+
+	t.Run("trims trailing slash from base url", func(t *testing.T) {
+		c := SublimeConfig{
+			ClientOptions: testClientOptions(t),
+			ApiKey:        "k",
+			BaseURL:       "https://platform.sublime.security/",
+		}
+		require.NoError(t, c.Validate())
+		assert.Equal(t, "https://platform.sublime.security", c.BaseURL,
+			"a trailing slash must be trimmed so the request path is not //v0/...")
+	})
 }
 
 // TestMakeOneRequestFiltersAndAdvancesSince verifies one poll: events at or

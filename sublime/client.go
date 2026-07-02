@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,6 +75,7 @@ func (c *SublimeConfig) Validate() error {
 	if c.BaseURL == "" {
 		c.BaseURL = defaultBaseURL
 	}
+	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	if c.PollInterval <= 0 {
 		c.PollInterval = defaultPollInterval
 	}
@@ -103,6 +105,9 @@ func newSublimeAdapter(ctx context.Context, conf SublimeConfig, sink uspSink) (*
 	if a.conf.BaseURL == "" {
 		a.conf.BaseURL = defaultBaseURL
 	}
+	// Tolerate a configured base URL with a trailing slash (as a user might
+	// copy it from the dashboard); otherwise it produces a `//v0/...` path.
+	a.conf.BaseURL = strings.TrimRight(a.conf.BaseURL, "/")
 	if a.conf.PollInterval <= 0 {
 		a.conf.PollInterval = defaultPollInterval
 	}
