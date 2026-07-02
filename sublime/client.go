@@ -8,6 +8,9 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -67,6 +70,7 @@ func (c *SublimeConfig) Validate() error {
 	if c.BaseURL == "" {
 		c.BaseURL = defaultBaseURL
 	}
+	c.BaseURL = strings.TrimRight(c.BaseURL, "/")
 	if c.PollInterval <= 0 {
 		c.PollInterval = defaultPollInterval
 	}
@@ -74,6 +78,9 @@ func (c *SublimeConfig) Validate() error {
 }
 
 func NewSublimeAdapter(ctx context.Context, conf SublimeConfig) (*SublimeAdapter, chan struct{}, error) {
+	if err := conf.Validate(); err != nil {
+		return nil, nil, err
+	}
 	return newSublimeAdapter(ctx, conf, nil)
 }
 
@@ -88,9 +95,9 @@ func newSublimeAdapter(ctx context.Context, conf SublimeConfig, sink uspSink) (*
 		dedupe: make(map[string]int64),
 	}
 
-	// The general adapter runner constructs the adapter without calling
-	// Validate(), so backfill the poll interval default here as well --
-	// otherwise the poll loop would spin on WaitFor(0).
+	// Tests construct the adapter through here without calling Validate(),
+	// so backfill the poll interval default as well -- otherwise the poll
+	// loop would spin on WaitFor(0).
 	if a.conf.PollInterval <= 0 {
 		a.conf.PollInterval = defaultPollInterval
 	}
@@ -177,11 +184,20 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 	var offset int
 	lastDetectionTime := since
 
-	for {
-		url := fmt.Sprintf("%s%s?limit=%d&offset=%d", a.conf.BaseURL, logsPath, pageLimit, offset)
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
+	// Only request events at or after the watermark (minus a small overlap
+	// for clock skew): without the filter every poll pages through the
+	// tenant's entire audit log history, which for high-volume tenants never
+	// completes before the HTTP timeout.
+	query := url.Values{}
+	query.Set("limit", strconv.Itoa(pageLimit))
+	query.Set("created_at[gte]", since.Add(-overlapPeriod).UTC().Format(time.RFC3339))
 
-		req, err := http.NewRequest("GET", url, nil)
+	for {
+		query.Set("offset", strconv.Itoa(offset))
+		reqURL := fmt.Sprintf("%s%s?%s", a.conf.BaseURL, logsPath, query.Encode())
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", reqURL))
+
+		req, err := http.NewRequest("GET", reqURL, nil)
 		if err != nil {
 			a.doStop.Set()
 			return nil, lastDetectionTime, err
@@ -195,15 +211,17 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 			return nil, lastDetectionTime, err
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
-			a.conf.ClientOptions.OnError(fmt.Errorf("sublime api non-200: %s\nRESPONSE: %s", resp.Status, string(body)))
+			resp.Body.Close()
+			err = fmt.Errorf("sublime api non-200: %s\nRESPONSE: %s", resp.Status, string(body))
+			a.conf.ClientOptions.OnError(err)
 			return nil, lastDetectionTime, err
 		}
 
 		body, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("read body error: %v", err))
 			return nil, lastDetectionTime, err
