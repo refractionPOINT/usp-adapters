@@ -7,12 +7,12 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/sqs"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -32,22 +32,20 @@ type SQSAdapter struct {
 }
 
 type SQSConfig struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	AccessKey     string                  `json:"access_key" yaml:"access_key"`
-	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
-	QueueURL      string                  `json:"queue_url" yaml:"queue_url"`
-	Region        string                  `json:"region" yaml:"region"`
+	ClientOptions uspclient.ClientOptions      `json:"client_options" yaml:"client_options"`
+	AccessKey     string                       `json:"access_key" yaml:"access_key"`
+	SecretKey     string                       `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
+	RolesAnywhere utils.AWSRolesAnywhereConfig `json:"roles_anywhere,omitempty" yaml:"roles_anywhere,omitempty"`
+	QueueURL      string                       `json:"queue_url" yaml:"queue_url"`
+	Region        string                       `json:"region" yaml:"region"`
 }
 
 func (c *SQSConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
-	if c.AccessKey == "" {
-		return errors.New("missing access_key")
-	}
-	if c.SecretKey == "" {
-		return errors.New("missing secret_key")
+	if err := utils.ValidateAWSAuth(c.AccessKey, c.SecretKey, c.RolesAnywhere); err != nil {
+		return err
 	}
 	if c.Region == "" {
 		return errors.New("missing region")
@@ -64,10 +62,13 @@ func NewSQSAdapter(ctx context.Context, conf SQSConfig) (*SQSAdapter, chan struc
 		ctx:  context.Background(),
 	}
 
-	var err error
+	awsCreds, err := utils.NewAWSCredentials(conf.AccessKey, conf.SecretKey, conf.RolesAnywhere)
+	if err != nil {
+		return nil, nil, fmt.Errorf("aws credentials: %v", err)
+	}
 	a.awsConfig = &aws.Config{
 		Region:      aws.String(conf.Region),
-		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
+		Credentials: awsCreds,
 	}
 
 	if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {

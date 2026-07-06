@@ -115,6 +115,19 @@ journalctl -f -q | netcat 127.0.0.1 4444
 ./general s3 client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=carbon_black client_options.sensor_seed_key=tests3 bucket_name=lc-cb-test access_key=YYYYYYYYYY secret_key=XXXXXXXX  "prefix=events/org_key=NKZFDWEM/"
 ```
 
+The `s3`, `sqs` and `sqs-files` adapters can authenticate with
+[AWS IAM Roles Anywhere](https://docs.aws.amazon.com/rolesanywhere/latest/userguide/introduction.html)
+instead of long-lived access keys. Provide the PEM-encoded X.509 certificate
+(optionally followed by its chain) and private key issued under your trust
+anchor's CA, along with the trust anchor, profile and role ARNs, in place of
+`access_key`/`secret_key`. The adapter obtains temporary session credentials
+and refreshes them automatically before they expire. PEM values may be passed
+on a single line with `\n` escapes.
+
+```
+./general s3 client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=carbon_black client_options.sensor_seed_key=tests3 bucket_name=lc-cb-test "roles_anywhere.certificate=$(cat client.pem)" "roles_anywhere.private_key=$(cat client.key)" roles_anywhere.trust_anchor_arn=arn:aws:rolesanywhere:us-east-1:123456789012:trust-anchor/UUID roles_anywhere.profile_arn=arn:aws:rolesanywhere:us-east-1:123456789012:profile/UUID roles_anywhere.role_arn=arn:aws:iam::123456789012:role/lc-adapter "prefix=events/org_key=NKZFDWEM/"
+```
+
 ### Stdin
 
 ```

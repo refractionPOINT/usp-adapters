@@ -64,6 +64,7 @@ type S3Adapter struct {
 
 	ctx context.Context
 
+	awsCreds      *credentials.Credentials
 	awsConfig     *aws.Config
 	awsSession    *session.Session
 	awsS3         *s3.S3
@@ -76,14 +77,15 @@ type S3Adapter struct {
 }
 
 type S3Config struct {
-	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
-	BucketName    string                  `json:"bucket_name" yaml:"bucket_name"`
-	AccessKey     string                  `json:"access_key" yaml:"access_key"`
-	SecretKey     string                  `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
-	IsOneTimeLoad bool                    `json:"single_load" yaml:"single_load"`
-	Prefix        string                  `json:"prefix" yaml:"prefix"`
-	ParallelFetch int                     `json:"parallel_fetch" yaml:"parallel_fetch"`
-	Region        string                  `json:"region" yaml:"region"`
+	ClientOptions uspclient.ClientOptions      `json:"client_options" yaml:"client_options"`
+	BucketName    string                       `json:"bucket_name" yaml:"bucket_name"`
+	AccessKey     string                       `json:"access_key" yaml:"access_key"`
+	SecretKey     string                       `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
+	RolesAnywhere utils.AWSRolesAnywhereConfig `json:"roles_anywhere,omitempty" yaml:"roles_anywhere,omitempty"`
+	IsOneTimeLoad bool                         `json:"single_load" yaml:"single_load"`
+	Prefix        string                       `json:"prefix" yaml:"prefix"`
+	ParallelFetch int                          `json:"parallel_fetch" yaml:"parallel_fetch"`
+	Region        string                       `json:"region" yaml:"region"`
 }
 
 func (c *S3Config) Validate() error {
@@ -93,11 +95,8 @@ func (c *S3Config) Validate() error {
 	if c.BucketName == "" {
 		return errors.New("missing bucket_name")
 	}
-	if c.AccessKey == "" {
-		return errors.New("missing access_key")
-	}
-	if c.SecretKey == "" {
-		return errors.New("missing secret_key")
+	if err := utils.ValidateAWSAuth(c.AccessKey, c.SecretKey, c.RolesAnywhere); err != nil {
+		return err
 	}
 	return nil
 }
@@ -125,6 +124,10 @@ func NewS3Adapter(ctx context.Context, conf S3Config) (*S3Adapter, chan struct{}
 
 	var err error
 	var region string
+
+	if a.awsCreds, err = utils.NewAWSCredentials(conf.AccessKey, conf.SecretKey, conf.RolesAnywhere); err != nil {
+		return nil, nil, fmt.Errorf("aws credentials: %v", err)
+	}
 
 	if conf.Region != "" {
 		region = conf.Region
@@ -161,7 +164,7 @@ func NewS3Adapter(ctx context.Context, conf S3Config) (*S3Adapter, chan struct{}
 
 	a.awsConfig = &aws.Config{
 		Region:      aws.String(region),
-		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
+		Credentials: a.awsCreds,
 		HTTPClient:  httpClient,
 		Retryer: connResetRetryer{
 			DefaultRetryer: client.DefaultRetryer{NumMaxRetries: 8},
@@ -215,7 +218,7 @@ func (a *S3Adapter) getRegion() (string, error) {
 	// Try commercial partition first
 	sess, err := session.NewSession(&aws.Config{
 		Region:           aws.String("us-east-1"),
-		Credentials:      credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+		Credentials:      a.awsCreds,
 		S3ForcePathStyle: aws.Bool(false),
 	})
 	if err != nil {
@@ -235,7 +238,7 @@ func (a *S3Adapter) getRegion() (string, error) {
 		// Try GovCloud partition
 		govSess, govErr := session.NewSession(&aws.Config{
 			Region:           aws.String("us-gov-west-1"),
-			Credentials:      credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+			Credentials:      a.awsCreds,
 			S3ForcePathStyle: aws.Bool(false),
 		})
 		if govErr != nil {
