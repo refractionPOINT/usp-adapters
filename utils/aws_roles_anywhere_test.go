@@ -89,7 +89,12 @@ func makeTestCert(t *testing.T, keyType string, serial int64, issuerKey crypto.S
 // key of the certificate presented in X-Amz-X509.
 func newFakeRolesAnywhereServer(t *testing.T, expiration time.Time, onRequest func(r *http.Request, body []byte)) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(makeFakeRolesAnywhereHandler(t, expiration, onRequest)))
+}
+
+func makeFakeRolesAnywhereHandler(t *testing.T, expiration time.Time, onRequest func(r *http.Request, body []byte)) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/sessions" {
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
@@ -201,7 +206,7 @@ func newFakeRolesAnywhereServer(t *testing.T, expiration time.Time, onRequest fu
 				},
 			}},
 		})
-	}))
+	}
 }
 
 func parseTestAuthorization(auth string) (algorithm string, credential string, signedHeaders string, signature string, err error) {
@@ -289,6 +294,73 @@ func TestRolesAnywhereRetrieveECDSA(t *testing.T) {
 	testRetrieve(t, "ec")
 }
 
+func TestRolesAnywhereRetryOnServerError(t *testing.T) {
+	pair, _ := makeTestCert(t, "rsa", 21, nil, nil)
+
+	failuresLeft := 1
+	handler := makeFakeRolesAnywhereHandler(t, time.Now().Add(time.Hour), nil)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if failuresLeft > 0 {
+			failuresLeft--
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		handler(w, r)
+	}))
+	defer server.Close()
+
+	conf := AWSRolesAnywhereConfig{
+		Certificate:    pair.certPEM,
+		PrivateKey:     pair.keyPEM,
+		TrustAnchorARN: testTrustAnchorARN,
+		ProfileARN:     testProfileARN,
+		RoleARN:        testRoleARN,
+	}
+	p, err := newRolesAnywhereProvider(conf)
+	if err != nil {
+		t.Fatalf("newRolesAnywhereProvider: %v", err)
+	}
+	p.endpoint = server.URL
+
+	v, err := p.Retrieve()
+	if err != nil {
+		t.Fatalf("Retrieve should have retried past the 503: %v", err)
+	}
+	if v.AccessKeyID != "ASIAEXAMPLE" {
+		t.Errorf("unexpected credentials: %+v", v)
+	}
+}
+
+func TestRolesAnywhereClockSkew(t *testing.T) {
+	pair, _ := makeTestCert(t, "rsa", 23, nil, nil)
+
+	// Simulate a local clock far ahead of AWS: the returned expiration
+	// is already in the past. The provider must not enter a state where
+	// every SDK call triggers a new CreateSession.
+	server := newFakeRolesAnywhereServer(t, time.Now().Add(-2*time.Hour), nil)
+	defer server.Close()
+
+	conf := AWSRolesAnywhereConfig{
+		Certificate:    pair.certPEM,
+		PrivateKey:     pair.keyPEM,
+		TrustAnchorARN: testTrustAnchorARN,
+		ProfileARN:     testProfileARN,
+		RoleARN:        testRoleARN,
+	}
+	p, err := newRolesAnywhereProvider(conf)
+	if err != nil {
+		t.Fatalf("newRolesAnywhereProvider: %v", err)
+	}
+	p.endpoint = server.URL
+
+	if _, err := p.Retrieve(); err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+	if p.IsExpired() {
+		t.Errorf("credentials should be kept for a minimum period despite a skewed expiration")
+	}
+}
+
 func TestRolesAnywhereCertificateChain(t *testing.T) {
 	caPair, caKey := makeTestCert(t, "rsa", 1, nil, nil)
 	leafPair, _ := makeTestCert(t, "rsa", 2, caKey, caPair.cert)
@@ -318,6 +390,50 @@ func TestRolesAnywhereCertificateChain(t *testing.T) {
 	expectedChain := base64.StdEncoding.EncodeToString(caPair.cert.Raw)
 	if chainSeen != expectedChain {
 		t.Errorf("x-amz-x509-chain = %q, expected %q", chainSeen, expectedChain)
+	}
+}
+
+func TestRolesAnywhereCertificateChainCAFirst(t *testing.T) {
+	caPair, caKey := makeTestCert(t, "rsa", 3, nil, nil)
+	leafPair, _ := makeTestCert(t, "rsa", 4, caKey, caPair.cert)
+
+	// The fake server asserts that the Credential serial matches the
+	// certificate presented in X-Amz-X509, so this passing proves the
+	// leaf was correctly identified despite the CA coming first.
+	server := newFakeRolesAnywhereServer(t, time.Now().Add(time.Hour), nil)
+	defer server.Close()
+
+	conf := AWSRolesAnywhereConfig{
+		Certificate:    caPair.certPEM + leafPair.certPEM,
+		PrivateKey:     leafPair.keyPEM,
+		TrustAnchorARN: testTrustAnchorARN,
+		ProfileARN:     testProfileARN,
+		RoleARN:        testRoleARN,
+	}
+	p, err := newRolesAnywhereProvider(conf)
+	if err != nil {
+		t.Fatalf("newRolesAnywhereProvider: %v", err)
+	}
+	p.endpoint = server.URL
+
+	if _, err := p.Retrieve(); err != nil {
+		t.Fatalf("Retrieve: %v", err)
+	}
+}
+
+func TestRolesAnywhereKeyCertificateMismatch(t *testing.T) {
+	pairA, _ := makeTestCert(t, "rsa", 5, nil, nil)
+	pairB, _ := makeTestCert(t, "rsa", 6, nil, nil)
+
+	conf := AWSRolesAnywhereConfig{
+		Certificate:    pairA.certPEM,
+		PrivateKey:     pairB.keyPEM,
+		TrustAnchorARN: testTrustAnchorARN,
+		ProfileARN:     testProfileARN,
+		RoleARN:        testRoleARN,
+	}
+	if _, err := newRolesAnywhereProvider(conf); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected key/certificate mismatch error, got: %v", err)
 	}
 }
 

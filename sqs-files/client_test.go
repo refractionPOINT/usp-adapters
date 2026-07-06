@@ -8,7 +8,8 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-func testClientOptions() uspclient.ClientOptions {
+func testClientOptions(t *testing.T) uspclient.ClientOptions {
+	t.Helper()
 	return uspclient.ClientOptions{
 		Identity: uspclient.Identity{
 			Oid:             "00000000-0000-0000-0000-000000000000",
@@ -33,25 +34,25 @@ func TestSQSFilesConfigValidate(t *testing.T) {
 	}{
 		{
 			name: "static keys",
-			conf: SQSFilesConfig{ClientOptions: testClientOptions(), AccessKey: "ak", SecretKey: "sk", Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
+			conf: SQSFilesConfig{ClientOptions: testClientOptions(t), AccessKey: "ak", SecretKey: "sk", Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
 		},
 		{
 			name: "roles anywhere",
-			conf: SQSFilesConfig{ClientOptions: testClientOptions(), RolesAnywhere: rolesAnywhere, Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
+			conf: SQSFilesConfig{ClientOptions: testClientOptions(t), RolesAnywhere: rolesAnywhere, Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
 		},
 		{
 			name:    "no auth",
-			conf:    SQSFilesConfig{ClientOptions: testClientOptions(), Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
+			conf:    SQSFilesConfig{ClientOptions: testClientOptions(t), Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
 			errPart: "missing access_key",
 		},
 		{
 			name:    "both auth methods",
-			conf:    SQSFilesConfig{ClientOptions: testClientOptions(), AccessKey: "ak", SecretKey: "sk", RolesAnywhere: rolesAnywhere, Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
+			conf:    SQSFilesConfig{ClientOptions: testClientOptions(t), AccessKey: "ak", SecretKey: "sk", RolesAnywhere: rolesAnywhere, Region: "us-east-1", QueueURL: "https://sqs.us-east-1.amazonaws.com/123456789012/q"},
 			errPart: "not both",
 		},
 		{
 			name:    "missing queue",
-			conf:    SQSFilesConfig{ClientOptions: testClientOptions(), AccessKey: "ak", SecretKey: "sk", Region: "us-east-1"},
+			conf:    SQSFilesConfig{ClientOptions: testClientOptions(t), AccessKey: "ak", SecretKey: "sk", Region: "us-east-1"},
 			errPart: "missing queue_url",
 		},
 	} {

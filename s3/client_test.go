@@ -8,7 +8,8 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-func testClientOptions() uspclient.ClientOptions {
+func testClientOptions(t *testing.T) uspclient.ClientOptions {
+	t.Helper()
 	return uspclient.ClientOptions{
 		Identity: uspclient.Identity{
 			Oid:             "00000000-0000-0000-0000-000000000000",
@@ -33,30 +34,30 @@ func TestS3ConfigValidate(t *testing.T) {
 	}{
 		{
 			name: "static keys",
-			conf: S3Config{ClientOptions: testClientOptions(), BucketName: "b", AccessKey: "ak", SecretKey: "sk"},
+			conf: S3Config{ClientOptions: testClientOptions(t), BucketName: "b", AccessKey: "ak", SecretKey: "sk"},
 		},
 		{
 			name: "roles anywhere",
-			conf: S3Config{ClientOptions: testClientOptions(), BucketName: "b", RolesAnywhere: rolesAnywhere},
+			conf: S3Config{ClientOptions: testClientOptions(t), BucketName: "b", RolesAnywhere: rolesAnywhere},
 		},
 		{
 			name:    "missing bucket",
-			conf:    S3Config{ClientOptions: testClientOptions(), AccessKey: "ak", SecretKey: "sk"},
+			conf:    S3Config{ClientOptions: testClientOptions(t), AccessKey: "ak", SecretKey: "sk"},
 			errPart: "missing bucket_name",
 		},
 		{
 			name:    "no auth",
-			conf:    S3Config{ClientOptions: testClientOptions(), BucketName: "b"},
+			conf:    S3Config{ClientOptions: testClientOptions(t), BucketName: "b"},
 			errPart: "missing access_key",
 		},
 		{
 			name:    "both auth methods",
-			conf:    S3Config{ClientOptions: testClientOptions(), BucketName: "b", AccessKey: "ak", SecretKey: "sk", RolesAnywhere: rolesAnywhere},
+			conf:    S3Config{ClientOptions: testClientOptions(t), BucketName: "b", AccessKey: "ak", SecretKey: "sk", RolesAnywhere: rolesAnywhere},
 			errPart: "not both",
 		},
 		{
 			name:    "partial roles anywhere",
-			conf:    S3Config{ClientOptions: testClientOptions(), BucketName: "b", RolesAnywhere: utils.AWSRolesAnywhereConfig{Certificate: "cert"}},
+			conf:    S3Config{ClientOptions: testClientOptions(t), BucketName: "b", RolesAnywhere: utils.AWSRolesAnywhereConfig{Certificate: "cert"}},
 			errPart: "missing roles_anywhere.private_key",
 		},
 	} {

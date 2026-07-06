@@ -1,6 +1,8 @@
 package utils
 
 import (
+	"bytes"
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/rand"
@@ -19,13 +21,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/endpoints"
 )
 
 // AWSRolesAnywhereConfig holds the parameters needed to obtain temporary
 // AWS credentials through IAM Roles Anywhere instead of long-lived
 // access keys. The certificate and private key are PEM encoded; the
-// certificate value may contain the full chain, leaf first.
+// certificate value may contain the full chain in any order, the leaf
+// is identified by matching the private key.
 type AWSRolesAnywhereConfig struct {
 	Certificate    string `json:"certificate,omitempty" yaml:"certificate,omitempty"`
 	PrivateKey     string `json:"private_key,omitempty" yaml:"private_key,omitempty"`
@@ -74,7 +79,7 @@ func ValidateAWSAuth(accessKey string, secretKey string, ra AWSRolesAnywhereConf
 		return ra.Validate()
 	}
 	if accessKey == "" {
-		return errors.New("missing access_key")
+		return errors.New("missing access_key (provide access_key/secret_key or roles_anywhere)")
 	}
 	if secretKey == "" {
 		return errors.New("missing secret_key")
@@ -85,6 +90,11 @@ func ValidateAWSAuth(accessKey string, secretKey string, ra AWSRolesAnywhereConf
 // NewAWSCredentials returns aws-sdk-go credentials backed by either the
 // static access keys or, when configured, IAM Roles Anywhere.
 func NewAWSCredentials(accessKey string, secretKey string, ra AWSRolesAnywhereConfig) (*credentials.Credentials, error) {
+	// Not all runners call Config.Validate() before building the
+	// adapter, so enforce the auth rules here too.
+	if err := ValidateAWSAuth(accessKey, secretKey, ra); err != nil {
+		return nil, err
+	}
 	if !ra.IsEnabled() {
 		return credentials.NewStaticCredentials(accessKey, secretKey, ""), nil
 	}
@@ -101,6 +111,7 @@ const (
 	// Refresh credentials a bit before they actually expire so requests
 	// in flight never race the expiration.
 	rolesAnywhereExpiryWindow = 5 * time.Minute
+	rolesAnywhereMaxAttempts  = 3
 )
 
 // rolesAnywhereProvider implements credentials.Provider by calling the
@@ -111,66 +122,106 @@ const (
 type rolesAnywhereProvider struct {
 	credentials.Expiry
 
-	conf AWSRolesAnywhereConfig
-
-	cert      *x509.Certificate
-	chain     []*x509.Certificate
 	key       crypto.Signer
 	algorithm string
+	serial    string
+
+	// Immutable request components, precomputed at construction.
+	certHeader  string
+	chainHeader string
+	body        []byte
 
 	region   string
 	endpoint string
 
 	httpClient *http.Client
-	now        func() time.Time
 }
 
 func newRolesAnywhereProvider(conf AWSRolesAnywhereConfig) (*rolesAnywhereProvider, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, err
 	}
-	cert, chain, err := parsePEMCertificates(conf.Certificate)
-	if err != nil {
-		return nil, fmt.Errorf("roles_anywhere.certificate: %v", err)
-	}
 	key, algorithm, err := parsePEMPrivateKey(conf.PrivateKey)
 	if err != nil {
 		return nil, fmt.Errorf("roles_anywhere.private_key: %v", err)
+	}
+	cert, chain, err := parsePEMCertificates(conf.Certificate, key)
+	if err != nil {
+		return nil, fmt.Errorf("roles_anywhere.certificate: %v", err)
 	}
 	region, endpoint, err := rolesAnywhereEndpoint(conf.TrustAnchorARN)
 	if err != nil {
 		return nil, fmt.Errorf("roles_anywhere.trust_anchor_arn: %v", err)
 	}
+	body, err := json.Marshal(map[string]interface{}{
+		"durationSeconds": rolesAnywhereSessionSeconds,
+		"profileArn":      conf.ProfileARN,
+		"roleArn":         conf.RoleARN,
+		"trustAnchorArn":  conf.TrustAnchorARN,
+	})
+	if err != nil {
+		return nil, err
+	}
+	chainHeader := ""
+	if len(chain) != 0 {
+		encoded := make([]string, 0, len(chain))
+		for _, c := range chain {
+			encoded = append(encoded, base64.StdEncoding.EncodeToString(c.Raw))
+		}
+		chainHeader = strings.Join(encoded, ",")
+	}
 	return &rolesAnywhereProvider{
-		conf:       conf,
-		cert:       cert,
-		chain:      chain,
-		key:        key,
-		algorithm:  algorithm,
-		region:     region,
-		endpoint:   endpoint,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		now:        time.Now,
+		key:         key,
+		algorithm:   algorithm,
+		serial:      cert.SerialNumber.String(),
+		certHeader:  base64.StdEncoding.EncodeToString(cert.Raw),
+		chainHeader: chainHeader,
+		body:        body,
+		region:      region,
+		endpoint:    endpoint,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}, nil
 }
 
 func (p *rolesAnywhereProvider) Retrieve() (credentials.Value, error) {
-	body, err := json.Marshal(map[string]interface{}{
-		"durationSeconds": rolesAnywhereSessionSeconds,
-		"profileArn":      p.conf.ProfileARN,
-		"roleArn":         p.conf.RoleARN,
-		"trustAnchorArn":  p.conf.TrustAnchorARN,
-	})
-	if err != nil {
-		return credentials.Value{}, err
-	}
+	return p.RetrieveWithContext(context.Background())
+}
 
+// RetrieveWithContext implements credentials.ProviderWithContext so the
+// SDK propagates request contexts into the credential fetch. Transient
+// CreateSession failures are retried since a mid-run credential refresh
+// error is surfaced to the adapter as a non-retryable request failure.
+func (p *rolesAnywhereProvider) RetrieveWithContext(ctx context.Context) (credentials.Value, error) {
+	var lastErr error
+	for attempt := 0; attempt < rolesAnywhereMaxAttempts; attempt++ {
+		if attempt != 0 {
+			select {
+			case <-ctx.Done():
+				return credentials.Value{}, ctx.Err()
+			case <-time.After(time.Duration(attempt) * time.Second):
+			}
+		}
+		v, isRetryable, err := p.createSession(ctx)
+		if err == nil {
+			return v, nil
+		}
+		lastErr = err
+		if !isRetryable {
+			break
+		}
+	}
+	return credentials.Value{}, lastErr
+}
+
+// createSession performs one signed CreateSession call. The second
+// return value indicates whether the error is worth retrying.
+func (p *rolesAnywhereProvider) createSession(ctx context.Context) (credentials.Value, bool, error) {
 	u, err := url.Parse(p.endpoint)
 	if err != nil {
-		return credentials.Value{}, fmt.Errorf("rolesanywhere endpoint: %v", err)
+		return credentials.Value{}, false, fmt.Errorf("rolesanywhere endpoint: %v", err)
 	}
 
-	now := p.now().UTC()
+	now := time.Now().UTC()
 	amzDate := now.Format("20060102T150405Z")
 	scope := fmt.Sprintf("%s/%s/rolesanywhere/aws4_request", now.Format("20060102"), p.region)
 
@@ -180,14 +231,10 @@ func (p *rolesAnywhereProvider) Retrieve() (credentials.Value, error) {
 		{"content-type", "application/json"},
 		{"host", u.Host},
 		{"x-amz-date", amzDate},
-		{"x-amz-x509", base64.StdEncoding.EncodeToString(p.cert.Raw)},
+		{"x-amz-x509", p.certHeader},
 	}
-	if len(p.chain) != 0 {
-		encoded := make([]string, 0, len(p.chain))
-		for _, c := range p.chain {
-			encoded = append(encoded, base64.StdEncoding.EncodeToString(c.Raw))
-		}
-		headers = append(headers, [2]string{"x-amz-x509-chain", strings.Join(encoded, ",")})
+	if p.chainHeader != "" {
+		headers = append(headers, [2]string{"x-amz-x509-chain", p.chainHeader})
 	}
 
 	canonicalHeaders := strings.Builder{}
@@ -198,7 +245,7 @@ func (p *rolesAnywhereProvider) Retrieve() (credentials.Value, error) {
 	}
 	signedHeaders := strings.Join(signedNames, ";")
 
-	payloadHash := sha256.Sum256(body)
+	payloadHash := sha256.Sum256(p.body)
 	canonicalRequest := strings.Join([]string{
 		"POST",
 		"/sessions",
@@ -227,12 +274,12 @@ func (p *rolesAnywhereProvider) Retrieve() (credentials.Value, error) {
 		err = fmt.Errorf("unsupported private key type %T", p.key)
 	}
 	if err != nil {
-		return credentials.Value{}, fmt.Errorf("rolesanywhere signing: %v", err)
+		return credentials.Value{}, false, fmt.Errorf("rolesanywhere signing: %v", err)
 	}
 
-	req, err := http.NewRequest(http.MethodPost, p.endpoint+"/sessions", strings.NewReader(string(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint+"/sessions", bytes.NewReader(p.body))
 	if err != nil {
-		return credentials.Value{}, err
+		return credentials.Value{}, false, err
 	}
 	for _, h := range headers {
 		if h[0] == "host" {
@@ -242,19 +289,22 @@ func (p *rolesAnywhereProvider) Retrieve() (credentials.Value, error) {
 	}
 	req.Header.Set("Authorization", fmt.Sprintf(
 		"%s Credential=%s/%s, SignedHeaders=%s, Signature=%s",
-		p.algorithm, p.cert.SerialNumber.String(), scope, signedHeaders, hex.EncodeToString(signature)))
+		p.algorithm, p.serial, scope, signedHeaders, hex.EncodeToString(signature)))
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		return credentials.Value{}, fmt.Errorf("rolesanywhere CreateSession: %v", err)
+		return credentials.Value{}, true, fmt.Errorf("rolesanywhere CreateSession: %v", err)
 	}
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
-		return credentials.Value{}, fmt.Errorf("rolesanywhere CreateSession: %v", err)
+		return credentials.Value{}, true, fmt.Errorf("rolesanywhere CreateSession: %v", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return credentials.Value{}, fmt.Errorf("rolesanywhere CreateSession status %d: %s", resp.StatusCode, string(respBody))
+		// Throttling and server-side errors are transient; auth and
+		// validation failures are not.
+		isRetryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500
+		return credentials.Value{}, isRetryable, fmt.Errorf("rolesanywhere CreateSession status %d: %s", resp.StatusCode, string(respBody))
 	}
 
 	session := struct {
@@ -268,23 +318,34 @@ func (p *rolesAnywhereProvider) Retrieve() (credentials.Value, error) {
 		} `json:"credentialSet"`
 	}{}
 	if err := json.Unmarshal(respBody, &session); err != nil {
-		return credentials.Value{}, fmt.Errorf("rolesanywhere CreateSession response: %v", err)
+		return credentials.Value{}, false, fmt.Errorf("rolesanywhere CreateSession response: %v", err)
 	}
 	if len(session.CredentialSet) == 0 {
-		return credentials.Value{}, errors.New("rolesanywhere CreateSession response: empty credentialSet")
+		return credentials.Value{}, false, errors.New("rolesanywhere CreateSession response: empty credentialSet")
 	}
 	creds := session.CredentialSet[0].Credentials
 	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" {
-		return credentials.Value{}, errors.New("rolesanywhere CreateSession response: missing credentials")
+		return credentials.Value{}, false, errors.New("rolesanywhere CreateSession response: missing credentials")
 	}
 
 	expiration, err := time.Parse(time.RFC3339, creds.Expiration)
 	if err != nil {
-		return credentials.Value{}, fmt.Errorf("rolesanywhere CreateSession expiration: %v", err)
+		return credentials.Value{}, false, fmt.Errorf("rolesanywhere CreateSession expiration: %v", err)
 	}
 	window := rolesAnywhereExpiryWindow
 	if remaining := expiration.Sub(now); remaining < 2*window {
 		window = remaining / 2
+		if window < 0 {
+			window = 0
+		}
+	}
+	if expiration.Before(now.Add(time.Minute)) {
+		// The expiration can land in the past when the local clock is
+		// badly skewed from AWS. Keep the credentials for a minute so
+		// a skewed host refreshes periodically instead of calling
+		// CreateSession for every single request.
+		expiration = now.Add(time.Minute)
+		window = 0
 	}
 	p.SetExpiration(expiration, window)
 
@@ -293,23 +354,27 @@ func (p *rolesAnywhereProvider) Retrieve() (credentials.Value, error) {
 		SecretAccessKey: creds.SecretAccessKey,
 		SessionToken:    creds.SessionToken,
 		ProviderName:    rolesAnywhereProviderName,
-	}, nil
+	}, false, nil
 }
 
 // rolesAnywhereEndpoint derives the region and API endpoint from the
 // trust anchor ARN, like:
 // arn:aws:rolesanywhere:us-east-1:123456789012:trust-anchor/uuid
+// The endpoint comes from the SDK endpoint data so partition domains
+// (GovCloud, CN, ISO...) resolve correctly.
 func rolesAnywhereEndpoint(trustAnchorARN string) (string, string, error) {
-	parts := strings.Split(trustAnchorARN, ":")
-	if len(parts) < 6 || parts[0] != "arn" || parts[2] != "rolesanywhere" || parts[3] == "" {
+	a, err := arn.Parse(trustAnchorARN)
+	if err != nil {
+		return "", "", fmt.Errorf("invalid trust anchor ARN %q: %v", trustAnchorARN, err)
+	}
+	if a.Service != "rolesanywhere" || a.Region == "" {
 		return "", "", fmt.Errorf("invalid trust anchor ARN %q", trustAnchorARN)
 	}
-	region := parts[3]
-	domain := "amazonaws.com"
-	if parts[1] == "aws-cn" {
-		domain = "amazonaws.com.cn"
+	resolved, err := endpoints.DefaultResolver().EndpointFor("rolesanywhere", a.Region, endpoints.ResolveUnknownServiceOption)
+	if err != nil {
+		return "", "", fmt.Errorf("no rolesanywhere endpoint for region %q: %v", a.Region, err)
 	}
-	return region, fmt.Sprintf("https://rolesanywhere.%s.%s", region, domain), nil
+	return a.Region, resolved.URL, nil
 }
 
 // normalizePEM allows PEM values pasted as a single line with literal
@@ -319,9 +384,11 @@ func normalizePEM(data string) []byte {
 	return []byte(strings.TrimSpace(strings.ReplaceAll(data, "\\n", "\n")))
 }
 
-// parsePEMCertificates returns the leaf certificate and, if the PEM
-// contains more than one certificate, the rest of the chain in order.
-func parsePEMCertificates(pemData string) (*x509.Certificate, []*x509.Certificate, error) {
+// parsePEMCertificates returns the leaf certificate matching the
+// private key, plus the rest of the certificates as the chain. The
+// leaf is identified by public key so the PEM bundle can be in any
+// order (leaf-first, CA-first...).
+func parsePEMCertificates(pemData string, key crypto.Signer) (*x509.Certificate, []*x509.Certificate, error) {
 	rest := normalizePEM(pemData)
 	certs := []*x509.Certificate{}
 	for {
@@ -342,7 +409,20 @@ func parsePEMCertificates(pemData string) (*x509.Certificate, []*x509.Certificat
 	if len(certs) == 0 {
 		return nil, nil, errors.New("no certificate found in PEM data")
 	}
-	return certs[0], certs[1:], nil
+	pub, ok := key.Public().(interface{ Equal(crypto.PublicKey) bool })
+	if !ok {
+		return certs[0], certs[1:], nil
+	}
+	for i, c := range certs {
+		if !pub.Equal(c.PublicKey) {
+			continue
+		}
+		chain := make([]*x509.Certificate, 0, len(certs)-1)
+		chain = append(chain, certs[:i]...)
+		chain = append(chain, certs[i+1:]...)
+		return c, chain, nil
+	}
+	return nil, nil, errors.New("private key does not match any certificate in PEM data")
 }
 
 // parsePEMPrivateKey parses an RSA or ECDSA private key in PKCS#8,

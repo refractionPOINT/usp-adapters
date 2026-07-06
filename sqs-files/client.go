@@ -190,13 +190,20 @@ func (a *SQSFilesAdapter) initS3SDKs(bucket string) error {
 		return fmt.Errorf("s3.NewSession(): %v", err)
 	}
 
-	a.awsS3 = s3.New(a.awsSession)
+	a.awsS3 = s3.New(a.awsS3Session)
 	a.awsDownloader = s3manager.NewDownloader(a.awsS3Session)
+	a.isS3Inited = true
 	return nil
 }
 
 func (a *SQSFilesAdapter) getBucketRegion(bucket string) (string, error) {
-	return s3manager.GetBucketRegion(a.ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
+	sess, err := session.NewSession(&aws.Config{
+		Credentials: a.awsCreds,
+	})
+	if err != nil {
+		return "", err
+	}
+	return s3manager.GetBucketRegion(a.ctx, sess, bucket, "us-east-1")
 }
 
 func (a *SQSFilesAdapter) receiveEvents() error {
