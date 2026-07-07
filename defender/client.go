@@ -1,7 +1,6 @@
 package usp_defender
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +8,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -18,15 +18,46 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-var scope = "https://graph.microsoft.com/.default"
+// Microsoft Graph national cloud deployments. Each environment has its own MS
+// Graph service root and Azure AD token host, and the OAuth2 scope must match
+// the Graph root. gcc-gov (US Government GCC / moderate) uses the worldwide
+// endpoints -- identical to enterprise -- and is kept as a named option for
+// parity with the o365 adapter, which exposes the same four names.
+// Reference: https://learn.microsoft.com/en-us/graph/deployments
+
+// defaultEndpoint is the environment used when Endpoint is left empty.
+const defaultEndpoint = "enterprise"
+
+// URL maps an environment name to its MS Graph security alerts_v2 endpoint.
 var URL = map[string]string{
-	"get_alerts": "https://graph.microsoft.com/v1.0/security/alerts_v2",
+	"enterprise":   "https://graph.microsoft.com/v1.0/security/alerts_v2",
+	"gcc-gov":      "https://graph.microsoft.com/v1.0/security/alerts_v2",
+	"gcc-high-gov": "https://graph.microsoft.us/v1.0/security/alerts_v2",
+	"dod-gov":      "https://dod-graph.microsoft.us/v1.0/security/alerts_v2",
+}
+
+// TokenURL maps an environment name to its Azure AD token host. The full token
+// endpoint is <host>/<tenant_id>/oauth2/v2.0/token.
+var TokenURL = map[string]string{
+	"enterprise":   "https://login.microsoftonline.com",
+	"gcc-gov":      "https://login.microsoftonline.com",
+	"gcc-high-gov": "https://login.microsoftonline.us",
+	"dod-gov":      "https://login.microsoftonline.us",
+}
+
+// Scope maps an environment name to its OAuth2 scope, which must match that
+// environment's MS Graph service root.
+var Scope = map[string]string{
+	"enterprise":   "https://graph.microsoft.com/.default",
+	"gcc-gov":      "https://graph.microsoft.com/.default",
+	"gcc-high-gov": "https://graph.microsoft.us/.default",
+	"dod-gov":      "https://dod-graph.microsoft.us/.default",
 }
 
 const (
-	// defaultTokenURLTemplate is the Microsoft identity platform token endpoint,
-	// parameterized by tenant id.
-	defaultTokenURLTemplate = "https://login.microsoftonline.com/%s/oauth2/v2.0/token"
+	// defaultTokenURLTemplate is the Azure AD token endpoint host template,
+	// parameterized by the token host and tenant id.
+	defaultTokenURLTemplate = "%s/%s/oauth2/v2.0/token"
 
 	// defaultPollInterval is how long the adapter waits between polls of the
 	// alerts endpoint.
@@ -63,12 +94,22 @@ type DefenderConfig struct {
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
 	ClientSecret  string                  `json:"client_secret" yaml:"client_secret"`
 
-	// TokenURL overrides the Microsoft identity platform token endpoint
-	// (default: https://login.microsoftonline.com/<tenant_id>/oauth2/v2.0/token).
+	// Endpoint selects the Microsoft national cloud deployment. Valid values:
+	// "enterprise" (default, global/commercial), "gcc-gov" (US Government GCC /
+	// moderate), "gcc-high-gov" (US Government GCC High / L4) and "dod-gov"
+	// (US Government DoD / L5). An empty value defaults to "enterprise", so
+	// existing configs keep talking to the commercial cloud unchanged.
+	// Reference: https://learn.microsoft.com/en-us/graph/deployments
+	Endpoint string `json:"endpoint" yaml:"endpoint"`
+
+	// TokenURL overrides the Azure AD token endpoint derived from Endpoint and
+	// TenantID (e.g. https://login.microsoftonline.com/<tenant_id>/oauth2/v2.0/token
+	// for the enterprise endpoint).
 	TokenURL string `json:"token_url" yaml:"token_url"`
 
-	// AlertsURL overrides the MS Graph security alerts endpoint
-	// (default: https://graph.microsoft.com/v1.0/security/alerts_v2).
+	// AlertsURL overrides the MS Graph security alerts endpoint derived from
+	// Endpoint (e.g. https://graph.microsoft.com/v1.0/security/alerts_v2 for
+	// the enterprise endpoint).
 	AlertsURL string `json:"alerts_url" yaml:"alerts_url"`
 
 	// PollInterval overrides how long the adapter waits between polls of the
@@ -78,22 +119,37 @@ type DefenderConfig struct {
 	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
+// endpoint returns the configured Microsoft national cloud deployment name,
+// defaulting to "enterprise" when unset.
+func (c *DefenderConfig) endpoint() string {
+	if c.Endpoint == "" {
+		return defaultEndpoint
+	}
+	return c.Endpoint
+}
+
 // tokenURL returns the token endpoint to use: the configured override, or the
-// default Microsoft identity platform endpoint for the configured tenant.
+// Azure AD token endpoint for the configured environment and tenant.
 func (c *DefenderConfig) tokenURL() string {
 	if c.TokenURL != "" {
 		return c.TokenURL
 	}
-	return fmt.Sprintf(defaultTokenURLTemplate, c.TenantID)
+	return fmt.Sprintf(defaultTokenURLTemplate, TokenURL[c.endpoint()], c.TenantID)
 }
 
 // alertsURL returns the alerts endpoint to use: the configured override, or
-// the default MS Graph security alerts endpoint.
+// the MS Graph security alerts endpoint for the configured environment.
 func (c *DefenderConfig) alertsURL() string {
 	if c.AlertsURL != "" {
 		return c.AlertsURL
 	}
-	return URL["get_alerts"]
+	return URL[c.endpoint()]
+}
+
+// scope returns the OAuth2 scope for the configured environment, which must
+// match that environment's MS Graph service root.
+func (c *DefenderConfig) scope() string {
+	return Scope[c.endpoint()]
 }
 
 func (c *DefenderConfig) Validate() error {
@@ -108,6 +164,11 @@ func (c *DefenderConfig) Validate() error {
 	}
 	if c.ClientSecret == "" {
 		return errors.New("missing client_secret")
+	}
+	if c.Endpoint != "" {
+		if _, ok := URL[c.Endpoint]; !ok {
+			return fmt.Errorf("invalid endpoint %q, must be one of: enterprise, gcc-gov, gcc-high-gov, dod-gov", c.Endpoint)
+		}
 	}
 	return nil
 }
@@ -181,10 +242,14 @@ func (a *DefenderAdapter) Close() error {
 
 func (a *DefenderAdapter) fetchToken() (string, error) {
 
-	url := a.conf.tokenURL()
-	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
+	tokenURL := a.conf.tokenURL()
+	form := url.Values{}
+	form.Set("client_id", a.conf.ClientID)
+	form.Set("scope", a.conf.scope())
+	form.Set("grant_type", "client_credentials")
+	form.Set("client_secret", a.conf.ClientSecret)
 
-	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
+	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
