@@ -18,44 +18,53 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-// Microsoft Graph national cloud deployments. Each environment has its own MS
-// Graph service root and Azure AD token host, and the OAuth2 scope must match
-// the Graph root. gcc-gov (US Government GCC / moderate) uses the worldwide
+// environment describes one Microsoft national cloud deployment. Keeping the
+// three values that must move together (alerts endpoint, token host and scope)
+// in a single struct makes a partial/desynced configuration impossible -- the
+// alertsURL, tokenHost and scope for an environment can never disagree.
+type environment struct {
+	// alertsURL is the MS Graph security alerts_v2 endpoint.
+	alertsURL string
+	// tokenHost is the Azure AD token host; the full token endpoint is
+	// <tokenHost>/<tenant_id>/oauth2/v2.0/token.
+	tokenHost string
+	// scope is the OAuth2 scope, which must match the MS Graph service root.
+	scope string
+}
+
+// environments maps an endpoint name to its Microsoft national cloud
+// deployment. gcc-gov (US Government GCC / moderate) uses the worldwide
 // endpoints -- identical to enterprise -- and is kept as a named option for
 // parity with the o365 adapter, which exposes the same four names.
 // Reference: https://learn.microsoft.com/en-us/graph/deployments
+var environments = map[string]environment{
+	"enterprise": {
+		alertsURL: "https://graph.microsoft.com/v1.0/security/alerts_v2",
+		tokenHost: "https://login.microsoftonline.com",
+		scope:     "https://graph.microsoft.com/.default",
+	},
+	"gcc-gov": {
+		alertsURL: "https://graph.microsoft.com/v1.0/security/alerts_v2",
+		tokenHost: "https://login.microsoftonline.com",
+		scope:     "https://graph.microsoft.com/.default",
+	},
+	"gcc-high-gov": {
+		alertsURL: "https://graph.microsoft.us/v1.0/security/alerts_v2",
+		tokenHost: "https://login.microsoftonline.us",
+		scope:     "https://graph.microsoft.us/.default",
+	},
+	"dod-gov": {
+		alertsURL: "https://dod-graph.microsoft.us/v1.0/security/alerts_v2",
+		tokenHost: "https://login.microsoftonline.us",
+		scope:     "https://dod-graph.microsoft.us/.default",
+	},
+}
 
 // defaultEndpoint is the environment used when Endpoint is left empty.
 const defaultEndpoint = "enterprise"
 
-// URL maps an environment name to its MS Graph security alerts_v2 endpoint.
-var URL = map[string]string{
-	"enterprise":   "https://graph.microsoft.com/v1.0/security/alerts_v2",
-	"gcc-gov":      "https://graph.microsoft.com/v1.0/security/alerts_v2",
-	"gcc-high-gov": "https://graph.microsoft.us/v1.0/security/alerts_v2",
-	"dod-gov":      "https://dod-graph.microsoft.us/v1.0/security/alerts_v2",
-}
-
-// TokenURL maps an environment name to its Azure AD token host. The full token
-// endpoint is <host>/<tenant_id>/oauth2/v2.0/token.
-var TokenURL = map[string]string{
-	"enterprise":   "https://login.microsoftonline.com",
-	"gcc-gov":      "https://login.microsoftonline.com",
-	"gcc-high-gov": "https://login.microsoftonline.us",
-	"dod-gov":      "https://login.microsoftonline.us",
-}
-
-// Scope maps an environment name to its OAuth2 scope, which must match that
-// environment's MS Graph service root.
-var Scope = map[string]string{
-	"enterprise":   "https://graph.microsoft.com/.default",
-	"gcc-gov":      "https://graph.microsoft.com/.default",
-	"gcc-high-gov": "https://graph.microsoft.us/.default",
-	"dod-gov":      "https://dod-graph.microsoft.us/.default",
-}
-
 const (
-	// defaultTokenURLTemplate is the Azure AD token endpoint host template,
+	// defaultTokenURLTemplate is the Azure AD token endpoint template,
 	// parameterized by the token host and tenant id.
 	defaultTokenURLTemplate = "%s/%s/oauth2/v2.0/token"
 
@@ -104,12 +113,16 @@ type DefenderConfig struct {
 
 	// TokenURL overrides the Azure AD token endpoint derived from Endpoint and
 	// TenantID (e.g. https://login.microsoftonline.com/<tenant_id>/oauth2/v2.0/token
-	// for the enterprise endpoint).
+	// for the enterprise endpoint). It only overrides the token URL; the OAuth2
+	// scope still follows Endpoint, so a token_url pointed at a gov host without
+	// also setting endpoint sends the commercial scope and will fail auth.
 	TokenURL string `json:"token_url" yaml:"token_url"`
 
 	// AlertsURL overrides the MS Graph security alerts endpoint derived from
 	// Endpoint (e.g. https://graph.microsoft.com/v1.0/security/alerts_v2 for
-	// the enterprise endpoint).
+	// the enterprise endpoint). It only overrides the alerts URL; the OAuth2
+	// scope still follows Endpoint, so an alerts_url pointed at a gov host
+	// without also setting endpoint sends the commercial scope and will 401.
 	AlertsURL string `json:"alerts_url" yaml:"alerts_url"`
 
 	// PollInterval overrides how long the adapter waits between polls of the
@@ -134,7 +147,7 @@ func (c *DefenderConfig) tokenURL() string {
 	if c.TokenURL != "" {
 		return c.TokenURL
 	}
-	return fmt.Sprintf(defaultTokenURLTemplate, TokenURL[c.endpoint()], c.TenantID)
+	return fmt.Sprintf(defaultTokenURLTemplate, environments[c.endpoint()].tokenHost, c.TenantID)
 }
 
 // alertsURL returns the alerts endpoint to use: the configured override, or
@@ -143,13 +156,13 @@ func (c *DefenderConfig) alertsURL() string {
 	if c.AlertsURL != "" {
 		return c.AlertsURL
 	}
-	return URL[c.endpoint()]
+	return environments[c.endpoint()].alertsURL
 }
 
 // scope returns the OAuth2 scope for the configured environment, which must
 // match that environment's MS Graph service root.
 func (c *DefenderConfig) scope() string {
-	return Scope[c.endpoint()]
+	return environments[c.endpoint()].scope
 }
 
 func (c *DefenderConfig) Validate() error {
@@ -166,7 +179,7 @@ func (c *DefenderConfig) Validate() error {
 		return errors.New("missing client_secret")
 	}
 	if c.Endpoint != "" {
-		if _, ok := URL[c.Endpoint]; !ok {
+		if _, ok := environments[c.Endpoint]; !ok {
 			return fmt.Errorf("invalid endpoint %q, must be one of: enterprise, gcc-gov, gcc-high-gov, dod-gov", c.Endpoint)
 		}
 	}
@@ -182,10 +195,20 @@ func NewDefenderAdapter(ctx context.Context, conf DefenderConfig) (*DefenderAdap
 // tests use to capture shipped events.
 func newDefenderAdapter(ctx context.Context, conf DefenderConfig, sink uspSink) (*DefenderAdapter, chan struct{}, error) {
 	var err error
+
+	// Resolve and validate the endpoint up front. Nothing on the runtime path
+	// (containers/general/tool.go) calls Validate(), so guard here too: a
+	// non-empty but unknown endpoint would otherwise resolve to empty URLs and
+	// scope and silently poll nothing.
+	if _, ok := environments[conf.endpoint()]; !ok {
+		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
+	}
+
 	a := &DefenderAdapter{
 		conf:         conf,
 		ctx:          context.Background(),
 		doStop:       utils.NewEvent(),
+		endpoint:     conf.endpoint(),
 		pollInterval: conf.PollInterval,
 	}
 	if a.pollInterval <= 0 {
@@ -256,8 +279,10 @@ func (a *DefenderAdapter) fetchToken() (string, error) {
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	// Use the adapter's httpClient (10s timeout): a bare http.Client{} has no
+	// timeout, so a token host that accepts the TCP connection but never
+	// responds would hang the poll goroutine forever.
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
@@ -357,8 +382,10 @@ func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, las
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
 		req.Header.Set("Content-Type", "application/json")
 
-		client := &http.Client{}
-		resp, err := client.Do(req)
+		// Use the adapter's httpClient (10s timeout) rather than a bare
+		// http.Client{}, which has no timeout and would hang the poll goroutine
+		// forever against an endpoint that never responds.
+		resp, err := a.httpClient.Do(req)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Error making request: %s\n", err))
 			return nil, since, "", err
