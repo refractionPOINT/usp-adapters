@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -603,4 +605,287 @@ func TestRetryExhaustion(t *testing.T) {
 		"doStop should NOT be set after exhausting retries - adapter should continue")
 
 	adapter.Close()
+}
+
+// memorySink is an in-memory uspSink that captures shipped messages so tests
+// can assert on what the adapter would have sent to LimaCharlie.
+type memorySink struct {
+	mu       sync.Mutex
+	messages []*protocol.DataMessage
+}
+
+func (s *memorySink) Ship(message *protocol.DataMessage, timeout time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.messages = append(s.messages, message)
+	return nil
+}
+
+func (s *memorySink) Drain(timeout time.Duration) error { return nil }
+
+func (s *memorySink) Close() ([]*protocol.DataMessage, error) { return nil, nil }
+
+func (s *memorySink) byEventType(eventType string) []*protocol.DataMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := []*protocol.DataMessage{}
+	for _, m := range s.messages {
+		if m.EventType == eventType {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// TestSiteAndAccountScopingAppliedToRequests verifies that configured
+// site_ids/account_ids are sent as the standard siteIds/accountIds query
+// filters on every polled endpoint, with whitespace in the CSV normalized.
+func TestSiteAndAccountScopingAppliedToRequests(t *testing.T) {
+	var sawActivities, sawAgents atomic.Bool
+	var activitiesQuery, agentsQuery atomic.Value
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/web/api/v2.1/activities":
+			sawActivities.Store(true)
+			activitiesQuery.Store(r.URL.Query())
+		case "/web/api/v2.1/agents":
+			sawAgents.Store(true)
+			agentsQuery.Store(r.URL.Query())
+		default:
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"data":       []map[string]interface{}{},
+			"nextCursor": nil,
+		})
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conf := SentinelOneConfig{
+		Domain:              server.URL,
+		APIKey:              "test-api-key",
+		URLs:                "/web/api/v2.1/activities",
+		SiteIDs:             " 1000000000000000201 , 1000000000000000202 ",
+		AccountIDs:          "1000000000000000301",
+		CollectAgents:       true,
+		AgentsPollInterval:  50 * time.Millisecond,
+		TimeBetweenRequests: 50 * time.Millisecond,
+		RetryBaseDelay:      50 * time.Millisecond,
+		MaxRetryAttempts:    3,
+		ClientOptions: uspclient.ClientOptions{
+			TestSinkMode: true,
+			OnError:      func(err error) { t.Logf("ERROR: %v", err) },
+			OnWarning:    func(msg string) { t.Logf("WARNING: %s", msg) },
+			DebugLog:     func(msg string) {},
+		},
+	}
+
+	adapter, _, err := NewSentinelOneAdapter(ctx, conf)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sawActivities.Load() && sawAgents.Load() },
+		5*time.Second, 10*time.Millisecond, "both endpoints should have been polled")
+
+	for name, q := range map[string]url.Values{
+		"activities": activitiesQuery.Load().(url.Values),
+		"agents":     agentsQuery.Load().(url.Values),
+	} {
+		assert.Equal(t, "1000000000000000201,1000000000000000202", q.Get("siteIds"),
+			"%s should be scoped to the configured sites", name)
+		assert.Equal(t, "1000000000000000301", q.Get("accountIds"),
+			"%s should be scoped to the configured accounts", name)
+	}
+
+	agentsQ := agentsQuery.Load().(url.Values)
+	assert.Equal(t, "false", agentsQ.Get("isDecommissioned"),
+		"agent inventory should exclude decommissioned agents")
+	assert.Equal(t, agentsPageLimit, agentsQ.Get("limit"))
+}
+
+// TestAgentsInventoryShipsOncePerUpdate verifies the agents inventory feed:
+// the first poll walks all pages and ships every agent, later polls only ship
+// agents whose updatedAt changed.
+func TestAgentsInventoryShipsOncePerUpdate(t *testing.T) {
+	agentA := map[string]interface{}{
+		"id":           "1000000000000000001",
+		"uuid":         "aaaaaaaa-1111-2222-3333-444444444444",
+		"computerName": "HOST-A",
+		"updatedAt":    "2026-07-07T10:00:00.000000Z",
+	}
+	agentB := map[string]interface{}{
+		"id":           "1000000000000000002",
+		"uuid":         "bbbbbbbb-1111-2222-3333-444444444444",
+		"computerName": "HOST-B",
+		"updatedAt":    "2026-07-07T10:00:00.000000Z",
+	}
+
+	var agentsPolls atomic.Int32
+	var updateB atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/web/api/v2.1/activities":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data":       []map[string]interface{}{},
+				"nextCursor": nil,
+			})
+		case "/web/api/v2.1/agents":
+			// Two pages: agent A with a cursor, then agent B. The cursor is
+			// nested under "pagination" exactly as the live API returns it —
+			// there is no top-level nextCursor.
+			if r.URL.Query().Get("cursor") == "" {
+				agentsPolls.Add(1)
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"data": []map[string]interface{}{agentA},
+					"pagination": map[string]interface{}{
+						"totalItems": 2,
+						"nextCursor": "next-page",
+					},
+				})
+				return
+			}
+			b := agentB
+			if updateB.Load() {
+				b = map[string]interface{}{}
+				for k, v := range agentB {
+					b[k] = v
+				}
+				b["updatedAt"] = "2026-07-07T11:00:00.000000Z"
+			}
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": []map[string]interface{}{b},
+				"pagination": map[string]interface{}{
+					"totalItems": 2,
+					"nextCursor": nil,
+				},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sink := &memorySink{}
+	conf := SentinelOneConfig{
+		Domain:              server.URL,
+		APIKey:              "test-api-key",
+		URLs:                "/web/api/v2.1/activities",
+		CollectAgents:       true,
+		AgentsPollInterval:  50 * time.Millisecond,
+		TimeBetweenRequests: 50 * time.Millisecond,
+		RetryBaseDelay:      50 * time.Millisecond,
+		MaxRetryAttempts:    3,
+		ClientOptions: uspclient.ClientOptions{
+			TestSinkMode: true,
+			OnError:      func(err error) { t.Logf("ERROR: %v", err) },
+			OnWarning:    func(msg string) { t.Logf("WARNING: %s", msg) },
+			DebugLog:     func(msg string) {},
+		},
+	}
+
+	adapter, _, err := newSentinelOneAdapter(ctx, conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// First poll: both agents (across two pages) ship exactly once.
+	require.Eventually(t, func() bool { return len(sink.byEventType(agentsEventType)) >= 2 },
+		5*time.Second, 10*time.Millisecond, "the initial inventory should ship every agent")
+
+	// Let a few more polls run: nothing new ships while updatedAt is stable.
+	require.Eventually(t, func() bool { return agentsPolls.Load() >= 3 },
+		5*time.Second, 10*time.Millisecond)
+	shipped := sink.byEventType(agentsEventType)
+	require.Len(t, shipped, 2, "unchanged agents must not be re-shipped on later polls")
+	hostnames := map[string]bool{}
+	for _, m := range shipped {
+		name, _ := m.JsonPayload["computerName"].(string)
+		hostnames[name] = true
+		assert.NotZero(t, m.TimestampMs)
+	}
+	assert.Equal(t, map[string]bool{"HOST-A": true, "HOST-B": true}, hostnames)
+
+	// Bump agent B's updatedAt: exactly that one agent ships again.
+	updateB.Store(true)
+	require.Eventually(t, func() bool { return len(sink.byEventType(agentsEventType)) == 3 },
+		5*time.Second, 10*time.Millisecond, "an updated agent should be re-shipped")
+	last := sink.byEventType(agentsEventType)[2]
+	name, _ := last.JsonPayload["computerName"].(string)
+	assert.Equal(t, "HOST-B", name)
+}
+
+// TestAgentsInventoryShipsAgentWithoutUpdatedAt guards against the dedup
+// zero-value collision: an agent whose updatedAt is missing must still ship on
+// the first walk ("" must not read as already-shipped), and must not be
+// re-shipped on later walks.
+func TestAgentsInventoryShipsAgentWithoutUpdatedAt(t *testing.T) {
+	var agentsPolls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/web/api/v2.1/activities":
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": []map[string]interface{}{}})
+		case "/web/api/v2.1/agents":
+			agentsPolls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"data": []map[string]interface{}{{
+					"id":           "1000000000000000003",
+					"uuid":         "cccccccc-1111-2222-3333-444444444444",
+					"computerName": "HOST-C",
+					// no updatedAt
+				}},
+				"pagination": map[string]interface{}{"totalItems": 1, "nextCursor": nil},
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	sink := &memorySink{}
+	conf := SentinelOneConfig{
+		Domain:              server.URL,
+		APIKey:              "test-api-key",
+		URLs:                "/web/api/v2.1/activities",
+		CollectAgents:       true,
+		AgentsPollInterval:  50 * time.Millisecond,
+		TimeBetweenRequests: 50 * time.Millisecond,
+		RetryBaseDelay:      50 * time.Millisecond,
+		MaxRetryAttempts:    3,
+		ClientOptions: uspclient.ClientOptions{
+			TestSinkMode: true,
+			OnError:      func(err error) { t.Logf("ERROR: %v", err) },
+			OnWarning:    func(msg string) { t.Logf("WARNING: %s", msg) },
+			DebugLog:     func(msg string) {},
+		},
+	}
+
+	adapter, _, err := newSentinelOneAdapter(ctx, conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// Ships once on the first walk...
+	require.Eventually(t, func() bool { return len(sink.byEventType(agentsEventType)) == 1 },
+		5*time.Second, 10*time.Millisecond, "an agent without updatedAt must still ship")
+
+	// ...and is not re-shipped on later walks.
+	require.Eventually(t, func() bool { return agentsPolls.Load() >= 3 },
+		5*time.Second, 10*time.Millisecond)
+	assert.Len(t, sink.byEventType(agentsEventType), 1,
+		"an unchanged agent without updatedAt must not be re-shipped")
 }

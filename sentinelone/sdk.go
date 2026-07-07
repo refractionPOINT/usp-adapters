@@ -39,11 +39,33 @@ func NewSentinelOneClient(baseURL, apiToken string) *SentinelOneClient {
 	}
 }
 
+// SentinelOnePagination is the envelope the Management API nests page state
+// under: {"pagination": {"totalItems": N, "nextCursor": "..."}, "data": [...]}.
+type SentinelOnePagination struct {
+	TotalItems int     `json:"totalItems"`
+	NextCursor *string `json:"nextCursor"`
+}
+
 // SentinelOnePagedData represents pagination information
 type SentinelOnePagedData struct {
 	Data       []map[string]interface{} `json:"data"`
 	TotalItems int                      `json:"totalItems"`
 	NextCursor *string                  `json:"nextCursor"`
+	Pagination *SentinelOnePagination   `json:"pagination"`
+}
+
+// NextPageCursor returns the cursor for the next page, or "" on the last
+// page. The live Management API nests the cursor under "pagination"; the
+// top-level "nextCursor" is kept as a fallback for older/other response
+// shapes.
+func (d *SentinelOnePagedData) NextPageCursor() string {
+	if d.Pagination != nil && d.Pagination.NextCursor != nil {
+		return *d.Pagination.NextCursor
+	}
+	if d.NextCursor != nil {
+		return *d.NextCursor
+	}
+	return ""
 }
 
 // GetFromAPI retrieves data from the API based on the provided options
