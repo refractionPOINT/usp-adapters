@@ -576,6 +576,13 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 			Dial: (&net.Dialer{
 				Timeout: 10 * time.Second,
 			}).Dial,
+			// The Check Point gateway drops idle keep-alive connections
+			// server-side. Left unbounded (the default), the pool would hand
+			// a stale connection to the next poll and the POST would fail with
+			// a bare EOF. Closing our idle connections after 30s — comfortably
+			// under the poll cadence — keeps us from reusing one the gateway
+			// has already discarded.
+			IdleConnTimeout: 30 * time.Second,
 		},
 	}
 
@@ -1238,13 +1245,23 @@ func isTransientErr(err error) bool {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	// A dropped connection surfaces as io.EOF (bare `Post "…": EOF`) or
+	// io.ErrUnexpectedEOF. The Check Point gateway routinely kills an idle
+	// keep-alive connection this way; Go does not auto-replay a POST on a
+	// dead connection, so we must classify it transient and let the retry
+	// helper re-issue on a fresh connection. errors.Is covers the wrapped
+	// *url.Error; the "EOF" string fragment below covers any error that
+	// only carries the message.
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
 	msg := err.Error()
 	for _, frag := range []string{
 		"context deadline exceeded",
 		"Client.Timeout",
 		"connection reset",
 		"connection refused",
-		"unexpected EOF",
+		"EOF",
 		"i/o timeout",
 		"TLS handshake timeout",
 		"server closed idle connection",
