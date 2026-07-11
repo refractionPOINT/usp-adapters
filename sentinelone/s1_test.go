@@ -387,6 +387,15 @@ func TestIsTransientError(t *testing.T) {
 		// Network error (string-based)
 		{"network error", errors.New(`failed to execute request "http://test": connection refused`), true},
 
+		// A malformed/empty base URL surfaces as an "unsupported protocol
+		// scheme" (or "missing protocol scheme") wrapped in the SDK's "failed
+		// to execute request" text. This is a permanent misconfiguration, not a
+		// transient network blip, so it must not be retried forever.
+		{"unsupported protocol scheme", fmt.Errorf("failed to execute request %q: %v", "/web/api/v2.1/threats",
+			errors.New(`Get "/web/api/v2.1/threats": unsupported protocol scheme ""`)), false},
+		{"missing protocol scheme", fmt.Errorf("failed to execute request %q: %v", "//example.net/web",
+			errors.New(`parse "//example.net/web": missing protocol scheme`)), false},
+
 		// Permanent HTTP errors (using HTTPError type)
 		{"401 error", &HTTPError{StatusCode: 401, URL: "http://test", Body: "unauthorized"}, false},
 		{"403 error", &HTTPError{StatusCode: 403, URL: "http://test", Body: "forbidden"}, false},
@@ -888,4 +897,64 @@ func TestAgentsInventoryShipsAgentWithoutUpdatedAt(t *testing.T) {
 		5*time.Second, 10*time.Millisecond)
 	assert.Len(t, sink.byEventType(agentsEventType), 1,
 		"an unchanged agent without updatedAt must not be re-shipped")
+}
+
+// TestConstructorFailsFastOnMissingDomain verifies the constructor rejects an
+// empty domain up front, instead of building a malformed base URL that makes
+// every request fail with a cryptic "unsupported protocol scheme" it then
+// retries forever. This is the cloud-hosted launch path, which reaches the
+// constructor without ever calling Validate().
+func TestConstructorFailsFastOnMissingDomain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conf := SentinelOneConfig{
+		Domain: "",
+		APIKey: "test-api-key",
+		URLs:   "/web/api/v2.1/activities",
+		ClientOptions: uspclient.ClientOptions{
+			TestSinkMode: true,
+			OnError:      func(err error) {},
+			DebugLog:     func(msg string) {},
+		},
+	}
+
+	adapter, chStopped, err := newSentinelOneAdapter(ctx, conf, &memorySink{})
+	require.Error(t, err, "constructor should reject an empty domain")
+	assert.EqualError(t, err, "missing domain")
+	assert.Nil(t, adapter)
+	assert.Nil(t, chStopped)
+}
+
+// TestConstructorNormalizesDomain verifies applyDefaults (run by the
+// constructor) prefixes https:// on a bare domain and strips a trailing slash,
+// so the SDK client is built with a well-formed base URL even when Validate()
+// was never called.
+func TestConstructorNormalizesDomain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conf := SentinelOneConfig{
+		Domain:              "example.sentinelone.net/",
+		APIKey:              "test-api-key",
+		URLs:                "/web/api/v2.1/activities",
+		TimeBetweenRequests: 50 * time.Millisecond,
+		RetryBaseDelay:      50 * time.Millisecond,
+		MaxRetryAttempts:    3,
+		ClientOptions: uspclient.ClientOptions{
+			TestSinkMode: true,
+			OnError:      func(err error) {},
+			OnWarning:    func(msg string) {},
+			DebugLog:     func(msg string) {},
+		},
+	}
+
+	adapter, _, err := newSentinelOneAdapter(ctx, conf, &memorySink{})
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	assert.Equal(t, "https://example.sentinelone.net", adapter.conf.Domain,
+		"a bare domain should be prefixed with https:// and the trailing slash stripped")
+	assert.Equal(t, "https://example.sentinelone.net", adapter.s1Client.baseURL,
+		"the SDK client should be built with the normalized base URL")
 }

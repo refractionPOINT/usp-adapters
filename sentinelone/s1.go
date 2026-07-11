@@ -58,6 +58,16 @@ func isTransientError(err error) bool {
 
 	// Network-related errors are typically transient
 	errStr := err.Error()
+
+	// A missing/malformed protocol scheme means the base URL itself is empty or
+	// malformed (e.g. a domain with no https:// prefix): a permanent
+	// misconfiguration that retrying can never fix. Check this before the
+	// generic "failed to execute request" catch-all, which the SDK wraps such
+	// errors in.
+	if strings.Contains(errStr, "unsupported protocol scheme") || strings.Contains(errStr, "missing protocol scheme") {
+		return false
+	}
+
 	if strings.Contains(errStr, "failed to execute request") {
 		// This could be timeout, connection refused, DNS failure, etc.
 		return true
@@ -134,10 +144,6 @@ func (c *SentinelOneConfig) Validate() error {
 	if c.APIKey == "" {
 		return errors.New("missing api_key")
 	}
-	if !strings.HasPrefix(c.Domain, "https://") {
-		c.Domain = "https://" + c.Domain
-	}
-	c.Domain = strings.TrimSuffix(c.Domain, "/")
 	if _, err := time.Parse(s1TimeFormat, c.StartTime); c.StartTime != "" && err != nil {
 		return fmt.Errorf("invalid start_time: %v", err)
 	}
@@ -145,10 +151,22 @@ func (c *SentinelOneConfig) Validate() error {
 	return nil
 }
 
-// applyDefaults fills unset knobs and normalizes inputs. It runs both from
+// applyDefaults fills unset knobs and normalizes inputs, including the Domain
+// (prefixing https:// and trimming a trailing slash). It runs both from
 // Validate() and from the constructor, because the general adapter runner
-// constructs the adapter without calling Validate().
+// constructs the adapter without calling Validate(); normalizing here ensures
+// the base URL is well-formed on every launch path.
 func (c *SentinelOneConfig) applyDefaults() {
+	if c.Domain != "" {
+		// A bare domain ("example.sentinelone.net") gets the https:// scheme the
+		// SDK needs to build a usable base URL. Only add it when no scheme is
+		// present so an explicit scheme (e.g. an http:// endpoint) is preserved
+		// rather than turned into "https://http://...".
+		if !strings.Contains(c.Domain, "://") {
+			c.Domain = "https://" + c.Domain
+		}
+		c.Domain = strings.TrimSuffix(c.Domain, "/")
+	}
 	if c.TimeBetweenRequests == 0 {
 		c.TimeBetweenRequests = 1 * time.Minute
 	}
@@ -193,8 +211,21 @@ func NewSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig) (*Sentin
 // seam tests use to capture shipped events.
 func newSentinelOneAdapter(ctx context.Context, conf SentinelOneConfig, sink uspSink) (*SentinelOneAdapter, chan struct{}, error) {
 	// Ensure defaults are set (these may not be set if Validate() wasn't called,
-	// e.g. when launched through the general adapter runner).
+	// e.g. when launched through the general adapter runner). applyDefaults also
+	// normalizes the Domain into a well-formed base URL.
 	conf.applyDefaults()
+
+	// Fail fast on the essentials the general adapter runner never validates.
+	// Without these the SDK builds a malformed base URL and every request fails
+	// with a cryptic "unsupported protocol scheme" that retries forever. We
+	// don't call full Validate() here because it also validates ClientOptions,
+	// which the test seam and some launch paths don't populate.
+	if conf.Domain == "" {
+		return nil, nil, errors.New("missing domain")
+	}
+	if conf.APIKey == "" {
+		return nil, nil, errors.New("missing api_key")
+	}
 
 	a := &SentinelOneAdapter{
 		conf:     conf,
