@@ -35,26 +35,45 @@ const (
 
 	// maxPagesPerPoll bounds how many @odata.nextLink continuations are
 	// followed within a single poll. Anything left over is picked up by the
-	// next poll through the timestamp cursor.
-	maxPagesPerPoll = 10
+	// next poll through the timestamp cursor; a warning is emitted when the
+	// cap is hit so sustained truncation is visible.
+	maxPagesPerPoll = 50
+
+	// ingestionLookback compensates for Microsoft Graph ingestion delay: an
+	// event can become visible in the API after events with later timestamps
+	// have already been returned, and a cursor that only moves forward would
+	// then never request it. Each poll re-requests this much history behind
+	// the newest timestamp seen and dedups by event ID, so late arrivals
+	// inside the window still ship exactly once.
+	ingestionLookback = 5 * time.Minute
+
+	// filterTimeLayout is how cursor timestamps are rendered into the OData
+	// $filter (UTC with fractional seconds, as Graph emits them).
+	filterTimeLayout = "2006-01-02T15:04:05.000000Z"
 )
 
 // entraStream describes one Microsoft Graph collection the adapter can poll.
-// Each collection filters and cursors on a different timestamp field.
+// Each collection filters and cursors on a different timestamp field. orderBy,
+// when set, is sent as $orderby so truncated result sets drain oldest-first
+// across polls -- Graph does not guarantee an ordering otherwise (and commonly
+// returns these collections newest-first).
 type entraStream struct {
 	name    string
 	path    string
 	tsField string
+	orderBy string
 }
 
 // Streams supported through EntraIDConfig.Streams. sign_ins requires the
 // tenant to hold an Entra ID P1/P2 license (a Microsoft Graph requirement);
 // sign_ins and audit_logs both require the AuditLog.Read.All application
 // permission, risk_detections requires IdentityRiskEvent.Read.All.
+// risk_detections deliberately sends no $orderby, preserving the historical
+// request shape for existing deployments.
 var entraStreamsByName = map[string]entraStream{
 	"risk_detections": {name: "risk_detections", path: "/v1.0/identityProtection/riskDetections", tsField: "activityDateTime"},
-	"sign_ins":        {name: "sign_ins", path: "/v1.0/auditLogs/signIns", tsField: "createdDateTime"},
-	"audit_logs":      {name: "audit_logs", path: "/v1.0/auditLogs/directoryAudits", tsField: "activityDateTime"},
+	"sign_ins":        {name: "sign_ins", path: "/v1.0/auditLogs/signIns", tsField: "createdDateTime", orderBy: "createdDateTime asc"},
+	"audit_logs":      {name: "audit_logs", path: "/v1.0/auditLogs/directoryAudits", tsField: "activityDateTime", orderBy: "activityDateTime asc"},
 }
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -274,8 +293,7 @@ func (a *EntraIDAdapter) fetchToken() (string, error) {
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
@@ -300,32 +318,44 @@ func (a *EntraIDAdapter) fetchToken() (string, error) {
 
 }
 
-// fetchEvents polls one Graph collection on the poll interval, advancing an
-// inclusive timestamp cursor. Because the $filter is "ge", items sitting
-// exactly on the cursor are refetched on the next poll: shippedAtCursor holds
-// the IDs already shipped at the cursor timestamp so they ship exactly once
-// even when many events share the same timestamp.
+// fetchEvents polls one Graph collection on the poll interval. The $filter
+// requests everything at or after (latest timestamp seen - ingestionLookback),
+// and the shipped map (event ID -> event timestamp) suppresses re-shipping
+// anything already sent from that window. This tolerates both many events
+// sharing one timestamp (the inclusive "ge" filter refetches them every poll)
+// and events surfacing in the API out of timestamp order due to Graph
+// ingestion delay, as long as the delay stays within the lookback.
 func (a *EntraIDAdapter) fetchEvents(stream entraStream) {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", stream.name))
 
 	eventsUrl := a.conf.graphEndpoint() + stream.path
-	since := time.Now().UTC().Format("2006-01-02T15:04:05.000000Z")
-	shippedAtCursor := map[string]struct{}{}
+	// Collection starts at adapter startup: the lookback never reaches before
+	// processStart, so restarts do not re-ship history (there is no persisted
+	// cursor to dedup against across restarts).
+	processStart := time.Now().UTC()
+	latest := processStart
+	shipped := map[string]time.Time{}
 
 	for !a.doStop.WaitFor(a.pollInterval) {
-		// The makeOneListRequest function handles error
-		// handling and fatal error handling.
-		items, newSince, newShipped, _ := a.makeOneListRequest(eventsUrl, stream.tsField, since, shippedAtCursor)
-		since = newSince
-		shippedAtCursor = newShipped
-		if items == nil {
+		windowStart := latest.Add(-ingestionLookback)
+		if windowStart.Before(processStart) {
+			windowStart = processStart
+		}
+
+		// makeOneListRequest handles error reporting and retries.
+		items, err := a.makeOneListRequest(eventsUrl, stream, windowStart)
+		if err != nil {
 			continue
 		}
 
 		for _, item := range items {
+			if _, dup := shipped[item.id]; dup {
+				continue
+			}
+
 			msg := &protocol.DataMessage{
-				JsonPayload: item,
+				JsonPayload: item.payload,
 				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 			}
 			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
@@ -333,36 +363,60 @@ func (a *EntraIDAdapter) fetchEvents(stream entraStream) {
 					a.conf.ClientOptions.OnWarning("stream falling behind")
 					err = a.uspClient.Ship(msg, 1*time.Hour)
 				}
-				if err == nil {
-					continue
+				if err != nil {
+					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					a.doStop.Set()
+					return
 				}
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				a.doStop.Set()
-				return
+			}
+
+			shipped[item.id] = item.ts
+			if item.ts.After(latest) {
+				latest = item.ts
+			}
+		}
+
+		// Prune IDs that fell out of the lookback window: the next $filter
+		// can never return them again.
+		cutoff := latest.Add(-ingestionLookback)
+		for id, ts := range shipped {
+			if ts.Before(cutoff) {
+				delete(shipped, id)
 			}
 		}
 	}
 }
 
+// entraEvent is one validated item from a Graph collection response.
+type entraEvent struct {
+	payload map[string]interface{}
+	id      string
+	ts      time.Time
+}
+
 // makeOneListRequest performs one poll of a Graph collection: it requests
-// every item whose tsField is at or after since (following @odata.nextLink
-// continuations up to maxPagesPerPoll), drops the items already shipped at the
-// cursor and returns the new items along with the advanced cursor and the set
-// of IDs shipped at it.
-func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, tsField string, since string, shippedAtCursor map[string]struct{}) ([]map[string]interface{}, string, map[string]struct{}, error) {
+// every item whose timestamp field is at or after windowStart (following
+// @odata.nextLink continuations up to maxPagesPerPoll) and returns the items
+// that carry a valid ID and timestamp.
+func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, stream entraStream, windowStart time.Time) ([]entraEvent, error) {
+	tsField := stream.tsField
 	var rawItems []interface{}
 
 	// Retry up to 3 times
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Request everything at or after the cursor. "ge" is inclusive as
-		// OData defines it, which is what lets the cursor make progress
-		// without missing same-timestamp events.
+		// Request everything at or after the window start. "ge" is inclusive
+		// as OData defines it, so boundary events are always refetched and
+		// deduped by the caller.
+		since := windowStart.UTC().Format(filterTimeLayout)
 		requestUrl := eventsUrl + "?%24filter=" + url.QueryEscape(fmt.Sprintf("%s ge %s", tsField, since))
+		if stream.orderBy != "" {
+			requestUrl += "&%24orderby=" + url.QueryEscape(stream.orderBy)
+		}
 
 		authToken, err := a.fetchToken()
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("error fetching token: %s", err))
-			return nil, since, shippedAtCursor, err
+			return nil, err
 		}
 
 		items, err, isRetryable := a.fetchAllPages(requestUrl, authToken)
@@ -371,22 +425,14 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, tsField string, si
 			if isRetryable && attempt < 3 {
 				continue
 			}
-			return nil, since, shippedAtCursor, err
+			return nil, err
 		}
 
 		rawItems = items
 		break
 	}
 
-	// Advance the cursor to the latest timestamp seen and rebuild the set of
-	// IDs shipped at it; everything strictly before the new cursor can never
-	// be refetched so it does not need remembering.
-	toShip := []map[string]interface{}{}
-	newSince := since
-	newSinceParsed, _ := time.Parse(time.RFC3339, since)
-	shippedAtNewCursor := map[string]struct{}{}
-	seenThisPoll := map[string]struct{}{}
-
+	events := []entraEvent{}
 	for _, item := range rawItems {
 		itemMap, ok := item.(map[string]interface{})
 		if !ok {
@@ -409,36 +455,10 @@ func (a *EntraIDAdapter) makeOneListRequest(eventsUrl string, tsField string, si
 			continue
 		}
 
-		if _, dup := seenThisPoll[id]; dup {
-			continue
-		}
-		seenThisPoll[id] = struct{}{}
-
-		shipped := false
-		if _, already := shippedAtCursor[id]; !already {
-			toShip = append(toShip, itemMap)
-			shipped = true
-		}
-
-		if tsParsed.After(newSinceParsed) {
-			newSinceParsed = tsParsed
-			newSince = ts
-			shippedAtNewCursor = map[string]struct{}{}
-		}
-		if tsParsed.Equal(newSinceParsed) && shipped {
-			shippedAtNewCursor[id] = struct{}{}
-		}
+		events = append(events, entraEvent{payload: itemMap, id: id, ts: tsParsed})
 	}
 
-	// When the cursor did not move, previously shipped IDs are still sitting
-	// on it and must stay remembered.
-	if newSince == since {
-		for id := range shippedAtCursor {
-			shippedAtNewCursor[id] = struct{}{}
-		}
-	}
-
-	return toShip, newSince, shippedAtNewCursor, nil
+	return events, nil
 }
 
 // fetchAllPages GETs a Graph collection URL and follows @odata.nextLink
@@ -480,6 +500,10 @@ func (a *EntraIDAdapter) fetchAllPages(requestUrl string, authToken string) ([]i
 
 		nextLink, _ := data["@odata.nextLink"].(string)
 		requestUrl = nextLink
+	}
+
+	if requestUrl != "" {
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("page cap (%d) reached before draining the result set, remainder deferred to the next poll", maxPagesPerPoll))
 	}
 
 	return allItems, nil, false

@@ -158,6 +158,15 @@ type mockMicrosoft struct {
 	// (e.g. the app registration lost its IdentityRiskEvent.Read.All grant).
 	revokeGraphAccess bool
 
+	// descendingDefault serves results newest-first when the request carries
+	// no $orderby, mirroring how Graph commonly returns the auditLogs
+	// collections. An explicit $orderby always wins.
+	descendingDefault bool
+
+	// lastQueryByPath records the most recent raw query string per Graph
+	// path, so tests can assert on the filter/orderby the adapter sent.
+	lastQueryByPath map[string]string
+
 	tokenRequests int
 	graphRequests int
 
@@ -170,11 +179,18 @@ type mockMicrosoft struct {
 
 func newMockMicrosoft() *mockMicrosoft {
 	return &mockMicrosoft{
-		tenantID:     testTenantID,
-		clientID:     testClientID,
-		clientSecret: testClientSecret,
-		accessToken:  testAccessToken,
+		tenantID:        testTenantID,
+		clientID:        testClientID,
+		clientSecret:    testClientSecret,
+		accessToken:     testAccessToken,
+		lastQueryByPath: map[string]string{},
 	}
+}
+
+func (m *mockMicrosoft) lastQuery(path string) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastQueryByPath[path]
 }
 
 func (m *mockMicrosoft) start(t *testing.T) *httptest.Server {
@@ -320,9 +336,11 @@ func (m *mockMicrosoft) handleToken(w http.ResponseWriter, r *http.Request) {
 func (m *mockMicrosoft) handleCollection(w http.ResponseWriter, r *http.Request, dataset func() []map[string]interface{}, tsField string) {
 	m.mu.Lock()
 	m.graphRequests++
+	m.lastQueryByPath[r.URL.Path] = r.URL.RawQuery
 	token := m.accessToken
 	revoked := m.revokeGraphAccess
 	pageSize := m.pageSize
+	descendingDefault := m.descendingDefault
 	items := make([]map[string]interface{}, len(dataset()))
 	copy(items, dataset())
 	serverURL := m.serverURL
@@ -360,9 +378,23 @@ func (m *mockMicrosoft) handleCollection(w http.ResponseWriter, r *http.Request,
 			matched = append(matched, d)
 		}
 	}
+	// Ordering: an explicit $orderby ("<field> asc" or "<field> desc") is
+	// honoured; without one the mock defaults to ascending unless the test
+	// opted into descendingDefault (Graph's common newest-first behavior).
+	descending := descendingDefault
+	if orderBy := r.URL.Query().Get("$orderby"); orderBy != "" {
+		if orderBy != tsField+" asc" && orderBy != tsField+" desc" {
+			writeGraphError(w, http.StatusBadRequest, "BadRequest", "Unsupported $orderby: "+orderBy)
+			return
+		}
+		descending = strings.HasSuffix(orderBy, " desc")
+	}
 	sort.SliceStable(matched, func(i, j int) bool {
 		ti, _ := time.Parse(time.RFC3339, matched[i][tsField].(string))
 		tj, _ := time.Parse(time.RFC3339, matched[j][tsField].(string))
+		if descending {
+			return tj.Before(ti)
+		}
 		return ti.Before(tj)
 	})
 
@@ -387,6 +419,9 @@ func (m *mockMicrosoft) handleCollection(w http.ResponseWriter, r *http.Request,
 		// https://learn.microsoft.com/en-us/graph/paging).
 		q := url.Values{}
 		q.Set("$filter", r.URL.Query().Get("$filter"))
+		if orderBy := r.URL.Query().Get("$orderby"); orderBy != "" {
+			q.Set("$orderby", orderBy)
+		}
 		q.Set("$skiptoken", fmt.Sprintf("offset-%d", offset+pageSize))
 		envelope["@odata.nextLink"] = serverURL + r.URL.Path + "?" + q.Encode()
 	}
@@ -693,6 +728,9 @@ func TestPaginatedResultSetFullyConsumed(t *testing.T) {
 
 	mock := newMockMicrosoft()
 	mock.pageSize = 2
+	// risk_detections sends no $orderby (historical request shape), so serve
+	// newest-first to prove draining does not depend on response order.
+	mock.descendingDefault = true
 	base := fixtureBaseTime()
 	for i := 1; i <= total; i++ {
 		mock.addDetection(realisticRiskDetection(
@@ -808,6 +846,9 @@ func TestGraphRejectsTokenShipsNothing(t *testing.T) {
 // verbatim exactly once, and does not touch the risk detections dataset.
 func TestSignInsStreamEndToEnd(t *testing.T) {
 	mock := newMockMicrosoft()
+	// Graph commonly returns auditLogs collections newest-first; the adapter
+	// counters with an explicit $orderby, which the mock honours over this.
+	mock.descendingDefault = true
 	base := fixtureBaseTime()
 	// A risk detection that must NOT ship: the stream selection excludes it.
 	mock.addDetection(realisticRiskDetection(1, "anonymizedIPAddress", "jdoe@example.com", base.Format(graphTimeLayout)))
@@ -847,6 +888,13 @@ func TestSignInsStreamEndToEnd(t *testing.T) {
 		assert.JSONEq(t, mustJSON(t, src), mustJSON(t, msg.JsonPayload),
 			"shipped payload must match the original Graph signIn")
 	}
+
+	// The adapter must request a deterministic oldest-first ordering so
+	// truncated result sets drain correctly across polls.
+	query, err := url.ParseQuery(mock.lastQuery("/v1.0/auditLogs/signIns"))
+	require.NoError(t, err)
+	assert.Equal(t, "createdDateTime asc", query.Get("$orderby"))
+	assert.Contains(t, query.Get("$filter"), "createdDateTime ge ")
 }
 
 // TestAllStreamsShipConcurrently verifies that configuring all three streams
@@ -922,6 +970,48 @@ func TestSameTimestampEventsShipOnce(t *testing.T) {
 		shippedPerID[msg.JsonPayload["id"].(string)]++
 	}
 	require.Len(t, shippedPerID, total+1)
+	for id, n := range shippedPerID {
+		assert.Equal(t, 1, n, "sign-in %q must ship exactly once", id)
+	}
+}
+
+// TestLateArrivalWithinLookbackShips verifies an event that surfaces in the
+// API with a timestamp OLDER than events already shipped (Graph ingestion
+// delay) still ships: the poll window looks back behind the newest timestamp
+// seen instead of only moving forward. A forward-only cursor would exclude
+// such an event forever.
+func TestLateArrivalWithinLookbackShips(t *testing.T) {
+	mock := newMockMicrosoft()
+	base := fixtureBaseTime()
+	mock.addSignIn(realisticSignIn(1, "jdoe@example.com", base.Format(graphTimeLayout)))
+	mock.addSignIn(realisticSignIn(2, "asmith@example.com", base.Add(2*time.Minute).Format(graphTimeLayout)))
+	server := mock.start(t)
+
+	conf := testConfig(t, server.URL)
+	conf.Streams = "sign_ins"
+
+	sink := &captureSink{}
+	adapter, _, err := newEntraIDAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 2 },
+		10*time.Second, 20*time.Millisecond, "initial sign-ins should ship")
+
+	// A sign-in surfaces late: its createdDateTime sits BETWEEN the two
+	// already-shipped events, i.e. behind the newest timestamp seen.
+	mock.addSignIn(realisticSignIn(3, "late@example.com", base.Add(1*time.Minute).Format(graphTimeLayout)))
+
+	require.Eventually(t, func() bool { return sink.count() == 3 },
+		10*time.Second, 20*time.Millisecond, "the late-arriving sign-in should ship")
+	require.Never(t, func() bool { return sink.count() != 3 },
+		400*time.Millisecond, 30*time.Millisecond, "sign-ins were re-shipped after the late arrival")
+
+	shippedPerID := map[string]int{}
+	for _, msg := range sink.snapshot() {
+		shippedPerID[msg.JsonPayload["id"].(string)]++
+	}
+	require.Len(t, shippedPerID, 3)
 	for id, n := range shippedPerID {
 		assert.Equal(t, 1, n, "sign-in %q must ship exactly once", id)
 	}
