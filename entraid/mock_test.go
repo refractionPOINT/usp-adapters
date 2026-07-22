@@ -1,20 +1,20 @@
 package usp_entraid
 
-// This file exercises the adapter end-to-end against a mock of the two
-// Microsoft endpoints it talks to:
+// This file exercises the adapter end-to-end against a mock of the Microsoft
+// endpoints it talks to:
 //
 //   - the Microsoft identity platform token endpoint
 //     (POST /<tenant>/oauth2/v2.0/token, OAuth2 client_credentials), and
-//   - the Microsoft Graph Identity Protection risk detections endpoint
-//     (GET /v1.0/identityProtection/riskDetections?$filter=activityDateTime ge <ts>).
+//   - the Microsoft Graph collections the adapter's streams poll:
+//     /v1.0/identityProtection/riskDetections (filtered on activityDateTime),
+//     /v1.0/auditLogs/signIns (filtered on createdDateTime) and
+//     /v1.0/auditLogs/directoryAudits (filtered on activityDateTime).
 //
 // The mock validates the credential exchange and the bearer token, honours the
-// adapter's $filter on activityDateTime (inclusive "ge", as OData defines it),
-// orders results by activityDateTime ascending and can truncate responses to a
-// page size, advertising the Graph "@odata.nextLink" continuation the real API
-// returns. Note the adapter does not follow @odata.nextLink: it drains large
-// result sets across successive polls by advancing its $filter to the last
-// detection's activityDateTime, which is what the pagination test exercises.
+// adapter's $filter (inclusive "ge", as OData defines it), orders results by
+// the collection's timestamp field ascending and can truncate responses to a
+// page size, advertising the Graph "@odata.nextLink" continuation (with a
+// working $skiptoken) the real API returns.
 //
 // All fixture data is fake: example.com principals, all-1s UUIDs,
 // documentation-range IPs (203.0.113.0/24) and made-up tokens.
@@ -27,6 +27,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -141,8 +142,11 @@ type mockMicrosoft struct {
 	clientSecret string
 	accessToken  string
 
-	// detections is the in-memory Graph dataset.
+	// detections, signIns and audits are the in-memory Graph datasets, one
+	// per collection the adapter can poll.
 	detections []map[string]interface{}
+	signIns    []map[string]interface{}
+	audits     []map[string]interface{}
 
 	// pageSize, when > 0, caps how many detections a single response carries;
 	// truncated responses include an @odata.nextLink, like the real Graph API
@@ -189,6 +193,18 @@ func (m *mockMicrosoft) addDetection(d map[string]interface{}) {
 	m.detections = append(m.detections, d)
 }
 
+func (m *mockMicrosoft) addSignIn(d map[string]interface{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.signIns = append(m.signIns, d)
+}
+
+func (m *mockMicrosoft) addAudit(d map[string]interface{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.audits = append(m.audits, d)
+}
+
 func (m *mockMicrosoft) tokenRequestCount() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -209,14 +225,17 @@ func (m *mockMicrosoft) lastTokenRequest() url.Values {
 
 func (m *mockMicrosoft) handler(t *testing.T) http.HandlerFunc {
 	tokenPath := "/" + testTenantID + "/oauth2/v2.0/token"
-	graphPath := "/v1.0/identityProtection/riskDetections"
 
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case tokenPath:
 			m.handleToken(w, r)
-		case graphPath:
-			m.handleRiskDetections(w, r)
+		case "/v1.0/identityProtection/riskDetections":
+			m.handleCollection(w, r, func() []map[string]interface{} { return m.detections }, "activityDateTime")
+		case "/v1.0/auditLogs/signIns":
+			m.handleCollection(w, r, func() []map[string]interface{} { return m.signIns }, "createdDateTime")
+		case "/v1.0/auditLogs/directoryAudits":
+			m.handleCollection(w, r, func() []map[string]interface{} { return m.audits }, "activityDateTime")
 		default:
 			writeGraphError(w, http.StatusNotFound, "ResourceNotFound",
 				fmt.Sprintf("Resource not found for the segment %q.", r.URL.Path))
@@ -294,16 +313,18 @@ func (m *mockMicrosoft) handleToken(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRiskDetections implements GET /v1.0/identityProtection/riskDetections
-// with the $filter the adapter sends: "activityDateTime ge <timestamp>".
-func (m *mockMicrosoft) handleRiskDetections(w http.ResponseWriter, r *http.Request) {
+// handleCollection implements a GET on a Graph collection with the $filter the
+// adapter sends: "<tsField> ge <timestamp>". Truncated responses advertise an
+// @odata.nextLink whose $skiptoken encodes the offset into the matched set,
+// like the real API's server-driven paging.
+func (m *mockMicrosoft) handleCollection(w http.ResponseWriter, r *http.Request, dataset func() []map[string]interface{}, tsField string) {
 	m.mu.Lock()
 	m.graphRequests++
 	token := m.accessToken
 	revoked := m.revokeGraphAccess
 	pageSize := m.pageSize
-	detections := make([]map[string]interface{}, len(m.detections))
-	copy(detections, m.detections)
+	items := make([]map[string]interface{}, len(dataset()))
+	copy(items, dataset())
 	serverURL := m.serverURL
 	m.mu.Unlock()
 
@@ -319,21 +340,19 @@ func (m *mockMicrosoft) handleRiskDetections(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	since, ok := parseActivityDateTimeFilter(r.URL.Query().Get("$filter"))
+	since, ok := parseTimestampFilter(r.URL.Query().Get("$filter"), tsField)
 	if !ok {
 		writeGraphError(w, http.StatusBadRequest, "BadRequest", "Invalid $filter clause.")
 		return
 	}
 
 	// "ge" is inclusive (greater than or equal, as OData defines it). The
-	// mock returns matches ordered by activityDateTime ascending: the
-	// official docs make no ordering guarantee for this endpoint, but the
-	// adapter's cursor -- it advances "since" to the activityDateTime of the
-	// last item in the response -- only makes progress when responses are
-	// ascending, so the mock keeps them deterministic.
-	matched := make([]map[string]interface{}, 0, len(detections))
-	for _, d := range detections {
-		at, err := time.Parse(time.RFC3339, d["activityDateTime"].(string))
+	// mock returns matches ordered by the timestamp field ascending: the
+	// official docs make no ordering guarantee for these endpoints, but
+	// keeping them ordered makes the tests deterministic.
+	matched := make([]map[string]interface{}, 0, len(items))
+	for _, d := range items {
+		at, err := time.Parse(time.RFC3339, d[tsField].(string))
 		if err != nil {
 			continue
 		}
@@ -342,22 +361,34 @@ func (m *mockMicrosoft) handleRiskDetections(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	sort.SliceStable(matched, func(i, j int) bool {
-		ti, _ := time.Parse(time.RFC3339, matched[i]["activityDateTime"].(string))
-		tj, _ := time.Parse(time.RFC3339, matched[j]["activityDateTime"].(string))
+		ti, _ := time.Parse(time.RFC3339, matched[i][tsField].(string))
+		tj, _ := time.Parse(time.RFC3339, matched[j][tsField].(string))
 		return ti.Before(tj)
 	})
 
+	offset := 0
+	if skip := r.URL.Query().Get("$skiptoken"); skip != "" {
+		n, err := strconv.Atoi(strings.TrimPrefix(skip, "offset-"))
+		if err != nil || n < 0 || n > len(matched) {
+			writeGraphError(w, http.StatusBadRequest, "BadRequest", "Invalid $skiptoken.")
+			return
+		}
+		offset = n
+	}
+	matched = matched[offset:]
+
 	envelope := map[string]interface{}{
-		"@odata.context": "https://graph.microsoft.com/v1.0/$metadata#riskDetections",
+		"@odata.context": "https://graph.microsoft.com/v1.0/$metadata" + r.URL.Path,
 	}
 	if pageSize > 0 && len(matched) > pageSize {
 		matched = matched[:pageSize]
 		// Like the real API, the nextLink carries the query parameters of the
 		// original request plus a $skiptoken (see
 		// https://learn.microsoft.com/en-us/graph/paging).
-		envelope["@odata.nextLink"] = serverURL +
-			"/v1.0/identityProtection/riskDetections?" + r.URL.RawQuery +
-			"&$skiptoken=fake-skip-token-1111"
+		q := url.Values{}
+		q.Set("$filter", r.URL.Query().Get("$filter"))
+		q.Set("$skiptoken", fmt.Sprintf("offset-%d", offset+pageSize))
+		envelope["@odata.nextLink"] = serverURL + r.URL.Path + "?" + q.Encode()
 	}
 	envelope["value"] = matched
 
@@ -365,15 +396,10 @@ func (m *mockMicrosoft) handleRiskDetections(w http.ResponseWriter, r *http.Requ
 	_ = json.NewEncoder(w).Encode(envelope)
 }
 
-// parseActivityDateTimeFilter extracts the timestamp from a
-// "activityDateTime ge <ts>" OData filter. The adapter has a quirk where a
-// retried request re-appends "?$filter=..." to an URL that already carries one,
-// so anything from a stray "?" onward is ignored.
-func parseActivityDateTimeFilter(filter string) (time.Time, bool) {
-	if i := strings.Index(filter, "?"); i >= 0 {
-		filter = filter[:i]
-	}
-	const prefix = "activityDateTime ge "
+// parseTimestampFilter extracts the timestamp from a "<tsField> ge <ts>" OData
+// filter.
+func parseTimestampFilter(filter string, tsField string) (time.Time, bool) {
+	prefix := tsField + " ge "
 	if !strings.HasPrefix(filter, prefix) {
 		return time.Time{}, false
 	}
@@ -442,6 +468,87 @@ func realisticRiskDetection(seq int, riskEventType, upn, activityDateTime string
 			"geoCoordinates": map[string]interface{}{
 				"latitude":  39.78,
 				"longitude": -89.65,
+			},
+		},
+	}
+}
+
+// realisticSignIn builds a record shaped like a Microsoft Graph auditLogs
+// signIn resource. All identifying values are fake.
+func realisticSignIn(seq int, upn, createdDateTime string) map[string]interface{} {
+	return map[string]interface{}{
+		"id":                      fmt.Sprintf("%056d%04d-sgn", 0, seq),
+		"createdDateTime":         createdDateTime,
+		"userDisplayName":         "Jane Doe",
+		"userPrincipalName":       upn,
+		"userId":                  "11111111-1111-1111-1111-111111111111",
+		"appId":                   "11111111-1111-1111-1111-333333333333",
+		"appDisplayName":          "Office 365 Exchange Online",
+		"ipAddress":               fmt.Sprintf("203.0.113.%d", seq%250+1),
+		"clientAppUsed":           "Browser",
+		"correlationId":           "11111111-1111-1111-1111-111111111111",
+		"conditionalAccessStatus": "success",
+		"isInteractive":           true,
+		"riskDetail":              "none",
+		"riskLevelAggregated":     "none",
+		"riskLevelDuringSignIn":   "none",
+		"riskState":               "none",
+		"status": map[string]interface{}{
+			"errorCode":         0,
+			"failureReason":     "Other.",
+			"additionalDetails": nil,
+		},
+		"deviceDetail": map[string]interface{}{
+			"deviceId":        "",
+			"displayName":     "",
+			"operatingSystem": "Windows 10",
+			"browser":         "Edge 138.0.0",
+		},
+		"location": map[string]interface{}{
+			"city":            "Springfield",
+			"state":           "Illinois",
+			"countryOrRegion": "US",
+			"geoCoordinates": map[string]interface{}{
+				"latitude":  39.78,
+				"longitude": -89.65,
+			},
+		},
+	}
+}
+
+// realisticDirectoryAudit builds a record shaped like a Microsoft Graph
+// auditLogs directoryAudit resource. All identifying values are fake.
+func realisticDirectoryAudit(seq int, activityDisplayName, activityDateTime string) map[string]interface{} {
+	return map[string]interface{}{
+		"id":                  fmt.Sprintf("Directory_%04d", seq),
+		"category":            "UserManagement",
+		"correlationId":       "11111111-1111-1111-1111-111111111111",
+		"result":              "success",
+		"resultReason":        "",
+		"activityDisplayName": activityDisplayName,
+		"activityDateTime":    activityDateTime,
+		"loggedByService":     "Core Directory",
+		"operationType":       "Add",
+		"initiatedBy": map[string]interface{}{
+			"user": map[string]interface{}{
+				"id":                "11111111-1111-1111-1111-111111111111",
+				"displayName":       nil,
+				"userPrincipalName": "admin@example.com",
+			},
+		},
+		"targetResources": []interface{}{
+			map[string]interface{}{
+				"id":                "11111111-1111-1111-1111-444444444444",
+				"displayName":       nil,
+				"type":              "User",
+				"userPrincipalName": "new.user@example.com",
+				"modifiedProperties": []interface{}{
+					map[string]interface{}{
+						"displayName": "AccountEnabled",
+						"oldValue":    nil,
+						"newValue":    "[true]",
+					},
+				},
 			},
 		},
 	}
@@ -579,9 +686,8 @@ func TestMidRunDetectionShipsOnce(t *testing.T) {
 
 // TestPaginatedResultSetFullyConsumed verifies a result set larger than one
 // Graph response is fully consumed. The mock truncates each response to a page
-// and advertises @odata.nextLink like the real API; the adapter does not follow
-// the link but drains the set across polls by advancing its activityDateTime
-// filter, and every detection must ship exactly once.
+// and advertises @odata.nextLink like the real API; the adapter follows the
+// continuations within a poll, and every detection must ship exactly once.
 func TestPaginatedResultSetFullyConsumed(t *testing.T) {
 	const total = 5
 
@@ -605,9 +711,10 @@ func TestPaginatedResultSetFullyConsumed(t *testing.T) {
 	require.Never(t, func() bool { return sink.count() != total },
 		400*time.Millisecond, 30*time.Millisecond, "detections were re-shipped")
 
-	// Draining a truncated result set takes multiple Graph requests.
+	// Draining a truncated result set takes multiple Graph requests
+	// (@odata.nextLink continuations within the poll).
 	assert.GreaterOrEqual(t, mock.graphRequestCount(), 3,
-		"consuming the set should take several polls when responses are truncated")
+		"consuming the set should take several Graph requests when responses are truncated")
 
 	shippedPerID := map[string]int{}
 	for _, msg := range sink.snapshot() {
@@ -694,4 +801,186 @@ func TestGraphRejectsTokenShipsNothing(t *testing.T) {
 	default:
 	}
 	assert.Equal(t, 0, sink.count(), "nothing should ship when Graph rejects the token")
+}
+
+// TestSignInsStreamEndToEnd verifies the sign_ins stream polls
+// auditLogs/signIns (filtered on createdDateTime), ships every sign-in
+// verbatim exactly once, and does not touch the risk detections dataset.
+func TestSignInsStreamEndToEnd(t *testing.T) {
+	mock := newMockMicrosoft()
+	base := fixtureBaseTime()
+	// A risk detection that must NOT ship: the stream selection excludes it.
+	mock.addDetection(realisticRiskDetection(1, "anonymizedIPAddress", "jdoe@example.com", base.Format(graphTimeLayout)))
+	want := []map[string]interface{}{
+		realisticSignIn(1, "jdoe@example.com", base.Format(graphTimeLayout)),
+		realisticSignIn(2, "asmith@example.com", base.Add(1*time.Minute).Format(graphTimeLayout)),
+	}
+	for _, s := range want {
+		mock.addSignIn(s)
+	}
+	server := mock.start(t)
+
+	conf := testConfig(t, server.URL)
+	conf.Streams = "sign_ins"
+
+	sink := &captureSink{}
+	adapter, _, err := newEntraIDAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 2 },
+		10*time.Second, 20*time.Millisecond, "expected both sign-ins to ship")
+	require.Never(t, func() bool { return sink.count() != 2 },
+		400*time.Millisecond, 30*time.Millisecond, "sign-ins were re-shipped on a later poll")
+
+	byID := map[string]*protocol.DataMessage{}
+	for _, msg := range sink.snapshot() {
+		id, _ := msg.JsonPayload["id"].(string)
+		require.NotEmpty(t, id)
+		byID[id] = msg
+	}
+	require.Len(t, byID, 2)
+	for _, src := range want {
+		id := src["id"].(string)
+		msg := byID[id]
+		require.NotNil(t, msg, "sign-in %s was not shipped", id)
+		assert.JSONEq(t, mustJSON(t, src), mustJSON(t, msg.JsonPayload),
+			"shipped payload must match the original Graph signIn")
+	}
+}
+
+// TestAllStreamsShipConcurrently verifies that configuring all three streams
+// ships risk detections, sign-ins and directory audits, each exactly once.
+func TestAllStreamsShipConcurrently(t *testing.T) {
+	mock := newMockMicrosoft()
+	base := fixtureBaseTime()
+	mock.addDetection(realisticRiskDetection(1, "anonymizedIPAddress", "jdoe@example.com", base.Format(graphTimeLayout)))
+	mock.addSignIn(realisticSignIn(2, "asmith@example.com", base.Add(1*time.Minute).Format(graphTimeLayout)))
+	mock.addAudit(realisticDirectoryAudit(3, "Add user", base.Add(2*time.Minute).Format(graphTimeLayout)))
+	server := mock.start(t)
+
+	conf := testConfig(t, server.URL)
+	conf.Streams = "risk_detections, sign_ins,audit_logs"
+
+	sink := &captureSink{}
+	adapter, _, err := newEntraIDAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 3 },
+		10*time.Second, 20*time.Millisecond, "expected one event from each stream")
+	require.Never(t, func() bool { return sink.count() != 3 },
+		400*time.Millisecond, 30*time.Millisecond, "events were re-shipped on a later poll")
+
+	shippedPerID := map[string]int{}
+	for _, msg := range sink.snapshot() {
+		shippedPerID[msg.JsonPayload["id"].(string)]++
+	}
+	require.Len(t, shippedPerID, 3)
+	for id, n := range shippedPerID {
+		assert.Equal(t, 1, n, "event %q must ship exactly once", id)
+	}
+}
+
+// TestSameTimestampEventsShipOnce verifies the cursor dedup handles many
+// events sharing one timestamp: with an inclusive "ge" filter they are
+// refetched every poll and must still ship exactly once. Sign-ins commonly
+// carry second-resolution timestamps, making this the norm, not the edge.
+func TestSameTimestampEventsShipOnce(t *testing.T) {
+	const total = 5
+
+	mock := newMockMicrosoft()
+	base := fixtureBaseTime()
+	ts := base.Format(graphTimeLayout)
+	for i := 1; i <= total; i++ {
+		mock.addSignIn(realisticSignIn(i, fmt.Sprintf("user%d@example.com", i), ts))
+	}
+	server := mock.start(t)
+
+	conf := testConfig(t, server.URL)
+	conf.Streams = "sign_ins"
+
+	sink := &captureSink{}
+	adapter, _, err := newEntraIDAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == total },
+		10*time.Second, 20*time.Millisecond, "all same-timestamp sign-ins should ship")
+	require.Never(t, func() bool { return sink.count() != total },
+		600*time.Millisecond, 30*time.Millisecond, "same-timestamp sign-ins were re-shipped")
+
+	// A new sign-in at the same timestamp must still ship exactly once.
+	mock.addSignIn(realisticSignIn(total+1, "late@example.com", ts))
+	require.Eventually(t, func() bool { return sink.count() == total+1 },
+		10*time.Second, 20*time.Millisecond, "the late same-timestamp sign-in should ship")
+	require.Never(t, func() bool { return sink.count() != total+1 },
+		400*time.Millisecond, 30*time.Millisecond, "sign-ins were re-shipped after the late arrival")
+
+	shippedPerID := map[string]int{}
+	for _, msg := range sink.snapshot() {
+		shippedPerID[msg.JsonPayload["id"].(string)]++
+	}
+	require.Len(t, shippedPerID, total+1)
+	for id, n := range shippedPerID {
+		assert.Equal(t, 1, n, "sign-in %q must ship exactly once", id)
+	}
+}
+
+// TestPaginatedSameTimestampSetFullyConsumed verifies a same-timestamp result
+// set larger than one page is fully consumed within a poll via
+// @odata.nextLink: the timestamp cursor alone cannot make progress here, so
+// only the continuation following drains it.
+func TestPaginatedSameTimestampSetFullyConsumed(t *testing.T) {
+	const total = 5
+
+	mock := newMockMicrosoft()
+	mock.pageSize = 2
+	base := fixtureBaseTime()
+	ts := base.Format(graphTimeLayout)
+	for i := 1; i <= total; i++ {
+		mock.addSignIn(realisticSignIn(i, fmt.Sprintf("user%d@example.com", i), ts))
+	}
+	server := mock.start(t)
+
+	conf := testConfig(t, server.URL)
+	conf.Streams = "sign_ins"
+
+	sink := &captureSink{}
+	adapter, _, err := newEntraIDAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == total },
+		10*time.Second, 20*time.Millisecond, "all paginated same-timestamp sign-ins should ship")
+	require.Never(t, func() bool { return sink.count() != total },
+		400*time.Millisecond, 30*time.Millisecond, "sign-ins were re-shipped")
+}
+
+// TestDirectoryAuditsStreamEndToEnd verifies the audit_logs stream polls
+// auditLogs/directoryAudits (filtered on activityDateTime) and ships the
+// audit events verbatim.
+func TestDirectoryAuditsStreamEndToEnd(t *testing.T) {
+	mock := newMockMicrosoft()
+	base := fixtureBaseTime()
+	want := realisticDirectoryAudit(1, "Add user", base.Format(graphTimeLayout))
+	mock.addAudit(want)
+	server := mock.start(t)
+
+	conf := testConfig(t, server.URL)
+	conf.Streams = "audit_logs"
+
+	sink := &captureSink{}
+	adapter, _, err := newEntraIDAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 1 },
+		10*time.Second, 20*time.Millisecond, "expected the directory audit to ship")
+	require.Never(t, func() bool { return sink.count() != 1 },
+		400*time.Millisecond, 30*time.Millisecond, "the directory audit was re-shipped")
+
+	msg := sink.snapshot()[0]
+	assert.JSONEq(t, mustJSON(t, want), mustJSON(t, msg.JsonPayload),
+		"shipped payload must match the original Graph directoryAudit")
 }
