@@ -167,3 +167,14 @@ restarts.
 ```
 ./general cato client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=cato client_options.sensor_seed_key=cato apikey=$CATO_API_KEY accountid=$CATO_ACCOUNT_ID
 ```
+
+### Cloudflare Access
+
+Pulls per-request Access authentication audit logs (policy evaluations, app
+logins, MFA challenges) from the Cloudflare API. It polls a `since`/`until`
+time window, paginating forward when a window holds more records than fit in
+one response. See [cloudflare_access/README.md](./cloudflare_access/README.md).
+
+```
+./general cloudflare_access client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=cloudflare_access api_token=$CF_API_TOKEN account_id=$CF_ACCOUNT_ID
+```

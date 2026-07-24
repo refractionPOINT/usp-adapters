@@ -22,6 +22,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	"github.com/refractionPOINT/usp-adapters/cloudflare_access"
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -375,6 +376,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.Cato.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Cato
 		client, chRunning, err = usp_cato.NewCatoAdapter(ctx, configs.Cato)
+	} else if method == "cloudflare_access" {
+		configs.CloudflareAccess.ClientOptions = applyLogging(configs.CloudflareAccess.ClientOptions)
+		configs.CloudflareAccess.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.CloudflareAccess
+		client, chRunning, err = usp_cloudflare_access.NewCloudflareAccessAdapter(ctx, configs.CloudflareAccess)
 	} else if method == "cylance" {
 		configs.Cylance.ClientOptions = applyLogging(configs.Cylance.ClientOptions)
 		configs.Cylance.ClientOptions.Architecture = "usp_adapter"
