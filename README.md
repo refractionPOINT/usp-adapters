@@ -142,6 +142,18 @@ be added purely through configuration. See [threatlocker/README.md](./threatlock
 ./general threatlocker client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=threatlocker api_key=$THREATLOCKER_API_TOKEN instance=g
 ```
 
+### WithSecure
+
+Pulls telemetry from the WithSecure Elements cloud (formerly F-Secure): the EPP
+security event stream, Broad Context Detections (correlated EDR incidents) with
+their underlying detections, and optionally the administrative audit trail. Each
+stream is polled incrementally on a timestamp cursor. See
+[withsecure/README.md](./withsecure/README.md).
+
+```
+./general withsecure client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=withsecure client_id=$WS_CLIENT_ID client_secret=$WS_CLIENT_SECRET
+```
+
 ### Gmail
 
 Collects incoming email as telemetry from one or many Gmail mailboxes via the
