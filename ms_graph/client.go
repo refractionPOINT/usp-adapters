@@ -22,6 +22,7 @@ const scope = "https://graph.microsoft.com/.default"
 const URLPrefix = "https://graph.microsoft.com/v1.0/"
 const defaultLoginEndpoint = "https://login.microsoftonline.com"
 const defaultPollInterval = 30 * time.Second
+const defaultTimestampField = "createdDateTime"
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
@@ -64,6 +65,12 @@ type MsGraphConfig struct {
 	// is appended to. Empty means the public cloud v1.0 root
 	// (https://graph.microsoft.com/v1.0/).
 	GraphEndpoint string `json:"graph_endpoint" yaml:"graph_endpoint"`
+
+	// TimestampField is the datetime property the polled collection is
+	// filtered and cursored on. Empty means "createdDateTime", which fits
+	// collections like auditLogs/signIns or security/alerts; collections such
+	// as auditLogs/directoryAudits use "activityDateTime" instead.
+	TimestampField string `json:"timestamp_field,omitempty" yaml:"timestamp_field,omitempty"`
 
 	// PollInterval is the wait between polls of the Graph endpoint. It is
 	// not settable through a config file; it exists as a seam for tests.
@@ -254,11 +261,16 @@ func (a *MsGraphAdapter) makeOneListRequest(eventsUrl string, since string, last
 	var lastDetectionTime, eventId string
 
 	// Retry up to 3 times
+	tsField := a.conf.TimestampField
+	if tsField == "" {
+		tsField = defaultTimestampField
+	}
+
 	for attempt := 1; attempt <= 3; attempt++ {
 		// Create query parameters
 		filter := "%24"
 		query := "%20ge%20"
-		date_filter := fmt.Sprintf("?%sfilter=createdDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
+		date_filter := fmt.Sprintf("?%sfilter=%s%s%s", filter, tsField, query, strings.Replace(since, ":", "%3A", -1))
 
 		// Create the full request URL with query parameters (don't modify eventsUrl to avoid corruption on retries)
 		requestUrl := eventsUrl + date_filter
@@ -347,13 +359,13 @@ func (a *MsGraphAdapter) makeOneListRequest(eventsUrl string, since string, last
 			eventId = id
 
 			if id != lastEventId {
-				createdDateTime, ok := detectMap["createdDateTime"].(string)
+				eventTime, ok := detectMap[tsField].(string)
 				if !ok {
-					a.conf.ClientOptions.DebugLog("error parsing createdDateTime from detectMap JSON")
+					a.conf.ClientOptions.DebugLog(fmt.Sprintf("error parsing %s from detectMap JSON", tsField))
 					continue
 				}
 
-				lastDetectionTime = createdDateTime
+				lastDetectionTime = eventTime
 				alerts = append(alerts, detectMap)
 			}
 		}

@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -1432,6 +1434,15 @@ func TestTransientClassification(t *testing.T) {
 		fmt.Errorf("read tcp 1.2.3.4:5->6.7.8.9:443: connection reset by peer"),
 		fmt.Errorf("net/http: TLS handshake timeout"),
 		&net.DNSError{IsTimeout: true},
+		// A dropped keep-alive connection to the Check Point gateway: the
+		// real prod shape is a *url.Error wrapping io.EOF, whose message is a
+		// bare `Post "…": EOF`. Both the wrapped sentinel and a message-only
+		// reconstruction must classify transient so the POST is re-issued
+		// instead of tearing the hosted sensor down.
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		&url.Error{Op: "Post", URL: "https://cloudinfra-gw-us.portal.checkpoint.com/app/laas-logs-api/api/logs_query", Err: io.EOF},
+		fmt.Errorf(`Post "https://cloudinfra-gw-us.portal.checkpoint.com/app/laas-logs-api/api/logs_query": EOF`),
 	}
 	for _, e := range transient {
 		if !isTransientErr(e) {

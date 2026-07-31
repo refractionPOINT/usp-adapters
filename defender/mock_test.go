@@ -99,6 +99,11 @@ type mockMicrosoft struct {
 	alerts   []map[string]interface{} // ascending createdDateTime
 	pageSize int                      // 0 = no truncation
 
+	// expectedScope is the OAuth2 scope the token endpoint requires. It varies
+	// by Microsoft cloud (commercial vs. gov), so tests set it to match the
+	// adapter's configured Endpoint. Set once before the server starts.
+	expectedScope string
+
 	tokenRequests int
 	alertRequests int
 	nextLinks     int
@@ -109,7 +114,9 @@ type mockMicrosoft struct {
 }
 
 func newMockMicrosoft() *mockMicrosoft {
-	return &mockMicrosoft{}
+	return &mockMicrosoft{
+		expectedScope: "https://graph.microsoft.com/.default",
+	}
 }
 
 // appendAlert appends an alert at the end of the dataset (newest last),
@@ -199,7 +206,7 @@ func (m *mockMicrosoft) handleToken(t *testing.T, w http.ResponseWriter, r *http
 	// All ids here are clearly fake; the adapter only cares that no
 	// access_token is present.
 	if form.Get("grant_type") != "client_credentials" ||
-		form.Get("scope") != "https://graph.microsoft.com/.default" ||
+		form.Get("scope") != m.expectedScope ||
 		form.Get("client_id") != mockClientID {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -545,6 +552,50 @@ func TestMockAlertsEndToEnd(t *testing.T) {
 	// A token is fetched for every poll of the alerts endpoint.
 	assert.GreaterOrEqual(t, mock.tokenRequestCount(), 1)
 	assert.GreaterOrEqual(t, mock.alertRequestCount(), 1)
+}
+
+// TestMockAlertsGovEndpoint drives the full mock flow with Endpoint set to a
+// US Government cloud (gcc-high-gov) and proves the adapter sends that
+// environment's OAuth2 scope end-to-end. The TokenURL/AlertsURL overrides still
+// point at the mock server (there is no real gov host in a unit test), but the
+// scope must follow Endpoint: the mock's token handler is told to require the
+// gov scope, so a commercial scope would fail the token grant and nothing would
+// ship. This pins scope-follows-endpoint through the actual token request, not
+// just the config helper.
+func TestMockAlertsGovEndpoint(t *testing.T) {
+	const govScope = "https://graph.microsoft.us/.default"
+	base := time.Now().Add(1 * time.Hour)
+
+	mock := newMockMicrosoft()
+	mock.expectedScope = govScope
+	mock.appendAlert(realisticAlert("da637551227677560813_-5555555551", base))
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	sink := &captureSink{}
+	conf := DefenderConfig{
+		ClientOptions: testClientOptions(t),
+		TenantID:      mockTenantID,
+		ClientID:      mockClientID,
+		ClientSecret:  mockClientSecret,
+		Endpoint:      "gcc-high-gov",
+		TokenURL:      server.URL + tokenPath,
+		AlertsURL:     server.URL + alertsPath,
+		PollInterval:  30 * time.Millisecond,
+	}
+	require.NoError(t, conf.Validate())
+	adapter, _, err := newDefenderAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 1 },
+		5*time.Second, 10*time.Millisecond, "the alert must ship under the gov endpoint")
+
+	// The token endpoint saw the gov scope, not the commercial one.
+	form := mock.lastSeenTokenForm()
+	require.NotNil(t, form)
+	assert.Equal(t, govScope, form.Get("scope"),
+		"the gov endpoint's scope must be sent to the token endpoint")
 }
 
 // TestMockNewAlertMidRunShipsOnce verifies an alert appearing while the

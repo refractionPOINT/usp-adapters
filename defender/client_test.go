@@ -59,6 +59,26 @@ func TestValidate(t *testing.T) {
 		c.ClientSecret = ""
 		assert.Error(t, c.Validate())
 	})
+
+	t.Run("empty endpoint is valid (defaults to enterprise)", func(t *testing.T) {
+		c := valid()
+		c.Endpoint = ""
+		assert.NoError(t, c.Validate())
+	})
+
+	t.Run("known endpoints are valid", func(t *testing.T) {
+		for _, ep := range []string{"enterprise", "gcc-gov", "gcc-high-gov", "dod-gov"} {
+			c := valid()
+			c.Endpoint = ep
+			assert.NoErrorf(t, c.Validate(), "endpoint %q should be valid", ep)
+		}
+	})
+
+	t.Run("rejects an unknown endpoint", func(t *testing.T) {
+		c := valid()
+		c.Endpoint = "china"
+		assert.Error(t, c.Validate())
+	})
 }
 
 func TestEndpointDefaults(t *testing.T) {
@@ -86,6 +106,70 @@ func TestEndpointDefaults(t *testing.T) {
 		c := DefenderConfig{AlertsURL: "https://mock.example.com/v1.0/security/alerts_v2"}
 		assert.Equal(t, "https://mock.example.com/v1.0/security/alerts_v2", c.alertsURL())
 	})
+
+	t.Run("scope defaults to the commercial MS Graph root", func(t *testing.T) {
+		c := DefenderConfig{}
+		assert.Equal(t, "https://graph.microsoft.com/.default", c.scope())
+	})
+
+	t.Run("empty endpoint resolves to the commercial cloud", func(t *testing.T) {
+		c := DefenderConfig{TenantID: "11111111-1111-1111-1111-111111111111"}
+		assert.Equal(t, "https://graph.microsoft.com/v1.0/security/alerts_v2", c.alertsURL())
+		assert.Equal(t,
+			"https://login.microsoftonline.com/11111111-1111-1111-1111-111111111111/oauth2/v2.0/token",
+			c.tokenURL())
+		assert.Equal(t, "https://graph.microsoft.com/.default", c.scope())
+	})
+}
+
+// TestEndpointEnvironments pins the alerts URL, token URL and OAuth2 scope
+// each named Microsoft national cloud deployment resolves to. Sources are the
+// MS Graph deployments doc (https://learn.microsoft.com/en-us/graph/deployments):
+// gcc-gov shares the worldwide endpoints with enterprise; gcc-high-gov (L4)
+// uses graph.microsoft.us; dod-gov (L5) uses dod-graph.microsoft.us; both L4
+// and L5 authenticate against login.microsoftonline.us. The scope always
+// matches the Graph service root.
+func TestEndpointEnvironments(t *testing.T) {
+	const tenant = "11111111-1111-1111-1111-111111111111"
+	cases := []struct {
+		endpoint  string
+		alertsURL string
+		tokenURL  string
+		scope     string
+	}{
+		{
+			endpoint:  "enterprise",
+			alertsURL: "https://graph.microsoft.com/v1.0/security/alerts_v2",
+			tokenURL:  "https://login.microsoftonline.com/" + tenant + "/oauth2/v2.0/token",
+			scope:     "https://graph.microsoft.com/.default",
+		},
+		{
+			endpoint:  "gcc-gov",
+			alertsURL: "https://graph.microsoft.com/v1.0/security/alerts_v2",
+			tokenURL:  "https://login.microsoftonline.com/" + tenant + "/oauth2/v2.0/token",
+			scope:     "https://graph.microsoft.com/.default",
+		},
+		{
+			endpoint:  "gcc-high-gov",
+			alertsURL: "https://graph.microsoft.us/v1.0/security/alerts_v2",
+			tokenURL:  "https://login.microsoftonline.us/" + tenant + "/oauth2/v2.0/token",
+			scope:     "https://graph.microsoft.us/.default",
+		},
+		{
+			endpoint:  "dod-gov",
+			alertsURL: "https://dod-graph.microsoft.us/v1.0/security/alerts_v2",
+			tokenURL:  "https://login.microsoftonline.us/" + tenant + "/oauth2/v2.0/token",
+			scope:     "https://dod-graph.microsoft.us/.default",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.endpoint, func(t *testing.T) {
+			c := DefenderConfig{TenantID: tenant, Endpoint: tc.endpoint}
+			assert.Equal(t, tc.alertsURL, c.alertsURL(), "alerts URL")
+			assert.Equal(t, tc.tokenURL, c.tokenURL(), "token URL")
+			assert.Equal(t, tc.scope, c.scope(), "scope")
+		})
+	}
 }
 
 // TestPollIntervalDefault verifies an unset poll_interval falls back to the

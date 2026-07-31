@@ -104,8 +104,12 @@ type mockMsGraph struct {
 	mu      sync.Mutex
 	baseURL string // set once the httptest server is up; used for nextLink
 
-	records  []graphRecord // kept in ascending createdDateTime order
+	records  []graphRecord // kept in ascending timestamp order
 	pageSize int           // 0 = unlimited
+
+	// tsField is the datetime property the mock filters on; empty means
+	// "createdDateTime", mirroring the adapter's default.
+	tsField string
 
 	graphFailStatus    int // when non-zero, the graph endpoint fails with this
 	graphFailRemaining int // how many failures to serve; < 0 = forever
@@ -133,12 +137,20 @@ func (m *mockMsGraph) start(t *testing.T) *httptest.Server {
 	return server
 }
 
+// timestampField returns the datetime property the mock filters on.
+func (m *mockMsGraph) timestampField() string {
+	if m.tsField == "" {
+		return "createdDateTime"
+	}
+	return m.tsField
+}
+
 // addRecord appends a record. Records must be added in ascending
-// createdDateTime order, matching how tests model a growing event stream.
+// timestamp order, matching how tests model a growing event stream.
 func (m *mockMsGraph) addRecord(payload map[string]interface{}) {
-	created, err := time.Parse(time.RFC3339Nano, payload["createdDateTime"].(string))
+	created, err := time.Parse(time.RFC3339Nano, payload[m.timestampField()].(string))
 	if err != nil {
-		panic(fmt.Sprintf("fixture createdDateTime unparseable: %v", err))
+		panic(fmt.Sprintf("fixture %s unparseable: %v", m.timestampField(), err))
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -275,7 +287,7 @@ func (m *mockMsGraph) serveGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	const filterPrefix = "createdDateTime ge "
+	filterPrefix := m.timestampField() + " ge "
 	filter := r.URL.Query().Get("$filter")
 	m.mu.Lock()
 	m.lastGraphFilter = filter
@@ -745,5 +757,58 @@ func TestMsGraphTransient503Retried(t *testing.T) {
 	case <-chStopped:
 		t.Fatal("adapter should survive transient 503s")
 	default:
+	}
+}
+
+// TestMsGraphCustomTimestampField verifies timestamp_field switches both the
+// $filter property and the per-record watermark, letting the adapter poll
+// collections like auditLogs/directoryAudits that cursor on activityDateTime
+// instead of createdDateTime.
+func TestMsGraphCustomTimestampField(t *testing.T) {
+	mock := newMockMsGraph()
+	mock.tsField = "activityDateTime"
+	base := fixtureBase()
+	want := []map[string]interface{}{
+		{"id": "audit-0001", "category": "UserManagement", "activityDisplayName": "Add user", "activityDateTime": graphTimestamp(base.Add(1 * time.Minute))},
+		{"id": "audit-0002", "category": "GroupManagement", "activityDisplayName": "Add member to group", "activityDateTime": graphTimestamp(base.Add(2 * time.Minute))},
+	}
+	for _, rec := range want {
+		mock.addRecord(rec)
+	}
+	server := mock.start(t)
+
+	conf := testConfig(t, server)
+	conf.URL = "auditLogs/directoryAudits"
+	conf.TimestampField = "activityDateTime"
+
+	sink, _, _ := startAdapter(t, conf)
+
+	require.Eventually(t, func() bool { return sink.count() == 2 },
+		5*time.Second, 20*time.Millisecond, "expected both audit records to ship")
+	require.Never(t, func() bool { return sink.count() != 2 },
+		300*time.Millisecond, 30*time.Millisecond, "records were re-shipped on a later poll")
+
+	// A record appearing mid-run must be picked up by the advancing
+	// activityDateTime watermark.
+	late := map[string]interface{}{"id": "audit-0003", "category": "UserManagement", "activityDisplayName": "Delete user", "activityDateTime": graphTimestamp(base.Add(5 * time.Minute))}
+	mock.addRecord(late)
+	require.Eventually(t, func() bool { return sink.count() == 3 },
+		5*time.Second, 20*time.Millisecond, "the late audit record should ship")
+
+	path, filter := mock.graphPathAndFilter()
+	assert.Equal(t, "/v1.0/auditLogs/directoryAudits", path)
+	assert.True(t, strings.HasPrefix(filter, "activityDateTime ge "), "unexpected $filter: %q", filter)
+
+	byID := map[string]*protocol.DataMessage{}
+	for _, msg := range sink.snapshot() {
+		id, _ := msg.JsonPayload["id"].(string)
+		require.NotEmpty(t, id)
+		byID[id] = msg
+	}
+	require.Len(t, byID, 3)
+	for _, src := range append(want, late) {
+		id := src["id"].(string)
+		require.NotNil(t, byID[id], "record %s was not shipped", id)
+		assert.JSONEq(t, mustJSON(t, src), mustJSON(t, byID[id].JsonPayload))
 	}
 }

@@ -39,6 +39,49 @@ func TestValidate(t *testing.T) {
 		c.ClientSecret = ""
 		assert.Error(t, c.Validate())
 	})
+
+	t.Run("accepts known streams", func(t *testing.T) {
+		c := valid(t)
+		c.Streams = "risk_detections, sign_ins,audit_logs"
+		require.NoError(t, c.Validate())
+	})
+
+	t.Run("rejects unknown streams", func(t *testing.T) {
+		c := valid(t)
+		c.Streams = "sign_ins,signin_logs"
+		assert.Error(t, c.Validate())
+	})
+}
+
+func TestStreamSelection(t *testing.T) {
+	t.Run("defaults to risk detections only", func(t *testing.T) {
+		c := EntraIDConfig{}
+		streams, err := c.streams()
+		require.NoError(t, err)
+		require.Len(t, streams, 1)
+		assert.Equal(t, "risk_detections", streams[0].name)
+		assert.Equal(t, "/v1.0/identityProtection/riskDetections", streams[0].path)
+		assert.Equal(t, "activityDateTime", streams[0].tsField)
+	})
+
+	t.Run("resolves paths and timestamp fields", func(t *testing.T) {
+		c := EntraIDConfig{Streams: "sign_ins, audit_logs"}
+		streams, err := c.streams()
+		require.NoError(t, err)
+		require.Len(t, streams, 2)
+		assert.Equal(t, "/v1.0/auditLogs/signIns", streams[0].path)
+		assert.Equal(t, "createdDateTime", streams[0].tsField)
+		assert.Equal(t, "/v1.0/auditLogs/directoryAudits", streams[1].path)
+		assert.Equal(t, "activityDateTime", streams[1].tsField)
+	})
+
+	t.Run("collapses duplicates and normalizes case", func(t *testing.T) {
+		c := EntraIDConfig{Streams: "Sign_Ins,sign_ins"}
+		streams, err := c.streams()
+		require.NoError(t, err)
+		require.Len(t, streams, 1)
+		assert.Equal(t, "sign_ins", streams[0].name)
+	})
 }
 
 func TestEndpointResolution(t *testing.T) {
