@@ -737,12 +737,14 @@ func TestGCCHighScope(t *testing.T) {
 		require.NoError(t, err)
 		defer adapter.Close()
 
+		// Wait for the token exchange to actually have been attempted rather
+		// than inferring it from elapsed time, then assert on what it sent.
+		require.Eventually(t, func() bool { return mock.lastTokenRequest() != nil },
+			10*time.Second, 20*time.Millisecond, "expected a token request")
+		assert.Equal(t, "https://graph.microsoft.com/.default", mock.lastTokenRequest().Get("scope"))
+
 		require.Never(t, func() bool { return sink.count() != 0 },
 			500*time.Millisecond, 25*time.Millisecond, "no event can ship without a valid token")
-
-		form := mock.lastTokenRequest()
-		require.NotNil(t, form)
-		assert.Equal(t, "https://graph.microsoft.com/.default", form.Get("scope"))
 	})
 }
 
