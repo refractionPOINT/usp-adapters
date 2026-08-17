@@ -51,6 +51,20 @@ func TestValidate(t *testing.T) {
 		c.Streams = "sign_ins,signin_logs"
 		assert.Error(t, c.Validate())
 	})
+
+	t.Run("accepts known endpoints", func(t *testing.T) {
+		for _, name := range []string{"", "enterprise", "gcc-gov", "gcc-high-gov", "dod-gov"} {
+			c := valid(t)
+			c.Endpoint = name
+			assert.NoErrorf(t, c.Validate(), "endpoint %q", name)
+		}
+	})
+
+	t.Run("rejects unknown endpoint", func(t *testing.T) {
+		c := valid(t)
+		c.Endpoint = "gcch"
+		assert.Error(t, c.Validate())
+	})
 }
 
 func TestStreamSelection(t *testing.T) {
@@ -96,6 +110,28 @@ func TestEndpointResolution(t *testing.T) {
 		// The default Graph URL must stay in sync with the historical
 		// hardcoded value.
 		assert.Equal(t, URL["get_alerts"], c.riskDetectionsURL())
+	})
+
+	t.Run("national clouds resolve hosts and scope together", func(t *testing.T) {
+		// A token acquired for one deployment is not valid against another, so
+		// the scope must track the Graph service root of the same environment.
+		for _, tc := range []struct {
+			endpoint string
+			login    string
+			graph    string
+			scope    string
+		}{
+			{"", "https://login.microsoftonline.com", "https://graph.microsoft.com", "https://graph.microsoft.com/.default"},
+			{"enterprise", "https://login.microsoftonline.com", "https://graph.microsoft.com", "https://graph.microsoft.com/.default"},
+			{"gcc-gov", "https://login.microsoftonline.com", "https://graph.microsoft.com", "https://graph.microsoft.com/.default"},
+			{"gcc-high-gov", "https://login.microsoftonline.us", "https://graph.microsoft.us", "https://graph.microsoft.us/.default"},
+			{"dod-gov", "https://login.microsoftonline.us", "https://dod-graph.microsoft.us", "https://dod-graph.microsoft.us/.default"},
+		} {
+			c := EntraIDConfig{TenantID: testTenantID, Endpoint: tc.endpoint}
+			assert.Equalf(t, tc.login+"/"+testTenantID+"/oauth2/v2.0/token", c.tokenURL(), "endpoint %q", tc.endpoint)
+			assert.Equalf(t, tc.graph+"/v1.0/identityProtection/riskDetections", c.riskDetectionsURL(), "endpoint %q", tc.endpoint)
+			assert.Equalf(t, tc.scope, c.scope(), "endpoint %q", tc.endpoint)
+		}
 	})
 
 	t.Run("overrides are honored and trailing slashes trimmed", func(t *testing.T) {
