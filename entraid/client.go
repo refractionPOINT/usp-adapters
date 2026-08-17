@@ -19,15 +19,56 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-var scope = "https://graph.microsoft.com/.default"
 var URL = map[string]string{
 	"get_alerts": "https://graph.microsoft.com/v1.0/identityProtection/riskDetections",
 }
 
+// environment holds the hosts of one Microsoft national cloud deployment.
+type environment struct {
+	// loginHost is the Microsoft identity platform base URL the OAuth2
+	// client_credentials token is requested from.
+	loginHost string
+	// graphHost is the Microsoft Graph service root the collections are
+	// fetched from.
+	graphHost string
+	// scope is the OAuth2 scope, which must match graphHost -- tokens are not
+	// interchangeable between deployments.
+	scope string
+}
+
+// environments maps an endpoint name to its Microsoft national cloud
+// deployment. gcc-gov (US Government GCC / moderate) uses the worldwide
+// endpoints -- identical to enterprise -- and is kept as a named option for
+// parity with the defender and o365 adapters, which expose the same four names.
+// Reference: https://learn.microsoft.com/en-us/graph/deployments
+var environments = map[string]environment{
+	"enterprise": {
+		loginHost: "https://login.microsoftonline.com",
+		graphHost: "https://graph.microsoft.com",
+		scope:     "https://graph.microsoft.com/.default",
+	},
+	"gcc-gov": {
+		loginHost: "https://login.microsoftonline.com",
+		graphHost: "https://graph.microsoft.com",
+		scope:     "https://graph.microsoft.com/.default",
+	},
+	"gcc-high-gov": {
+		loginHost: "https://login.microsoftonline.us",
+		graphHost: "https://graph.microsoft.us",
+		scope:     "https://graph.microsoft.us/.default",
+	},
+	"dod-gov": {
+		loginHost: "https://login.microsoftonline.us",
+		graphHost: "https://dod-graph.microsoft.us",
+		scope:     "https://dod-graph.microsoft.us/.default",
+	},
+}
+
 const (
-	defaultLoginEndpoint = "https://login.microsoftonline.com"
-	defaultGraphEndpoint = "https://graph.microsoft.com"
-	defaultPollInterval  = 30 * time.Second
+	// defaultEndpoint is the environment used when Endpoint is left empty,
+	// preserving the commercial-cloud behavior of existing deployments.
+	defaultEndpoint     = "enterprise"
+	defaultPollInterval = 30 * time.Second
 
 	// defaultStreams preserves the historical behavior of the adapter, which
 	// only polled Identity Protection risk detections.
@@ -114,14 +155,29 @@ type EntraIDConfig struct {
 	// existing deployments.
 	Streams string `json:"streams,omitempty" yaml:"streams,omitempty"`
 
+	// Endpoint selects the Microsoft national cloud deployment. Valid values:
+	// "enterprise" (default, global/commercial), "gcc-gov" (US Government GCC /
+	// moderate, which runs on the worldwide endpoints), "gcc-high-gov" (US
+	// Government GCC High / L4) and "dod-gov" (US Government DoD / L5). An
+	// empty value defaults to "enterprise", so existing configs keep talking to
+	// the commercial cloud unchanged.
+	// Reference: https://learn.microsoft.com/en-us/graph/deployments
+	Endpoint string `json:"endpoint,omitempty" yaml:"endpoint,omitempty"`
+
 	// LoginEndpoint overrides the base URL of the Microsoft identity platform
-	// used for the OAuth2 client_credentials token exchange. Defaults to
-	// https://login.microsoftonline.com when empty.
+	// used for the OAuth2 client_credentials token exchange, derived from
+	// Endpoint otherwise (https://login.microsoftonline.com for "enterprise").
+	// It only overrides the host; the OAuth2 scope still follows Endpoint, so a
+	// login_endpoint pointed at a gov host without also setting endpoint sends
+	// the commercial scope and will fail auth.
 	LoginEndpoint string `json:"login_endpoint,omitempty" yaml:"login_endpoint,omitempty"`
 
 	// GraphEndpoint overrides the base URL of the Microsoft Graph API the
-	// collections are fetched from. Defaults to https://graph.microsoft.com
-	// when empty.
+	// collections are fetched from, derived from Endpoint otherwise
+	// (https://graph.microsoft.com for "enterprise"). It only overrides the
+	// host; the OAuth2 scope still follows Endpoint, so a graph_endpoint
+	// pointed at a gov host without also setting endpoint sends the commercial
+	// scope and will 401.
 	GraphEndpoint string `json:"graph_endpoint,omitempty" yaml:"graph_endpoint,omitempty"`
 
 	// PollInterval overrides the wait between polls of each stream (default
@@ -130,22 +186,38 @@ type EntraIDConfig struct {
 	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
-// loginEndpoint returns the Microsoft identity platform base URL to use,
-// defaulting to the public endpoint when no override is configured.
+// endpoint returns the configured Microsoft national cloud deployment name,
+// defaulting to "enterprise" when unset.
+func (c EntraIDConfig) endpoint() string {
+	if c.Endpoint == "" {
+		return defaultEndpoint
+	}
+	return c.Endpoint
+}
+
+// loginEndpoint returns the Microsoft identity platform base URL to use: the
+// configured override, or the identity host of the configured environment.
 func (c EntraIDConfig) loginEndpoint() string {
 	if c.LoginEndpoint != "" {
 		return strings.TrimRight(c.LoginEndpoint, "/")
 	}
-	return defaultLoginEndpoint
+	return environments[c.endpoint()].loginHost
 }
 
-// graphEndpoint returns the Microsoft Graph base URL to use, defaulting to the
-// public endpoint when no override is configured.
+// graphEndpoint returns the Microsoft Graph base URL to use: the configured
+// override, or the Graph service root of the configured environment.
 func (c EntraIDConfig) graphEndpoint() string {
 	if c.GraphEndpoint != "" {
 		return strings.TrimRight(c.GraphEndpoint, "/")
 	}
-	return defaultGraphEndpoint
+	return environments[c.endpoint()].graphHost
+}
+
+// scope returns the OAuth2 scope for the configured environment, which must
+// match that environment's Graph service root -- access tokens are not
+// interchangeable between national cloud deployments.
+func (c EntraIDConfig) scope() string {
+	return environments[c.endpoint()].scope
 }
 
 // tokenURL is the OAuth2 client_credentials token endpoint for the tenant.
@@ -202,6 +274,9 @@ func (c *EntraIDConfig) Validate() error {
 	if c.ClientSecret == "" {
 		return errors.New("missing client_secret")
 	}
+	if _, ok := environments[c.endpoint()]; !ok {
+		return fmt.Errorf("invalid endpoint %q, supported endpoints: enterprise, gcc-gov, gcc-high-gov, dod-gov", c.Endpoint)
+	}
 	if _, err := c.streams(); err != nil {
 		return fmt.Errorf("streams: %v", err)
 	}
@@ -219,6 +294,11 @@ func newEntraIDAdapter(ctx context.Context, conf EntraIDConfig, sink uspSink) (*
 	streams, err := conf.streams()
 	if err != nil {
 		return nil, nil, err
+	}
+	// Guard the environment lookup here as well: an unknown endpoint would
+	// otherwise resolve to empty hosts and produce unusable request URLs.
+	if _, ok := environments[conf.endpoint()]; !ok {
+		return nil, nil, fmt.Errorf("invalid endpoint %q, supported endpoints: enterprise, gcc-gov, gcc-high-gov, dod-gov", conf.Endpoint)
 	}
 
 	a := &EntraIDAdapter{
@@ -284,7 +364,7 @@ func (a *EntraIDAdapter) Close() error {
 func (a *EntraIDAdapter) fetchToken() (string, error) {
 
 	url := a.conf.tokenURL()
-	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
+	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, a.conf.scope(), "client_credentials", a.conf.ClientSecret)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
 	if err != nil {
