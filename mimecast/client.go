@@ -19,10 +19,32 @@ import (
 )
 
 const (
-	defaultBaseURL      = "https://api.services.mimecast.com"
-	overlapPeriod       = 30 * time.Second
+	defaultBaseURL = "https://api.services.mimecast.com"
+
+	// overlapPeriod is how far back each poll reaches. It must exceed the
+	// Mimecast audit index's ingestion lag: a record is not retrievable until
+	// some time after its eventTime, so a lookback shorter than that lag
+	// returns nothing at all. 30 seconds was shorter than the observed lag.
+	// Matches the okta and hubspot adapters; the resulting window overlap is
+	// absorbed by the dedupe map.
+	overlapPeriod       = 30 * time.Minute
 	defaultPollInterval = 30 * time.Second
 )
+
+// mimecastTimeLayout is the ISO 8601 form Mimecast uses for startDateTime,
+// endDateTime and eventTime: yyyy-MM-dd'T'HH:mm:ssZ with a colonless numeric
+// offset, e.g. "2011-12-03T10:15:30+0000". This is NOT time.RFC3339, which
+// requires "+00:00" or "Z".
+const mimecastTimeLayout = "2006-01-02T15:04:05-0700"
+
+// parseEventTime parses a Mimecast eventTime, accepting both the documented
+// colonless-offset form and RFC3339 in case the API ever emits it.
+func parseEventTime(s string) (time.Time, error) {
+	if t, err := time.Parse(mimecastTimeLayout, s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339, s)
+}
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
@@ -202,13 +224,24 @@ func (a *MimecastAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.baseURL))
 
-	since := time.Now().Add(-400 * time.Hour)
+	// notBefore floors how far back the lookback may reach. It is deliberately
+	// fixed, not a moving cursor: the window start is
+	// max(notBefore, now-overlapPeriod), so feeding a moving cursor in here
+	// shrinks the window instead of extending it -- which is what stopped this
+	// adapter from ever returning data.
+	//
+	// The floor is set one overlapPeriod before start-up rather than at
+	// start-up (as the okta adapter does) because Mimecast only makes a record
+	// retrievable some time after its eventTime. Flooring at start-up would
+	// drop every record still working through the index at restart. The cost
+	// is that a restart may re-ship up to one overlapPeriod of events, since
+	// the dedupe map is in-memory; for security telemetry duplicates beat gaps.
+	notBefore := time.Now().Add(-overlapPeriod)
 
 	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
-		items, newSince, _ := a.makeOneRequest(since)
-		since = newSince
+		items, _, _ := a.makeOneRequest(notBefore)
 		if items == nil {
 			continue
 		}
@@ -241,11 +274,11 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 	var lastDetectionTime time.Time
 
 	if t := currentTime.Add(-overlapPeriod); t.Before(since) {
-		start = since.UTC().Format("2006-01-02T15:04:05-0700")
+		start = since.UTC().Format(mimecastTimeLayout)
 	} else {
-		start = currentTime.Add(-overlapPeriod).UTC().Format("2006-01-02T15:04:05-0700")
+		start = currentTime.Add(-overlapPeriod).UTC().Format(mimecastTimeLayout)
 	}
-	end := currentTime.UTC().Format("2006-01-02T15:04:05-0700")
+	end := currentTime.UTC().Format(mimecastTimeLayout)
 
 	pageToken := ""
 	url := a.baseURL + "/api/audit/get-audit-events"
@@ -298,7 +331,9 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 		// Evaluate if success.
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
-			a.conf.ClientOptions.OnError(fmt.Errorf("mimecast api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(body), string(body)))
+			// err is nil here; build a real one so callers can see the failure.
+			err = fmt.Errorf("mimecast api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(jsonData), string(body))
+			a.conf.ClientOptions.OnError(err)
 			return nil, lastDetectionTime, err
 		}
 
@@ -338,7 +373,14 @@ func (a *MimecastAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 			if _, ok := a.dedupe[eventid]; ok {
 				continue
 			}
-			epoch, _ := time.Parse(time.RFC3339, timestamp)
+			epoch, perr := parseEventTime(timestamp)
+			if perr != nil {
+				// Without a usable eventTime the dedupe entry would be culled
+				// immediately and the record would re-ship every poll. Stamp
+				// it with now so it survives the overlap window instead.
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("unparseable eventTime %q: %v", timestamp, perr))
+				epoch = time.Now()
+			}
 			a.dedupe[eventid] = epoch.Unix()
 			newItems = append(newItems, newItem)
 			lastDetectionTime = epoch
