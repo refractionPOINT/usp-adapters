@@ -34,9 +34,9 @@ import (
 // (fewer than 100 records) means the result set is exhausted.
 const mockPageSize = 100
 
-// queryTimeLayout is the layout the adapter renders `since`/`to` in: ISO-8601
-// with millisecond precision and no zone designator (interpreted as UTC).
-const queryTimeLayout = "2006-01-02T15:04:05.000"
+// queryTimeLayout (the layout the adapter renders `since`/`to` in: ISO-8601
+// with millisecond precision and no zone designator, interpreted as UTC) is
+// declared alongside the parser in client.go.
 
 // --- in-memory USP sink -----------------------------------------------------
 

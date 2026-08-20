@@ -147,8 +147,8 @@ func TestMakeOneRequestInvalidJSON(t *testing.T) {
 }
 
 // TestMakeOneRequestNon200 pins the adapter's behavior on a non-200: no items,
-// the watermark is preserved, and (a long-standing quirk) no error is returned
-// -- the failure is only reported through OnError.
+// the watermark is preserved, the failure is reported through OnError, and a
+// real error is returned to the caller.
 func TestMakeOneRequestNon200(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -165,7 +165,8 @@ func TestMakeOneRequestNon200(t *testing.T) {
 	assert.Nil(t, items)
 	assert.True(t, newSince.Equal(since), "since must not advance on an error response")
 	assert.Equal(t, 1, errs, "a non-200 must be reported via OnError")
-	// Pin the current behavior: the non-200 path returns a nil error (the
-	// error variable it returns belongs to the preceding, successful, Do call).
-	assert.NoError(t, err)
+	// The non-200 path must surface a real error. It previously returned the
+	// nil error belonging to the preceding, successful, Do call, which made an
+	// API failure indistinguishable from a successful empty poll.
+	assert.Error(t, err)
 }
