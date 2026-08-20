@@ -18,11 +18,33 @@ import (
 
 const (
 	defaultLogsEndpoint = "https://api.pandadoc.com/public/v1/logs"
-	overlapPeriod       = 30 * time.Second
+
+	// overlapPeriod is how far back each poll reaches. It must exceed the
+	// API's ingestion lag -- the delay between an event happening and the log
+	// list returning it -- or every poll asks only for a slice of time the
+	// backend has not caught up to yet and returns nothing. The resulting
+	// window overlap is absorbed by the dedupe map.
+	overlapPeriod = 30 * time.Minute
 
 	// defaultPollInterval is how long fetchEvents idles between polling ticks.
 	defaultPollInterval = 30 * time.Second
 )
+
+// queryTimeLayout is the layout the adapter renders the since/to query bounds
+// in, and the layout PandaDoc uses for request_time in its responses: ISO-8601
+// with millisecond precision and no zone designator, e.g.
+// "2024-07-15T18:59:38.000". Note this is NOT time.RFC3339Nano, which requires
+// a zone.
+const queryTimeLayout = "2006-01-02T15:04:05.000"
+
+// parseLogTime parses a PandaDoc request_time, accepting the documented
+// zone-less form and falling back to RFC3339Nano for zoned values.
+func parseLogTime(s string) (time.Time, error) {
+	if t, err := time.ParseInLocation(queryTimeLayout, s, time.UTC); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339Nano, s)
+}
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
@@ -155,13 +177,21 @@ func (a *PandaDocAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.logsURL))
 
-	since := time.Now()
+	// notBefore floors how far back the lookback may reach. It is deliberately
+	// fixed, not a moving cursor: the window start is
+	// max(notBefore, now-overlapPeriod), so feeding a moving cursor in here
+	// shrinks the window on every event instead of extending it.
+	//
+	// The floor sits one overlapPeriod before start-up so records still
+	// working through the backend's ingestion lag at restart are not dropped.
+	// The cost is that a restart may re-ship up to one overlap window, since
+	// the dedupe map is in-memory; duplicates beat gaps.
+	notBefore := time.Now().Add(-overlapPeriod)
 
 	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
-		items, newSince, _ := a.makeOneRequest(since)
-		since = newSince
+		items, _, _ := a.makeOneRequest(notBefore)
 		if items == nil {
 			continue
 		}
@@ -194,11 +224,11 @@ func (a *PandaDocAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 	var lastDetectionTime time.Time
 
 	if t := currentTime.Add(-overlapPeriod); t.Before(since) {
-		start = since.UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000")
+		start = since.UTC().Truncate(time.Millisecond).Format(queryTimeLayout)
 	} else {
-		start = currentTime.Add(-overlapPeriod).UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000")
+		start = currentTime.Add(-overlapPeriod).UTC().Truncate(time.Millisecond).Format(queryTimeLayout)
 	}
-	until := currentTime.UTC().Truncate(time.Millisecond).Format("2006-01-02T15:04:05.000")
+	until := currentTime.UTC().Truncate(time.Millisecond).Format(queryTimeLayout)
 
 	for page := 1; ; page++ {
 		// Prepare the request.
@@ -223,7 +253,10 @@ func (a *PandaDocAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 		// Evaluate if success.
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
-			a.conf.ClientOptions.OnError(fmt.Errorf("pandadoc api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(body), string(body)))
+			// err is nil here; build a real one so callers can tell a failure
+			// apart from a successful empty poll.
+			err = fmt.Errorf("pandadoc api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, req.URL.String(), string(body))
+			a.conf.ClientOptions.OnError(err)
 			return nil, lastDetectionTime, err
 		}
 
@@ -254,7 +287,14 @@ func (a *PandaDocAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 			if _, ok := a.dedupe[eventid]; ok {
 				continue
 			}
-			epoch, _ := time.Parse(time.RFC3339Nano, timestamp)
+			epoch, perr := parseLogTime(timestamp)
+			if perr != nil {
+				// Without a usable request_time the dedupe entry would be
+				// culled immediately and the record would re-ship every poll.
+				// Stamp it with now so it survives the overlap window.
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("unparseable request_time %q: %v", timestamp, perr))
+				epoch = time.Now()
+			}
 			a.dedupe[eventid] = epoch.Unix()
 			newItems = append(newItems, item)
 			lastDetectionTime = epoch
