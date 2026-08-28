@@ -142,6 +142,17 @@ be added purely through configuration. See [threatlocker/README.md](./threatlock
 ./general threatlocker client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=threatlocker api_key=$THREATLOCKER_API_TOKEN instance=g
 ```
 
+### Cortex XSOAR
+
+Pulls incidents from the Palo Alto Networks Cortex XSOAR (formerly Demisto)
+"search incidents by filter" API. Works against both Cortex XSOAR 6 (on-prem)
+and 8 (cloud); collection is incremental by the incident `modified` time. See
+[cortex_xsoar/README.md](./cortex_xsoar/README.md).
+
+```
+./general cortex_xsoar client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=cortex_xsoar url=$XSOAR_URL api_key=$XSOAR_API_KEY
+```
+
 ### Gmail
 
 Collects incoming email as telemetry from one or many Gmail mailboxes via the
