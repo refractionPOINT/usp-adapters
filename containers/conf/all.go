@@ -25,6 +25,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
 	"github.com/refractionPOINT/usp-adapters/mimecast"
 	"github.com/refractionPOINT/usp-adapters/ms_graph"
+	"github.com/refractionPOINT/usp-adapters/netskope"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
@@ -85,6 +86,7 @@ type GeneralConfigs struct {
 	Harmony           usp_harmony.HarmonyConfig                       `json:"harmony" yaml:"harmony"`
 	Mimecast          usp_mimecast.MimecastConfig                     `json:"mimecast" yaml:"mimecast"`
 	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
+	Netskope          usp_netskope.NetskopeConfig                     `json:"netskope" yaml:"netskope"`
 	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
 	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
 	ProofpointTap     usp_proofpoint_tap.ProofpointTapConfig          `json:"proofpoint_tap" yaml:"proofpoint_tap"`

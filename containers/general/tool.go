@@ -39,6 +39,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/mac_unified_logging"
 	"github.com/refractionPOINT/usp-adapters/mimecast"
 	"github.com/refractionPOINT/usp-adapters/ms_graph"
+	"github.com/refractionPOINT/usp-adapters/netskope"
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
@@ -510,6 +511,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ThreatLocker
 		client, chRunning, err = usp_threatlocker.NewThreatLockerAdapter(ctx, configs.ThreatLocker)
+	} else if method == "netskope" {
+		configs.Netskope.ClientOptions = applyLogging(configs.Netskope.ClientOptions)
+		configs.Netskope.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Netskope
+		client, chRunning, err = usp_netskope.NewNetskopeAdapter(ctx, configs.Netskope)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
