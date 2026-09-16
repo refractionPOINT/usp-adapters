@@ -29,10 +29,11 @@ harmony:
   # paste the Infinity Portal's "Authentication URL", which already ends in
   # /auth/external; that used to be accepted and then 404 every request as
   # POST /auth/external/auth/external, and is now rejected by Validate with
-  # an error naming the value to use instead. Matching is case-insensitive
-  # and segment-bounded, so an unrelated path prefix (the gateway behind a
-  # reverse proxy, https://proxy.example.com/checkpoint, or even
-  # /auth/external-gw) composes correctly and is still accepted.
+  # an error naming the value to use instead, as is a url carrying a query
+  # or fragment. Matching is case-insensitive and segment-bounded, so an
+  # unrelated path prefix (the gateway behind a reverse proxy,
+  # https://proxy.example.com/checkpoint, or even /auth/external-gw)
+  # composes correctly and is still accepted.
   url: "https://cloudinfra-gw.portal.checkpoint.com"
 
   events:   { enabled: false, ... }

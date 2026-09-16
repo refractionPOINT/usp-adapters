@@ -425,6 +425,10 @@ type fakeGateway struct {
 	// acceptedSubmits counts submits accepted per cloudService.
 	acceptedSubmits map[string]int
 
+	// submittedStarts records the timeframe.startTime of every submit per
+	// cloudService, so a test can assert on the wire that the cursor moved.
+	submittedStarts map[string][]time.Time
+
 	// retrieve503Times controls how many retrieve calls return a transient
 	// 503 before succeeding — models the intermittent gateway slowness the
 	// adapter must absorb via bounded retry. Negative = always 503.
@@ -530,6 +534,16 @@ func (f *fakeGateway) serveEventsSubmit(w http.ResponseWriter, r *http.Request) 
 	svc, _ := req.GetString("cloudService")
 
 	f.mu.Lock()
+	if tf, ok := req.GetDict("timeframe"); ok {
+		if s, ok := tf.GetString("startTime"); ok {
+			if ts, err := time.Parse(time.RFC3339, s); err == nil {
+				if f.submittedStarts == nil {
+					f.submittedStarts = map[string][]time.Time{}
+				}
+				f.submittedStarts[svc] = append(f.submittedStarts[svc], ts)
+			}
+		}
+	}
 	forbidden := f.submit403Times != 0
 	if f.submit403Times > 0 {
 		f.submit403Times--
@@ -642,9 +656,16 @@ func (f *fakeGateway) serveEventsRetrieve(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if forbidden {
+		// Carries the same phrase the submit refusal does, so the test that
+		// uses this pins the submit-only *scoping* rather than passing
+		// incidentally on the phrase gate.
 		writeJSON(w, http.StatusForbidden, utils.Dict{
 			"success": false,
-			"error":   utils.Dict{"status": 403, "name": "Forbidden"},
+			"error": utils.Dict{
+				"status":  403,
+				"name":    "Forbidden",
+				"details": []string{"Unauthorized to perform operations on the given Cloud Service"},
+			},
 		})
 		return
 	}
@@ -1076,6 +1097,78 @@ func TestEventsAllUnauthorizedLatchClears(t *testing.T) {
 		"expected a second all-refused error after the latch cleared")
 }
 
+// TestEventsAllUnauthorizedForgetsRecoveredService is the other half of the
+// latch's bookkeeping: recovering must forget the service, not merely clear
+// the flag. If the refused-set is left stale, one service failing later looks
+// like the whole set failing, and the adapter claims it is ingesting nothing
+// while the other service is ingesting fine.
+func TestEventsAllUnauthorizedForgetsRecoveredService(t *testing.T) {
+	fake := &fakeGateway{
+		submit403Times: -1, // start with everything refused
+		eventPages: [][]utils.Dict{
+			{{"id": "recovered", "time": "2026-05-14T22:00:00Z"}},
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(string) {}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint", "Harmony Mobile"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	errCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs)
+	}
+
+	waitUntil(t, 3*time.Second, func() bool { return errCount() >= 1 },
+		"expected the first all-refused error")
+
+	// Everything recovers.
+	fake.mu.Lock()
+	fake.submit403Times = 0
+	fake.mu.Unlock()
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
+	}, "expected ingestion to resume")
+
+	// Now refuse only ONE of the two. The other keeps ingesting, so this is
+	// not the all-refused condition and must not raise a second error.
+	fake.mu.Lock()
+	fake.unauthorizedServices = map[string]bool{"Harmony Mobile": true}
+	fake.mu.Unlock()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return fake.acceptedSubmits["Harmony Endpoint"] >= 3
+	}, "expected the still-licensed service to keep submitting")
+
+	if n := errCount(); n != 1 {
+		mu.Lock()
+		defer mu.Unlock()
+		t.Fatalf("one refused service out of two must not re-raise the all-refused error; got %d errors: %v", n, errs)
+	}
+}
+
 // TestEventsRetrieve403StaysHardError guards the deliberate asymmetry: only a
 // 403 on the *submit* is soft. Once a task is accepted, records from the
 // window may already be downstream, so a later 403 must not silently advance
@@ -1090,9 +1183,15 @@ func TestEventsRetrieve403StaysHardError(t *testing.T) {
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
 
+	var warnings []string
 	var errs []string
 	var mu sync.Mutex
 	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
 	opts.OnError = func(err error) {
 		mu.Lock()
 		errs = append(errs, err.Error())
@@ -1110,11 +1209,25 @@ func TestEventsRetrieve403StaysHardError(t *testing.T) {
 	}
 	defer adapter.Close()
 
+	// Assert on the *retrieve* error specifically. A bare "some error
+	// arrived" would also be satisfied by the all-configured-services-
+	// refused error, which is what a soft-failed retrieve would produce.
 	waitUntil(t, 3*time.Second, func() bool {
 		mu.Lock()
 		defer mu.Unlock()
-		return len(errs) >= 1
-	}, "expected a 403 on retrieve to surface as OnError")
+		for _, e := range errs {
+			if strings.Contains(e, "retrieveEventsPage") {
+				return true
+			}
+		}
+		return false
+	}, "expected a 403 on retrieve to surface as OnError naming retrieveEventsPage")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(warnings) != 0 {
+		t.Fatalf("a retrieve 403 must not be soft-failed; got warnings %v", warnings)
+	}
 }
 
 // TestEventsStatusPoll403StaysHardError is the status-poll half of the
@@ -1211,6 +1324,109 @@ func TestEventsNonCloudService403StaysHardError(t *testing.T) {
 	defer mu.Unlock()
 	if len(warnings) != 0 {
 		t.Fatalf("a proxy/WAF 403 must not be soft-failed; got warnings %v", warnings)
+	}
+}
+
+// TestEventsUnknownCloudService403StaysHardError is the phrase gate's real
+// test: a body that mentions the cloud service but is *not* the authorization
+// refusal. This is the gateway's answer to a misspelled service name (the
+// "and" vs "&" mistake documented on defaultEventsCloudServices), which will
+// never resolve on its own and so must stay loud rather than be skipped as
+// though the tenant simply lacked the product.
+func TestEventsUnknownCloudService403StaysHardError(t *testing.T) {
+	fake := &fakeGateway{
+		submit403Times: -1,
+		submit403Body:  `{"success":false,"error":{"status":403,"name":"Forbidden","details":["The provided Cloud Service is unknown"]}}`,
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var warnings []string
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint and Collaboration"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs) >= 1
+	}, "expected an unknown-cloud-service 403 to surface as OnError")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(warnings) != 0 {
+		t.Fatalf("a misspelled service name must not be soft-failed; got warnings %v", warnings)
+	}
+}
+
+// TestEventsUnauthorizedAdvancesCursor pins the single line the whole change
+// turns on: the refused window must be skipped. Without it the cursor stays
+// put and the query window grows without bound on every poll — the original
+// bug. Asserted on the wire, by watching the startTime the adapter submits.
+func TestEventsUnauthorizedAdvancesCursor(t *testing.T) {
+	fake := &fakeGateway{unauthorizedServices: map[string]bool{"Harmony Endpoint": true}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	opts := validClientOptions()
+	opts.OnWarning = func(string) {}
+	opts.OnError = func(error) {}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint", "Harmony Mobile"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return len(fake.submittedStarts["Harmony Endpoint"]) >= 3
+	}, "expected several submits for the refused service")
+
+	fake.mu.Lock()
+	starts := append([]time.Time(nil), fake.submittedStarts["Harmony Endpoint"]...)
+	fake.mu.Unlock()
+
+	// The first submit starts at the initial lookback (an hour back). If the
+	// refused window is skipped, the next one jumps forward to roughly the
+	// previous endTime; if the cursor is pinned, every submit repeats that
+	// same hour-old startTime. Compare against the first rather than
+	// pairwise: startTime is RFC3339, so consecutive polls at this interval
+	// legitimately share a second.
+	if !starts[len(starts)-1].After(starts[0].Add(30 * time.Minute)) {
+		t.Fatalf("refused window was not skipped: startTime never advanced past the initial lookback (all: %v)", starts)
+	}
+	for i := 1; i < len(starts); i++ {
+		if starts[i].Before(starts[i-1]) {
+			t.Fatalf("cursor went backwards at submit %d: %s after %s (all: %v)", i, starts[i], starts[i-1], starts)
+		}
 	}
 }
 

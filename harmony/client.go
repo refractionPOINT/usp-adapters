@@ -573,8 +573,11 @@ func validateGatewayURL(raw string) error {
 	if u.Host == "" {
 		return fmt.Errorf("url: missing host in %q", raw)
 	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("url: must not carry a query or fragment, got %q", raw)
+	// Checked against the raw string rather than the parsed fields: a bare
+	// "https://host?" (ForceQuery) or "https://host#" leaves RawQuery and
+	// Fragment empty, yet still breaks every appended path.
+	if strings.ContainsAny(raw, "?#") {
+		return fmt.Errorf("url: must not carry a query or fragment, got %q", redactURL(raw, u))
 	}
 	lowerPath := strings.ToLower(u.Path)
 	for _, p := range apiPathPrefixes {
@@ -604,6 +607,19 @@ func redactURL(raw string, u *url.URL) string {
 		return raw
 	}
 	return u.Redacted()
+}
+
+// redactURLString is redactURL for a URL we only have as a string. Used to
+// build the request labels that end up in errors and debug logs, so a
+// password in the configured gateway url doesn't get written out on every
+// poll. Unparseable input is returned as-is: it cannot carry userinfo in any
+// form worth protecting, and dropping it would make the label useless.
+func redactURLString(s string) string {
+	u, err := url.Parse(s)
+	if err != nil {
+		return s
+	}
+	return redactURL(s, u)
 }
 
 // indexPathSegment returns the index of a whole-segment occurrence of seg in
@@ -1415,7 +1431,7 @@ func (a *HarmonyAdapter) doAuthRequest(method, reqURL string, body utils.Dict, e
 		}
 	}
 
-	label := method + " " + reqURL
+	label := method + " " + redactURLString(reqURL)
 	status, respBody, err := a.doHTTPWithRetry(label, build(token))
 	if err != nil {
 		return nil, err
@@ -1536,7 +1552,7 @@ func (a *HarmonyAdapter) getToken(force bool) (string, error) {
 	// otherwise an auth-endpoint timeout still produces the OnError +
 	// window-rerun the data-path retry was added to prevent. A 401 here
 	// means bad creds / IP allowlist (not transient) and is returned.
-	status, respBody, err := a.doHTTPWithRetry("POST "+a.conf.URL+authPath, func() (*http.Request, error) {
+	status, respBody, err := a.doHTTPWithRetry("POST "+redactURLString(a.conf.URL+authPath), func() (*http.Request, error) {
 		req, err := http.NewRequestWithContext(a.ctx, "POST", a.conf.URL+authPath, bytes.NewReader(reqBody))
 		if err != nil {
 			return nil, err
