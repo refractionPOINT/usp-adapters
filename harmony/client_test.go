@@ -255,21 +255,66 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
-	// A path prefix that isn't one of ours composes correctly — the gateway
-	// behind a reverse proxy. Rejecting it would take working deployments
-	// down on upgrade, so it must keep validating.
-	t.Run("unrelated path prefix is accepted", func(t *testing.T) {
+	// Matching is case-insensitive: a host that upper-cases the path still
+	// routes, so the doubled suffix would 404 forever if this slipped past.
+	t.Run("API path is matched case-insensitively", func(t *testing.T) {
 		c := HarmonyConfig{
 			ClientOptions: validClientOptions(),
 			ClientID:      "x", AccessKey: "y",
-			URL:    "https://proxy.example.com/checkpoint",
+			URL:    "https://example.com/AUTH/EXTERNAL",
 			Events: EventsConfig{Enabled: true},
 		}
-		if err := c.Validate(); err != nil {
-			t.Fatalf("a reverse-proxy base URL must stay valid; got %v", err)
+		if err := c.Validate(); err == nil {
+			t.Fatalf("expected an upper-cased API path to be rejected")
 		}
-		if c.URL != "https://proxy.example.com/checkpoint" {
-			t.Fatalf("url should be preserved verbatim, got %q", c.URL)
+	})
+
+	// A path prefix that isn't one of ours composes correctly — the gateway
+	// behind a reverse proxy. Rejecting it would take working deployments
+	// down on upgrade, so these must keep validating. The -gw / -mirror cases
+	// matter because a substring match would wrongly refuse them.
+	t.Run("unrelated path prefix is accepted", func(t *testing.T) {
+		for _, ok := range []string{
+			"https://proxy.example.com/checkpoint",
+			"https://proxy.example.com/auth/external-gw",
+			"https://proxy.example.com/app/hec-api-mirror",
+			"https://proxy.example.com:8443/checkpoint",
+		} {
+			c := HarmonyConfig{
+				ClientOptions: validClientOptions(),
+				ClientID:      "x", AccessKey: "y",
+				URL:    ok,
+				Events: EventsConfig{Enabled: true},
+			}
+			if err := c.Validate(); err != nil {
+				t.Fatalf("a reverse-proxy base URL must stay valid; %q got %v", ok, err)
+			}
+			if c.URL != ok {
+				t.Fatalf("url should be preserved verbatim, got %q", c.URL)
+			}
+		}
+	})
+
+	// The suggested replacement is rebuilt from the parsed URL, so parts that
+	// are not the path must survive into it — dropping the userinfo, port or
+	// proxy prefix would hand the operator a value that fails differently.
+	// A password is redacted, since the message is logged.
+	t.Run("rejection suggestion preserves userinfo and port, redacting the password", func(t *testing.T) {
+		c := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "x", AccessKey: "y",
+			URL:    "https://user:hunter2@example.com:8443/checkpoint" + authPath,
+			Events: EventsConfig{Enabled: true},
+		}
+		err := c.Validate()
+		if err == nil {
+			t.Fatalf("expected rejection")
+		}
+		if !strings.Contains(err.Error(), "@example.com:8443/checkpoint\"") {
+			t.Fatalf("suggestion should keep userinfo, port and the proxy prefix; got %q", err)
+		}
+		if strings.Contains(err.Error(), "hunter2") {
+			t.Fatalf("the password must not reach the error message; got %q", err)
 		}
 	})
 
@@ -371,6 +416,14 @@ type fakeGateway struct {
 	// cloudService values, modelling a tenant licensed for some of the
 	// Harmony suite but not all of it.
 	unauthorizedServices map[string]bool
+
+	// unauthorizedServiceTimes refuses the named cloudService that many
+	// times and then accepts it, so a test can pin per-service recovery
+	// rather than inferring it from another service's traffic.
+	unauthorizedServiceTimes map[string]int
+
+	// acceptedSubmits counts submits accepted per cloudService.
+	acceptedSubmits map[string]int
 
 	// retrieve503Times controls how many retrieve calls return a transient
 	// 503 before succeeding — models the intermittent gateway slowness the
@@ -483,6 +536,18 @@ func (f *fakeGateway) serveEventsSubmit(w http.ResponseWriter, r *http.Request) 
 	}
 	if f.unauthorizedServices[svc] {
 		forbidden = true
+	}
+	if n, ok := f.unauthorizedServiceTimes[svc]; ok && n != 0 {
+		forbidden = true
+		if n > 0 {
+			f.unauthorizedServiceTimes[svc] = n - 1
+		}
+	}
+	if !forbidden {
+		if f.acceptedSubmits == nil {
+			f.acceptedSubmits = map[string]int{}
+		}
+		f.acceptedSubmits[svc]++
 	}
 	body := f.submit403Body
 	f.mu.Unlock()
@@ -903,10 +968,11 @@ func TestEventsSubmit403IsSoftFailure(t *testing.T) {
 // 403 window is skipped the worker must resume normally once the gateway
 // starts accepting, rather than staying wedged on the refused window.
 func TestEventsSubmit403RecoversWhenLicensed(t *testing.T) {
-	// Two services so the single refusal doesn't amount to "every service
-	// refused", which is a separate, louder condition.
+	// Refuse one named service once, so recovery is asserted on *that*
+	// service's own traffic. Two services so the single refusal doesn't
+	// amount to "every service refused", a separate and louder condition.
 	fake := &fakeGateway{
-		submit403Times: 1, // refuse once, then accept
+		unauthorizedServiceTimes: map[string]int{"Harmony Endpoint": 1},
 		eventPages: [][]utils.Dict{
 			{{"id": "after-403", "time": "2026-05-14T22:00:00Z"}},
 		},
@@ -934,15 +1000,80 @@ func TestEventsSubmit403RecoversWhenLicensed(t *testing.T) {
 	}
 	defer adapter.Close()
 
+	// Assert on the refused service specifically — waiting on any retrieve
+	// would be satisfied by the never-refused worker even if this one stayed
+	// wedged.
 	waitUntil(t, 3*time.Second, func() bool {
-		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
-	}, "expected the worker to resume retrieving once the gateway accepts the submit")
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return fake.acceptedSubmits["Harmony Endpoint"] >= 1
+	}, "expected the refused service's own worker to resume submitting")
 
 	mu.Lock()
 	defer mu.Unlock()
 	if len(errs) != 0 {
 		t.Fatalf("recovery path should produce no OnError; got %v", errs)
 	}
+}
+
+// TestEventsAllUnauthorizedLatchClears drives refuse-all -> recover ->
+// refuse-all. The latch must let the second episode through: if the flag and
+// the map ever drift apart, a source that goes dark a second time would do so
+// in silence, which is exactly the failure the error exists to prevent.
+func TestEventsAllUnauthorizedLatchClears(t *testing.T) {
+	fake := &fakeGateway{
+		submit403Times: -1, // start with everything refused
+		eventPages: [][]utils.Dict{
+			{{"id": "recovered", "time": "2026-05-14T22:00:00Z"}},
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(string) {}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint", "Harmony Mobile"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	errCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs)
+	}
+
+	waitUntil(t, 3*time.Second, func() bool { return errCount() >= 1 },
+		"expected the first all-refused error")
+
+	// Recover: every service starts succeeding, which must clear the latch.
+	fake.mu.Lock()
+	fake.submit403Times = 0
+	fake.mu.Unlock()
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
+	}, "expected ingestion to resume")
+
+	// Go dark again — a second error must be raised, not swallowed.
+	fake.mu.Lock()
+	fake.submit403Times = -1
+	fake.mu.Unlock()
+	waitUntil(t, 3*time.Second, func() bool { return errCount() >= 2 },
+		"expected a second all-refused error after the latch cleared")
 }
 
 // TestEventsRetrieve403StaysHardError guards the deliberate asymmetry: only a

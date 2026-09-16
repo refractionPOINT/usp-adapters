@@ -29,9 +29,10 @@ harmony:
   # paste the Infinity Portal's "Authentication URL", which already ends in
   # /auth/external; that used to be accepted and then 404 every request as
   # POST /auth/external/auth/external, and is now rejected by Validate with
-  # an error naming the value to use instead. An unrelated path prefix (the
-  # gateway behind a reverse proxy, https://proxy.example.com/checkpoint)
-  # composes correctly and is still accepted.
+  # an error naming the value to use instead. Matching is case-insensitive
+  # and segment-bounded, so an unrelated path prefix (the gateway behind a
+  # reverse proxy, https://proxy.example.com/checkpoint, or even
+  # /auth/external-gw) composes correctly and is still accepted.
   url: "https://cloudinfra-gw.portal.checkpoint.com"
 
   events:   { enabled: false, ... }
@@ -74,7 +75,7 @@ If a configured `cloud_service` is not available for the tenant, the gateway say
 Three deliberate limits on that soft-failing:
 
 - **Only the submit.** A 403 on the status poll or the record retrieval stays a hard error: records from that window may already have shipped, so the cursor must not advance past them.
-- **Only the gateway's own refusal.** The 403 body must name the cloud service. A 403 from a proxy or WAF in front of the gateway, or an IP restriction, is a real fault and stays a hard error. The match is strict on purpose — if Check Point rewords the message the adapter falls back to erroring, which is merely noisy, whereas matching too loosely would silently drop data.
+- **Only the gateway's own refusal.** The 403 body must carry `Unauthorized to perform operations on the given Cloud Service` (matched case-insensitively). A 403 from a proxy or WAF in front of the gateway, or an IP restriction, is a real fault and stays a hard error — as does `The provided Cloud Service is unknown`, which is a misspelled service name rather than an authorization verdict. The match is the whole sentence on purpose: if Check Point rewords it the adapter falls back to erroring, which is merely noisy, whereas matching loosely would silently drop data.
 - **Not when every service is refused.** An API key missing the *Logs as a Service* service is refused for all of them, so the source ingests nothing. Per service that is only a warning, so the adapter additionally raises one error when the whole configured set is refused. It is latched: raised once per episode, cleared as soon as any service succeeds.
 
 Skipping the window does mean a 403 that turns out to be transient costs one window, where the old pinned-cursor behaviour would have backfilled it. That is the intended trade — a 403 is an authorization verdict, not a transient fault, and pinning is what made an unlicensed product grow its window without bound while erroring every poll.

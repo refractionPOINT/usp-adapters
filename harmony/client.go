@@ -576,14 +576,58 @@ func validateGatewayURL(raw string) error {
 	if u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("url: must not carry a query or fragment, got %q", raw)
 	}
+	lowerPath := strings.ToLower(u.Path)
 	for _, p := range apiPathPrefixes {
-		if !strings.Contains(u.Path, p) {
+		i := indexPathSegment(lowerPath, p)
+		if i < 0 {
 			continue
 		}
-		base := strings.TrimSuffix(u.Scheme+"://"+u.Host+strings.Split(u.Path, p)[0], "/")
-		return fmt.Errorf("url: must be the gateway base URL, but %q already contains the API path %q, which the adapter appends itself — use %q instead", raw, p, base)
+		// Rebuild the suggestion from a copy of the parsed URL rather than
+		// from scheme+host, so userinfo and port survive into the message.
+		base := *u
+		base.Path = strings.TrimSuffix(u.Path[:i], "/")
+		return fmt.Errorf("url: must be the gateway base URL, but %q already contains the API path %q, which the adapter appends itself — use %q instead", redactURL(raw, u), p, redactURL(base.String(), &base))
 	}
 	return nil
+}
+
+// redactURL returns the URL as written, unless it carries a password — these
+// messages are surfaced through OnError and end up in logs, and the gateway
+// behind a reverse proxy is exactly the deployment that might use basic auth.
+// The common no-credentials case echoes the operator's own string verbatim,
+// so the message still matches what they configured.
+func redactURL(raw string, u *url.URL) string {
+	if u.User == nil {
+		return raw
+	}
+	if _, hasPassword := u.User.Password(); !hasPassword {
+		return raw
+	}
+	return u.Redacted()
+}
+
+// indexPathSegment returns the index of a whole-segment occurrence of seg in
+// path, or -1. seg always starts with "/", so its start is necessarily on a
+// segment boundary; only the end needs checking, which is what keeps a
+// reverse-proxy prefix such as /auth/external-gw or /app/hec-api-mirror from
+// being mistaken for our own API path and refused at startup.
+//
+// Both arguments must already be lowercased — the comparison is deliberately
+// case-insensitive, since a host that upper-cases the path still routes and
+// would otherwise slip through to 404 on every request.
+func indexPathSegment(path, seg string) int {
+	for from := 0; from < len(path); {
+		i := strings.Index(path[from:], seg)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		if end := i + len(seg); end == len(path) || path[end] == '/' {
+			return i
+		}
+		from = i + 1
+	}
+	return -1
 }
 
 type HarmonyAdapter struct {
@@ -777,9 +821,18 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 // the failure modes are asymmetric — if Check Point rewords the message we
 // fall back to treating it as a hard error, which is merely the old noisy
 // behaviour, whereas matching too loosely would silently drop data.
+// It matches the gateway's sentence, not merely the words "cloud service":
+// that phrase also appears in "The provided Cloud Service is unknown" (see
+// defaultEventsCloudServices above), which is a misspelled service name, not
+// an authorization verdict, and must not be skipped as though the tenant
+// simply lacked the product.
 func isCloudServiceForbidden(body string) bool {
-	return strings.Contains(strings.ToLower(body), "cloud service")
+	return strings.Contains(strings.ToLower(body), cloudServiceForbiddenPhrase)
 }
+
+// cloudServiceForbiddenPhrase is the gateway's 403 detail, lowercased for
+// case-insensitive comparison.
+const cloudServiceForbiddenPhrase = "unauthorized to perform operations on the given cloud service"
 
 // noteEventsServiceUnauthorized records a 403 for one cloud service and
 // reports whether this call is the moment every configured service has been
