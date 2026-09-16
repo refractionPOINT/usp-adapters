@@ -228,6 +228,19 @@ func (c *EventsConfig) Validate() error {
 	if len(c.CloudServices) == 0 {
 		c.CloudServices = append([]string{}, defaultEventsCloudServices...)
 	}
+	// Deduplicate, preserving order. A repeated entry would otherwise start
+	// two identical pollers for the same cloud service — double the gateway
+	// load and, since events are not deduped, double-shipped records.
+	seen := make(map[string]struct{}, len(c.CloudServices))
+	deduped := c.CloudServices[:0:0]
+	for _, svc := range c.CloudServices {
+		if _, ok := seen[svc]; ok {
+			continue
+		}
+		seen[svc] = struct{}{}
+		deduped = append(deduped, svc)
+	}
+	c.CloudServices = deduped
 	pi, err := parseConfigDuration("events.poll_interval", c.PollInterval, defaultEventsPollInterval)
 	if err != nil {
 		return err
@@ -270,11 +283,11 @@ func (c *EventsConfig) Close() {}
 //
 // New deployments should use:
 //
-//   entities:
-//     enabled: true
-//     queries:
-//       - name: emails
-//         include_splits: true   # match the old firehose semantics
+//	entities:
+//	  enabled: true
+//	  queries:
+//	    - name: emails
+//	      include_splits: true   # match the old firehose semantics
 type EmailsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 }
@@ -565,33 +578,77 @@ var apiPathPrefixes = []string{authPath, "/app/laas-logs-api", "/app/hec-api"}
 func validateGatewayURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("url: %v", err)
+		// No parse, so no structured redaction — fall back to the textual
+		// scrub. A stray character in a password is one of the things that
+		// lands us here, so this branch must not echo raw.
+		return fmt.Errorf("url: %v", scrubURLCredentials(err.Error()))
 	}
+	safe := redactURL(raw, u)
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("url: must be an http(s) URL, got %q", raw)
+		return fmt.Errorf("url: must be an http(s) URL, got %q", safe)
 	}
 	if u.Host == "" {
-		return fmt.Errorf("url: missing host in %q", raw)
+		return fmt.Errorf("url: missing host in %q", safe)
 	}
 	// Checked against the raw string rather than the parsed fields: a bare
 	// "https://host?" (ForceQuery) or "https://host#" leaves RawQuery and
 	// Fragment empty, yet still breaks every appended path.
 	if strings.ContainsAny(raw, "?#") {
-		return fmt.Errorf("url: must not carry a query or fragment, got %q", redactURL(raw, u))
+		return fmt.Errorf("url: must not carry a query or fragment, got %q", safe)
 	}
-	lowerPath := strings.ToLower(u.Path)
+	// Matched against the *escaped* path: "/auth%2Fexternal" is one segment
+	// literally named "auth/external", not our API path, and decoding first
+	// would refuse it.
+	escaped := u.EscapedPath()
 	for _, p := range apiPathPrefixes {
-		i := indexPathSegment(lowerPath, p)
+		i := indexPathSegment(strings.ToLower(escaped), p)
 		if i < 0 {
 			continue
 		}
 		// Rebuild the suggestion from a copy of the parsed URL rather than
 		// from scheme+host, so userinfo and port survive into the message.
+		// Path and RawPath are set together, or String() would re-encode
+		// from a stale RawPath and emit a different URL.
 		base := *u
-		base.Path = strings.TrimSuffix(u.Path[:i], "/")
-		return fmt.Errorf("url: must be the gateway base URL, but %q already contains the API path %q, which the adapter appends itself — use %q instead", redactURL(raw, u), p, redactURL(base.String(), &base))
+		truncated := strings.TrimSuffix(escaped[:i], "/")
+		decoded, decErr := url.PathUnescape(truncated)
+		if decErr != nil {
+			decoded = truncated
+		}
+		base.Path, base.RawPath = decoded, truncated
+		return fmt.Errorf("url: must be the gateway base URL, but %q already contains the API path %q, which the adapter appends itself — use %q instead", safe, p, redactURL(base.String(), &base))
 	}
 	return nil
+}
+
+// scrubURLCredentials blanks the password in a URL-shaped string without
+// requiring it to parse, for the one error path where url.Parse has already
+// failed. It is a heuristic — it gives up rather than guessing when it cannot
+// locate the authority — so it is only ever a fallback for redactURL.
+func scrubURLCredentials(raw string) string {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return raw
+	}
+	authStart := i + len("://")
+	// The authority ends at the first "/" after the scheme. "?" and "#" are
+	// deliberately not treated as terminators: they cannot appear unencoded
+	// in a host, so one occurring here is inside the credentials — which is
+	// precisely the case that made the URL unparseable.
+	authEnd := len(raw)
+	if j := strings.Index(raw[authStart:], "/"); j >= 0 {
+		authEnd = authStart + j
+	}
+	at := strings.LastIndex(raw[authStart:authEnd], "@")
+	if at < 0 {
+		return raw
+	}
+	at += authStart
+	colon := strings.Index(raw[authStart:at], ":")
+	if colon < 0 {
+		return raw // userinfo without a password
+	}
+	return raw[:authStart+colon+1] + "xxxxx" + raw[at:]
 }
 
 // redactURL returns the URL as written, unless it carries a password — these
@@ -864,14 +921,9 @@ func (a *HarmonyAdapter) noteEventsServiceUnauthorized(service string) bool {
 	}
 	a.eventsUnauthorized[service] = struct{}{}
 
-	// Count distinct names: cloud_services is operator-supplied and may
-	// repeat one, which would otherwise keep the total out of reach forever.
-	configured := make(map[string]struct{}, len(a.conf.Events.CloudServices))
-	for _, svc := range a.conf.Events.CloudServices {
-		configured[svc] = struct{}{}
-	}
-
-	if len(a.eventsUnauthorized) < len(configured) || a.eventsAllUnauthReported {
+	// CloudServices is deduplicated by EventsConfig.Validate, so its length
+	// is the number of distinct services and the map can actually reach it.
+	if len(a.eventsUnauthorized) < len(a.conf.Events.CloudServices) || a.eventsAllUnauthReported {
 		return false
 	}
 	a.eventsAllUnauthReported = true

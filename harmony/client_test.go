@@ -78,6 +78,68 @@ func TestEntitiesDedupKey(t *testing.T) {
 	})
 }
 
+// TestURLCredentialsNeverLeak covers every error return in
+// validateGatewayURL, including the ones reached before the URL parses.
+// These messages go to the operator's logs, and a gateway behind a reverse
+// proxy is exactly the deployment likely to carry basic-auth credentials.
+func TestURLCredentialsNeverLeak(t *testing.T) {
+	for _, raw := range []string{
+		"ftp://user:hunter2@example.com",                   // scheme branch
+		"https://user:hunter2@",                            // host branch
+		"https://user:hunter2@example.com?x=1",             // query branch
+		"https://user:hunter2@example.com" + authPath,      // API-path branch
+		"https://user:hunter2@example.com/\x7f" + authPath, // parse-failure branch
+		"https://user:hunt\x7fer2@example.com",             // parse failure inside the password
+		"https://user:hunter2@exa mple.com",                // parse failure in the host
+	} {
+		err := validateGatewayURL(raw)
+		if err == nil {
+			t.Fatalf("expected %q to be rejected", raw)
+		}
+		if strings.Contains(err.Error(), "hunter2") {
+			t.Fatalf("password leaked for %q: %q", raw, err)
+		}
+	}
+}
+
+func TestRedactURLString(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		// Untouched when there is nothing to protect — the operator should
+		// see the string they configured.
+		{"https://example.com/auth/external", "https://example.com/auth/external"},
+		{"https://user@example.com", "https://user@example.com"},
+		{"not a url at all", "not a url at all"},
+		// Redacted when a password is present.
+		{"https://user:hunter2@example.com/x", "https://user:xxxxx@example.com/x"},
+	} {
+		if got := redactURLString(tc.in); got != tc.want {
+			t.Fatalf("redactURLString(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestValidateGatewayURLSuggestionRoundTrips guards the Path/RawPath pairing:
+// a stale RawPath makes String() re-encode from the wrong source and emit a
+// URL that is not the one being suggested.
+func TestValidateGatewayURLSuggestionRoundTrips(t *testing.T) {
+	err := validateGatewayURL("https://example.com/a%2Fb/app/hec-api")
+	if err == nil {
+		t.Fatalf("expected rejection")
+	}
+	if !strings.Contains(err.Error(), "https://example.com/a%2Fb\"") {
+		t.Fatalf("suggestion should preserve the percent-encoded segment; got %q", err)
+	}
+}
+
+// TestValidateGatewayURLEncodedSegmentAccepted is the other half: a segment
+// literally named "auth/external" is not our API path and must not be
+// refused, since matching happens on the escaped path.
+func TestValidateGatewayURLEncodedSegmentAccepted(t *testing.T) {
+	if err := validateGatewayURL("https://example.com/auth%2Fexternal"); err != nil {
+		t.Fatalf("a percent-encoded segment is not our API path; got %v", err)
+	}
+}
+
 func TestExtractRecordTime(t *testing.T) {
 	cases := []struct {
 		name string
@@ -190,6 +252,31 @@ func TestValidate(t *testing.T) {
 		}
 		if c.Events.pollInterval != defaultEventsPollInterval {
 			t.Fatalf("expected default poll interval, got %s", c.Events.pollInterval)
+		}
+	})
+
+	// A repeated entry would otherwise start two identical pollers for the
+	// same service, doubling gateway load and — since events are not
+	// deduped — double-shipping records.
+	t.Run("duplicate cloud services are collapsed, preserving order", func(t *testing.T) {
+		c := HarmonyConfig{
+			ClientOptions: validClientOptions(),
+			ClientID:      "x", AccessKey: "y",
+			Events: EventsConfig{Enabled: true, CloudServices: []string{
+				"Harmony Mobile", "Harmony Endpoint", "Harmony Mobile",
+			}},
+		}
+		if err := c.Validate(); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		want := []string{"Harmony Mobile", "Harmony Endpoint"}
+		if len(c.Events.CloudServices) != len(want) {
+			t.Fatalf("expected duplicates collapsed, got %v", c.Events.CloudServices)
+		}
+		for i := range want {
+			if c.Events.CloudServices[i] != want[i] {
+				t.Fatalf("order not preserved: got %v, want %v", c.Events.CloudServices, want)
+			}
 		}
 	})
 
@@ -408,6 +495,11 @@ type fakeGateway struct {
 	// the gateway's real payload.
 	submit403Body string
 
+	// submit403Status overrides the refusal's status code, so a test can
+	// send the refusal phrase under a status that is not 403 and assert the
+	// status gate holds. 0 means 403.
+	submit403Status int
+
 	// status403 makes every status poll return 403, to prove that only a
 	// submit-time 403 is soft-failed.
 	status403 bool
@@ -564,15 +656,19 @@ func (f *fakeGateway) serveEventsSubmit(w http.ResponseWriter, r *http.Request) 
 		f.acceptedSubmits[svc]++
 	}
 	body := f.submit403Body
+	status := f.submit403Status
 	f.mu.Unlock()
+	if status == 0 {
+		status = http.StatusForbidden
+	}
 	if forbidden {
 		if body != "" {
-			w.WriteHeader(http.StatusForbidden)
+			w.WriteHeader(status)
 			_, _ = w.Write([]byte(body))
 			return
 		}
 		// The gateway's real refusal payload.
-		writeJSON(w, http.StatusForbidden, utils.Dict{
+		writeJSON(w, status, utils.Dict{
 			"success": false,
 			"error": utils.Dict{
 				"status":  403,
@@ -974,8 +1070,12 @@ func TestEventsSubmit403IsSoftFailure(t *testing.T) {
 	if len(warnings) == 0 {
 		t.Fatalf("expected at least one OnWarning for the 403 submit")
 	}
-	if !strings.Contains(warnings[0], "Harmony Endpoint") {
-		t.Fatalf("warning should name the offending service; got %q", warnings[0])
+	// Match the error's own rendering, not just the service name: the
+	// worker's "harmony[events:%s]" prefix already contains the latter, so
+	// a bare name check would pass even with the service dropped from the
+	// error itself.
+	if !strings.Contains(warnings[0], `cloud service "Harmony Endpoint" is not authorized`) {
+		t.Fatalf("warning should carry the service in the error itself; got %q", warnings[0])
 	}
 	if !strings.Contains(warnings[0], "Unauthorized to perform operations on the given Cloud Service") {
 		t.Fatalf("warning should carry the gateway's detail; got %q", warnings[0])
@@ -1142,13 +1242,17 @@ func TestEventsAllUnauthorizedForgetsRecoveredService(t *testing.T) {
 	waitUntil(t, 3*time.Second, func() bool { return errCount() >= 1 },
 		"expected the first all-refused error")
 
-	// Everything recovers.
+	// Everything recovers. Wait for *both* services to be accepted — a gate
+	// on total retrieves is satisfied by whichever worker gets there first,
+	// leaving the other still in the refused-set and the test racy.
 	fake.mu.Lock()
 	fake.submit403Times = 0
 	fake.mu.Unlock()
 	waitUntil(t, 3*time.Second, func() bool {
-		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
-	}, "expected ingestion to resume")
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return fake.acceptedSubmits["Harmony Endpoint"] >= 1 && fake.acceptedSubmits["Harmony Mobile"] >= 1
+	}, "expected both services to resume ingesting")
 
 	// Now refuse only ONE of the two. The other keeps ingesting, so this is
 	// not the all-refused condition and must not raise a second error.
@@ -1430,7 +1534,158 @@ func TestEventsUnauthorizedAdvancesCursor(t *testing.T) {
 	}
 }
 
-// TestEventsAllServices403SurfacesError covers the case the per-service soft
+// TestEventsRefusalPhraseUnder500StaysHardError pins the status half of the
+// gate: the phrase alone must not soft-fail a response. A gateway returning
+// the same wording under a 5xx is a fault, not an authorization verdict.
+func TestEventsRefusalPhraseUnder500StaysHardError(t *testing.T) {
+	fake := &fakeGateway{
+		submit403Times:  -1,
+		submit403Status: http.StatusInternalServerError,
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var warnings []string
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs) >= 1
+	}, "expected the refusal phrase under a 500 to surface as OnError")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(warnings) != 0 {
+		t.Fatalf("only a 403 may be soft-failed; got warnings %v", warnings)
+	}
+}
+
+// TestEventsCanceledClearsUnauthorized covers the `noteEventsServiceAuthorized`
+// call in the Canceled branch. A cancelled query proves the credentials reach
+// that service, so it must leave the refused-set — otherwise the set stays
+// stale and the all-refused error cannot be raised a second time.
+func TestEventsCanceledClearsUnauthorized(t *testing.T) {
+	fake := &fakeGateway{submit403Times: -1}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(string) {}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint", "Harmony Mobile"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	errCount := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs)
+	}
+
+	waitUntil(t, 3*time.Second, func() bool { return errCount() >= 1 },
+		"expected the first all-refused error")
+
+	// Stop refusing, but cancel every task instead: the submit succeeds, so
+	// the services are reachable even though no records come back.
+	fake.mu.Lock()
+	fake.submit403Times = 0
+	fake.cancelEventsTimes = -1
+	fake.cancelEventsErrors = []string{"not provisioned"}
+	fake.mu.Unlock()
+	waitUntil(t, 3*time.Second, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return fake.acceptedSubmits["Harmony Endpoint"] >= 1 && fake.acceptedSubmits["Harmony Mobile"] >= 1
+	}, "expected both services to submit successfully while cancelling")
+
+	// Back to refusing everything: a second error proves Canceled cleared
+	// the refused-set rather than leaving it full.
+	fake.mu.Lock()
+	fake.submit403Times = -1
+	fake.mu.Unlock()
+	waitUntil(t, 3*time.Second, func() bool { return errCount() >= 2 },
+		"expected a second all-refused error after Canceled cleared the set")
+}
+
+// TestEventsCanceledAdvancesCursor pins the Canceled branch's cursor advance,
+// the counterpart of TestEventsUnauthorizedAdvancesCursor.
+func TestEventsCanceledAdvancesCursor(t *testing.T) {
+	fake := &fakeGateway{
+		cancelEventsTimes:  -1,
+		cancelEventsErrors: []string{"not provisioned"},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	opts := validClientOptions()
+	opts.OnWarning = func(string) {}
+	opts.OnError = func(error) {}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Connect"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		fake.mu.Lock()
+		defer fake.mu.Unlock()
+		return len(fake.submittedStarts["Harmony Connect"]) >= 3
+	}, "expected several submits for the cancelled service")
+
+	fake.mu.Lock()
+	starts := append([]time.Time(nil), fake.submittedStarts["Harmony Connect"]...)
+	fake.mu.Unlock()
+
+	if !starts[len(starts)-1].After(starts[0].Add(30 * time.Minute)) {
+		t.Fatalf("cancelled window was not skipped: startTime never advanced past the initial lookback (all: %v)", starts)
+	}
+}
+
+// TestEventsAllServices403SurfacesError covers the case the per-task soft
 // failure would otherwise hide: an API key without the "Logs as a Service"
 // grant is refused for *every* cloud service, so the source ingests nothing.
 // Per-service that is only a warning, so the adapter must additionally raise
@@ -1664,7 +1919,6 @@ func (d *recordingDeduper) admittedKeys() []string {
 	defer d.mu.Unlock()
 	return append([]string(nil), d.admitted...)
 }
-
 
 func TestEntitiesValidate(t *testing.T) {
 	base := func(q EntityQuery) *HarmonyConfig {
