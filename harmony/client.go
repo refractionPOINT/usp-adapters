@@ -540,18 +540,28 @@ func (c *HarmonyConfig) Validate() error {
 	return nil
 }
 
-// validateGatewayURL rejects a url carrying anything beyond scheme + host.
+// apiPathPrefixes are the constant suffixes this adapter appends to conf.URL.
+// A configured url that already contains one of them has been built from a
+// full API URL rather than the gateway base, and every request would repeat
+// the segment.
+var apiPathPrefixes = []string{authPath, "/app/laas-logs-api", "/app/hec-api"}
+
+// validateGatewayURL rejects a url that has an API path baked into it.
 //
-// Every request path in this adapter is built as conf.URL + a constant suffix
-// (authPath, eventsQueryPath, …), so a url with a path component corrupts all
-// of them. The common way to get one is to paste the "Authentication URL" the
-// Infinity Portal shows next to a new API key: it already ends in
-// /auth/external, which yields POST /auth/external/auth/external and a 404
-// whose message gives no hint that the url field is at fault. Trimming a
-// trailing slash — all this used to do — does not catch it.
+// Every request is conf.URL plus a constant suffix (authPath,
+// eventsQueryPath, …). The common way to get that wrong is to paste the
+// "Authentication URL" the Infinity Portal shows next to a new API key: it
+// already ends in /auth/external, so every call doubles the segment and 404s
+// with nothing pointing at the url field. Trimming a trailing slash — all
+// this used to do — does not catch it.
 //
-// Checking here turns that into a startup error naming the exact value to use,
-// instead of a 404 on the first poll.
+// Note what is deliberately *not* rejected: an unrelated path prefix, as used
+// when the gateway is reached through a reverse proxy
+// (https://proxy.example.com/checkpoint). That composes correctly today, so
+// failing it at startup would take working deployments down on upgrade. Only
+// a path that repeats one of this adapter's own API segments is refused. A
+// query or fragment is refused too — those cannot compose with an appended
+// path under any deployment, so they are always a mistake.
 func validateGatewayURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -563,8 +573,15 @@ func validateGatewayURL(raw string) error {
 	if u.Host == "" {
 		return fmt.Errorf("url: missing host in %q", raw)
 	}
-	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("url: must be the gateway base URL (scheme and host only), got %q — use %q instead. The Infinity Portal's Authentication URL ends in %s; this field takes only the part before that", raw, u.Scheme+"://"+u.Host, authPath)
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("url: must not carry a query or fragment, got %q", raw)
+	}
+	for _, p := range apiPathPrefixes {
+		if !strings.Contains(u.Path, p) {
+			continue
+		}
+		base := strings.TrimSuffix(u.Scheme+"://"+u.Host+strings.Split(u.Path, p)[0], "/")
+		return fmt.Errorf("url: must be the gateway base URL, but %q already contains the API path %q, which the adapter appends itself — use %q instead", raw, p, base)
 	}
 	return nil
 }
@@ -581,6 +598,17 @@ type HarmonyAdapter struct {
 	tokenMu      sync.Mutex
 	cachedToken  string
 	tokenExpires time.Time
+
+	// eventsAuthMu guards the bookkeeping the per-service events workers use
+	// to notice, collectively, that *every* configured cloud service is being
+	// refused with 403. One service refused is a soft failure — the tenant
+	// isn't licensed for that product. All of them refused is a different
+	// fault: the API key is missing the "Logs as a Service" service, so the
+	// source ships nothing at all. Without this the whole source would fail
+	// silently, warning per service and never erroring.
+	eventsAuthMu            sync.Mutex
+	eventsUnauthorized      map[string]struct{}
+	eventsAllUnauthReported bool
 
 	ctx context.Context
 }
@@ -694,9 +722,23 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 			// gateway as a 403 on the submit instead of a cancelled task.
 			// Handle it identically: warn, skip the window, keep the other
 			// services' workers running.
+			//
+			// Skipping does mean a 403 that turns out to be transient costs
+			// one window, where pinning the cursor would have backfilled it.
+			// That is the intended trade: a 403 is an authorization verdict,
+			// not a transient fault, and pinning is what made an unlicensed
+			// product grow its window without bound while erroring every poll.
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — skipping window; drop it from cloud_services to silence this", service, unauthorized))
+			if a.noteEventsServiceUnauthorized(service) {
+				// Every configured service refused: not a licensing gap in
+				// one product but a credential that can't read any of them.
+				// The source is ingesting nothing, so this has to be an error
+				// even though each service on its own is only a warning.
+				a.conf.ClientOptions.OnError(fmt.Errorf("harmony[events]: every configured cloud service was refused with HTTP 403, so this source is ingesting nothing — the API key is most likely missing the \"Logs as a Service\" service; if the key is correct, set events.cloud_services to the products this tenant is licensed for"))
+			}
 			nextStart = endTime
 		case errors.As(err, &canceled):
+			a.noteEventsServiceAuthorized(service)
 			// Soft failure: the gateway accepted the query but couldn't
 			// fulfill it for this service (commonly: the service isn't
 			// provisioned for the tenant). Warn once per poll with the
@@ -708,15 +750,77 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — skipping window", service, canceled))
 			nextStart = endTime
 		case err != nil:
+			// Anything else proves nothing about authorization either way, so
+			// the 403 bookkeeping is deliberately left alone here.
 			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[events:%s]: %v", service, err))
-		case !newCursor.IsZero():
-			nextStart = newCursor
+		default:
+			a.noteEventsServiceAuthorized(service)
+			if !newCursor.IsZero() {
+				nextStart = newCursor
+			}
 		}
 
 		if a.doStop.WaitFor(a.conf.Events.pollInterval) {
 			return
 		}
 	}
+}
+
+// isCloudServiceForbidden reports whether a 403 body is the gateway refusing
+// the cloudService in the request ("Unauthorized to perform operations on the
+// given Cloud Service"), as opposed to some other 403 on the same path — an
+// IP restriction, or a corporate proxy or WAF sitting in front of the gateway.
+//
+// The distinction matters because the two want opposite handling: the former
+// is a per-service soft failure whose window is skipped, the latter is a real
+// fault that must stay loud. Matching is therefore deliberately strict, since
+// the failure modes are asymmetric — if Check Point rewords the message we
+// fall back to treating it as a hard error, which is merely the old noisy
+// behaviour, whereas matching too loosely would silently drop data.
+func isCloudServiceForbidden(body string) bool {
+	return strings.Contains(strings.ToLower(body), "cloud service")
+}
+
+// noteEventsServiceUnauthorized records a 403 for one cloud service and
+// reports whether this call is the moment every configured service has been
+// refused. It returns true at most once per episode — the latch clears as soon
+// as any service proves reachable again, so a later recurrence is reported
+// afresh rather than swallowed.
+func (a *HarmonyAdapter) noteEventsServiceUnauthorized(service string) bool {
+	a.eventsAuthMu.Lock()
+	defer a.eventsAuthMu.Unlock()
+
+	if a.eventsUnauthorized == nil {
+		a.eventsUnauthorized = make(map[string]struct{}, len(a.conf.Events.CloudServices))
+	}
+	a.eventsUnauthorized[service] = struct{}{}
+
+	// Count distinct names: cloud_services is operator-supplied and may
+	// repeat one, which would otherwise keep the total out of reach forever.
+	configured := make(map[string]struct{}, len(a.conf.Events.CloudServices))
+	for _, svc := range a.conf.Events.CloudServices {
+		configured[svc] = struct{}{}
+	}
+
+	if len(a.eventsUnauthorized) < len(configured) || a.eventsAllUnauthReported {
+		return false
+	}
+	a.eventsAllUnauthReported = true
+	return true
+}
+
+// noteEventsServiceAuthorized clears the 403 bookkeeping for a cloud service
+// the gateway has just proven reachable with these credentials (it either
+// served the query or accepted it and cancelled the task).
+func (a *HarmonyAdapter) noteEventsServiceAuthorized(service string) {
+	a.eventsAuthMu.Lock()
+	defer a.eventsAuthMu.Unlock()
+
+	if _, ok := a.eventsUnauthorized[service]; !ok {
+		return
+	}
+	delete(a.eventsUnauthorized, service)
+	a.eventsAllUnauthReported = false
 }
 
 func (a *HarmonyAdapter) runOneEventsQuery(service string, startTime, endTime time.Time) (time.Time, error) {
@@ -729,7 +833,7 @@ func (a *HarmonyAdapter) runOneEventsQuery(service string, startTime, endTime ti
 		// error, because records from this window may already be downstream
 		// and advancing the cursor past them would silently drop the rest.
 		var statusErr *httpStatusError
-		if errors.As(err, &statusErr) && statusErr.Status == http.StatusForbidden {
+		if errors.As(err, &statusErr) && statusErr.Status == http.StatusForbidden && isCloudServiceForbidden(statusErr.Body) {
 			return time.Time{}, &serviceUnauthorizedError{Service: service, Detail: statusErr.Body}
 		}
 		return time.Time{}, fmt.Errorf("submitEventsQuery: %w", err)
@@ -1225,7 +1329,7 @@ func (a *HarmonyAdapter) doHTTPWithRetry(label string, buildReq func() (*http.Re
 // x-av-req-id required by HEC endpoints) can be supplied via extraHeaders.
 // Transient gateway failures are absorbed by doHTTPWithRetry; a 401 triggers
 // a single token refresh + re-issue (itself transient-retried).
-func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extraHeaders map[string]string) (utils.Dict, error) {
+func (a *HarmonyAdapter) doAuthRequest(method, reqURL string, body utils.Dict, extraHeaders map[string]string) (utils.Dict, error) {
 	bodyBytes, err := marshalBody(body)
 	if err != nil {
 		return nil, err
@@ -1242,7 +1346,7 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 			if bodyBytes != nil {
 				reader = bytes.NewReader(bodyBytes)
 			}
-			req, err := http.NewRequestWithContext(a.ctx, method, url, reader)
+			req, err := http.NewRequestWithContext(a.ctx, method, reqURL, reader)
 			if err != nil {
 				return nil, err
 			}
@@ -1258,7 +1362,7 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 		}
 	}
 
-	label := method + " " + url
+	label := method + " " + reqURL
 	status, respBody, err := a.doHTTPWithRetry(label, build(token))
 	if err != nil {
 		return nil, err
