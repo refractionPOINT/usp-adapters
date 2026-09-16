@@ -222,6 +222,49 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	// The Infinity Portal shows an "Authentication URL" ending in
+	// /auth/external next to every new API key. Pasted whole into `url` it
+	// makes every request double the suffix, and the resulting 404 says
+	// nothing about the url field. Validate must catch it up front.
+	t.Run("URL carrying a path is rejected", func(t *testing.T) {
+		for _, bad := range []string{
+			"https://example.com" + authPath,
+			"https://example.com" + authPath + "/",
+			"https://example.com/app/laas-logs-api",
+			"https://example.com?x=1",
+		} {
+			c := HarmonyConfig{
+				ClientOptions: validClientOptions(),
+				ClientID:      "x", AccessKey: "y",
+				URL:    bad,
+				Events: EventsConfig{Enabled: true},
+			}
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("expected %q to be rejected as a gateway base URL", bad)
+			}
+			// The message has to carry the value to use instead, or it is no
+			// more actionable than the 404 it replaces.
+			if !strings.Contains(err.Error(), "https://example.com\"") {
+				t.Fatalf("error for %q should name the corrected URL; got %q", bad, err)
+			}
+		}
+	})
+
+	t.Run("URL without a scheme or host is rejected", func(t *testing.T) {
+		for _, bad := range []string{"example.com", "ftp://example.com", "https://"} {
+			c := HarmonyConfig{
+				ClientOptions: validClientOptions(),
+				ClientID:      "x", AccessKey: "y",
+				URL:    bad,
+				Events: EventsConfig{Enabled: true},
+			}
+			if err := c.Validate(); err == nil {
+				t.Fatalf("expected %q to be rejected", bad)
+			}
+		}
+	})
+
 	t.Run("deprecated emails field surfaces a migration error", func(t *testing.T) {
 		c := HarmonyConfig{
 			ClientOptions: validClientOptions(),
@@ -273,10 +316,19 @@ type fakeGateway struct {
 	// service that never recovers).
 	cancelEventsTimes int
 
+	// submit403Times controls how many logs_query submits are rejected with
+	// HTTP 403 before the gateway accepts them — models a cloudService the
+	// tenant isn't licensed for. Negative = always reject.
+	submit403Times int
+
 	// retrieve503Times controls how many retrieve calls return a transient
 	// 503 before succeeding — models the intermittent gateway slowness the
 	// adapter must absorb via bounded retry. Negative = always 503.
 	retrieve503Times int
+
+	// retrieve403 makes every retrieve return 403, to prove that only a
+	// submit-time 403 is treated as a soft per-service failure.
+	retrieve403 bool
 
 	// auth503Times controls how many /auth/external calls return a
 	// transient 503 before succeeding — models the same gateway slowness
@@ -368,6 +420,25 @@ func (f *fakeGateway) serveEventsSubmit(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	atomic.AddInt32(&f.submitCalls, 1)
+
+	f.mu.Lock()
+	forbidden := f.submit403Times != 0
+	if f.submit403Times > 0 {
+		f.submit403Times--
+	}
+	f.mu.Unlock()
+	if forbidden {
+		writeJSON(w, http.StatusForbidden, utils.Dict{
+			"success": false,
+			"error": utils.Dict{
+				"status":  403,
+				"name":    "Forbidden",
+				"details": []string{"Unauthorized to perform operations on the given Cloud Service"},
+			},
+		})
+		return
+	}
+
 	writeJSON(w, http.StatusOK, utils.Dict{"success": true, "data": utils.Dict{"taskId": "task-1"}})
 }
 
@@ -418,10 +489,18 @@ func (f *fakeGateway) serveEventsRetrieve(w http.ResponseWriter, r *http.Request
 	if f.retrieve503Times > 0 {
 		f.retrieve503Times--
 	}
+	forbidden := f.retrieve403
 	f.mu.Unlock()
 	if transient {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		_, _ = w.Write([]byte(`{"success":false,"message":"temporarily unavailable"}`))
+		return
+	}
+	if forbidden {
+		writeJSON(w, http.StatusForbidden, utils.Dict{
+			"success": false,
+			"error":   utils.Dict{"status": 403, "name": "Forbidden"},
+		})
 		return
 	}
 
@@ -668,6 +747,151 @@ func TestEventsCanceledIsSoftFailure(t *testing.T) {
 	if !strings.Contains(warnings[0], "Couldn't process request") {
 		t.Fatalf("warning should include the gateway's error detail; got %q", warnings[0])
 	}
+}
+
+// TestEventsSubmit403IsSoftFailure is the 403 twin of
+// TestEventsCanceledIsSoftFailure. A cloudService the tenant isn't licensed
+// for is rejected at submit rather than cancelled mid-task, and before this
+// was handled it produced an OnError on every poll — one per unlicensed
+// product in the default fan-out, forever, with the cursor pinned.
+func TestEventsSubmit403IsSoftFailure(t *testing.T) {
+	fake := &fakeGateway{submit403Times: -1} // never licensed, never recovers
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var warnings []string
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnWarning = func(msg string) {
+		mu.Lock()
+		warnings = append(warnings, msg)
+		mu.Unlock()
+	}
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	// Two submits proves the worker keeps polling rather than wedging.
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.submitCalls) >= 2
+	}, "expected the worker to keep polling after a 403 submit")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("a 403 submit should not surface as OnError; got %d: %v", len(errs), errs)
+	}
+	if len(warnings) == 0 {
+		t.Fatalf("expected at least one OnWarning for the 403 submit")
+	}
+	if !strings.Contains(warnings[0], "Harmony Endpoint") {
+		t.Fatalf("warning should name the offending service; got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "Unauthorized to perform operations on the given Cloud Service") {
+		t.Fatalf("warning should carry the gateway's detail; got %q", warnings[0])
+	}
+	if !strings.Contains(warnings[0], "cloud_services") {
+		t.Fatalf("warning should tell the operator how to silence it; got %q", warnings[0])
+	}
+}
+
+// TestEventsSubmit403RecoversWhenLicensed pins the cursor behaviour: after a
+// 403 window is skipped the worker must resume normally once the gateway
+// starts accepting, rather than staying wedged on the refused window.
+func TestEventsSubmit403RecoversWhenLicensed(t *testing.T) {
+	fake := &fakeGateway{
+		submit403Times: 1, // refuse once, then accept
+		eventPages: [][]utils.Dict{
+			{{"id": "after-403", "time": "2026-05-14T22:00:00Z"}},
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		return atomic.LoadInt32(&fake.retrieveCalls) >= 1
+	}, "expected the worker to resume retrieving once the gateway accepts the submit")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(errs) != 0 {
+		t.Fatalf("recovery path should produce no OnError; got %v", errs)
+	}
+}
+
+// TestEventsRetrieve403StaysHardError guards the deliberate asymmetry: only a
+// 403 on the *submit* is soft. Once a task is accepted, records from the
+// window may already be downstream, so a later 403 must not silently advance
+// the cursor past them.
+func TestEventsRetrieve403StaysHardError(t *testing.T) {
+	fake := &fakeGateway{
+		retrieve403: true,
+		eventPages: [][]utils.Dict{
+			{{"id": "never-delivered", "time": "2026-05-14T22:00:00Z"}},
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	var errs []string
+	var mu sync.Mutex
+	opts := validClientOptions()
+	opts.OnError = func(err error) {
+		mu.Lock()
+		errs = append(errs, err.Error())
+		mu.Unlock()
+	}
+
+	conf := HarmonyConfig{
+		ClientOptions: opts,
+		ClientID:      "c", AccessKey: "s", URL: srv.URL,
+		Events: EventsConfig{Enabled: true, CloudServices: []string{"Harmony Endpoint"}, PollInterval: "10ms"},
+	}
+	adapter, _, err := NewHarmonyAdapter(context.Background(), conf)
+	if err != nil {
+		t.Fatalf("NewHarmonyAdapter: %v", err)
+	}
+	defer adapter.Close()
+
+	waitUntil(t, 3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(errs) >= 1
+	}, "expected a 403 on retrieve to surface as OnError")
 }
 
 // TestEventsCanceledTransientRecovery covers the recovery case: the gateway

@@ -56,7 +56,14 @@ harmony:
     limit: 5000       # per-cloud-service window cap; gateway minimum is 10
 ```
 
-If a configured `cloud_service` is not provisioned for the tenant the gateway returns the query in state `Canceled`; the adapter logs one warning per poll and keeps going (it does not surface as an error). Remove the service from `cloud_services` to silence the warning.
+If a configured `cloud_service` is not available for the tenant, the gateway says so in one of two ways, and the adapter treats both as a per-service soft failure — one warning per poll, the window skipped, the other services' workers unaffected:
+
+- it accepts the query and returns it in state `Canceled`; or
+- it rejects the submit with `HTTP 403: Unauthorized to perform operations on the given Cloud Service`, which means the tenant is not licensed for that product, or the API key is missing the *Logs as a Service* grant.
+
+Neither surfaces as an error. Remove the service from `cloud_services` to silence the warning — `cloud_services` defaults to the **full** Harmony suite, so a tenant licensed for only part of it will warn about the rest until the list is narrowed.
+
+A 403 later in the sequence (status poll or retrieve) is deliberately *not* soft: records from that window may already have shipped, so the cursor must not advance past them.
 
 Each shipped record is annotated:
 

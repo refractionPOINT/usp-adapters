@@ -10,6 +10,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -517,6 +518,9 @@ func (c *HarmonyConfig) Validate() error {
 		return errors.New("the `emails` firehose source has been removed; express it as an `entities` query with `include_splits: true` (see harmony/README.md for the migration)")
 	}
 	c.URL = strings.TrimRight(c.URL, "/")
+	if err := validateGatewayURL(c.URL); err != nil {
+		return err
+	}
 
 	anyEnabled := false
 	names := make([]string, 0, 4)
@@ -532,6 +536,35 @@ func (c *HarmonyConfig) Validate() error {
 	}
 	if !anyEnabled {
 		return fmt.Errorf("at least one source must be enabled (%s)", strings.Join(names, ", "))
+	}
+	return nil
+}
+
+// validateGatewayURL rejects a url carrying anything beyond scheme + host.
+//
+// Every request path in this adapter is built as conf.URL + a constant suffix
+// (authPath, eventsQueryPath, …), so a url with a path component corrupts all
+// of them. The common way to get one is to paste the "Authentication URL" the
+// Infinity Portal shows next to a new API key: it already ends in
+// /auth/external, which yields POST /auth/external/auth/external and a 404
+// whose message gives no hint that the url field is at fault. Trimming a
+// trailing slash — all this used to do — does not catch it.
+//
+// Checking here turns that into a startup error naming the exact value to use,
+// instead of a 404 on the first poll.
+func validateGatewayURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("url: %v", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("url: must be an http(s) URL, got %q", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("url: missing host in %q", raw)
+	}
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("url: must be the gateway base URL (scheme and host only), got %q — use %q instead. The Infinity Portal's Authentication URL ends in %s; this field takes only the part before that", raw, u.Scheme+"://"+u.Host, authPath)
 	}
 	return nil
 }
@@ -654,7 +687,15 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 
 		newCursor, err := a.runOneEventsQuery(service, nextStart, endTime)
 		var canceled *taskCanceledError
+		var unauthorized *serviceUnauthorizedError
 		switch {
+		case errors.As(err, &unauthorized):
+			// Same condition as the Canceled case below, surfaced by the
+			// gateway as a 403 on the submit instead of a cancelled task.
+			// Handle it identically: warn, skip the window, keep the other
+			// services' workers running.
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — skipping window; drop it from cloud_services to silence this", service, unauthorized))
+			nextStart = endTime
 		case errors.As(err, &canceled):
 			// Soft failure: the gateway accepted the query but couldn't
 			// fulfill it for this service (commonly: the service isn't
@@ -681,7 +722,17 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 func (a *HarmonyAdapter) runOneEventsQuery(service string, startTime, endTime time.Time) (time.Time, error) {
 	taskID, err := a.submitEventsQuery(service, startTime, endTime)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("submitEventsQuery: %v", err)
+		// A 403 here is the gateway refusing this cloudService outright —
+		// see serviceUnauthorizedError. Only the submit is treated this way:
+		// nothing has shipped yet, so skipping the window loses nothing. A
+		// 403 later in the sequence (status poll / retrieve) stays a hard
+		// error, because records from this window may already be downstream
+		// and advancing the cursor past them would silently drop the rest.
+		var statusErr *httpStatusError
+		if errors.As(err, &statusErr) && statusErr.Status == http.StatusForbidden {
+			return time.Time{}, &serviceUnauthorizedError{Service: service, Detail: statusErr.Body}
+		}
+		return time.Time{}, fmt.Errorf("submitEventsQuery: %w", err)
 	}
 
 	pageTokens, err := a.waitForEventsTask(taskID)
@@ -766,6 +817,28 @@ func (a *HarmonyAdapter) submitEventsQuery(service string, startTime, endTime ti
 type taskCanceledError struct {
 	TaskID  string
 	Details []string
+}
+
+// serviceUnauthorizedError is the other way the gateway says "I won't serve
+// this cloud service for this tenant": instead of accepting the query and
+// cancelling the task, it rejects the submit outright with HTTP 403
+// ("Unauthorized to perform operations on the given Cloud Service"). That
+// happens when the tenant isn't licensed for the product named in
+// cloudService, or when the API key is missing the Logs as a Service grant.
+//
+// Like taskCanceledError this is a per-service, effectively permanent
+// condition — not an adapter-wide fault and not something a retry fixes — so
+// the worker treats it the same way: warn once per poll and skip the window.
+// Without this the default cloud_services fan-out makes every unlicensed
+// product in the suite emit an OnError every poll_interval forever, with its
+// cursor pinned so the query window grows without bound.
+type serviceUnauthorizedError struct {
+	Service string
+	Detail  string
+}
+
+func (e *serviceUnauthorizedError) Error() string {
+	return fmt.Sprintf("cloud service %q is not authorized for these credentials (tenant not licensed for it, or the API key lacks the Logs as a Service grant): %s", e.Service, e.Detail)
 }
 
 func (e *taskCanceledError) Error() string {
@@ -1206,7 +1279,7 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 	}
 
 	if status < 200 || status >= 300 {
-		return nil, fmt.Errorf("%s: HTTP %d: %s", label, status, string(respBody))
+		return nil, &httpStatusError{Label: label, Status: status, Body: string(respBody)}
 	}
 
 	out := utils.Dict{}
@@ -1216,6 +1289,19 @@ func (a *HarmonyAdapter) doAuthRequest(method, url string, body utils.Dict, extr
 		}
 	}
 	return out, nil
+}
+
+// httpStatusError carries a non-2xx gateway response so callers can branch on
+// the status code instead of string-matching the message. The Error() text is
+// byte-identical to the fmt.Errorf it replaced, so log output is unchanged.
+type httpStatusError struct {
+	Label  string
+	Status int
+	Body   string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s: HTTP %d: %s", e.Label, e.Status, e.Body)
 }
 
 // isTransientStatus reports whether an HTTP status is a retryable gateway
