@@ -22,6 +22,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/bitwarden"
 	"github.com/refractionPOINT/usp-adapters/box"
 	"github.com/refractionPOINT/usp-adapters/cato"
+	"github.com/refractionPOINT/usp-adapters/cortex_xdr"
 	"github.com/refractionPOINT/usp-adapters/cylance"
 	"github.com/refractionPOINT/usp-adapters/defender"
 	"github.com/refractionPOINT/usp-adapters/duo"
@@ -380,6 +381,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.Cylance.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.Cylance
 		client, chRunning, err = usp_cylance.NewCylanceAdapter(ctx, configs.Cylance)
+	} else if method == "cortex_xdr" {
+		configs.CortexXdr.ClientOptions = applyLogging(configs.CortexXdr.ClientOptions)
+		configs.CortexXdr.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.CortexXdr
+		client, chRunning, err = usp_cortex_xdr.NewCortexXdrAdapter(ctx, configs.CortexXdr)
 	} else if method == "entraid" {
 		configs.EntraID.ClientOptions = applyLogging(configs.EntraID.ClientOptions)
 		configs.EntraID.ClientOptions.Architecture = "usp_adapter"
