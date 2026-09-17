@@ -31,6 +31,8 @@ type SQSFilesAdapter struct {
 
 	chFiles chan fileInfo
 
+	awsCreds *credentials.Credentials
+
 	// SQS
 	awsConfig  *aws.Config
 	awsSession *session.Session
@@ -52,10 +54,11 @@ type SQSFilesConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 
 	// SQS specific
-	AccessKey string `json:"access_key" yaml:"access_key"`
-	SecretKey string `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
-	QueueURL  string `json:"queue_url" yaml:"queue_url"`
-	Region    string `json:"region" yaml:"region"`
+	AccessKey     string                       `json:"access_key" yaml:"access_key"`
+	SecretKey     string                       `json:"secret_key,omitempty" yaml:"secret_key,omitempty"`
+	RolesAnywhere utils.AWSRolesAnywhereConfig `json:"roles_anywhere,omitempty" yaml:"roles_anywhere,omitempty"`
+	QueueURL      string                       `json:"queue_url" yaml:"queue_url"`
+	Region        string                       `json:"region" yaml:"region"`
 
 	// S3 specific
 	ParallelFetch     int    `json:"parallel_fetch" yaml:"parallel_fetch"`
@@ -75,11 +78,8 @@ func (c *SQSFilesConfig) Validate() error {
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
-	if c.AccessKey == "" {
-		return errors.New("missing access_key")
-	}
-	if c.SecretKey == "" {
-		return errors.New("missing secret_key")
+	if err := utils.ValidateAWSAuth(c.AccessKey, c.SecretKey, c.RolesAnywhere); err != nil {
+		return err
 	}
 	if c.Region == "" {
 		return errors.New("missing region")
@@ -108,10 +108,14 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 
 	var err error
 
+	if a.awsCreds, err = utils.NewAWSCredentials(conf.AccessKey, conf.SecretKey, conf.RolesAnywhere); err != nil {
+		return nil, nil, fmt.Errorf("aws credentials: %v", err)
+	}
+
 	// SQS
 	a.awsConfig = &aws.Config{
 		Region:      aws.String(conf.Region),
-		Credentials: credentials.NewStaticCredentials(conf.AccessKey, conf.SecretKey, ""),
+		Credentials: a.awsCreds,
 	}
 
 	if a.awsSession, err = session.NewSession(a.awsConfig); err != nil {
@@ -179,20 +183,27 @@ func (a *SQSFilesAdapter) initS3SDKs(bucket string) error {
 	}
 	a.awsS3Config = &aws.Config{
 		Region:      aws.String(region),
-		Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+		Credentials: a.awsCreds,
 	}
 
 	if a.awsS3Session, err = session.NewSession(a.awsS3Config); err != nil {
 		return fmt.Errorf("s3.NewSession(): %v", err)
 	}
 
-	a.awsS3 = s3.New(a.awsSession)
+	a.awsS3 = s3.New(a.awsS3Session)
 	a.awsDownloader = s3manager.NewDownloader(a.awsS3Session)
+	a.isS3Inited = true
 	return nil
 }
 
 func (a *SQSFilesAdapter) getBucketRegion(bucket string) (string, error) {
-	return s3manager.GetBucketRegion(a.ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
+	sess, err := session.NewSession(&aws.Config{
+		Credentials: a.awsCreds,
+	})
+	if err != nil {
+		return "", err
+	}
+	return s3manager.GetBucketRegion(a.ctx, sess, bucket, "us-east-1")
 }
 
 func (a *SQSFilesAdapter) receiveEvents() error {

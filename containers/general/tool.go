@@ -138,7 +138,36 @@ func printUsage() {
 
 func printConfig(method string, c interface{}) {
 	b, _ := yaml.Marshal(c)
+	var redacted interface{}
+	if err := yaml.Unmarshal(b, &redacted); err == nil {
+		redactSecrets(redacted)
+		if rb, err := yaml.Marshal(redacted); err == nil {
+			b = rb
+		}
+	}
 	log("Configs in use (%s):\n----------------------------------\n%s----------------------------------\n", method, string(b))
+}
+
+// redactSecrets masks secret material in a config tree so it never
+// lands in logs.
+func redactSecrets(v interface{}) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, val := range t {
+			switch k {
+			case "secret_key", "private_key":
+				if s, ok := val.(string); ok && s != "" {
+					t[k] = "<redacted>"
+				}
+			default:
+				redactSecrets(val)
+			}
+		}
+	case []interface{}:
+		for _, e := range t {
+			redactSecrets(e)
+		}
+	}
 }
 
 func main() {
