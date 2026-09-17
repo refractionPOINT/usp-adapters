@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -23,11 +24,11 @@ const (
 
 type MacUnifiedLoggingAdapter struct {
 	conf         MacUnifiedLoggingConfig
-	wg           sync.WaitGroup
-	isRunning    uint32
-	mRunning     sync.RWMutex
 	uspClient    *uspclient.Client
 	writeTimeout time.Duration
+
+	logs      *Logs
+	isRunning uint32
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -38,6 +39,7 @@ type MacUnifiedLoggingAdapter struct {
 func NewMacUnifiedLoggingAdapter(ctx context.Context, conf MacUnifiedLoggingConfig) (*MacUnifiedLoggingAdapter, chan struct{}, error) {
 	a := &MacUnifiedLoggingAdapter{
 		conf:      conf,
+		ctx:       ctx,
 		isRunning: 1,
 	}
 
@@ -52,10 +54,27 @@ func NewMacUnifiedLoggingAdapter(ctx context.Context, conf MacUnifiedLoggingConf
 		return nil, nil, err
 	}
 
+	a.logs = NewLogs()
+	if err := a.logs.StartGathering(a.conf.Predicate, a.conf.ClientOptions.OnWarning); err != nil {
+		a.uspClient.Close()
+		return nil, nil, err
+	}
+
+	// Make sure the `log stream` subprocess does not outlive us if the
+	// process is signaled: stop gathering (which kills the subprocess)
+	// before exiting.
+	signalChannel := make(chan os.Signal, 1)
+	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-signalChannel
+		a.logs.StopGathering()
+		os.Exit(0)
+	}()
+
 	a.chStopped = make(chan struct{})
 
 	a.wgSenders.Add(1)
-	go a.handleEvent(a.conf.Predicate)
+	go a.handleEvents()
 
 	go func() {
 		a.wgSenders.Wait()
@@ -68,18 +87,25 @@ func NewMacUnifiedLoggingAdapter(ctx context.Context, conf MacUnifiedLoggingConf
 func (a *MacUnifiedLoggingAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 
-	a.mRunning.Lock()
-	a.isRunning = 0
-	a.mRunning.Unlock()
+	// Stop shipping new events, then stop the gatherer (which kills the
+	// subprocess and closes logs.Channel so handleEvents drains and exits).
+	atomic.StoreUint32(&a.isRunning, 0)
+	a.logs.StopGathering()
 
-	a.wg.Done()
-	a.wg.Wait()
+	// Flush already-queued events, then close the client. Close() also
+	// unblocks any Ship() that handleEvents is parked in on a full buffer
+	// (an uplink stall makes Ship(_, 0) block indefinitely), so the wait
+	// below cannot deadlock. Order matters: wgSenders.Wait() must come
+	// AFTER the client is closed.
+	err1 := a.uspClient.Drain(1 * time.Minute)
+	_, err2 := a.uspClient.Close()
 
-	_, err := a.uspClient.Close()
-	if err != nil {
-		return err
+	a.wgSenders.Wait()
+
+	if err1 != nil {
+		return err1
 	}
-	return nil
+	return err2
 }
 
 func (a *MacUnifiedLoggingAdapter) convertStructToMap(obj interface{}) map[string]interface{} {
@@ -97,23 +123,18 @@ func (a *MacUnifiedLoggingAdapter) convertStructToMap(obj interface{}) map[strin
 	return mapRepresentation
 }
 
-func (a *MacUnifiedLoggingAdapter) handleEvent(predicate string) uintptr {
+func (a *MacUnifiedLoggingAdapter) handleEvents() {
+	defer a.wgSenders.Done()
 
-	logs := NewLogs()
-
-	signalChannel := make(chan os.Signal)
-	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		<-signalChannel
-		logs.StopGathering()
-		os.Exit(0)
-	}()
-
-	if err := logs.StartGathering(predicate); err != nil {
-		panic(err)
-	}
-
-	for log := range logs.Channel {
+	// The channel is closed by StopGathering once the gatherer has fully
+	// wound down, so this loop is guaranteed to exit on shutdown.
+	for log := range a.logs.Channel {
+		// While closing, drain the channel without shipping: the uspClient
+		// is being drained and closed, so further Ship() calls would just
+		// error. This also lets the range complete promptly.
+		if atomic.LoadUint32(&a.isRunning) == 0 {
+			continue
+		}
 		msg := &protocol.DataMessage{
 			JsonPayload: a.convertStructToMap(log),
 			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
@@ -127,6 +148,4 @@ func (a *MacUnifiedLoggingAdapter) handleEvent(predicate string) uintptr {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
 	}
-
-	return 0
 }
