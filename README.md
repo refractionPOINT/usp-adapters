@@ -142,6 +142,19 @@ be added purely through configuration. See [threatlocker/README.md](./threatlock
 ./general threatlocker client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=threatlocker api_key=$THREATLOCKER_API_TOKEN instance=g
 ```
 
+### Netskope
+
+Pulls security telemetry from the Netskope REST API v2 dataexport iterator. By
+default it collects every alert stream (DLP, malware, CTEP, UEBA, compromised
+credentials, ...) plus the admin audit log; additional event streams (page,
+application, network, ...) can be added purely through configuration. Each stream
+uses a server-side iterator cursor, so a restart resumes without gaps. See
+[netskope/README.md](./netskope/README.md).
+
+```
+./general netskope client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=netskope token=$NETSKOPE_API_TOKEN tenant=acme.goskope.com
+```
+
 ### Gmail
 
 Collects incoming email as telemetry from one or many Gmail mailboxes via the
