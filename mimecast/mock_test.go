@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/assert"
@@ -57,16 +58,55 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 	return out
 }
 
+// --- captured adapter logging -------------------------------------------------
+
+// logCapture records the warnings and errors an adapter reports, so a test can
+// assert on a signal that has no other observable effect.
+type logCapture struct {
+	mu       sync.Mutex
+	warnings []string
+	errors   []string
+}
+
+func (l *logCapture) joinedWarnings() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.warnings, "\n")
+}
+
+func (l *logCapture) joinedErrors() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.errors, "\n")
+}
+
+// recordingClientOptions returns test ClientOptions whose warning and error
+// callbacks are captured as well as logged.
+func recordingClientOptions(t *testing.T) (uspclient.ClientOptions, *logCapture) {
+	t.Helper()
+	capture := &logCapture{}
+	opts := testClientOptions(t)
+	opts.OnWarning = func(msg string) {
+		t.Logf("WRN: %s", msg)
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		capture.warnings = append(capture.warnings, msg)
+	}
+	opts.OnError = func(err error) {
+		t.Logf("ERR: %v", err)
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		capture.errors = append(capture.errors, err.Error())
+	}
+	return opts, capture
+}
+
 // --- mock Mimecast API 2.0 ----------------------------------------------------
 
-// mimecastRequestTimeLayout is the format the adapter renders startDateTime /
-// endDateTime in ("2006-01-02T15:04:05-0700"). It matches the documented
-// format for those fields, yyyy-MM-dd'T'HH:mm:ssZ with a colonless offset
-// (e.g. "2011-12-03T10:15:30+0000").
-const mimecastRequestTimeLayout = "2006-01-02T15:04:05-0700"
-
-// mockAccessToken is the bearer token the mock issues on a successful
-// client-credentials exchange. Clearly fake.
+// mockAccessToken is the first bearer token the mock issues on a successful
+// client-credentials exchange. Later exchanges append a serial (see
+// rotateToken), so a test can tell a re-authentication from a cache hit.
+// Clearly fake.
 const mockAccessToken = "fake-mimecast-access-token-1111111111111111"
 
 // mockMimecast is an in-memory stand-in for the Mimecast API 2.0. It exposes
@@ -84,6 +124,9 @@ type mockMimecast struct {
 	clientID     string
 	clientSecret string
 	events       []utils.Dict // audit logs, oldest first
+	// unfilteredEvents are returned on every first page regardless of the
+	// window; see addEventUnfiltered.
+	unfilteredEvents []utils.Dict
 
 	tokenRequests int
 	auditRequests int
@@ -97,10 +140,104 @@ type mockMimecast struct {
 	// auditStatus, when non-zero, forces the audit endpoint to return that
 	// HTTP status (the token endpoint keeps working).
 	auditStatus int
+
+	// auditStatusQueue forces a status for the next N audit requests, one
+	// entry consumed per request, 0 meaning "respond normally". It models a
+	// failure that hits partway through a multi-page window.
+	auditStatusQueue []int
+
+	// indexDelay models the behaviour that broke this adapter: an audit record
+	// with eventTime T is not retrievable until T+indexDelay, even for a
+	// request whose window contains T. Zero means instantly retrievable.
+	indexDelay time.Duration
+
+	// windows records the (startDateTime, endDateTime) pair of every audit
+	// request, plus the wall-clock time it arrived, so a test can assert how
+	// far back the adapter actually reached.
+	windows []window
+
+	// currentToken is the bearer token the audit endpoint currently accepts.
+	// rotateToken invalidates it, which is how token expiry is simulated.
+	currentToken string
+	tokenSerial  int
+
+	// tokenExpiresIn is the expires_in the token endpoint advertises, in
+	// seconds. Zero means the field is omitted entirely.
+	tokenExpiresIn int
+}
+
+// window is one observed (startDateTime, endDateTime) pair as rendered by the
+// adapter, plus the wall-clock time the request arrived.
+type window struct {
+	start, end, seen time.Time
 }
 
 func newMockMimecast(clientID, clientSecret string) *mockMimecast {
-	return &mockMimecast{clientID: clientID, clientSecret: clientSecret}
+	return &mockMimecast{
+		clientID:       clientID,
+		clientSecret:   clientSecret,
+		currentToken:   mockAccessToken,
+		tokenExpiresIn: 1800,
+	}
+}
+
+// rotateToken invalidates the token the audit endpoint accepts, the way a real
+// token expiring server-side would. The adapter should notice the resulting
+// 401 and re-authenticate.
+func (m *mockMimecast) rotateToken() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokenSerial++
+	m.currentToken = fmt.Sprintf("%s-%d", mockAccessToken, m.tokenSerial)
+}
+
+func (m *mockMimecast) activeToken() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentToken
+}
+
+// failNextAuditRequests forces a status for the next len(statuses) audit
+// requests; a 0 entry responds normally.
+func (m *mockMimecast) failNextAuditRequests(statuses ...int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditStatusQueue = append(m.auditStatusQueue, statuses...)
+}
+
+// addEventUnfiltered adds a record the mock returns on every page-1 response
+// regardless of the requested window. It exists for fixtures whose eventTime is
+// deliberately unusable, which by definition cannot be placed on a timeline.
+func (m *mockMimecast) addEventUnfiltered(e utils.Dict) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unfilteredEvents = append(m.unfilteredEvents, e)
+}
+
+func (m *mockMimecast) setIndexDelay(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.indexDelay = d
+}
+
+func (m *mockMimecast) setAuditStatus(status int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditStatus = status
+}
+
+func (m *mockMimecast) setTokenExpiresIn(seconds int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokenExpiresIn = seconds
+}
+
+func (m *mockMimecast) seenWindows() []window {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]window, len(m.windows))
+	copy(out, m.windows)
+	return out
 }
 
 func (m *mockMimecast) addEvent(e utils.Dict) {
@@ -170,13 +307,22 @@ func (m *mockMimecast) handleToken(t *testing.T, w http.ResponseWriter, r *http.
 		return
 	}
 
+	m.mu.Lock()
+	issued := m.currentToken
+	expiresIn := m.tokenExpiresIn
+	m.mu.Unlock()
+
+	resp := map[string]interface{}{
+		"access_token": issued,
+		"token_type":   "Bearer",
+	}
+	if expiresIn > 0 {
+		resp["expires_in"] = expiresIn
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"access_token": mockAccessToken,
-		"token_type":   "Bearer",
-		"expires_in":   1800,
-	})
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // auditRequestBody mirrors the request envelope the adapter sends to
@@ -198,6 +344,13 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	m.mu.Lock()
 	m.auditRequests++
 	forcedStatus := m.auditStatus
+	if len(m.auditStatusQueue) > 0 {
+		if queued := m.auditStatusQueue[0]; queued != 0 {
+			forcedStatus = queued
+		}
+		m.auditStatusQueue = m.auditStatusQueue[1:]
+	}
+	expectedAuth := "Bearer " + m.currentToken
 	m.mu.Unlock()
 
 	if !assert.Equal(t, http.MethodPost, r.Method, "get-audit-events must be a POST") {
@@ -205,7 +358,7 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 		return
 	}
 
-	if r.Header.Get("Authorization") != "Bearer "+mockAccessToken {
+	if r.Header.Get("Authorization") != expectedAuth {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"meta":{"status":401},"data":[],"fail":[{"errors":[{"code":"invalid_access_token","message":"Access token is invalid","retryable":false}]}]}`))
@@ -238,28 +391,48 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	}
 	m.mu.Unlock()
 
-	start, errS := time.Parse(mimecastRequestTimeLayout, req.Data[0].StartDateTime)
-	end, errE := time.Parse(mimecastRequestTimeLayout, req.Data[0].EndDateTime)
-	if !assert.NoError(t, errS, "startDateTime must parse as %s", mimecastRequestTimeLayout) ||
-		!assert.NoError(t, errE, "endDateTime must parse as %s", mimecastRequestTimeLayout) {
+	start, errS := time.Parse(mimecastTimeLayout, req.Data[0].StartDateTime)
+	end, errE := time.Parse(mimecastTimeLayout, req.Data[0].EndDateTime)
+	if !assert.NoError(t, errS, "startDateTime must parse as %s", mimecastTimeLayout) ||
+		!assert.NoError(t, errE, "endDateTime must parse as %s", mimecastTimeLayout) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
+	now := time.Now()
+
 	// Filter the dataset to the requested window (inclusive bounds), the way
-	// the real API constrains results to startDateTime..endDateTime.
+	// the real API constrains results to startDateTime..endDateTime, and hold
+	// back anything the index has not caught up to yet.
 	m.mu.Lock()
+	m.windows = append(m.windows, window{start: start, end: end, seen: now})
 	var matched []utils.Dict
+	badTimes := []string{}
 	for _, e := range m.events {
-		ts, perr := time.Parse(time.RFC3339, e["eventTime"].(string))
+		raw := e["eventTime"].(string)
+		ts, perr := parseEventTime(raw)
 		if perr != nil {
+			// A fixture the adapter itself could not read would silently
+			// vanish here and quietly weaken every test that uses it.
+			badTimes = append(badTimes, raw)
+			continue
+		}
+		if now.Before(ts.Add(m.indexDelay)) {
 			continue
 		}
 		if !ts.Before(start) && !ts.After(end) {
 			matched = append(matched, e)
 		}
 	}
+	if pageToken := req.Meta.Pagination.PageToken; pageToken == "" {
+		matched = append(matched, m.unfilteredEvents...)
+	}
 	m.mu.Unlock()
+
+	if !assert.Empty(t, badTimes, "fixture eventTime values must be in a format the adapter can parse") {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
 	pageSize := req.Meta.Pagination.PageSize
 	if pageSize <= 0 {
@@ -309,16 +482,16 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 //
 // NOTE on eventTime format: the official API 2.0 spec documents eventTime as
 // ISO 8601 in the yyyy-MM-dd'T'HH:mm:ssZ pattern, i.e. a colonless numeric
-// offset like "2026-06-11T10:00:00+0000". The adapter parses eventTime with
-// time.RFC3339, which requires a colon in the offset (or "Z") and so rejects
-// the documented form; fixtures use the RFC3339 "Z" form so the adapter's
-// dedupe bookkeeping behaves as designed.
+// offset like "2026-06-11T10:00:00+0000", which time.RFC3339 rejects. Fixtures
+// render that documented form, so the whole suite runs against the format the
+// live API actually returns rather than one the adapter merely happens to
+// parse. See TestEventTimeFormats for the RFC3339 variants also accepted.
 func fakeAuditEvent(id, auditType, user, category, info string, eventTime time.Time) utils.Dict {
 	return utils.Dict{
 		"id":        id,
 		"auditType": auditType,
 		"user":      user,
-		"eventTime": eventTime.UTC().Truncate(time.Second).Format(time.RFC3339),
+		"eventTime": eventTime.UTC().Truncate(time.Second).Format(mimecastTimeLayout),
 		"eventInfo": info,
 		"category":  category,
 	}
@@ -438,9 +611,9 @@ func TestMimecastEndToEnd(t *testing.T) {
 	assert.Equal(t, 50, audit.Meta.Pagination.PageSize)
 	assert.Empty(t, audit.Meta.Pagination.PageToken, "the first page must not carry a pageToken")
 	require.Len(t, audit.Data, 1)
-	startT, err := time.Parse(mimecastRequestTimeLayout, audit.Data[0].StartDateTime)
+	startT, err := time.Parse(mimecastTimeLayout, audit.Data[0].StartDateTime)
 	require.NoError(t, err)
-	endT, err := time.Parse(mimecastRequestTimeLayout, audit.Data[0].EndDateTime)
+	endT, err := time.Parse(mimecastTimeLayout, audit.Data[0].EndDateTime)
 	require.NoError(t, err)
 	assert.False(t, endT.Before(startT), "the request window must not be inverted")
 }
@@ -556,7 +729,7 @@ func TestMimecastBadCredentialsShipsNothing(t *testing.T) {
 func TestMimecastAPIErrorKeepsPolling(t *testing.T) {
 	mock := newMockMimecast("client-id-test", "client-secret-test")
 	mock.addEvent(fakeLogonEvent("fake-audit-id-0001", time.Now().Add(-5*time.Second)))
-	mock.auditStatus = http.StatusInternalServerError
+	mock.setAuditStatus(http.StatusInternalServerError)
 	server := httptest.NewServer(mock.handler(t))
 	defer server.Close()
 
@@ -577,9 +750,7 @@ func TestMimecastAPIErrorKeepsPolling(t *testing.T) {
 	}
 
 	// Once the API recovers, the pending event ships exactly once.
-	mock.mu.Lock()
-	mock.auditStatus = 0
-	mock.mu.Unlock()
+	mock.setAuditStatus(0)
 
 	require.Eventually(t, func() bool { return sink.count() == 1 },
 		5*time.Second, 20*time.Millisecond, "the event should ship after the API recovers")
