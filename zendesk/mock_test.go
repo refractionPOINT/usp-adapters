@@ -84,12 +84,12 @@ type cursorState struct {
 //     sends the Rails array spelling "filter[created_at][]", which the mock
 //     mirrors. The docs do not say whether the bounds are inclusive; the mock
 //     treats them as inclusive.
-//   - The real API's links.next is a full URL carrying a page[after] cursor
-//     (https://developer.zendesk.com/api-reference/introduction/pagination/).
-//     This adapter instead feeds links.next back verbatim as the *first*
-//     filter[created_at][] value of the next request (see makeOneRequest), so
-//     the mock returns an opaque token and recognizes it there -- matching how
-//     the adapter actually consumes pagination.
+//   - links.next is a full URL carrying a page[after] cursor
+//     (https://developer.zendesk.com/api-reference/introduction/pagination/),
+//     which the mock returns and recognizes. The adapter previously fed
+//     links.next back verbatim as the *first* filter[created_at][] value of
+//     the next request, which built a malformed follow-up request; it now
+//     requests the URL directly.
 type mockZendesk struct {
 	mu    sync.Mutex
 	email string
@@ -185,14 +185,19 @@ func (m *mockZendesk) handler(t *testing.T) http.HandlerFunc {
 		created := q["filter[created_at][]"]
 		var cs cursorState
 		isCursor := false
-		m.mu.Lock()
-		if len(created) >= 1 {
-			if state, ok := m.cursors[created[0]]; ok {
+		if after := q.Get("page[after]"); after != "" {
+			m.mu.Lock()
+			state, ok := m.cursors[after]
+			if ok {
 				cs, isCursor = state, true
 				m.cursorRequests++
 			}
+			m.mu.Unlock()
+			if !assert.True(t, ok, "page[after] must be a cursor previously returned in links.next") {
+				http.Error(w, `{"error":"InvalidPaginationParameter"}`, http.StatusBadRequest)
+				return
+			}
 		}
-		m.mu.Unlock()
 
 		if !isCursor {
 			// A fresh window query carries exactly two created_at bounds.
@@ -234,11 +239,16 @@ func (m *mockZendesk) handler(t *testing.T) http.HandlerFunc {
 			page = matching[cs.offset:end]
 		}
 		hasMore := cs.offset+len(page) < len(matching)
-		next := ""
+		cursor := ""
+		nextURL := ""
 		if hasMore {
 			m.nextCursor++
-			next = fmt.Sprintf("cursor_%06d", m.nextCursor)
-			m.cursors[next] = cursorState{start: cs.start, until: cs.until, offset: cs.offset + len(page)}
+			cursor = fmt.Sprintf("cursor_%06d", m.nextCursor)
+			m.cursors[cursor] = cursorState{start: cs.start, until: cs.until, offset: cs.offset + len(page)}
+			// The real API returns links.next as a complete URL carrying the
+			// page[after] cursor, not a bare token.
+			nextURL = fmt.Sprintf("http://%s%s?page[after]=%s&page[size]=%d",
+				r.Host, logsEndpoint, url.QueryEscape(cursor), pageSize)
 		}
 		m.mu.Unlock()
 
@@ -248,11 +258,11 @@ func (m *mockZendesk) handler(t *testing.T) http.HandlerFunc {
 			"audit_logs": page,
 			"meta": map[string]interface{}{
 				"has_more":      hasMore,
-				"after_cursor":  next,
+				"after_cursor":  cursor,
 				"before_cursor": "",
 			},
 			"links": map[string]interface{}{
-				"next": next,
+				"next": nextURL,
 				"prev": "",
 			},
 		})

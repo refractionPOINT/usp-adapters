@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,12 +20,37 @@ import (
 )
 
 const (
-	logsEndpoint  = "/api/v2/audit_logs"
-	overlapPeriod = 30 * time.Second
+	logsEndpoint = "/api/v2/audit_logs"
+
+	// overlapPeriod is how far back each poll reaches. It must exceed the
+	// API's ingestion lag -- the delay between an event happening and the
+	// audit log returning it -- or every poll asks only for a slice of time
+	// the backend has not caught up to yet and returns nothing. The resulting
+	// window overlap is absorbed by the dedupe map.
+	overlapPeriod = 30 * time.Minute
 
 	// defaultPollInterval is how long fetchEvents idles between polling ticks.
 	defaultPollInterval = 30 * time.Second
 )
+
+// recordID renders an audit log id as a dedupe key. Zendesk types id as an
+// integer, so a JSON number arrives as a float64 rather than a string; a
+// plain string type assertion yields "" for every record, which collapses the
+// whole batch onto one dedupe key and drops every record after the first.
+func recordID(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return strconv.FormatInt(int64(t), 10)
+	case json.Number:
+		return t.String()
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", t)
+	}
+}
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
@@ -166,13 +192,21 @@ func (a *ZendeskAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", logsEndpoint))
 
-	since := time.Now()
+	// notBefore floors how far back the lookback may reach. It is deliberately
+	// fixed, not a moving cursor: the window start is
+	// max(notBefore, now-overlapPeriod), so feeding a moving cursor in here
+	// shrinks the window on every event instead of extending it.
+	//
+	// The floor sits one overlapPeriod before start-up so records still
+	// working through the backend's ingestion lag at restart are not dropped.
+	// The cost is that a restart may re-ship up to one overlap window, since
+	// the dedupe map is in-memory; duplicates beat gaps.
+	notBefore := time.Now().Add(-overlapPeriod)
 
 	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
-		items, newSince, _ := a.makeOneRequest(since)
-		since = newSince
+		items, _, _ := a.makeOneRequest(notBefore)
 		if items == nil {
 			continue
 		}
@@ -211,10 +245,15 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 	}
 	until := currentTime.UTC().Format(time.RFC3339)
 
+	// The first page carries the created_at window; every page after it is
+	// fetched from links.next, which Zendesk returns as a complete URL
+	// carrying the page[after] cursor.
+	url := fmt.Sprintf("%s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.baseURL, logsEndpoint, start, until)
+
 	for {
 		// Prepare the request.
-		req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.baseURL, logsEndpoint, start, until), nil)
-		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.baseURL, logsEndpoint, start, until))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
+		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			a.doStop.Set()
 			return nil, lastDetectionTime, err
@@ -240,7 +279,10 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 		// Evaluate if success.
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
-			a.conf.ClientOptions.OnError(fmt.Errorf("zendesk api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(body), string(body)))
+			// err is nil here; build a real one so callers can tell a failure
+			// apart from a successful empty poll.
+			err = fmt.Errorf("zendesk api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body))
+			a.conf.ClientOptions.OnError(err)
 			return nil, lastDetectionTime, err
 		}
 
@@ -276,22 +318,32 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 		lastDetectionTime = since
 		for _, item := range items {
 			timestamp, _ := item["created_at"].(string)
-			eventid, _ := item["id"].(string)
+			eventid := recordID(item["id"])
 			if _, ok := a.dedupe[eventid]; ok {
 				continue
 			}
-			epoch, _ := time.Parse(time.RFC3339, timestamp)
+			epoch, perr := time.Parse(time.RFC3339, timestamp)
+			if perr != nil {
+				// Without a usable created_at the dedupe entry would be culled
+				// immediately and the record would re-ship every poll. Stamp
+				// it with now so it survives the overlap window.
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("unparseable created_at %q: %v", timestamp, perr))
+				epoch = time.Now()
+			}
 			a.dedupe[eventid] = epoch.Unix()
 			newItems = append(newItems, item)
 			lastDetectionTime = epoch
 		}
 		allItems = append(allItems, newItems...)
 
-		// Handle pagination if there is a next link.
-		if !response.Meta.HasMore {
+		// Handle pagination if there is a next link. links.next is a full URL;
+		// feeding it back as a created_at bound (as this previously did) built
+		// a malformed request. Guard on it being present so a truthy has_more
+		// with no link cannot spin forever.
+		if !response.Meta.HasMore || response.Links.Next == "" {
 			break
 		}
-		start = response.Links.Next
+		url = response.Links.Next
 	}
 
 	// Cull old dedupe entries.

@@ -17,9 +17,17 @@ import (
 )
 
 const (
-	defaultBaseURL      = "https://platform.sublime.security"
-	logsPath            = "/v0/audit-log/events"
-	overlapPeriod       = 30 * time.Second
+	defaultBaseURL = "https://platform.sublime.security"
+	logsPath       = "/v0/audit-log/events"
+
+	// overlapPeriod is how far back the ship cutoff reaches. Unlike the other
+	// adapters this endpoint takes no server-side time filter, so the period
+	// governs client-side filtering: an event is shipped if its created_at is
+	// inside the window and the dedupe map has not seen it. It must exceed the
+	// API's ingestion lag, or an event that surfaces late is already older
+	// than the cutoff by the time it appears and is dropped for good.
+	overlapPeriod = 30 * time.Minute
+
 	pageLimit           = 500
 	defaultPollInterval = 30 * time.Second
 )
@@ -142,11 +150,20 @@ func (a *SublimeAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s%s events exiting", a.conf.BaseURL, logsPath))
 
-	since := time.Now()
+	// notBefore floors how far back the ship cutoff may reach. It is
+	// deliberately fixed, not a moving high-water mark: advancing the cutoff
+	// to the newest created_at seen means an event that the API surfaces late
+	// is already behind the cutoff when it appears and is dropped for good.
+	// Re-shipping is prevented by the dedupe map, not by the cutoff.
+	//
+	// The floor sits one overlapPeriod before start-up so records still
+	// working through the backend's ingestion lag at restart are not dropped.
+	// The cost is that a restart may re-ship up to one overlap window, since
+	// the dedupe map is in-memory; duplicates beat gaps.
+	notBefore := time.Now().Add(-overlapPeriod)
 
 	for !a.doStop.WaitFor(a.conf.PollInterval) {
-		items, newSince, _ := a.makeOneRequest(since)
-		since = newSince
+		items, _, _ := a.makeOneRequest(notBefore)
 		if items == nil {
 			continue
 		}
@@ -177,6 +194,13 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 	var offset int
 	lastDetectionTime := since
 
+	// Ship anything inside the overlap window, floored at since. Dedupe, not
+	// the cutoff, is what stops a record shipping twice.
+	cutoff := time.Now().Add(-overlapPeriod)
+	if cutoff.Before(since) {
+		cutoff = since
+	}
+
 	for {
 		url := fmt.Sprintf("%s%s?limit=%d&offset=%d", a.conf.BaseURL, logsPath, pageLimit, offset)
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
@@ -199,7 +223,10 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
-			a.conf.ClientOptions.OnError(fmt.Errorf("sublime api non-200: %s\nRESPONSE: %s", resp.Status, string(body)))
+			// err is nil here; build a real one so callers can tell a failure
+			// apart from a successful empty poll.
+			err = fmt.Errorf("sublime api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body))
+			a.conf.ClientOptions.OnError(err)
 			return nil, lastDetectionTime, err
 		}
 
@@ -232,7 +259,7 @@ func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 				continue
 			}
 
-			if createdAt.After(since) {
+			if createdAt.After(cutoff) {
 				a.dedupe[id] = createdAt.Unix()
 				newItems = append(newItems, event)
 				if createdAt.After(lastDetectionTime) {
