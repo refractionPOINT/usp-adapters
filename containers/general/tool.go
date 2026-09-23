@@ -58,6 +58,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/threatlocker"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
 	"github.com/refractionPOINT/usp-adapters/wel"
+	"github.com/refractionPOINT/usp-adapters/withsecure"
 	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
 
@@ -510,6 +511,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ThreatLocker
 		client, chRunning, err = usp_threatlocker.NewThreatLockerAdapter(ctx, configs.ThreatLocker)
+	} else if method == "withsecure" {
+		configs.WithSecure.ClientOptions = applyLogging(configs.WithSecure.ClientOptions)
+		configs.WithSecure.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.WithSecure
+		client, chRunning, err = usp_withsecure.NewWithSecureAdapter(ctx, configs.WithSecure)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}
