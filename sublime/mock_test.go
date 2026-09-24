@@ -75,7 +75,7 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 //     server-side. (`created_at[lte]` and `created_at[gt]` are not supported
 //     and are silently ignored.)
 //   - The filter is accepted with literal `[`/`]` and a percent-encoded value
-//     -- exactly the form makeOneRequest builds.
+//     -- exactly the form fetchWindow builds.
 //   - An unknown parameter name is SILENTLY IGNORED (a misspelled filter
 //     degrades to a full scan rather than erroring), so the name must stay
 //     exactly `created_at[gte]`.
@@ -109,10 +109,14 @@ type mockSublime struct {
 	// fail, when set, is consulted for every authenticated request; returning
 	// true makes that request fail with a 502 -- a transient upstream error.
 	fail func(r *http.Request) bool
+
+	// clock is Sublime's clock: it stamps the Date header of every response,
+	// which the adapter uses to measure clock skew.
+	clock *testClock
 }
 
 func newMockSublime(apiKey string) *mockSublime {
-	return &mockSublime{apiKey: apiKey}
+	return &mockSublime{apiKey: apiKey, clock: &testClock{}}
 }
 
 func (m *mockSublime) setEvents(events []utils.Dict) {
@@ -194,6 +198,7 @@ func (m *mockSublime) handler() http.HandlerFunc {
 		defer m.mu.Unlock()
 
 		m.requests++
+		w.Header().Set("Date", m.clock.Now().UTC().Format(http.TimeFormat))
 		m.lastMethod = r.Method
 		m.lastPath = r.URL.Path
 		m.lastAccept = r.Header.Get("Accept")
@@ -366,7 +371,7 @@ func shippedIDs(msgs []*protocol.DataMessage) map[string]int {
 
 // startMockAdapter wires the adapter to the mock server with the capture sink
 // and a fast poll interval.
-func startMockAdapter(t *testing.T, serverURL, apiKey string, sink uspSink) (*SublimeAdapter, chan struct{}) {
+func startMockAdapter(t *testing.T, mock *mockSublime, serverURL, apiKey string, sink uspSink) (*SublimeAdapter, chan struct{}) {
 	t.Helper()
 	conf := SublimeConfig{
 		ClientOptions: testClientOptions(t),
@@ -374,10 +379,12 @@ func startMockAdapter(t *testing.T, serverURL, apiKey string, sink uspSink) (*Su
 		BaseURL:       serverURL,
 		PollInterval:  25 * time.Millisecond,
 	}
-	clock := &testClock{}
+	// The adapter and the mock share one clock, like a host with an accurate
+	// clock talking to Sublime.
+	clock := mock.clock
 	adapter, chStopped, err := newSublimeAdapter(t.Context(), conf, sink, clock.Now)
 	require.NoError(t, err)
-	// The adapter captured its start time at construction; from here on its
+	// The adapter captured its start time at construction; from here on the
 	// clock runs ahead so that futureTS fixtures are inside the poll window.
 	clock.Advance(fixtureHorizon)
 	return adapter, chStopped
@@ -428,7 +435,7 @@ func TestMockAuditLogEndToEnd(t *testing.T) {
 
 	sink := &captureSink{}
 	before := uint64(time.Now().UnixMilli())
-	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	adapter, _ := startMockAdapter(t, mock, server.URL, apiKey, sink)
 	defer adapter.Close()
 
 	require.Eventually(t, func() bool { return sink.count() == 3 },
@@ -491,7 +498,7 @@ func TestMockNewEventMidRunShipsOnce(t *testing.T) {
 	defer server.Close()
 
 	sink := &captureSink{}
-	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	adapter, _ := startMockAdapter(t, mock, server.URL, apiKey, sink)
 	defer adapter.Close()
 
 	require.Eventually(t, func() bool { return sink.count() == 2 },
@@ -535,7 +542,7 @@ func TestMockPaginationFullDataset(t *testing.T) {
 	defer server.Close()
 
 	sink := &captureSink{}
-	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	adapter, _ := startMockAdapter(t, mock, server.URL, apiKey, sink)
 	defer adapter.Close()
 
 	require.Eventually(t, func() bool { return sink.count() == total },
@@ -572,7 +579,7 @@ func TestMockEventsBeforeStartDoNotShip(t *testing.T) {
 	defer server.Close()
 
 	sink := &captureSink{}
-	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	adapter, _ := startMockAdapter(t, mock, server.URL, apiKey, sink)
 	defer adapter.Close()
 
 	require.Eventually(t, func() bool { return sink.count() == 1 },
@@ -614,7 +621,7 @@ func TestMockHighVolumeUsesTimeFilter(t *testing.T) {
 	defer server.Close()
 
 	sink := &captureSink{}
-	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	adapter, _ := startMockAdapter(t, mock, server.URL, apiKey, sink)
 	defer adapter.Close()
 
 	// Let several full polls happen against the large backlog.
@@ -757,7 +764,7 @@ func TestMockTransientPageFailureLosesNothing(t *testing.T) {
 	defer server.Close()
 
 	sink := &captureSink{}
-	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	adapter, _ := startMockAdapter(t, mock, server.URL, apiKey, sink)
 	defer adapter.Close()
 
 	require.Eventually(t, func() bool { return sink.count() == total },
@@ -775,16 +782,44 @@ func TestMockTransientPageFailureLosesNothing(t *testing.T) {
 	assert.True(t, shippedInOrder(t, msgs), "events must ship oldest-first")
 }
 
-// TestMockOversizedWindowIsSplit covers a window holding more events than one
+// directMockAdapter builds an adapter against the mock without starting its
+// poll goroutine, so a test can drive poll itself. The adapter's clock is the
+// mock's clock plus hostOffset.
+func directMockAdapter(t *testing.T, mock *mockSublime, serverURL, apiKey string, hostOffset time.Duration) *SublimeAdapter {
+	t.Helper()
+	now := func() time.Time { return mock.clock.Now().Add(hostOffset) }
+	start := now().UTC().Truncate(time.Microsecond)
+	return &SublimeAdapter{
+		conf: SublimeConfig{
+			ClientOptions: testClientOptions(t),
+			ApiKey:        apiKey,
+			BaseURL:       serverURL,
+		},
+		httpClient: &http.Client{Timeout: 10 * time.Second},
+		doStop:     utils.NewEvent(),
+		now:        now,
+		start:      start,
+		cursor:     start,
+		dedupe:     map[string]time.Time{},
+	}
+}
+
+// TestMockOversizedWindowIsSplit covers a backlog holding more events than one
 // window may paginate (maxPagesPerWindow pages). Previously pagination stopped
 // at the cap and the watermark jumped to the newest event, skipping everything
-// older that had not been read. Now the window is halved until it fits, and
-// every event ships exactly once, in order.
+// older that had not been read. Now the window is halved until it fits: every
+// event ships exactly once, in order, and in several bounded batches -- each
+// window ships as soon as it is read rather than holding the whole backlog in
+// memory.
 func TestMockOversizedWindowIsSplit(t *testing.T) {
 	const apiKey = "sublime-test-api-key-000000000000"
 	total := maxPagesPerWindow*pageLimit + 5000
 
 	mock := newMockSublime(apiKey)
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+	a := directMockAdapter(t, mock, server.URL, apiKey, 0)
+
 	events := make([]utils.Dict, total)
 	for i := 0; i < total; i++ {
 		events[i] = realisticAuditEvent(
@@ -793,32 +828,98 @@ func TestMockOversizedWindowIsSplit(t *testing.T) {
 			futureTS(time.Hour+time.Duration(i)*10*time.Millisecond))
 	}
 	mock.setEvents(events)
+	mock.clock.Advance(fixtureHorizon)
 
-	server := httptest.NewServer(mock.handler())
-	defer server.Close()
+	var batches [][]utils.Dict
+	require.NoError(t, a.poll(func(items []utils.Dict) error {
+		batches = append(batches, items)
+		return nil
+	}))
 
-	sink := &captureSink{}
-	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
-	defer adapter.Close()
-
-	require.Eventually(t, func() bool { return sink.count() == total },
-		60*time.Second, 50*time.Millisecond, "every event of the oversized window must ship")
-	require.Never(t, func() bool { return sink.count() != total },
-		300*time.Millisecond, 25*time.Millisecond)
-
-	msgs := sink.snapshot()
-	ids := shippedIDs(msgs)
-	assert.Len(t, ids, total)
+	var shipped []*protocol.DataMessage
+	for _, b := range batches {
+		assert.LessOrEqual(t, len(b), maxPagesPerWindow*pageLimit, "a batch must not exceed one window")
+		for _, item := range b {
+			shipped = append(shipped, &protocol.DataMessage{JsonPayload: item})
+		}
+	}
+	assert.GreaterOrEqual(t, len(batches), 2, "the backlog must ship in several windows")
+	ids := shippedIDs(shipped)
+	assert.Len(t, ids, total, "every event of the oversized backlog must ship")
 	for id, n := range ids {
 		if n != 1 {
 			t.Fatalf("event %s shipped %d times", id, n)
 		}
 	}
-	assert.True(t, shippedInOrder(t, msgs), "events must ship oldest-first")
+	assert.True(t, shippedInOrder(t, shipped), "events must ship oldest-first")
 
 	mock.mu.Lock()
 	defer mock.mu.Unlock()
 	assert.True(t, mock.sawLT, "the adapter must bound every window with created_at[lt]")
-	assert.Less(t, mock.maxOffsetSeen, maxPagesPerWindow*pageLimit,
+	assert.Less(t, mock.maxOffsetSeen, (maxPagesPerWindow+maxOverlapPages)*pageLimit,
 		"no window may be paginated past the per-window cap")
+}
+
+// TestMockOverlapBurstDoesNotForceSplits: a burst larger than one window that
+// was already shipped sits in the 30s overlap re-read by the next poll. The
+// overlap must not count against the window budget, or every later window
+// would look oversized and be split down to the minimum, re-reading the burst
+// thousands of times and warning about skipped events that were not skipped.
+func TestMockOverlapBurstDoesNotForceSplits(t *testing.T) {
+	const apiKey = "sublime-test-api-key-000000000000"
+
+	mock := newMockSublime(apiKey)
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+	a := directMockAdapter(t, mock, server.URL, apiKey, 0)
+
+	cursor := a.cursor.Add(time.Hour)
+	burst := (maxPagesPerWindow + 1) * pageLimit
+	events := make([]utils.Dict, 0, burst+1)
+	for i := 0; i < burst; i++ {
+		// All inside [cursor - overlap, cursor): already shipped.
+		events = append(events, realisticAuditEvent(
+			fmt.Sprintf("56565656-0000-0000-0000-%012d", i), "message.view_contents",
+			cursor.Add(-overlapPeriod+time.Duration(i)*100*time.Microsecond).Format(time.RFC3339Nano)))
+	}
+	events = append(events, realisticAuditEvent("56565656-1111-1111-1111-111111111111", "message.flagged",
+		cursor.Add(time.Second).Format(time.RFC3339Nano)))
+	mock.setEvents(events)
+
+	got, truncated, err := a.fetchWindow(cursor, cursor.Add(time.Minute))
+	require.NoError(t, err)
+	assert.False(t, truncated, "an overlap full of already-shipped events must not make the window oversized")
+	assert.LessOrEqual(t, mock.requestCount(), 1+maxOverlapPages, "the overlap must only be re-read up to maxOverlapPages")
+	require.NotEmpty(t, got)
+	assert.Equal(t, "56565656-1111-1111-1111-111111111111", got[0]["id"], "the new event must be read")
+}
+
+// TestMockHostClockAheadLosesNothing: the host clock runs a minute ahead of
+// Sublime's. Windows used to end at the host's "now", so the cursor moved past
+// times Sublime had not reached yet and an event created just after a poll
+// fell behind the cursor, beyond the overlap, and was never fetched. The
+// adapter now measures the skew from the API's Date header and compensates.
+func TestMockHostClockAheadLosesNothing(t *testing.T) {
+	const apiKey = "sublime-test-api-key-000000000000"
+	const hostAhead = time.Minute
+
+	mock := newMockSublime(apiKey)
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+	a := directMockAdapter(t, mock, server.URL, apiKey, hostAhead)
+	warnings := 0
+	a.conf.ClientOptions.OnWarning = func(msg string) { warnings++; t.Logf("WRN: %s", msg) }
+
+	var shipped []utils.Dict
+	require.NoError(t, a.poll(collect(&shipped)))
+	assert.Empty(t, shipped)
+
+	// Created on Sublime's clock right after that poll.
+	mock.appendEvent(realisticAuditEvent("78787878-1111-1111-1111-111111111111", "message.flagged",
+		mock.clock.Now().UTC().Format(time.RFC3339Nano)))
+	mock.clock.Advance(2 * time.Second)
+
+	require.NoError(t, a.poll(collect(&shipped)))
+	require.Len(t, shipped, 1, "an event created after a poll must ship despite the host clock skew")
+	assert.Equal(t, 1, warnings, "a large clock skew must be reported once")
 }

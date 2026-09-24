@@ -25,12 +25,23 @@ const (
 	pageLimit           = 500
 	defaultPollInterval = 30 * time.Second
 
-	// maxPagesPerWindow caps how deep a single time window is paginated. The
-	// audit log is served newest-first, so a window can only be committed once
-	// it has been read to its oldest event. A window holding more events than
-	// this is split in half and its older half is fetched first, which keeps
-	// every request bounded no matter how far behind the adapter is.
+	// maxPagesPerWindow caps how many pages of not-yet-shipped events a single
+	// time window may hold. The audit log is served newest-first, so a window
+	// can only be committed once it has been read to its oldest event. A
+	// window holding more than this is split in half and its older half is
+	// fetched first, which bounds both the requests per window and the events
+	// held in memory before they ship.
 	maxPagesPerWindow = 100
+
+	// maxOverlapPages caps how much of the overlap (events already shipped by
+	// the previous poll, re-read to catch late-committed ones) is re-read.
+	// Overlap pages do not count against maxPagesPerWindow, so a burst that
+	// was already shipped cannot force windows to be split.
+	maxOverlapPages = 4
+
+	// clockSkewWarning is the host/Sublime clock difference above which a
+	// warning is emitted. Skew is compensated either way.
+	clockSkewWarning = 10 * time.Second
 
 	// minSplitWindow is the smallest window worth splitting further. A window
 	// this short that still exceeds maxPagesPerWindow is committed with what
@@ -61,11 +72,20 @@ type SublimeAdapter struct {
 
 	// start is when the adapter started: older events are not replayed.
 	// cursor is the exclusive upper bound of the time range already shipped.
-	// dedupe holds the ids (and created_at) of shipped events that are still
-	// inside the overlap re-fetched on the next poll.
+	// Both are on Sublime's clock. dedupe holds the keys (and created_at) of
+	// shipped events that are still inside the overlap re-fetched on the next
+	// poll.
 	start  time.Time
 	cursor time.Time
 	dedupe map[string]time.Time
+
+	// skew is Sublime's clock minus the host clock, measured from the Date
+	// header of API responses. Windows end at the host's now plus skew, so a
+	// host clock running ahead cannot move the cursor past events Sublime has
+	// not created yet.
+	skew        time.Duration
+	skewChecked bool
+	skewWarned  bool
 }
 
 type SublimeConfig struct {
@@ -181,41 +201,56 @@ func (a *SublimeAdapter) fetchEvents() {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s%s events exiting", a.conf.BaseURL, logsPath))
 
 	for !a.doStop.WaitFor(a.conf.PollInterval) {
-		// Events returned alongside an error belong to windows that were fully
-		// read before the failure; they are committed and must still ship.
-		items, _ := a.poll()
-
-		for _, item := range items {
-			msg := &protocol.DataMessage{
-				JsonPayload: item,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
-				}
-				if err == nil {
-					continue
-				}
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				a.doStop.Set()
-				return
-			}
-		}
+		// Errors are reported where they happen; a failed window is retried
+		// on the next poll.
+		_ = a.poll(a.ship)
 	}
 }
 
+// ship sends a batch of events to LimaCharlie. A failure stops the adapter.
+func (a *SublimeAdapter) ship(items []utils.Dict) error {
+	for _, item := range items {
+		msg := &protocol.DataMessage{
+			JsonPayload: item,
+			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+		}
+		if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+			if err == uspclient.ErrorBufferFull {
+				a.conf.ClientOptions.OnWarning("stream falling behind")
+				err = a.uspClient.Ship(msg, 1*time.Hour)
+			}
+			if err == nil {
+				continue
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			a.doStop.Set()
+			return err
+		}
+	}
+	return nil
+}
+
 // poll ships everything created between the cursor and now. The range is read
-// as one or more bounded windows; a window only advances the cursor once it
-// has been read completely, so a failed request leaves the cursor where it was
-// and the next poll retries the same range instead of skipping it.
-//
-// The returned events are committed (the cursor has moved past them) and are
-// returned oldest-first, even when an error is also returned.
-func (a *SublimeAdapter) poll() ([]utils.Dict, error) {
-	until := a.now().UTC().Truncate(time.Microsecond)
-	var committed []utils.Dict
+// as one or more bounded windows, oldest first. A window only advances the
+// cursor once it has been read completely, and is handed to ship right away,
+// so a failed request leaves the cursor where it was and the next poll retries
+// the same range instead of skipping it.
+func (a *SublimeAdapter) poll(ship func([]utils.Dict) error) error {
+	if !a.skewChecked {
+		// start was taken from the host clock, but it is compared with
+		// Sublime's timestamps: measure the difference before the first
+		// window is committed.
+		reqURL := fmt.Sprintf("%s%s?limit=1&created_at[gte]=%s",
+			a.conf.BaseURL, logsPath, url.QueryEscape(a.start.Format(time.RFC3339Nano)))
+		if _, err := a.fetchPage(reqURL); err != nil {
+			return err
+		}
+		a.skewChecked = true
+		a.start = a.start.Add(a.skew).Truncate(time.Microsecond)
+		a.cursor = a.start
+	}
+
+	until := a.now().Add(a.skew).UTC().Truncate(time.Microsecond)
 
 	for a.cursor.Before(until) {
 		end := until
@@ -223,9 +258,9 @@ func (a *SublimeAdapter) poll() ([]utils.Dict, error) {
 		for {
 			var truncated bool
 			var err error
-			events, truncated, err = a.fetchWindow(a.cursor.Add(-overlapPeriod), end)
+			events, truncated, err = a.fetchWindow(a.cursor, end)
 			if err != nil {
-				return committed, err
+				return err
 			}
 			if !truncated {
 				break
@@ -240,51 +275,81 @@ func (a *SublimeAdapter) poll() ([]utils.Dict, error) {
 		}
 
 		// The API returns newest-first; ship in chronological order.
+		var batch []utils.Dict
 		for i := len(events) - 1; i >= 0; i-- {
 			event := events[i]
-			id, _ := event["id"].(string)
-			if _, seen := a.dedupe[id]; seen {
+			key := eventKey(event)
+			if _, seen := a.dedupe[key]; seen {
 				continue
 			}
 			createdAtStr, _ := event["created_at"].(string)
 			createdAt, err := time.Parse(time.RFC3339Nano, createdAtStr)
 			if err != nil {
+				// The server matched it against the window, so it belongs
+				// here even if its timestamp is not one we can parse.
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("sublime: audit event with unparseable created_at %q shipped as-is", createdAtStr))
+				createdAt = end
+			} else if createdAt.Before(a.start) {
 				continue
 			}
-			if createdAt.Before(a.start) {
-				continue
-			}
-			a.dedupe[id] = createdAt
-			committed = append(committed, event)
+			a.dedupe[key] = createdAt
+			batch = append(batch, event)
 		}
 		a.cursor = end
 
-		// Only ids still inside the next poll's overlap can be seen again.
+		// Only events still inside the next poll's overlap can be seen again.
 		horizon := a.cursor.Add(-overlapPeriod)
 		for k, v := range a.dedupe {
 			if v.Before(horizon) {
 				delete(a.dedupe, k)
 			}
 		}
+
+		if len(batch) != 0 {
+			if err := ship(batch); err != nil {
+				return err
+			}
+		}
 	}
 
-	return committed, nil
+	return nil
 }
 
-// fetchWindow returns every event with from <= created_at < to, newest-first.
-// Pinning the upper bound keeps offset pagination stable: events created while
-// the pages are being read fall outside the window and cannot shift offsets.
-// truncated is true when the window holds more than maxPagesPerWindow pages.
-func (a *SublimeAdapter) fetchWindow(from, to time.Time) ([]utils.Dict, bool, error) {
+// eventKey identifies an event for deduplication: its id, or its whole content
+// for the (unexpected) event without one.
+func eventKey(event utils.Dict) string {
+	if id, _ := event["id"].(string); id != "" {
+		return id
+	}
+	b, _ := json.Marshal(event)
+	return "raw:" + string(b)
+}
+
+// fetchWindow returns the events with cursor - overlapPeriod <= created_at <
+// to, newest-first. Pinning the upper bound keeps offset pagination stable:
+// events created while the pages are being read fall outside the window and
+// cannot shift offsets. truncated is true when the events at or after cursor
+// span more than maxPagesPerWindow pages. The overlap below cursor was shipped
+// by the previous poll and is only re-read up to maxOverlapPages, to catch
+// events that became visible late.
+func (a *SublimeAdapter) fetchWindow(cursor, to time.Time) ([]utils.Dict, bool, error) {
 	var events []utils.Dict
 	seen := map[string]struct{}{}
+	from := cursor.Add(-overlapPeriod)
+	newPages, overlapPages := 0, 0
 
-	for page := 0; page < maxPagesPerWindow; page++ {
+	for offset := 0; ; offset += pageLimit {
+		if newPages >= maxPagesPerWindow {
+			return events, true, nil
+		}
+		if overlapPages >= maxOverlapPages {
+			return events, false, nil
+		}
 		if a.doStop.IsSet() {
 			return nil, false, errors.New("adapter stopping")
 		}
 		reqURL := fmt.Sprintf("%s%s?limit=%d&offset=%d&created_at[gte]=%s&created_at[lt]=%s",
-			a.conf.BaseURL, logsPath, pageLimit, page*pageLimit,
+			a.conf.BaseURL, logsPath, pageLimit, offset,
 			url.QueryEscape(from.UTC().Format(time.RFC3339Nano)),
 			url.QueryEscape(to.UTC().Format(time.RFC3339Nano)))
 
@@ -295,18 +360,26 @@ func (a *SublimeAdapter) fetchWindow(from, to time.Time) ([]utils.Dict, bool, er
 		for _, event := range pageEvents {
 			// A late-committed event inside the window can shift later pages
 			// by one; drop the resulting repeats.
-			id, _ := event["id"].(string)
-			if _, dup := seen[id]; dup {
+			key := eventKey(event)
+			if _, dup := seen[key]; dup {
 				continue
 			}
-			seen[id] = struct{}{}
+			seen[key] = struct{}{}
 			events = append(events, event)
 		}
 		if len(pageEvents) < pageLimit {
 			return events, false, nil
 		}
+
+		// Pages are newest-first: once a page reaches below the cursor, the
+		// rest of the window is overlap.
+		oldestStr, _ := pageEvents[len(pageEvents)-1]["created_at"].(string)
+		if oldest, err := time.Parse(time.RFC3339Nano, oldestStr); err == nil && oldest.Before(cursor) {
+			overlapPages++
+		} else {
+			newPages++
+		}
 	}
-	return events, true, nil
 }
 
 func (a *SublimeAdapter) fetchPage(reqURL string) ([]utils.Dict, error) {
@@ -337,6 +410,7 @@ func (a *SublimeAdapter) fetchPage(reqURL string) ([]utils.Dict, error) {
 		a.conf.ClientOptions.OnError(err)
 		return nil, err
 	}
+	a.measureSkew(resp.Header.Get("Date"))
 
 	var response struct {
 		Events []utils.Dict `json:"events"`
@@ -346,4 +420,23 @@ func (a *SublimeAdapter) fetchPage(reqURL string) ([]utils.Dict, error) {
 		return nil, err
 	}
 	return response.Events, nil
+}
+
+// measureSkew updates the Sublime-minus-host clock difference from a response
+// Date header. The header has one-second resolution and is stamped before the
+// response travels back, so the estimate errs towards Sublime being behind,
+// which only makes windows end slightly earlier.
+func (a *SublimeAdapter) measureSkew(date string) {
+	if date == "" {
+		return
+	}
+	serverNow, err := http.ParseTime(date)
+	if err != nil {
+		return
+	}
+	a.skew = serverNow.Sub(a.now())
+	if !a.skewWarned && (a.skew > clockSkewWarning || a.skew < -clockSkewWarning) {
+		a.skewWarned = true
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("sublime: host clock differs from the Sublime API clock by %s; compensating", -a.skew))
+	}
 }
