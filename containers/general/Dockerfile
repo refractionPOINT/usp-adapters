@@ -1,4 +1,4 @@
-FROM golang:1.25-bookworm AS builder
+FROM golang:1.27.1-bookworm AS builder
 
 ADD . .
 ENV GOPATH=/

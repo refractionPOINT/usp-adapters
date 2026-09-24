@@ -142,6 +142,11 @@ type mockMicrosoft struct {
 	clientSecret string
 	accessToken  string
 
+	// expectScope is the OAuth2 scope the token endpoint accepts; anything
+	// else is rejected with AADSTS70011, like a real tenant handed a scope
+	// belonging to a different national cloud deployment.
+	expectScope string
+
 	// detections, signIns and audits are the in-memory Graph datasets, one
 	// per collection the adapter can poll.
 	detections []map[string]interface{}
@@ -183,6 +188,7 @@ func newMockMicrosoft() *mockMicrosoft {
 		clientID:        testClientID,
 		clientSecret:    testClientSecret,
 		accessToken:     testAccessToken,
+		expectScope:     "https://graph.microsoft.com/.default",
 		lastQueryByPath: map[string]string{},
 	}
 }
@@ -289,6 +295,7 @@ func (m *mockMicrosoft) handleToken(w http.ResponseWriter, r *http.Request) {
 	m.lastTokenForm = r.PostForm
 	clientID, clientSecret := m.clientID, m.clientSecret
 	token := m.accessToken
+	expectScope := m.expectScope
 	m.mu.Unlock()
 
 	if r.PostForm.Get("grant_type") != "client_credentials" {
@@ -311,7 +318,7 @@ func (m *mockMicrosoft) handleToken(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	if r.PostForm.Get("scope") != "https://graph.microsoft.com/.default" {
+	if r.PostForm.Get("scope") != expectScope {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"error":             "invalid_scope",
@@ -682,6 +689,63 @@ func TestRiskDetectionsEndToEnd(t *testing.T) {
 	assert.Equal(t, testClientID, form.Get("client_id"))
 	assert.Equal(t, testClientSecret, form.Get("client_secret"))
 	assert.Equal(t, "https://graph.microsoft.com/.default", form.Get("scope"))
+}
+
+// TestGCCHighScope drives the adapter against a mock that only accepts the GCC
+// High scope, standing in for a US Government L4 tenant: the token exchange
+// there rejects the commercial scope with AADSTS70011. The hosts still point at
+// the mock (the real graph.microsoft.us is not reachable from tests), so what
+// is under test is that endpoint=gcc-high-gov moves the OAuth2 scope -- the
+// half a login_endpoint/graph_endpoint override cannot reach.
+func TestGCCHighScope(t *testing.T) {
+	base := fixtureBaseTime()
+	detection := realisticRiskDetection(1, "anonymizedIPAddress", "jdoe@example.com", base.Format(graphTimeLayout))
+
+	t.Run("endpoint gcc-high-gov authenticates and ships", func(t *testing.T) {
+		mock := newMockMicrosoft()
+		mock.expectScope = "https://graph.microsoft.us/.default"
+		mock.addDetection(detection)
+		server := mock.start(t)
+
+		conf := testConfig(t, server.URL)
+		conf.Endpoint = "gcc-high-gov"
+
+		sink := &captureSink{}
+		adapter, _, err := newEntraIDAdapter(context.Background(), conf, sink)
+		require.NoError(t, err)
+		defer adapter.Close()
+
+		require.Eventually(t, func() bool { return sink.count() == 1 },
+			10*time.Second, 20*time.Millisecond, "expected the detection to ship against the GCC High endpoint")
+
+		form := mock.lastTokenRequest()
+		require.NotNil(t, form)
+		assert.Equal(t, "https://graph.microsoft.us/.default", form.Get("scope"))
+	})
+
+	t.Run("commercial default is rejected by a GCC High tenant", func(t *testing.T) {
+		mock := newMockMicrosoft()
+		mock.expectScope = "https://graph.microsoft.us/.default"
+		mock.addDetection(detection)
+		server := mock.start(t)
+
+		// Same config, but without endpoint: only the hosts are overridden, so
+		// the adapter still asks for the commercial scope and never gets a
+		// token. Nothing ships.
+		sink := &captureSink{}
+		adapter, _, err := newEntraIDAdapter(context.Background(), testConfig(t, server.URL), sink)
+		require.NoError(t, err)
+		defer adapter.Close()
+
+		// Wait for the token exchange to actually have been attempted rather
+		// than inferring it from elapsed time, then assert on what it sent.
+		require.Eventually(t, func() bool { return mock.lastTokenRequest() != nil },
+			10*time.Second, 20*time.Millisecond, "expected a token request")
+		assert.Equal(t, "https://graph.microsoft.com/.default", mock.lastTokenRequest().Get("scope"))
+
+		require.Never(t, func() bool { return sink.count() != 0 },
+			500*time.Millisecond, 25*time.Millisecond, "no event can ship without a valid token")
+	})
 }
 
 // TestMidRunDetectionShipsOnce verifies a detection appearing while the adapter
