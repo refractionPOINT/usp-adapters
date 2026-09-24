@@ -37,7 +37,7 @@ const (
 	// the previous poll, re-read to catch late-committed ones) is re-read.
 	// Overlap pages do not count against maxPagesPerWindow, so a burst that
 	// was already shipped cannot force windows to be split.
-	maxOverlapPages = 4
+	maxOverlapPages = 10
 
 	// clockSkewWarning is the host/Sublime clock difference above which a
 	// warning is emitted. Skew is compensated either way.
@@ -80,12 +80,13 @@ type SublimeAdapter struct {
 	dedupe map[string]time.Time
 
 	// skew is Sublime's clock minus the host clock, measured from the Date
-	// header of API responses. Windows end at the host's now plus skew, so a
-	// host clock running ahead cannot move the cursor past events Sublime has
-	// not created yet.
-	skew        time.Duration
-	skewChecked bool
-	skewWarned  bool
+	// header of API responses at the start of every poll. Windows end at the
+	// host's now plus skew, so a host clock running ahead -- or corrected
+	// between polls -- cannot move the cursor past events Sublime has not
+	// created yet.
+	skew       time.Duration
+	started    bool
+	skewWarned bool
 }
 
 type SublimeConfig struct {
@@ -236,16 +237,20 @@ func (a *SublimeAdapter) ship(items []utils.Dict) error {
 // so a failed request leaves the cursor where it was and the next poll retries
 // the same range instead of skipping it.
 func (a *SublimeAdapter) poll(ship func([]utils.Dict) error) error {
-	if !a.skewChecked {
+	// Measure Sublime's clock right before choosing where this poll's
+	// windows end. A skew carried over from an earlier poll would be wrong
+	// if the host clock was stepped in between. The request is a single
+	// event at most.
+	reqURL := fmt.Sprintf("%s%s?limit=1&created_at[gte]=%s",
+		a.conf.BaseURL, logsPath, url.QueryEscape(a.cursor.Format(time.RFC3339Nano)))
+	a.skew = 0
+	if _, err := a.fetchPage(reqURL); err != nil {
+		return err
+	}
+	if !a.started {
 		// start was taken from the host clock, but it is compared with
-		// Sublime's timestamps: measure the difference before the first
-		// window is committed.
-		reqURL := fmt.Sprintf("%s%s?limit=1&created_at[gte]=%s",
-			a.conf.BaseURL, logsPath, url.QueryEscape(a.start.Format(time.RFC3339Nano)))
-		if _, err := a.fetchPage(reqURL); err != nil {
-			return err
-		}
-		a.skewChecked = true
+		// Sublime's timestamps.
+		a.started = true
 		a.start = a.start.Add(a.skew).Truncate(time.Microsecond)
 		a.cursor = a.start
 	}

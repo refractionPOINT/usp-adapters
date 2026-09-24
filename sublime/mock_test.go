@@ -100,7 +100,7 @@ type mockSublime struct {
 	lastMethod    string
 	lastPath      string
 	lastAccept    string
-	lastLimit     int
+	maxLimit      int
 	lastGTE       string
 	sawGTE        bool
 	lastLT        string
@@ -232,7 +232,9 @@ func (m *mockSublime) handler() http.HandlerFunc {
 		if v, err := strconv.Atoi(r.URL.Query().Get("offset")); err == nil && v >= 0 {
 			offset = v
 		}
-		m.lastLimit = limit
+		if limit > m.maxLimit {
+			m.maxLimit = limit
+		}
 		if offset > m.maxOffsetSeen {
 			m.maxOffsetSeen = offset
 		}
@@ -478,7 +480,7 @@ func TestMockAuditLogEndToEnd(t *testing.T) {
 	assert.Equal(t, http.MethodGet, mock.lastMethod)
 	assert.Equal(t, logsPath, mock.lastPath)
 	assert.Equal(t, "application/json", mock.lastAccept)
-	assert.Equal(t, pageLimit, mock.lastLimit, "the adapter should request the full page limit")
+	assert.Equal(t, pageLimit, mock.maxLimit, "the adapter should page with the full page limit")
 	assert.Zero(t, mock.authFailures, "the Bearer API key must be sent on every request")
 }
 
@@ -922,4 +924,40 @@ func TestMockHostClockAheadLosesNothing(t *testing.T) {
 	require.NoError(t, a.poll(collect(&shipped)))
 	require.Len(t, shipped, 1, "an event created after a poll must ship despite the host clock skew")
 	assert.Equal(t, 1, warnings, "a large clock skew must be reported once")
+}
+
+// TestMockHostClockSteppedBetweenPollsLosesNothing: the host clock starts five
+// minutes behind Sublime's and is then corrected (an NTP step, or a VM
+// resuming). A skew measured by an earlier poll would, once applied to the
+// corrected clock, end the next window five minutes in Sublime's future,
+// moving the cursor past events not yet created. The skew is measured afresh
+// at the start of every poll.
+func TestMockHostClockSteppedBetweenPollsLosesNothing(t *testing.T) {
+	const apiKey = "sublime-test-api-key-000000000000"
+
+	mock := newMockSublime(apiKey)
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+	host := &testClock{}
+	host.Advance(-5 * time.Minute)
+	a := directMockAdapter(t, mock, server.URL, apiKey, 0)
+	a.now = func() time.Time { return mock.clock.Now().Add(host.Now().Sub(time.Now())) }
+	// The adapter takes its start time from the host clock.
+	a.start = a.now().UTC().Truncate(time.Microsecond)
+	a.cursor = a.start
+
+	var shipped []utils.Dict
+	require.NoError(t, a.poll(collect(&shipped)))
+
+	host.Advance(5 * time.Minute) // the host clock is corrected
+	mock.clock.Advance(time.Second)
+	require.NoError(t, a.poll(collect(&shipped)))
+
+	// Created on Sublime's clock right after that poll.
+	mock.appendEvent(realisticAuditEvent("9a9a9a9a-1111-1111-1111-111111111111", "message.flagged",
+		mock.clock.Now().UTC().Format(time.RFC3339Nano)))
+	mock.clock.Advance(2 * time.Second)
+
+	require.NoError(t, a.poll(collect(&shipped)))
+	require.Len(t, shipped, 1, "an event created after the host clock was corrected must ship")
 }
