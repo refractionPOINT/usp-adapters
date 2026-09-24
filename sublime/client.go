@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,11 +25,17 @@ const (
 	pageLimit           = 500
 	defaultPollInterval = 30 * time.Second
 
-	// maxPagesPerPoll caps how deep a single poll will paginate. With the
-	// created_at[gte] server-side filter a poll only ever walks the recent
-	// window, so this is a safety backstop against a misbehaving API that
-	// keeps returning full pages -- it prevents an unbounded offset walk.
-	maxPagesPerPoll = 1000
+	// maxPagesPerWindow caps how deep a single time window is paginated. The
+	// audit log is served newest-first, so a window can only be committed once
+	// it has been read to its oldest event. A window holding more events than
+	// this is split in half and its older half is fetched first, which keeps
+	// every request bounded no matter how far behind the adapter is.
+	maxPagesPerWindow = 100
+
+	// minSplitWindow is the smallest window worth splitting further. A window
+	// this short that still exceeds maxPagesPerWindow is committed with what
+	// was fetched, and the shortfall is reported as a warning.
+	minSplitWindow = time.Second
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -50,8 +56,16 @@ type SublimeAdapter struct {
 	wgSenders sync.WaitGroup
 	doStop    *utils.Event
 
-	ctx    context.Context
-	dedupe map[string]int64
+	ctx context.Context
+	now func() time.Time
+
+	// start is when the adapter started: older events are not replayed.
+	// cursor is the exclusive upper bound of the time range already shipped.
+	// dedupe holds the ids (and created_at) of shipped events that are still
+	// inside the overlap re-fetched on the next poll.
+	start  time.Time
+	cursor time.Time
+	dedupe map[string]time.Time
 }
 
 type SublimeConfig struct {
@@ -83,19 +97,26 @@ func (c *SublimeConfig) Validate() error {
 }
 
 func NewSublimeAdapter(ctx context.Context, conf SublimeConfig) (*SublimeAdapter, chan struct{}, error) {
-	return newSublimeAdapter(ctx, conf, nil)
+	return newSublimeAdapter(ctx, conf, nil, nil)
 }
 
 // newSublimeAdapter is the implementation behind NewSublimeAdapter. When sink
-// is non-nil it is used in place of a real LimaCharlie client -- the seam
-// tests use to capture shipped events.
-func newSublimeAdapter(ctx context.Context, conf SublimeConfig, sink uspSink) (*SublimeAdapter, chan struct{}, error) {
+// is non-nil it is used in place of a real LimaCharlie client, and when now is
+// non-nil it replaces the wall clock -- the seams tests use to capture shipped
+// events and to control the polling window.
+func newSublimeAdapter(ctx context.Context, conf SublimeConfig, sink uspSink, now func() time.Time) (*SublimeAdapter, chan struct{}, error) {
+	if now == nil {
+		now = time.Now
+	}
 	a := &SublimeAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
+		now:    now,
 		doStop: utils.NewEvent(),
-		dedupe: make(map[string]int64),
+		dedupe: make(map[string]time.Time),
 	}
+	a.start = now().UTC().Truncate(time.Microsecond)
+	a.cursor = a.start
 
 	// The general adapter runner constructs the adapter without calling
 	// Validate(), so backfill the defaults here as well. Without the base URL
@@ -159,14 +180,10 @@ func (a *SublimeAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s%s events exiting", a.conf.BaseURL, logsPath))
 
-	since := time.Now()
-
 	for !a.doStop.WaitFor(a.conf.PollInterval) {
-		items, newSince, _ := a.makeOneRequest(since)
-		since = newSince
-		if items == nil {
-			continue
-		}
+		// Events returned alongside an error belong to windows that were fully
+		// read before the failure; they are committed and must still ship.
+		items, _ := a.poll()
 
 		for _, item := range items {
 			msg := &protocol.DataMessage{
@@ -189,104 +206,144 @@ func (a *SublimeAdapter) fetchEvents() {
 	}
 }
 
-func (a *SublimeAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Time, error) {
-	var allItems []utils.Dict
-	var offset int
-	var pages int
-	lastDetectionTime := since
+// poll ships everything created between the cursor and now. The range is read
+// as one or more bounded windows; a window only advances the cursor once it
+// has been read completely, so a failed request leaves the cursor where it was
+// and the next poll retries the same range instead of skipping it.
+//
+// The returned events are committed (the cursor has moved past them) and are
+// returned oldest-first, even when an error is also returned.
+func (a *SublimeAdapter) poll() ([]utils.Dict, error) {
+	until := a.now().UTC().Truncate(time.Microsecond)
+	var committed []utils.Dict
 
-	// Only ask the API for events in the recent window instead of walking the
-	// entire audit log from offset 0 on every poll. The overlap is re-fetched
-	// each time and the dedupe map suppresses re-shipping, so no event that the
-	// old full-scan would have shipped is missed. Without this filter a large
-	// backlog forces hundreds of ever-deeper offset pages per poll, which is
-	// what makes a single request exceed the HTTP timeout on busy tenants.
-	gteFilter := since.Add(-overlapPeriod).UTC().Format(time.RFC3339Nano)
-
-	for {
-		reqURL := fmt.Sprintf("%s%s?limit=%d&offset=%d&created_at[gte]=%s",
-			a.conf.BaseURL, logsPath, pageLimit, offset, url.QueryEscape(gteFilter))
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", reqURL))
-
-		req, err := http.NewRequest("GET", reqURL, nil)
-		if err != nil {
-			a.doStop.Set()
-			return nil, lastDetectionTime, err
+	for a.cursor.Before(until) {
+		end := until
+		var events []utils.Dict
+		for {
+			var truncated bool
+			var err error
+			events, truncated, err = a.fetchWindow(a.cursor.Add(-overlapPeriod), end)
+			if err != nil {
+				return committed, err
+			}
+			if !truncated {
+				break
+			}
+			if end.Sub(a.cursor) <= minSplitWindow {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("sublime: more than %d audit events between %s and %s, some may be skipped", maxPagesPerWindow*pageLimit, a.cursor.Format(time.RFC3339Nano), end.Format(time.RFC3339Nano)))
+				break
+			}
+			// Too many events to read in one window: fetch the older half
+			// first, the remainder is picked up by the next iteration.
+			end = a.cursor.Add(end.Sub(a.cursor) / 2).Truncate(time.Microsecond)
 		}
 
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.conf.ApiKey))
-		req.Header.Set("Accept", "application/json")
-
-		resp, err := a.httpClient.Do(req)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-			return nil, lastDetectionTime, err
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			body, _ := ioutil.ReadAll(resp.Body)
-			err = fmt.Errorf("sublime api non-200: %s\nRESPONSE: %s", resp.Status, string(body))
-			a.conf.ClientOptions.OnError(err)
-			return nil, lastDetectionTime, err
-		}
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("read body error: %v", err))
-			return nil, lastDetectionTime, err
-		}
-
-		var response struct {
-			Events []utils.Dict `json:"events"`
-		}
-		err = json.Unmarshal(body, &response)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("sublime api invalid json: %v", err))
-			return nil, lastDetectionTime, err
-		}
-
-		var newItems []utils.Dict
-		for _, event := range response.Events {
+		// The API returns newest-first; ship in chronological order.
+		for i := len(events) - 1; i >= 0; i-- {
+			event := events[i]
 			id, _ := event["id"].(string)
-			createdAtStr, _ := event["created_at"].(string)
-
 			if _, seen := a.dedupe[id]; seen {
 				continue
 			}
-
+			createdAtStr, _ := event["created_at"].(string)
 			createdAt, err := time.Parse(time.RFC3339Nano, createdAtStr)
 			if err != nil {
 				continue
 			}
+			if createdAt.Before(a.start) {
+				continue
+			}
+			a.dedupe[id] = createdAt
+			committed = append(committed, event)
+		}
+		a.cursor = end
 
-			if createdAt.After(since) {
-				a.dedupe[id] = createdAt.Unix()
-				newItems = append(newItems, event)
-				if createdAt.After(lastDetectionTime) {
-					lastDetectionTime = createdAt
-				}
+		// Only ids still inside the next poll's overlap can be seen again.
+		horizon := a.cursor.Add(-overlapPeriod)
+		for k, v := range a.dedupe {
+			if v.Before(horizon) {
+				delete(a.dedupe, k)
 			}
 		}
-
-		allItems = append(allItems, newItems...)
-
-		if len(response.Events) < pageLimit {
-			break
-		}
-		pages++
-		if pages >= maxPagesPerPoll {
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("sublime: stopping pagination after %d pages (offset=%d); remaining events will be picked up on the next poll", pages, offset))
-			break
-		}
-		offset += pageLimit
 	}
 
-	for k, v := range a.dedupe {
-		if v < time.Now().Add(-overlapPeriod).Unix() {
-			delete(a.dedupe, k)
+	return committed, nil
+}
+
+// fetchWindow returns every event with from <= created_at < to, newest-first.
+// Pinning the upper bound keeps offset pagination stable: events created while
+// the pages are being read fall outside the window and cannot shift offsets.
+// truncated is true when the window holds more than maxPagesPerWindow pages.
+func (a *SublimeAdapter) fetchWindow(from, to time.Time) ([]utils.Dict, bool, error) {
+	var events []utils.Dict
+	seen := map[string]struct{}{}
+
+	for page := 0; page < maxPagesPerWindow; page++ {
+		if a.doStop.IsSet() {
+			return nil, false, errors.New("adapter stopping")
+		}
+		reqURL := fmt.Sprintf("%s%s?limit=%d&offset=%d&created_at[gte]=%s&created_at[lt]=%s",
+			a.conf.BaseURL, logsPath, pageLimit, page*pageLimit,
+			url.QueryEscape(from.UTC().Format(time.RFC3339Nano)),
+			url.QueryEscape(to.UTC().Format(time.RFC3339Nano)))
+
+		pageEvents, err := a.fetchPage(reqURL)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, event := range pageEvents {
+			// A late-committed event inside the window can shift later pages
+			// by one; drop the resulting repeats.
+			id, _ := event["id"].(string)
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			events = append(events, event)
+		}
+		if len(pageEvents) < pageLimit {
+			return events, false, nil
 		}
 	}
+	return events, true, nil
+}
 
-	return allItems, lastDetectionTime, nil
+func (a *SublimeAdapter) fetchPage(reqURL string) ([]utils.Dict, error) {
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", reqURL))
+
+	req, err := http.NewRequest("GET", reqURL, nil)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
+		return nil, err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.conf.ApiKey))
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("read body error: %v", err))
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		err = fmt.Errorf("sublime api non-200: %s\nRESPONSE: %s", resp.Status, string(body))
+		a.conf.ClientOptions.OnError(err)
+		return nil, err
+	}
+
+	var response struct {
+		Events []utils.Dict `json:"events"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("sublime api invalid json: %v", err))
+		return nil, err
+	}
+	return response.Events, nil
 }

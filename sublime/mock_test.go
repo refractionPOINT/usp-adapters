@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -70,19 +71,28 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 //   - `created_at[gte]` is applied SERVER-SIDE and is INCLUSIVE, with
 //     microsecond resolution; `offset`/`limit` are applied AFTER it, which is
 //     why this mock filters before slicing.
+//   - `created_at[lt]` is the documented EXCLUSIVE upper bound, also applied
+//     server-side. (`created_at[lte]` and `created_at[gt]` are not supported
+//     and are silently ignored.)
 //   - The filter is accepted with literal `[`/`]` and a percent-encoded value
 //     -- exactly the form makeOneRequest builds.
 //   - An unknown parameter name is SILENTLY IGNORED (a misspelled filter
 //     degrades to a full scan rather than erroring), so the name must stay
 //     exactly `created_at[gte]`.
 //   - limit=500 is accepted; limit=501 is rejected with 400.
-//   - Events are returned newest-first (created_at DESCENDING).
+//   - Events are returned newest-first (created_at DESCENDING), and no sort
+//     parameter changes that. The mock sorts the same way, so pagination
+//     bugs that depend on the ordering are reproduced here.
 //   - An empty window returns {"events":[],"count":0,"total":0} -- `[]`, not
 //     null.
 type mockSublime struct {
 	mu     sync.Mutex
 	apiKey string
 	events []utils.Dict
+	// times caches each event's parsed created_at (the zero time when it
+	// does not parse), keyed by index into events. Both are kept sorted
+	// newest-first, the order the live API serves.
+	times []time.Time
 
 	requests      int
 	authFailures  int
@@ -93,6 +103,12 @@ type mockSublime struct {
 	lastLimit     int
 	lastGTE       string
 	sawGTE        bool
+	lastLT        string
+	sawLT         bool
+
+	// fail, when set, is consulted for every authenticated request; returning
+	// true makes that request fail with a 502 -- a transient upstream error.
+	fail func(r *http.Request) bool
 }
 
 func newMockSublime(apiKey string) *mockSublime {
@@ -102,7 +118,35 @@ func newMockSublime(apiKey string) *mockSublime {
 func (m *mockSublime) setEvents(events []utils.Dict) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.events = events
+	m.events = nil
+	m.times = nil
+	for _, e := range events {
+		m.events = append(m.events, e)
+		m.times = append(m.times, parseCreatedAt(e))
+	}
+	m.sortNewestFirst()
+}
+
+func (m *mockSublime) sortNewestFirst() {
+	idx := make([]int, len(m.events))
+	for i := range idx {
+		idx[i] = i
+	}
+	sort.SliceStable(idx, func(i, j int) bool { return m.times[idx[i]].After(m.times[idx[j]]) })
+	events := make([]utils.Dict, len(idx))
+	times := make([]time.Time, len(idx))
+	for i, k := range idx {
+		events[i], times[i] = m.events[k], m.times[k]
+	}
+	m.events, m.times = events, times
+}
+
+func parseCreatedAt(e utils.Dict) time.Time {
+	at, err := time.Parse(time.RFC3339Nano, fmt.Sprint(e["created_at"]))
+	if err != nil {
+		return time.Time{}
+	}
+	return at
 }
 
 // appendEvent adds a newly-occurred event to the audit log.
@@ -110,6 +154,14 @@ func (m *mockSublime) appendEvent(event utils.Dict) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events = append(m.events, event)
+	m.times = append(m.times, parseCreatedAt(event))
+	m.sortNewestFirst()
+}
+
+func (m *mockSublime) setFail(fail func(r *http.Request) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.fail = fail
 }
 
 func (m *mockSublime) requestCount() int {
@@ -162,6 +214,10 @@ func (m *mockSublime) handler() http.HandlerFunc {
 			_, _ = w.Write([]byte(`{"message":"invalid or missing API key"}`))
 			return
 		}
+		if m.fail != nil && m.fail(r) {
+			http.Error(w, `{"message":"bad gateway"}`, http.StatusBadGateway)
+			return
+		}
 
 		limit := pageLimit
 		if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
@@ -189,18 +245,29 @@ func (m *mockSublime) handler() http.HandlerFunc {
 			}
 		}
 
-		filtered := m.events
-		if !gte.IsZero() {
-			filtered = filtered[:0:0]
-			for _, e := range m.events {
-				createdAt, err := time.Parse(time.RFC3339Nano, fmt.Sprint(e["created_at"]))
-				if err != nil {
-					continue
-				}
-				if !createdAt.Before(gte) { // created_at >= gte
-					filtered = append(filtered, e)
-				}
+		m.lastLT = r.URL.Query().Get("created_at[lt]")
+		var lt time.Time
+		if m.lastLT != "" {
+			m.sawLT = true
+			if parsed, err := time.Parse(time.RFC3339Nano, m.lastLT); err == nil {
+				lt = parsed
 			}
+		}
+
+		// m.events is already newest-first, like the live API.
+		filtered := []utils.Dict{}
+		for i, e := range m.events {
+			createdAt := m.times[i]
+			if createdAt.IsZero() {
+				continue
+			}
+			if !gte.IsZero() && createdAt.Before(gte) { // created_at >= gte
+				continue
+			}
+			if !lt.IsZero() && !createdAt.Before(lt) { // created_at < lt
+				continue
+			}
+			filtered = append(filtered, e)
 		}
 
 		page := []utils.Dict{}
@@ -274,9 +341,9 @@ func realisticAuditEvent(id, eventType, createdAt string) utils.Dict {
 }
 
 // futureTS returns an RFC3339Nano timestamp d into the future. The adapter
-// starts its polling window at time.Now(), so only events whose created_at is
-// after adapter start are shipped; fixtures use future timestamps to land
-// inside the window deterministically.
+// only ships events created after it started, and startMockAdapter runs the
+// adapter's clock ahead of wall time once it has started, so future-dated
+// fixtures land inside the polling window deterministically.
 func futureTS(d time.Duration) string {
 	return time.Now().Add(d).UTC().Format(time.RFC3339Nano)
 }
@@ -307,9 +374,35 @@ func startMockAdapter(t *testing.T, serverURL, apiKey string, sink uspSink) (*Su
 		BaseURL:       serverURL,
 		PollInterval:  25 * time.Millisecond,
 	}
-	adapter, chStopped, err := newSublimeAdapter(t.Context(), conf, sink)
+	clock := &testClock{}
+	adapter, chStopped, err := newSublimeAdapter(t.Context(), conf, sink, clock.Now)
 	require.NoError(t, err)
+	// The adapter captured its start time at construction; from here on its
+	// clock runs ahead so that futureTS fixtures are inside the poll window.
+	clock.Advance(fixtureHorizon)
 	return adapter, chStopped
+}
+
+// fixtureHorizon is how far ahead of wall time the adapter's clock runs after
+// start: futureTS fixtures must stay below it.
+const fixtureHorizon = 3 * time.Hour
+
+// testClock is wall time plus an adjustable offset.
+type testClock struct {
+	mu     sync.Mutex
+	offset time.Duration
+}
+
+func (c *testClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Now().Add(c.offset)
+}
+
+func (c *testClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.offset += d
 }
 
 // --- tests --------------------------------------------------------------------
@@ -404,9 +497,10 @@ func TestMockNewEventMidRunShipsOnce(t *testing.T) {
 	require.Eventually(t, func() bool { return sink.count() == 2 },
 		5*time.Second, 10*time.Millisecond)
 
-	// A new event occurs mid-run, later than everything already seen.
+	// A new event occurs mid-run: it is created "now" on the adapter's clock,
+	// later than everything already seen.
 	mock.appendEvent(realisticAuditEvent(
-		"bbbbbbbb-3333-3333-3333-333333333333", "message_group.quarantine", futureTS(2*time.Hour)))
+		"bbbbbbbb-3333-3333-3333-333333333333", "message_group.quarantine", futureTS(fixtureHorizon)))
 
 	require.Eventually(t, func() bool { return sink.count() == 3 },
 		5*time.Second, 10*time.Millisecond, "the new event should ship")
@@ -550,7 +644,7 @@ func TestBaseURLDefaultBackfilled(t *testing.T) {
 		// BaseURL intentionally left empty, as in the failing customer config.
 	}
 	sink := &captureSink{}
-	adapter, _, err := newSublimeAdapter(t.Context(), conf, sink)
+	adapter, _, err := newSublimeAdapter(t.Context(), conf, sink, nil)
 	require.NoError(t, err)
 	// Close immediately: the poll loop waits PollInterval before its first
 	// request, so no network call is made against the real default host.
@@ -589,7 +683,7 @@ func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 		BaseURL:       server.URL,
 		PollInterval:  25 * time.Millisecond,
 	}
-	adapter, chStopped, err := newSublimeAdapter(t.Context(), conf, sink)
+	adapter, chStopped, err := newSublimeAdapter(t.Context(), conf, sink, nil)
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -608,4 +702,123 @@ func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 	assert.GreaterOrEqual(t, errorCount, 1, "auth failures must be reported via OnError")
 	mu.Unlock()
 	assert.Equal(t, 0, sink.count(), "nothing should ship when authentication fails")
+}
+
+// shippedInOrder reports whether the shipped events are in chronological
+// created_at order.
+func shippedInOrder(t *testing.T, msgs []*protocol.DataMessage) bool {
+	t.Helper()
+	var prev time.Time
+	for _, m := range msgs {
+		at, err := time.Parse(time.RFC3339Nano, fmt.Sprint(m.JsonPayload["created_at"]))
+		require.NoError(t, err)
+		if at.Before(prev) {
+			return false
+		}
+		prev = at
+	}
+	return true
+}
+
+// TestMockTransientPageFailureLosesNothing is the regression test for events
+// being dropped when one page of a multi-page poll fails. Previously the pages
+// read before the failure were discarded while the watermark still advanced
+// past them, so with the API's newest-first ordering a single transient error
+// lost the whole poll. Now the window is only committed once read completely,
+// and the next poll retries it.
+func TestMockTransientPageFailureLosesNothing(t *testing.T) {
+	const apiKey = "sublime-test-api-key-000000000000"
+	const total = 1200 // three pages
+
+	mock := newMockSublime(apiKey)
+	events := make([]utils.Dict, total)
+	for i := 0; i < total; i++ {
+		events[i] = realisticAuditEvent(
+			fmt.Sprintf("12121212-0000-0000-0000-%012d", i),
+			"message.view_contents",
+			futureTS(time.Hour+time.Duration(i)*time.Millisecond))
+	}
+	mock.setEvents(events)
+
+	// The second page fails exactly once.
+	var failed int32
+	var failMu sync.Mutex
+	mock.setFail(func(r *http.Request) bool {
+		failMu.Lock()
+		defer failMu.Unlock()
+		if failed == 0 && r.URL.Query().Get("offset") == strconv.Itoa(pageLimit) {
+			failed++
+			return true
+		}
+		return false
+	})
+
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == total },
+		10*time.Second, 25*time.Millisecond, "every event must ship despite the failed page")
+	require.Never(t, func() bool { return sink.count() != total },
+		300*time.Millisecond, 25*time.Millisecond)
+
+	failMu.Lock()
+	assert.Equal(t, int32(1), failed, "the injected failure must have happened")
+	failMu.Unlock()
+	msgs := sink.snapshot()
+	for id, n := range shippedIDs(msgs) {
+		assert.Equalf(t, 1, n, "event %s shipped %d times", id, n)
+	}
+	assert.True(t, shippedInOrder(t, msgs), "events must ship oldest-first")
+}
+
+// TestMockOversizedWindowIsSplit covers a window holding more events than one
+// window may paginate (maxPagesPerWindow pages). Previously pagination stopped
+// at the cap and the watermark jumped to the newest event, skipping everything
+// older that had not been read. Now the window is halved until it fits, and
+// every event ships exactly once, in order.
+func TestMockOversizedWindowIsSplit(t *testing.T) {
+	const apiKey = "sublime-test-api-key-000000000000"
+	total := maxPagesPerWindow*pageLimit + 5000
+
+	mock := newMockSublime(apiKey)
+	events := make([]utils.Dict, total)
+	for i := 0; i < total; i++ {
+		events[i] = realisticAuditEvent(
+			fmt.Sprintf("34343434-0000-0000-0000-%012d", i),
+			"message.view_contents",
+			futureTS(time.Hour+time.Duration(i)*10*time.Millisecond))
+	}
+	mock.setEvents(events)
+
+	server := httptest.NewServer(mock.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _ := startMockAdapter(t, server.URL, apiKey, sink)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == total },
+		60*time.Second, 50*time.Millisecond, "every event of the oversized window must ship")
+	require.Never(t, func() bool { return sink.count() != total },
+		300*time.Millisecond, 25*time.Millisecond)
+
+	msgs := sink.snapshot()
+	ids := shippedIDs(msgs)
+	assert.Len(t, ids, total)
+	for id, n := range ids {
+		if n != 1 {
+			t.Fatalf("event %s shipped %d times", id, n)
+		}
+	}
+	assert.True(t, shippedInOrder(t, msgs), "events must ship oldest-first")
+
+	mock.mu.Lock()
+	defer mock.mu.Unlock()
+	assert.True(t, mock.sawLT, "the adapter must bound every window with created_at[lt]")
+	assert.Less(t, mock.maxOffsetSeen, maxPagesPerWindow*pageLimit,
+		"no window may be paginated past the per-window cap")
 }
