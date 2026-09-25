@@ -88,6 +88,12 @@ type mockSophosCentral struct {
 	validTokens map[string]bool
 	tokenSeq    int
 
+	// Injected failures: each entry is served (and consumed) in place of a
+	// normal response, with Retry-After set when retryAfter is non-empty.
+	tokenFailures  []injectedFailure
+	eventsFailures []injectedFailure
+	expiresIn      int // token lifetime in seconds; 0 means 3600
+
 	tokenRequests     int
 	fromDateRequests  int
 	cursorRequests    int
@@ -96,6 +102,54 @@ type mockSophosCentral struct {
 	lastTokenForm     map[string]string
 	lastEventsAuth    string
 	lastEventsTenant  string
+	eventsRequestAt   []time.Time
+}
+
+type injectedFailure struct {
+	status     int
+	retryAfter string
+}
+
+// failNext queues failures to serve on the next requests to an endpoint.
+func (m *mockSophosCentral) failNextToken(f ...injectedFailure) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokenFailures = append(m.tokenFailures, f...)
+}
+
+func (m *mockSophosCentral) failNextEvents(f ...injectedFailure) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.eventsFailures = append(m.eventsFailures, f...)
+}
+
+// revokeTokens invalidates every issued token, as if they expired server-side.
+func (m *mockSophosCentral) revokeTokens() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.validTokens = map[string]bool{}
+}
+
+func (m *mockSophosCentral) eventsTimes() []time.Time {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]time.Time, len(m.eventsRequestAt))
+	copy(out, m.eventsRequestAt)
+	return out
+}
+
+// popFailure serves the next queued failure, if any. Callers hold m.mu.
+func popFailure(w http.ResponseWriter, queue *[]injectedFailure) bool {
+	if len(*queue) == 0 {
+		return false
+	}
+	f := (*queue)[0]
+	*queue = (*queue)[1:]
+	if f.retryAfter != "" {
+		w.Header().Set("Retry-After", f.retryAfter)
+	}
+	writeJSON(w, f.status, utils.Dict{"error": http.StatusText(f.status), "correlationId": "test"})
+	return true
 }
 
 func newMockSophosCentral(t *testing.T, clientID, clientSecret, tenantID string) *mockSophosCentral {
@@ -138,7 +192,11 @@ func (m *mockSophosCentral) handler() http.Handler {
 func (m *mockSophosCentral) handleToken(w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.tokenRequests++
+	failed := popFailure(w, &m.tokenFailures)
 	m.mu.Unlock()
+	if failed {
+		return
+	}
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -181,12 +239,16 @@ func (m *mockSophosCentral) handleToken(w http.ResponseWriter, r *http.Request) 
 	m.tokenSeq++
 	token := fmt.Sprintf("sophos-jwt-%d", m.tokenSeq)
 	m.validTokens[token] = true
+	expiresIn := m.expiresIn
 	m.mu.Unlock()
+	if expiresIn == 0 {
+		expiresIn = 3600
+	}
 
 	writeJSON(w, http.StatusOK, utils.Dict{
 		"access_token": token,
 		"token_type":   "bearer",
-		"expires_in":   3600,
+		"expires_in":   expiresIn,
 		"message":      "OK",
 		"errorCode":    "success",
 	})
@@ -203,6 +265,11 @@ func (m *mockSophosCentral) handleEvents(w http.ResponseWriter, r *http.Request)
 	token := strings.TrimPrefix(auth, "Bearer ")
 
 	m.mu.Lock()
+	m.eventsRequestAt = append(m.eventsRequestAt, time.Now())
+	if popFailure(w, &m.eventsFailures) {
+		m.mu.Unlock()
+		return
+	}
 	m.lastEventsAuth = auth
 	m.lastEventsTenant = tenant
 	authOK := strings.HasPrefix(auth, "Bearer ") && m.validTokens[token] && tenant == m.tenantID
@@ -420,7 +487,7 @@ func TestMockEventsEndToEnd(t *testing.T) {
 	// The first poll used from_date = now-30s (epoch seconds); later polls use
 	// the cursor.
 	tokenN, fromDateN, _, rejectedN := mock.counts()
-	assert.GreaterOrEqual(t, tokenN, 2, "a JWT is fetched on every poll")
+	assert.Equal(t, 1, tokenN, "the JWT is fetched once and reused across polls")
 	assert.Equal(t, 1, fromDateN, "only the first poll uses from_date")
 	assert.Equal(t, 0, rejectedN, "no request should have failed authentication")
 	fd, err := strconv.ParseInt(lastFromDate, 10, 64)
@@ -537,9 +604,8 @@ func TestMockMultiPagePagination(t *testing.T) {
 }
 
 // TestMockBadCredentialsShipNothing pins the adapter's behavior on a failed
-// OAuth exchange: it ships nothing and keeps retrying (it does not stop). Each
-// poll fails to obtain a JWT, falls through to the events endpoint with an
-// empty bearer token and is rejected there too.
+// OAuth exchange: it ships nothing, reports an error, and does not call the
+// events endpoint without a token.
 func TestMockBadCredentialsShipNothing(t *testing.T) {
 	conf := testConfig(t)
 	mock := newMockSophosCentral(t, conf.ClientId, "the-real-secret", conf.TenantId)
@@ -551,15 +617,20 @@ func TestMockBadCredentialsShipNothing(t *testing.T) {
 	defer server.Close()
 
 	// conf.ClientSecret does not match the mock's secret.
+	rec := recordLogs(t, &conf)
 	_, chStopped, sink := startMockAdapter(t, server, conf)
 
 	// Wait for several failed polls.
 	require.Eventually(t, func() bool {
-		token, _, _, rejected := mock.counts()
-		return token >= 2 && rejected >= 2
+		token, _, _, _ := mock.counts()
+		return token >= 2
 	}, 5*time.Second, 20*time.Millisecond, "the adapter should keep retrying the exchange")
 
 	assert.Equal(t, 0, sink.count(), "nothing may ship when authentication fails")
+	assert.Empty(t, mock.eventsTimes(), "the events endpoint must not be called without a token")
+	errs := rec.errorList()
+	require.NotEmpty(t, errs, "invalid credentials must be reported as an error")
+	assert.Contains(t, errs[0], "401")
 
 	select {
 	case <-chStopped:
