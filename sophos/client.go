@@ -216,9 +216,9 @@ func (a *SophosAdapter) Close() error {
 	return err2
 }
 
-func (a *SophosAdapter) fetchEvents(url string) {
+func (a *SophosAdapter) fetchEvents(path string) {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", path))
 
 	lastCursor := ""
 	has_more := "false"
@@ -227,7 +227,7 @@ func (a *SophosAdapter) fetchEvents(url string) {
 	var firstTransient time.Time
 	for !a.doStop.WaitFor(wait) {
 		wait = a.pollInterval
-		items, newCursor, has_more_resp, err := a.makeOneRequest(url, lastCursor, has_more)
+		items, newCursor, has_more_resp, err := a.makeOneRequest(path, lastCursor, has_more)
 		if err != nil {
 			var te *transientError
 			if !errors.As(err, &te) {
@@ -387,7 +387,7 @@ func (a *SophosAdapter) getJwt() (string, bool, error) {
 	return a.token, true, nil
 }
 
-func (a *SophosAdapter) makeOneRequest(url string, lastCursor string, has_more string) ([]utils.Dict, string, string, error) {
+func (a *SophosAdapter) makeOneRequest(path string, lastCursor string, has_more string) ([]utils.Dict, string, string, error) {
 	token, isFreshToken, err := a.getJwt()
 	if err != nil {
 		return nil, lastCursor, has_more, err
@@ -396,14 +396,14 @@ func (a *SophosAdapter) makeOneRequest(url string, lastCursor string, has_more s
 	// Prepare the request.
 	var req *http.Request
 	if has_more != "false" {
-		req, err = http.NewRequest("GET", fmt.Sprintf("%s%s?cursor=%s&limit=200", a.conf.URL, url, lastCursor), nil)
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s with cursor, has_more: %s", a.conf.URL, url, has_more))
+		req, err = http.NewRequest("GET", fmt.Sprintf("%s%s?cursor=%s&limit=200", a.conf.URL, path, lastCursor), nil)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s with cursor, has_more: %s", a.conf.URL, path, has_more))
 	} else {
 		if a.fromDate == "" {
 			a.fromDate = strconv.FormatInt(time.Now().Unix()-30, 10)
 		}
-		req, err = http.NewRequest("GET", fmt.Sprintf("%s%s?from_date=%s&limit=200", a.conf.URL, url, a.fromDate), nil)
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s, has_more: %s", a.conf.URL, url, a.fromDate, has_more))
+		req, err = http.NewRequest("GET", fmt.Sprintf("%s%s?from_date=%s&limit=200", a.conf.URL, path, a.fromDate), nil)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s, has_more: %s", a.conf.URL, path, a.fromDate, has_more))
 	}
 	if err != nil {
 		a.doStop.Set()
