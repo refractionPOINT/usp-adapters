@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/credguard"
 	"strings"
 	"time"
 
@@ -70,11 +71,19 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 			return nil, nil, err
 		}
 	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
-		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsFile(a.conf.ServiceAccountCreds)); err != nil {
+		credFileOpt, ferr := credguard.FileOption(a.conf.ServiceAccountCreds)
+		if ferr != nil {
+			return nil, nil, ferr
+		}
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, credFileOpt); err != nil {
 			return nil, nil, err
 		}
 	} else {
-		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsJSON([]byte(a.conf.ServiceAccountCreds))); err != nil {
+		credJSONOpt, jerr := credguard.Option([]byte(a.conf.ServiceAccountCreds))
+		if jerr != nil {
+			return nil, nil, jerr
+		}
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, credJSONOpt); err != nil {
 			return nil, nil, err
 		}
 	}

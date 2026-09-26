@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/credguard"
 	"strings"
 	"sync"
 	"time"
@@ -69,11 +70,19 @@ func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdap
 			return nil, nil, err
 		}
 	} else if !strings.HasPrefix(bq.conf.ServiceAccountCreds, "{") {
-		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithCredentialsFile(bq.conf.ServiceAccountCreds)); err != nil {
+		credFileOpt, ferr := credguard.FileOption(bq.conf.ServiceAccountCreds)
+		if ferr != nil {
+			return nil, nil, ferr
+		}
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, credFileOpt); err != nil {
 			return nil, nil, err
 		}
 	} else {
-		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithCredentialsJSON([]byte(bq.conf.ServiceAccountCreds))); err != nil {
+		credJSONOpt, jerr := credguard.Option([]byte(bq.conf.ServiceAccountCreds))
+		if jerr != nil {
+			return nil, nil, jerr
+		}
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, credJSONOpt); err != nil {
 			return nil, nil, err
 		}
 	}
