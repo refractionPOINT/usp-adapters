@@ -16,6 +16,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/credguard"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -81,12 +82,12 @@ func NewGCSAdapter(ctx context.Context, conf GCSConfig) (*GCSAdapter, chan struc
 		if a.client, err = storage.NewClient(a.ctx, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
-	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
-		if a.client, err = storage.NewClient(a.ctx, option.WithCredentialsFile(conf.ServiceAccountCreds)); err != nil {
-			return nil, nil, err
-		}
 	} else {
-		if a.client, err = storage.NewClient(a.ctx, option.WithCredentialsJSON([]byte(conf.ServiceAccountCreds))); err != nil {
+		credOpt, cerr := credguard.CredentialOption(conf.ServiceAccountCreds)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		if a.client, err = storage.NewClient(a.ctx, credOpt); err != nil {
 			return nil, nil, err
 		}
 	}
