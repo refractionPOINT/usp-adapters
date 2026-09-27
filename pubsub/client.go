@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/refractionPOINT/usp-adapters/credguard"
 	"strings"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/credguard"
 )
 
 const (
@@ -70,20 +70,12 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
-	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
-		credFileOpt, ferr := credguard.FileOption(a.conf.ServiceAccountCreds)
-		if ferr != nil {
-			return nil, nil, ferr
-		}
-		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, credFileOpt); err != nil {
-			return nil, nil, err
-		}
 	} else {
-		credJSONOpt, jerr := credguard.Option([]byte(a.conf.ServiceAccountCreds))
-		if jerr != nil {
-			return nil, nil, jerr
+		credOpt, cerr := credguard.CredentialOption(a.conf.ServiceAccountCreds)
+		if cerr != nil {
+			return nil, nil, cerr
 		}
-		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, credJSONOpt); err != nil {
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, credOpt); err != nil {
 			return nil, nil, err
 		}
 	}

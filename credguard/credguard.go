@@ -18,9 +18,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"strings"
+	"unicode"
 
 	"google.golang.org/api/option"
 )
@@ -30,6 +32,10 @@ var ErrRefused = errors.New("credguard: credential refused")
 
 const maxDocumentBytes = 256 << 10
 const maxDepth = 64
+
+// StrictGoogleCredentialsEnv opts hosted adapters into credential validation.
+// Self-hosted adapters keep the Google library's full credential support by default.
+const StrictGoogleCredentialsEnv = "USP_ADAPTER_STRICT_GOOGLE_CREDENTIALS"
 
 var googleTokenHosts = map[string]bool{
 	"oauth2.googleapis.com":         true,
@@ -108,6 +114,21 @@ func Option(raw []byte) (option.ClientOption, error) {
 	return option.WithAuthCredentialsJSON(option.ServiceAccount, raw), nil
 }
 
+// CredentialOption preserves the original Google credential options unless strict
+// validation is explicitly enabled by the adapter host.
+func CredentialOption(creds string) (option.ClientOption, error) {
+	if strings.HasPrefix(creds, "{") {
+		if os.Getenv(StrictGoogleCredentialsEnv) == "1" {
+			return Option([]byte(creds))
+		}
+		return option.WithCredentialsJSON([]byte(creds)), nil
+	}
+	if os.Getenv(StrictGoogleCredentialsEnv) == "1" {
+		return FileOption(creds)
+	}
+	return option.WithCredentialsFile(creds), nil
+}
+
 func nonEmptyJSON(raw json.RawMessage) bool {
 	return len(raw) > 0 && string(raw) != "null"
 }
@@ -147,10 +168,11 @@ func walkDistinct(dec *json.Decoder, depth int) error {
 				return fmt.Errorf("%w: not valid JSON", ErrRefused)
 			}
 			name := key.(string)
-			if seen[name] {
+			folded := foldKey(name)
+			if seen[folded] {
 				return fmt.Errorf("%w: duplicate key %q", ErrRefused, name)
 			}
-			seen[name] = true
+			seen[folded] = true
 			if err := walkDistinct(dec, depth+1); err != nil {
 				return err
 			}
@@ -171,14 +193,46 @@ func walkDistinct(dec *json.Decoder, depth int) error {
 	return nil
 }
 
+// encoding/json matches struct field names with Unicode simple case folding.
+// Use the same equivalence for duplicate keys, including non-ASCII spellings.
+func foldKey(key string) string {
+	var b strings.Builder
+	for _, r := range key {
+		lowest := r
+		for next := unicode.SimpleFold(r); next != r; next = unicode.SimpleFold(next) {
+			if next < lowest {
+				lowest = next
+			}
+		}
+		b.WriteRune(lowest)
+	}
+	return b.String()
+}
+
 // FileOption reads a credential file, validates it, and returns the client option. It is
 // the safe replacement for option.WithCredentialsFile when the file path or its contents
 // are not fully trusted: the file must be a service_account key, so the auth library never
 // reads a credential_source or exchanges against a non-Google endpoint from it.
 func FileOption(path string) (option.ClientOption, error) {
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	raw, err := readCredentialFile(f, info.Size())
 	if err != nil {
 		return nil, err
 	}
 	return Option(raw)
+}
+
+func readCredentialFile(r io.Reader, size int64) ([]byte, error) {
+	if size > maxDocumentBytes {
+		return nil, fmt.Errorf("%w: document too large", ErrRefused)
+	}
+	return io.ReadAll(io.LimitReader(r, maxDocumentBytes+1))
 }

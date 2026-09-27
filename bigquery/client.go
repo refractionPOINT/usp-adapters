@@ -7,16 +7,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/refractionPOINT/go-uspclient"
-	"github.com/refractionPOINT/go-uspclient/protocol"
-	"github.com/refractionPOINT/usp-adapters/credguard"
-	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/bigquery"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/credguard"
 )
 
 type BigQueryAdapter struct {
@@ -69,20 +69,12 @@ func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdap
 		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
-	} else if !strings.HasPrefix(bq.conf.ServiceAccountCreds, "{") {
-		credFileOpt, ferr := credguard.FileOption(bq.conf.ServiceAccountCreds)
-		if ferr != nil {
-			return nil, nil, ferr
-		}
-		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, credFileOpt); err != nil {
-			return nil, nil, err
-		}
 	} else {
-		credJSONOpt, jerr := credguard.Option([]byte(bq.conf.ServiceAccountCreds))
-		if jerr != nil {
-			return nil, nil, jerr
+		credOpt, cerr := credguard.CredentialOption(bq.conf.ServiceAccountCreds)
+		if cerr != nil {
+			return nil, nil, cerr
 		}
-		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, credJSONOpt); err != nil {
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, credOpt); err != nil {
 			return nil, nil, err
 		}
 	}
