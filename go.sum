@@ -322,8 +322,14 @@ github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d h1:5OLPrBvVR
 github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d/go.mod h1:7S4MA6zBzHBCOlHUFK+X+lgQq+pHiR0OZtW0v3VJOkY=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260118194651-c777c31a5f60 h1:cTfqzVFzp6BqwrWizYDZ855CU7QOrGBjBXOs6PVjUzY=
 github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260118194651-c777c31a5f60/go.mod h1:hLfQhXuLI/7LrXAkbG/FkxFCd8v2DoAvuK5gdkZ1bcA=
+github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260917025049-2bcb3175e03b h1:C12L2s3D/VGmuuMoazEi5hjTa5opSS9ycLQXYvoti+o=
+github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260917025049-2bcb3175e03b/go.mod h1:u4Wgfxz8znmpDhmt6/Sd1pXu72YTk7AhsF3Gda6o7zs=
 github.com/refractionPOINT/go-uspclient v1.6.3 h1:2iR2Q4cm0eDO/zhpsEHM+0ddlXj3Lw19hLE8tqo3axw=
 github.com/refractionPOINT/go-uspclient v1.6.3/go.mod h1:j4tCnHNLMcx80nZ2KHKLGgLFPW2UVvFVxRil6Qd6Wjo=
+github.com/refractionPOINT/go-uspclient v1.6.13-0.20261004191910-9f136352174c h1:icMCj2+P3ucFsmRDi9PtYC1vKs1r1zgNQoJVpMjF5gU=
+github.com/refractionPOINT/go-uspclient v1.6.13-0.20261004191910-9f136352174c/go.mod h1:wnk8cceCDeMV4suTbq5+hEZjmCWPhdXxFRBUWK8YIw4=
+github.com/refractionPOINT/go-uspclient v1.6.13-0.20261004193709-07eea871b834 h1:w4GG1PwD8/LwfNI509zwx/EZTyTdVzax5GsM67FtzWI=
+github.com/refractionPOINT/go-uspclient v1.6.13-0.20261004193709-07eea871b834/go.mod h1:wnk8cceCDeMV4suTbq5+hEZjmCWPhdXxFRBUWK8YIw4=
 github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6 h1:1+7g49ZLqdbxFcqy0ISBs6tXq5dl/D0WV/VQgcvqWhY=
 github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6/go.mod h1:A+9rV4WFp4DKg1Ym1v6YtCrJ2vvlt1ZA/iml0CNuu2A=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
