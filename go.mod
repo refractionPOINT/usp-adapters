@@ -20,7 +20,7 @@ require (
 	github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
 	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260917025049-2bcb3175e03b
-	github.com/refractionPOINT/go-uspclient v1.6.13-0.20261004193709-07eea871b834
+	github.com/refractionPOINT/go-uspclient v1.6.13-0.20261004200052-192af36cf0a2
 	github.com/stretchr/testify v1.11.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/net v0.58.0

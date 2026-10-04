@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -109,5 +110,31 @@ func TestSensorIdentityInvalidConfig(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Constructors use the ingestion client directly, so invalid declarations must
+// be refused on the actual executable entry path, before input/network work.
+func TestSensorIdentityAdapterConstructorRefusesInvalidConfig(t *testing.T) {
+	for _, field := range []string{"mapping", "mappings[0]"} {
+		t.Run(field, func(t *testing.T) {
+			var config Configuration
+			if err := parseConfigsFromParams("stdin", []string{
+				"client_options.identity.oid=test-org", "client_options.identity.installation_key=test-key", "client_options.platform=json",
+				"client_options." + field + ".sensor_identity_type=host",
+				"client_options." + field + ".sensor_key_path=actor",
+				"client_options." + field + ".parsing_re=(?P<actor>.+)",
+			}, &config); err != nil {
+				t.Fatal(err)
+			}
+			config.Stdin.ClientOptions.TestSinkMode = true
+			client, _, err := runAdapter(context.Background(), "stdin", config, false)
+			if client != nil {
+				_ = client.Close()
+			}
+			if err == nil || !strings.Contains(err.Error(), "sensor_identity_type") {
+				t.Fatalf("constructor accepted invalid declaration or unrelated error: %v", err)
+			}
+		})
 	}
 }
