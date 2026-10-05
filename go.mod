@@ -19,8 +19,8 @@ require (
 	github.com/nxadm/tail v1.4.8
 	github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121
 	github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d
-	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260118194651-c777c31a5f60
-	github.com/refractionPOINT/go-uspclient v1.6.3
+	github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260917025049-2bcb3175e03b
+	github.com/refractionPOINT/go-uspclient v1.6.13-0.20261005004033-0ecda14b5558
 	github.com/stretchr/testify v1.11.1
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 	golang.org/x/net v0.58.0

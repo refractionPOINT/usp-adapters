@@ -320,10 +320,10 @@ github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121 h1:8VEMti13FI
 github.com/refractionPOINT/evtx v0.0.0-20250821225651-06f8e57ee121/go.mod h1:ZQQ/GaL5743AyXXzuQgC9rcZzfNA1qKXWQv/4iVdGMo=
 github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d h1:5OLPrBvVR0V/eGezlkJ4fyTaaJS/7pbYNTzMqu0Qur0=
 github.com/refractionPOINT/gjson v0.0.0-20230509223721-3a6dd216c22d/go.mod h1:7S4MA6zBzHBCOlHUFK+X+lgQq+pHiR0OZtW0v3VJOkY=
-github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260118194651-c777c31a5f60 h1:cTfqzVFzp6BqwrWizYDZ855CU7QOrGBjBXOs6PVjUzY=
-github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260118194651-c777c31a5f60/go.mod h1:hLfQhXuLI/7LrXAkbG/FkxFCd8v2DoAvuK5gdkZ1bcA=
-github.com/refractionPOINT/go-uspclient v1.6.3 h1:2iR2Q4cm0eDO/zhpsEHM+0ddlXj3Lw19hLE8tqo3axw=
-github.com/refractionPOINT/go-uspclient v1.6.3/go.mod h1:j4tCnHNLMcx80nZ2KHKLGgLFPW2UVvFVxRil6Qd6Wjo=
+github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260917025049-2bcb3175e03b h1:C12L2s3D/VGmuuMoazEi5hjTa5opSS9ycLQXYvoti+o=
+github.com/refractionPOINT/go-limacharlie/limacharlie v0.0.0-20260917025049-2bcb3175e03b/go.mod h1:u4Wgfxz8znmpDhmt6/Sd1pXu72YTk7AhsF3Gda6o7zs=
+github.com/refractionPOINT/go-uspclient v1.6.13-0.20261005004033-0ecda14b5558 h1:xWBvSCpc1ghKzLQSowm+qACxu+3UYWvt6cABBjjgyJc=
+github.com/refractionPOINT/go-uspclient v1.6.13-0.20261005004033-0ecda14b5558/go.mod h1:wnk8cceCDeMV4suTbq5+hEZjmCWPhdXxFRBUWK8YIw4=
 github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6 h1:1+7g49ZLqdbxFcqy0ISBs6tXq5dl/D0WV/VQgcvqWhY=
 github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6/go.mod h1:A+9rV4WFp4DKg1Ym1v6YtCrJ2vvlt1ZA/iml0CNuu2A=
 github.com/rogpeppe/go-internal v1.14.1 h1:UQB4HGPB6osV0SQTLymcB4TgvyWu6ZyliaW0tI/otEQ=
