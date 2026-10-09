@@ -192,11 +192,22 @@ steps:
     - 'GOARCH=amd64'
   waitFor: ['get-github-keys']
 
+# Sign the Windows and macOS adapters in place, in one signing request
+# (build_scripts/code_signing/sign_release.py). The cloud-sdk image carries the
+# gcloud CLI that client.py drives, and python3.
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+  id: sign-binaries
+  entrypoint: 'python3'
+  args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$TAG_NAME.exe', 'lc_adapter_macos_64_$TAG_NAME', 'lc_adapter_macos_arm64_$TAG_NAME']
+  env:
+    - 'CODE_SIGNING_KEY=${_CODE_SIGNING_KEY}'
+  waitFor: ['build-win64', 'build-macos64', 'build-macosarm64']
+
 # Stage binaries
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-adapters
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64']
+  waitFor: ['build-linux64', 'sign-binaries', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64']
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-connectivity
   args: ['cp', './lc_connectivity_*', 'gs://limacharlie-io/installers/']

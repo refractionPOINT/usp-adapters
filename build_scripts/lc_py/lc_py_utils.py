@@ -30,13 +30,13 @@ class LcUtil:
                 if 0 != attr:
                     extracted_path = os.path.join(output_dir, info.filename)
 
-                    if True == os.path.isfile(extracted_path):
+                    if os.path.isfile(extracted_path):
                         os.chmod(extracted_path, attr)
 
     @staticmethod
     def zip(directory: str, out_file: str, include_root: bool = True) -> None:
 
-        if True == include_root:
+        if include_root:
             rel_dir = os.path.dirname(directory)
         else:
             rel_dir = directory
@@ -86,7 +86,7 @@ class LcUtil:
         else:
             stdin = None
 
-        if True == capture_stdout:
+        if capture_stdout:
             p = subprocess.Popen(cmd_line,
                                  shell=True,
                                  text=True,
@@ -113,7 +113,7 @@ class LcUtil:
 
             ret = p.returncode
 
-            if True == check and 0 != ret:
+            if check and 0 != ret:
                 raise AssertionError(cmd_line, ret, out_str, out_err)
         finally:
             p.wait()
@@ -223,7 +223,7 @@ class LcUtil:
 
             cur_dir_cache = os.path.join(cur_root, ".clock")
 
-            if True == os.path.isdir(cur_dir_cache):
+            if os.path.isdir(cur_dir_cache):
                 clock_cache = cur_dir_cache
                 break
 

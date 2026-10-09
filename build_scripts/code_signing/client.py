@@ -1,11 +1,6 @@
 #!/usr/bin/env -S uv run --script
 # /// script
-# requires-python = ">=3.10"
-# dependencies = [
-#     "google-cloud-pubsub",
-#     "google",
-#     "google-cloud-storage",
-# ]
+# dependencies = []
 # ///
 import argparse
 import base64
@@ -14,20 +9,25 @@ import json
 import logging
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
 
-from google.api_core.exceptions import NotFound  # type: ignore
-from google.cloud import pubsub_v1  # type: ignore
-from google.oauth2.service_account import Credentials  # type: ignore
+script_root = os.path.abspath(os.path.dirname(sys.argv[0]))
+lc_py_root = os.path.abspath(os.path.join(script_root, os.path.pardir))
+sys.path.append(lc_py_root)
+
 from lc_py.lc_config import JSONConfig  # nopep8
-from lc_py.lc_gsifile import LCGSIFile  # nopep8
 from lc_py.lc_py_utils import LcUtil  # nopep8
 
 DEF_SIGN_TIMEOUT = (20 * 60)
+DEF_SIGN_RETRIES = 3
+
+IS_WINDOWS = os.name == "nt"
 
 
 class SignFileType(enum.Enum):
@@ -47,86 +47,302 @@ class InvalidArgumentError(Exception):
     pass
 
 
+class GcloudError(Exception):
+
+    def __init__(self, returncode: int, cmd: list[str],
+                 stdout: bytes, stderr: bytes) -> None:
+        self.returncode = returncode
+        self.cmd = cmd
+        self.stdout = stdout
+        self.stderr = stderr
+        msg = (f"gcloud {' '.join(cmd[1:])} exited {returncode}: "
+               f"{stderr.decode(errors='replace').strip()}")
+        super().__init__(msg)
+
+
+def _resolve_gcloud() -> str:
+    path = shutil.which("gcloud")
+    if path is None and IS_WINDOWS:
+        path = shutil.which("gcloud.cmd")
+    if path is None:
+        raise RuntimeError("gcloud CLI not found in PATH")
+    return path
+
+
+def _long_path(p: str) -> str:
+    """Expand Windows 8.3 short-name path components (e.g. RUNNER~1) to their
+    long form. gcloud storage's glob matcher fails to resolve short paths even
+    though Python can open them, so paths handed to gcloud must be long form.
+    No-op on POSIX."""
+    if not IS_WINDOWS:
+        return p
+    import ctypes
+    buf = ctypes.create_unicode_buffer(32768)
+    n = ctypes.windll.kernel32.GetLongPathNameW(p, buf, 32768)  # type: ignore
+    if 0 < n < 32768:
+        return buf.value
+    return p
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    if IS_WINDOWS:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                       stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL,
+                       timeout=10)
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def _run_with_timeout(cmd: list[str], timeout: float,
+                      env: dict[str, str] | None = None) -> tuple[int, bytes, bytes]:
+    """Run cmd with a hard timeout.
+
+    On timeout, the whole process tree is killed — taskkill /T on Windows,
+    killpg on POSIX — so a hung gcloud (or its Python child) can't outlive us.
+    """
+    if IS_WINDOWS:
+        # CREATE_NEW_PROCESS_GROUP is Windows-only; use getattr so this
+        # module still imports on POSIX (where pyright/mypy also can't see it).
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        proc = subprocess.Popen(cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=env,
+                                creationflags=creationflags)
+    else:
+        proc = subprocess.Popen(cmd,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                                env=env,
+                                start_new_session=True)
+
+    try:
+        out, err = proc.communicate(timeout=max(0.1, timeout))
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            out, err = b"", b""
+        raise subprocess.TimeoutExpired(cmd, timeout,
+                                        output=out, stderr=err)
+
+    return proc.returncode, out, err
+
+
 class SigningPublisher:
 
     def __init__(self, project: str, topic: str, bucket_name: str, key: str) -> None:
         self.project = project
         self.topic = topic
-        self.key = key
         self.bucket_name = bucket_name
-        self.creds = Credentials.from_service_account_file(key)  # type: ignore
+        self.key = key
+        self.gcloud = _resolve_gcloud()
+        self._config_dir: str | None = None
+        self.env: dict[str, str] | None = None
 
     def __enter__(self) -> 'SigningPublisher':
-        # Code to run when entering the context
         logging.info(f"authenticating using {self.key}")
-        self.pub = pubsub_v1.PublisherClient(  # type: ignore
-            credentials=self.creds)  # type: ignore
+
+        self._config_dir = tempfile.mkdtemp(prefix="gcloud_cfg_")
+
+        env = dict(os.environ)
+        env["CLOUDSDK_CONFIG"] = self._config_dir
+        env["CLOUDSDK_CORE_PROJECT"] = self.project
+        env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
+        env["CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK"] = "1"
+        self.env = env
+
+        rc, out, err = _run_with_timeout(
+            [self.gcloud, "auth", "activate-service-account",
+             "--key-file", self.key, "--quiet"],
+            timeout=60.0,
+            env=self.env)
+
+        if rc != 0:
+            raise GcloudError(rc,
+                              [self.gcloud, "auth", "activate-service-account"],
+                              out, err)
+
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback):  # type: ignore
-        pass
+    def __exit__(self, exc_type: type[BaseException] | None,
+                 exc_value: BaseException | None, traceback: object) -> None:
+        if self._config_dir is not None:
+            shutil.rmtree(self._config_dir, ignore_errors=True)
 
-    def sign_archive(self, sign_type: SignFileType, input: str, output: str, timeout: float) -> None:
+    def _gcloud(self, args: list[str], timeout: float) -> tuple[int, bytes, bytes]:
+        cmd = [self.gcloud, *args]
+        return _run_with_timeout(cmd, timeout=timeout, env=self.env)
+
+    def _gcloud_checked(self, args: list[str], timeout: float) -> tuple[bytes, bytes]:
+        rc, out, err = self._gcloud(args, timeout)
+        if rc != 0:
+            raise GcloudError(rc, [self.gcloud, *args], out, err)
+        return out, err
+
+    def _object_exists(self, uri: str, timeout: float) -> bool:
+        rc, _out, _err = self._gcloud(
+            ["storage", "objects", "describe", uri,
+             "--format=value(name)"],
+            timeout=timeout)
+        return rc == 0
+
+    def _upload(self, local_path: str, uri: str, timeout: float) -> None:
+        src = _long_path(os.path.abspath(local_path))
+        logging.info(f"uploading {src} to {uri}")
+        self._gcloud_checked(
+            ["storage", "cp", src, uri],
+            timeout=timeout)
+
+    def _download(self, uri: str, local_path: str, timeout: float) -> None:
+        # Download to a temp file then move — gcloud storage cp can leave a
+        # partial file on failure, and callers expect an atomic replace.
+        # GetLongPathNameW only resolves existing paths, so resolve the dir
+        # first and then join the filename.
+        td = _long_path(tempfile.mkdtemp(prefix="gsi_storage_"))
+        try:
+            out_file = os.path.join(td, "download.bin")
+            logging.info(f"downloading {uri} to {local_path}")
+            self._gcloud_checked(
+                ["storage", "cp", uri, out_file],
+                timeout=timeout)
+            shutil.move(out_file, local_path)
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+    def _delete(self, uri: str, timeout: float) -> None:
+        logging.info(f"deleting {uri}")
+        rc, _out, err = self._gcloud(
+            ["storage", "rm", uri, "--quiet"],
+            timeout=timeout)
+        if rc != 0:
+            logging.info(
+                f"delete {uri} returned {rc}: "
+                f"{err.decode(errors='replace').strip()}")
+
+    def _publish(self, message_bytes: bytes, timeout: float) -> str:
+        # base64 is ASCII so round-tripping through gcloud's UTF-8 --message
+        # preserves bytes verbatim.
+        message_str = message_bytes.decode("ascii")
+        out, _err = self._gcloud_checked(
+            ["pubsub", "topics", "publish", self.topic,
+             f"--project={self.project}",
+             f"--message={message_str}",
+             "--format=value(messageIds)"],
+            timeout=timeout)
+        return out.decode(errors="replace").strip()
+
+    def sign_archive(self, sign_type: SignFileType, input: str, output: str, timeout: float, retries: int) -> None:
 
         logging.info(f"Input file: {input}")
         logging.info(f"Output file: {output}")
 
-        # upload file to a bucket
-        gsi = LCGSIFile(self.key)
+        GCS_OP_TIMEOUT = 120.0
+        CLEANUP_TIMEOUT = 30.0
+        PUBLISH_TIMEOUT = 30.0
+
+        # Overall wall-clock budget: one upload + retries * per-attempt polling
+        # window + small slop for publishes. Every gcloud op is clamped to what
+        # remains, and _run_with_timeout hard-kills the process tree on expiry.
+        overall_deadline = time.time() + GCS_OP_TIMEOUT + retries * \
+            (PUBLISH_TIMEOUT + timeout)
+
+        def remaining() -> float:
+            return max(0.0, overall_deadline - time.time())
 
         uuid_str = str(uuid.uuid4())
-
         file_name = f"lc_sensor_{uuid_str}.zip"
+        uri = f"gs://{self.bucket_name}/{file_name}"
+        signed_uri = uri + ".signed"
 
         try:
 
-            uri = gsi.upload(input, self.bucket_name, file_name)
-
-            signed_uri = uri + ".signed"
+            self._upload(input, uri,
+                         timeout=min(GCS_OP_TIMEOUT, remaining()))
 
             req = SigningRequest(sign_type.value, uri, signed_uri)
 
             message_json = json.dumps(asdict(req))
             message = base64.b64encode(message_json.encode("utf-8"))
 
-            topic_path = self.pub.topic_path(self.project,  # type: ignore
-                                             self.topic)
-            future = self.pub.publish(topic_path, message)  # type: ignore
+            signed = False
+            attempt = 0
 
-            msg_id = future.result()  # type: ignore
+            for attempt in range(1, retries + 1):
 
-            logging.info(f"message id: {msg_id}")
-
-            # wait for the signed file to appear
-            cur_ts = time.time()
-            end_ts = cur_ts + timeout
-
-            while cur_ts < end_ts:
+                if remaining() <= 0:
+                    break
 
                 try:
-                    gsi.download_uri(signed_uri, output)
-                    gsi.delete_uri(signed_uri)
+                    msg_id = self._publish(
+                        message,
+                        timeout=min(PUBLISH_TIMEOUT, remaining()))
+                except subprocess.TimeoutExpired:
+                    logging.warning(f"publish attempt {attempt} timed out")
+                    continue
+
+                logging.info(
+                    f"attempt {attempt}/{retries}, message id: {msg_id}")
+
+                # wait for the signed file to appear
+                end_ts = min(time.time() + timeout, overall_deadline)
+
+                while time.time() < end_ts:
+
+                    op_timeout = min(GCS_OP_TIMEOUT, end_ts - time.time())
+
+                    try:
+                        if self._object_exists(signed_uri, timeout=op_timeout):
+                            self._download(signed_uri, output,
+                                           timeout=min(GCS_OP_TIMEOUT,
+                                                       max(1.0, end_ts - time.time())))
+                            self._delete(signed_uri,
+                                         timeout=min(CLEANUP_TIMEOUT, remaining()))
+                            signed = True
+                            break
+                    except (subprocess.TimeoutExpired, GcloudError) as e:
+                        # Race: object disappeared between describe and cp, or
+                        # a transient gcloud/network error. Either way keep
+                        # polling — the outer retry loop bounds total attempts.
+                        logging.warning(f"poll/download/delete failed: {e}")
+
+                    time.sleep(min(5.0, max(0.0, end_ts - time.time())))
+
+                    logging.info(f"timeout={end_ts - time.time():.2f}")
+
+                if signed:
                     break
-                except NotFound:
-                    pass
 
-                time.sleep(5)
-                cur_ts = time.time()
+                logging.warning(
+                    f"Signing attempt {attempt}/{retries} timed out")
 
-                rem_secs = end_ts - cur_ts
+                sys.stdout.flush()
 
-                logging.info(f"timeout={rem_secs:.2f}")
-
-            if cur_ts > end_ts:
-                raise TimeoutError(f"Unable to sign {input} in time")
+            if not signed:
+                raise TimeoutError(
+                    f"Unable to sign {input} after {attempt} attempts "
+                    f"(retries={retries})")
 
         finally:
-            gsi.delete(self.bucket_name, file_name)
+            # Bound cleanup by whatever wall-clock budget is left (but give
+            # it at least 1s so we don't skip it after a deadline blow-out),
+            # and never let a cleanup exception mask the original error.
+            cleanup_timeout = min(CLEANUP_TIMEOUT, max(1.0, remaining()))
+            try:
+                self._delete(uri, timeout=cleanup_timeout)
+            except Exception:
+                logging.warning("bucket cleanup failed for %s",
+                                file_name, exc_info=True)
 
-    def sign(self, sign_type: SignFileType, input: str, output: str, timeout: float) -> None:
+    def sign(self, sign_type: SignFileType, input: str, output: str, timeout: float, retries: int) -> None:
 
         if input.endswith(".zip"):
-            self.sign_archive(sign_type, input, output, timeout)
+            self.sign_archive(sign_type, input, output, timeout, retries)
             return
 
         with tempfile.TemporaryDirectory(prefix="sign_file_") as td:
@@ -143,7 +359,7 @@ class SigningPublisher:
 
             LcUtil.zip(tmp_bin, tmp_zip, include_root=False)
 
-            self.sign_archive(sign_type, tmp_zip, tmp_zip, timeout)
+            self.sign_archive(sign_type, tmp_zip, tmp_zip, timeout, retries)
 
             signed_bin = os.path.join(td, "signed_bin")
             os.mkdir(signed_bin)
@@ -153,44 +369,6 @@ class SigningPublisher:
             signed_output = os.path.join(signed_bin, input_fn)
 
             shutil.copy2(signed_output, output)
-
-    def sign_macos(self, input: str, entitlements: str, output: str, timeout: float) -> None:
-
-        with tempfile.TemporaryDirectory(prefix="macos_sign_") as td:
-
-            input_fn = os.path.basename(input)
-            bin_file = os.path.join(td, input_fn)
-            shutil.copy2(input, bin_file)
-
-            entitlements_dir = os.path.join(td, "entitlements")
-            os.mkdir(entitlements_dir)
-
-            e_file = os.path.join(entitlements_dir, f"{input_fn}.plist")
-            shutil.copy2(entitlements, e_file)
-
-            e_zip = os.path.join(td, "entitlements.zip")
-
-            LcUtil.zip(entitlements_dir, e_zip)
-
-            shutil.rmtree(entitlements_dir)
-
-            with tempfile.TemporaryDirectory(prefix="unsigned") as unsigned:
-
-                sign_package = os.path.join(unsigned, "package.zip")
-
-                LcUtil.zip(td, sign_package, include_root=False)
-
-                # this may take a while
-                self.sign(SignFileType.SENSOR_ARCHIVE,
-                          sign_package,
-                          sign_package,
-                          timeout)
-
-                # unzip and extract the signed file
-                LcUtil.unzip(sign_package, td)
-
-            # return the signed / notarized file
-            shutil.copy2(bin_file, output)
 
 
 def main() -> int:
@@ -208,9 +386,15 @@ def main() -> int:
     def_bucket = config.get("/pub/bucket")
     def_project = config.get("/project")
 
+    if "GOOGLE_APPLICATION_CREDENTIALS" in os.environ:
+        default_key = os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+    else:
+        default_key = None
+
     parser.add_argument("-k",
                         "--key",
                         type=str,
+                        default=default_key,
                         help="Google service account key file")
 
     parser.add_argument("--base64-key",
@@ -256,16 +440,16 @@ def main() -> int:
                         default=DEF_SIGN_TIMEOUT,
                         help=f"Signing timeout. Default: {DEF_SIGN_TIMEOUT}")
 
+    parser.add_argument("--retries",
+                        type=int,
+                        default=DEF_SIGN_RETRIES,
+                        help=f"Number of signing attempts. Default: {DEF_SIGN_RETRIES}")
+
     parser.add_argument("--sign-type",
                         type=str,
                         default="sensor",
                         choices=["sensor", "package", "hlk"],
                         help="Type of signing")
-
-    parser.add_argument("-e",
-                        "--entitlements-file",
-                        type=str,
-                        help="/path/to/entitlements.plist")
 
     args = parser.parse_args()
 
@@ -289,15 +473,12 @@ def main() -> int:
             LcUtil.printkv("Google SA Key String",
                            args.base64_key[:30] + "...")
         else:
-            raise InvalidArgumentError("--key or --key--string is missing")
+            raise InvalidArgumentError("--key or --base64-key is missing")
 
         LcUtil.printkv("Project", args.project)
         LcUtil.printkv("Topic", args.topic)
         LcUtil.printkv("Bucket Name", args.bucket)
         LcUtil.printkv("Signing timeout", args.timeout)
-
-        if args.entitlements_file is not None:
-            LcUtil.printkv("Entitlements", args.entitlements_file)
 
         with tempfile.TemporaryDirectory(prefix="pub_client_") as td:
 
@@ -321,13 +502,8 @@ def main() -> int:
                                   args.bucket,
                                   key_file) as pub:
 
-                if args.entitlements_file is None:
-                    pub.sign(sign_type, args.input, args.output, args.timeout)
-                else:
-                    pub.sign_macos(args.input,
-                                   args.entitlements_file,
-                                   args.output,
-                                   args.timeout)
+                pub.sign(sign_type, args.input, args.output,
+                         args.timeout, args.retries)
 
         LcUtil.printkv("Output File", args.output)
         LcUtil.printkv("Output File Size", LcUtil.file_size_fmt(args.output))
