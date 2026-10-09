@@ -1,0 +1,50 @@
+# TEMPORARY: exercises code signing on every push to the signing branch, so it
+# can be tested before it reaches master. Remove before release.
+#
+# Builds only what gets signed (the Windows and macOS adapters), signs them the
+# way cloudbuild_release.yaml does, and copies the signed binaries to a scratch
+# prefix. Nothing is published: no installers upload, no Docker push.
+#
+# Run it from a push trigger on the branch only, never from a pull-request
+# trigger: _CODE_SIGNING_KEY must not reach builds of fork PRs.
+steps:
+- name: 'golang:1.27-bookworm'
+  id: build-win64
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64_$SHORT_SHA.exe', './containers/general']
+  env:
+    - 'GOOS=windows'
+    - 'GOARCH=amd64'
+- name: 'golang:1.27-bookworm'
+  id: build-macos64
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64_$SHORT_SHA', './containers/general']
+  env:
+    - 'GOOS=darwin'
+    - 'GOARCH=amd64'
+  waitFor: ['-']
+- name: 'golang:1.27-bookworm'
+  id: build-macosarm64
+  args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64_$SHORT_SHA', './containers/general']
+  env:
+    - 'GOOS=darwin'
+    - 'GOARCH=arm64'
+  waitFor: ['-']
+
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+  id: sign-binaries
+  entrypoint: 'python3'
+  args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$SHORT_SHA.exe', 'lc_adapter_macos_64_$SHORT_SHA', 'lc_adapter_macos_arm64_$SHORT_SHA']
+  env:
+    - 'CODE_SIGNING_KEY=${_CODE_SIGNING_KEY}'
+  waitFor: ['build-win64', 'build-macos64', 'build-macosarm64']
+
+- name: 'gcr.io/cloud-builders/gsutil'
+  id: copy-signed-binaries
+  args: ['cp', './lc_adapter_*', '${_OUTPUT}/$SHORT_SHA/']
+  waitFor: ['sign-binaries']
+
+substitutions:
+  _OUTPUT: 'gs://${PROJECT_ID}_cloudbuild/usp-adapters-signing-test'
+options:
+  machineType: 'N1_HIGHCPU_32'
+  dynamicSubstitutions: true
+timeout: 45m
