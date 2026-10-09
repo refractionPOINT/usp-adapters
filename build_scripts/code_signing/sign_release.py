@@ -4,7 +4,8 @@
 client.py sends an archive to the signing service, which signs each file in it
 by platform: Windows by extension, macOS when "macos" is in the file name. A
 macOS binary also needs entitlements, which the service looks up as
-"<file name>.plist" inside an "entitlements.zip" at the archive root, so this
+"entitlements/<file name>.plist" inside an "entitlements.zip" at the archive
+root, so this
 script builds that archive, has it signed, and writes each signed binary back
 over the original (keeping the original file's mode).
 
@@ -44,7 +45,10 @@ def build_archive(files: list[str], entitlements: str, archive: str) -> None:
             for f in files:
                 name = os.path.basename(f)
                 if "macos" in name:
-                    z.write(entitlements, name + ".plist")
+                    # The service unzips this archive into its work directory
+                    # and then reads "entitlements/<name>.plist", so the
+                    # directory is part of the path inside the zip.
+                    z.write(entitlements, f"entitlements/{name}.plist")
         with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
             for f in files:
                 z.write(f, os.path.basename(f))
