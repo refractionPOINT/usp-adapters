@@ -12,6 +12,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/credguard"
 )
 
 const (
@@ -47,6 +48,7 @@ func (c *PubSubConfig) Validate() error {
 	if c.ProjectName == "" {
 		return errors.New("missing project_name")
 	}
+	c.ServiceAccountCreds = strings.TrimSpace(c.ServiceAccountCreds)
 	if c.ServiceAccountCreds == "" {
 		return errors.New("missing service_account_creds")
 	}
@@ -68,12 +70,12 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
-	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
-		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsFile(a.conf.ServiceAccountCreds)); err != nil {
-			return nil, nil, err
-		}
 	} else {
-		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, option.WithCredentialsJSON([]byte(a.conf.ServiceAccountCreds))); err != nil {
+		credOpt, cerr := credguard.CredentialOption(a.conf.ServiceAccountCreds)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		if a.psClient, err = pubsub.NewClient(a.ctx, a.conf.ProjectName, credOpt); err != nil {
 			return nil, nil, err
 		}
 	}

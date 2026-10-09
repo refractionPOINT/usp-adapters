@@ -17,9 +17,19 @@ import (
 )
 
 const (
-	logsURL       = "https://api.hubapi.com/account-info/v3/activity/audit-logs"
-	overlapPeriod = 30 * time.Minute
+	logsURL             = "https://api.hubapi.com/account-info/v3/activity/audit-logs"
+	overlapPeriod       = 30 * time.Minute
+	defaultPollInterval = 30 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type opRequest struct {
 	Limit     int    `json:"page[size],omitempty"`
@@ -29,8 +39,11 @@ type opRequest struct {
 
 type HubSpotAdapter struct {
 	conf       HubSpotConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	apiURL       string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -44,6 +57,16 @@ type HubSpotAdapter struct {
 type HubSpotConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	AccessToken   string                  `json:"access_token" yaml:"access_token"`
+
+	// URL overrides the audit-logs endpoint queried. Empty means the standard
+	// HubSpot API endpoint
+	// (https://api.hubapi.com/account-info/v3/activity/audit-logs).
+	URL string `json:"url" yaml:"url"`
+
+	// PollInterval overrides the wait between polls of the audit-logs
+	// endpoint. It is not settable through a config file; it exists as a seam
+	// for tests. Zero means the default (30 seconds).
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *HubSpotConfig) Validate() error {
@@ -57,17 +80,36 @@ func (c *HubSpotConfig) Validate() error {
 }
 
 func NewHubSpotAdapter(ctx context.Context, conf HubSpotConfig) (*HubSpotAdapter, chan struct{}, error) {
-	var err error
+	return newHubSpotAdapter(ctx, conf, nil)
+}
+
+// newHubSpotAdapter is the implementation behind NewHubSpotAdapter. When sink
+// is non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newHubSpotAdapter(ctx context.Context, conf HubSpotConfig, sink uspSink) (*HubSpotAdapter, chan struct{}, error) {
 	a := &HubSpotAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
-		dedupe: make(map[string]int64),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		dedupe:       make(map[string]int64),
+		apiURL:       conf.URL,
+		pollInterval: conf.PollInterval,
+	}
+	if a.apiURL == "" {
+		a.apiURL = logsURL
+	}
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -109,10 +151,10 @@ func (a *HubSpotAdapter) Close() error {
 
 func (a *HubSpotAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", logsURL))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.apiURL))
 
 	adapterStart := time.Now()
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items := a.makeOneRequest(adapterStart)
@@ -155,8 +197,8 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 
 	for {
 		// Prepare the request.
-		req, err := http.NewRequest("GET", fmt.Sprintf("%s?occurredAfter=%s&occurredBefore=%s", logsURL, start, until), nil)
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s starting at %s until %s", logsURL, start, until))
+		req, err := http.NewRequest("GET", fmt.Sprintf("%s?occurredAfter=%s&occurredBefore=%s", a.apiURL, start, until), nil)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s starting at %s until %s", a.apiURL, start, until))
 		if err != nil {
 			a.doStop.Set()
 			return nil

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,10 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
+
+// defaultPollInterval is the historical fixed wait between polls of the
+// Vision One Workbench alerts endpoint.
+const defaultPollInterval = 60 * time.Second
 
 var regionalDomains = map[string]string{
 	"us": "https://api.xdr.trendmicro.com",
@@ -30,6 +35,16 @@ type TrendMicroConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	APIToken      string                  `json:"api_token" yaml:"api_token"`
 	Region        string                  `json:"region" yaml:"region"` // "us", "eu", "sg", "jp", "in", "au" - defaults to "us"
+
+	// URL optionally overrides the regional Vision One API root (e.g.
+	// "https://api.xdr.trendmicro.com"). When empty, the root is derived from
+	// Region as before.
+	URL string `json:"url" yaml:"url"`
+
+	// PollInterval overrides the fixed wait between polls of the alerts
+	// endpoint. It is not settable through a config file; it exists as a seam
+	// for tests (the production interval stays the historical 60 seconds).
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *TrendMicroConfig) Validate() error {
@@ -46,12 +61,24 @@ func (c *TrendMicroConfig) Validate() error {
 	if _, ok := regionalDomains[c.Region]; !ok {
 		return fmt.Errorf("invalid region: %s (must be one of: us, eu, sg, jp, in, au)", c.Region)
 	}
+	if c.PollInterval <= 0 {
+		c.PollInterval = defaultPollInterval
+	}
 	return nil
+}
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
 }
 
 type TrendMicroAdapter struct {
 	conf       TrendMicroConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 	chStopped  chan struct{}
 	wgSenders  sync.WaitGroup
@@ -62,11 +89,17 @@ type TrendMicroAdapter struct {
 }
 
 func NewTrendMicroAdapter(ctx context.Context, conf TrendMicroConfig) (*TrendMicroAdapter, chan struct{}, error) {
+	return newTrendMicroAdapter(ctx, conf, nil)
+}
+
+// newTrendMicroAdapter is the implementation behind NewTrendMicroAdapter. When
+// sink is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newTrendMicroAdapter(ctx context.Context, conf TrendMicroConfig, sink uspSink) (*TrendMicroAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
 
-	var err error
 	a := &TrendMicroAdapter{
 		conf:      conf,
 		ctx:       context.Background(),
@@ -75,12 +108,20 @@ func NewTrendMicroAdapter(ctx context.Context, conf TrendMicroConfig) (*TrendMic
 		lastFetch: time.Now().Add(-24 * time.Hour), // Start by fetching last 24 hours
 	}
 
-	// Set regional base URL
+	// Set regional base URL, unless explicitly overridden.
 	a.baseURL = regionalDomains[conf.Region]
+	if conf.URL != "" {
+		a.baseURL = strings.TrimRight(conf.URL, "/")
+	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -121,7 +162,7 @@ func (a *TrendMicroAdapter) fetchAlerts() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog("Trend Micro alert collection stopping")
 
-	for !a.doStop.WaitFor(60 * time.Second) {
+	for !a.doStop.WaitFor(a.conf.PollInterval) {
 		items, err := a.fetchAllPages()
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("failed to fetch alerts: %v", err))

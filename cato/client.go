@@ -23,6 +23,9 @@ import (
 
 const (
 	defaultWriteTimeout = 60 * 10
+	// defaultGraphqlURL is the Cato Networks GraphQL endpoint used when the
+	// config does not override it.
+	defaultGraphqlURL = "https://api.catonetworks.com/api/v1/graphql2"
 )
 
 var (
@@ -32,6 +35,9 @@ var (
 	start                  time.Time
 	marker                 string
 	configFile             string = "./config.txt"
+	// pollInterval is how long the feed loop waits between eventsFeed calls.
+	// It is a package variable (not a constant) only so tests can shorten it.
+	pollInterval = 1 * time.Minute
 )
 
 type CatoConfig struct {
@@ -39,6 +45,9 @@ type CatoConfig struct {
 	WriteTimeoutSec uint64                  `json:"write_timeout_sec,omitempty" yaml:"write_timeout_sec,omitempty"`
 	ApiKey          string                  `json:"apikey" yaml:"apikey"`
 	AccountId       int                     `json:"accountid" yaml:"accountid"`
+	// Url optionally overrides the Cato GraphQL endpoint. Empty means the
+	// production endpoint (defaultGraphqlURL).
+	Url string `json:"url,omitempty" yaml:"url,omitempty"`
 }
 
 func (c *CatoConfig) Validate() error {
@@ -54,12 +63,20 @@ func (c *CatoConfig) Validate() error {
 	return nil
 }
 
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type CatoAdapter struct {
 	conf         CatoConfig
 	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
-	uspClient    *uspclient.Client
+	uspClient    uspSink
 	writeTimeout time.Duration
 
 	chStopped chan struct{}
@@ -69,6 +86,13 @@ type CatoAdapter struct {
 }
 
 func NewCatoAdapter(ctx context.Context, conf CatoConfig) (*CatoAdapter, chan struct{}, error) {
+	return newCatoAdapter(ctx, conf, nil)
+}
+
+// newCatoAdapter is the implementation behind NewCatoAdapter. When sink is
+// non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newCatoAdapter(ctx context.Context, conf CatoConfig, sink uspSink) (*CatoAdapter, chan struct{}, error) {
 	a := &CatoAdapter{
 		conf:      conf,
 		isRunning: 1,
@@ -79,10 +103,14 @@ func NewCatoAdapter(ctx context.Context, conf CatoConfig) (*CatoAdapter, chan st
 	}
 	a.writeTimeout = time.Duration(a.conf.WriteTimeoutSec) * time.Second
 
-	var err error
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.chStopped = make(chan struct{})
@@ -143,6 +171,7 @@ func (a *CatoAdapter) convertStructToMap(obj interface{}) map[string]interface{}
 }
 
 func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key string) {
+	defer a.wgSenders.Done()
 
 	start = time.Now()
 
@@ -153,6 +182,15 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 	totalCount := 0
 
 	for {
+		// Exit if the adapter was asked to stop (test seam; in production
+		// nothing flips isRunning before the process exits).
+		a.mRunning.RLock()
+		running := a.isRunning
+		a.mRunning.RUnlock()
+		if running == 0 {
+			return
+		}
+
 		query := fmt.Sprintf(`{
   eventsFeed(accountIDs:[%q]
     marker:%q
@@ -239,9 +277,18 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 		iteration++
 
 		// Add sleep to ensure the request is made every 1 minute
-		time.Sleep(1 * time.Minute)
+		time.Sleep(pollInterval)
 	}
 
+}
+
+// graphqlURL returns the Cato GraphQL endpoint to call: the config override
+// when set, the production endpoint otherwise.
+func (a *CatoAdapter) graphqlURL() string {
+	if a.conf.Url != "" {
+		return a.conf.Url
+	}
+	return defaultGraphqlURL
 }
 
 func (a *CatoAdapter) send(query string, account_id string, api_key string) (bool, map[string]interface{}) {
@@ -266,7 +313,7 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 			continue
 		}
 
-		req, err := http.NewRequest("POST", "https://api.catonetworks.com/api/v1/graphql2", bytes.NewBuffer(jsonData))
+		req, err := http.NewRequest("POST", a.graphqlURL(), bytes.NewBuffer(jsonData))
 		if err != nil {
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
 			time.Sleep(2 * time.Second)

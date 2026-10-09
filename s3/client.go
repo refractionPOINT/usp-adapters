@@ -336,17 +336,25 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 			}
 		}
 
-		isCompressed := false
-
-		if strings.HasSuffix(item.Key, ".gz") {
-			isCompressed = true
+		// PrepareBundleData routes through the parquet decoder when
+		// needed (including gzipped parquet) and otherwise returns the
+		// bytes untouched. Anything that fails here surfaces as the
+		// download error so the caller skips the object.
+		rawData, isCompressed, err := utils.PrepareBundleData(item.Key, writerAt.Bytes())
+		if err != nil {
+			a.conf.ClientOptions.OnError(err)
+			return &s3LocalFile{
+				Obj:  item,
+				Data: nil,
+				Err:  err,
+			}
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", item.Key, time.Since(startTime), item.Size))
 
 		return &s3LocalFile{
 			Obj:          item,
-			Data:         writerAt.Bytes(),
+			Data:         rawData,
 			IsCompressed: isCompressed,
 		}
 	})

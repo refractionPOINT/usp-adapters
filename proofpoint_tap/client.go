@@ -22,10 +22,22 @@ const (
 	warnDedupeSize = 100000
 )
 
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type ProofpointTapAdapter struct {
 	conf       ProofpointTapConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	apiURL       string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -39,6 +51,15 @@ type ProofpointTapConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Principal     string                  `json:"principal" yaml:"principal"`
 	Secret        string                  `json:"secret" yaml:"secret"`
+
+	// URL overrides the SIEM endpoint queried. Empty means the standard
+	// Proofpoint TAP endpoint (https://tap-api-v2.proofpoint.com/v2/siem/all).
+	URL string `json:"url" yaml:"url"`
+
+	// PollInterval overrides the wait between polls of the SIEM endpoint. It
+	// is not settable through a config file; it exists as a seam for tests.
+	// Zero means the default (60 seconds).
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *ProofpointTapConfig) Validate() error {
@@ -55,6 +76,13 @@ func (c *ProofpointTapConfig) Validate() error {
 }
 
 func NewProofpointTapAdapter(ctx context.Context, conf ProofpointTapConfig) (*ProofpointTapAdapter, chan struct{}, error) {
+	return newProofpointTapAdapter(ctx, conf, nil)
+}
+
+// newProofpointTapAdapter is the implementation behind NewProofpointTapAdapter.
+// When sink is non-nil it is used in place of a real LimaCharlie client -- the
+// seam tests use to capture shipped events.
+func newProofpointTapAdapter(ctx context.Context, conf ProofpointTapConfig, sink uspSink) (*ProofpointTapAdapter, chan struct{}, error) {
 	if err := conf.Validate(); err != nil {
 		return nil, nil, err
 	}
@@ -64,12 +92,24 @@ func NewProofpointTapAdapter(ctx context.Context, conf ProofpointTapConfig) (*Pr
 		doStop:        utils.NewEvent(),
 		messageDedupe: make(map[string]int64),
 		clickDedupe:   make(map[string]int64),
+		apiURL:        conf.URL,
+		pollInterval:  conf.PollInterval,
 	}
-	var err error
+	if a.apiURL == "" {
+		a.apiURL = logsEndpoint
+	}
+	if a.pollInterval <= 0 {
+		a.pollInterval = queryInterval * time.Second
+	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -107,11 +147,11 @@ func (a *ProofpointTapAdapter) Close() error {
 
 func (a *ProofpointTapAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", logsEndpoint))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.apiURL))
 
 	since := time.Now()
 
-	for !a.doStop.WaitFor(queryInterval * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		items, newSince, _ := a.makeOneRequest(since)
 		since = newSince
 		if items == nil {
@@ -151,9 +191,9 @@ func (a *ProofpointTapAdapter) makeOneRequest(since time.Time) ([]utils.Dict, ti
 	var url string
 
 	if timeDiff > 1*time.Hour {
-		url = fmt.Sprintf("%s?format=json&interval=%s/%s", logsEndpoint, sinceWithOverlapString, sinceWithOverlap.Add(1*time.Hour).Add(-1*time.Minute).Format(time.RFC3339))
+		url = fmt.Sprintf("%s?format=json&interval=%s/%s", a.apiURL, sinceWithOverlapString, sinceWithOverlap.Add(1*time.Hour).Add(-1*time.Minute).Format(time.RFC3339))
 	} else {
-		url = fmt.Sprintf("%s?format=json&interval=%s/%s", logsEndpoint, sinceWithOverlapString, nowTimestamp.Format(time.RFC3339))
+		url = fmt.Sprintf("%s?format=json&interval=%s/%s", a.apiURL, sinceWithOverlapString, nowTimestamp.Format(time.RFC3339))
 	}
 
 	req, err := http.NewRequest("GET", url, nil)

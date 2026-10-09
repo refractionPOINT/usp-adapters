@@ -18,13 +18,26 @@ import (
 )
 
 const (
-	apiURL = "https://api.slack.com/audit/v1/logs"
+	defaultApiURL       = "https://api.slack.com/audit/v1/logs"
+	defaultPollInterval = 5 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type SlackAdapter struct {
 	conf       SlackConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	apiURL       string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -43,6 +56,15 @@ type slackResponse struct {
 type SlackConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	Token         string                  `json:"token" yaml:"token"`
+
+	// ApiURL overrides the Slack Audit Logs API endpoint. Empty means the
+	// public endpoint: https://api.slack.com/audit/v1/logs
+	ApiURL string `json:"api_url" yaml:"api_url"`
+
+	// PollInterval overrides the wait between polls of the audit logs
+	// endpoint (default 5s). It is not settable through a config file; it
+	// exists as a seam for tests.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *SlackConfig) Validate() error {
@@ -56,16 +78,36 @@ func (c *SlackConfig) Validate() error {
 }
 
 func NewSlackAdapter(ctx context.Context, conf SlackConfig) (*SlackAdapter, chan struct{}, error) {
-	var err error
+	return newSlackAdapter(ctx, conf, nil)
+}
+
+// newSlackAdapter is the implementation behind NewSlackAdapter. When sink is
+// nil a real LimaCharlie client is created from the config; tests pass an
+// in-memory sink instead.
+func newSlackAdapter(ctx context.Context, conf SlackConfig, sink uspSink) (*SlackAdapter, chan struct{}, error) {
 	a := &SlackAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	a.apiURL = conf.ApiURL
+	if a.apiURL == "" {
+		a.apiURL = defaultApiURL
+	}
+	a.pollInterval = conf.PollInterval
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -109,7 +151,7 @@ func (a *SlackAdapter) fetchEvents() {
 	// Initianlize the search parameters
 	lastTime := time.Now().Unix()
 
-	for !a.doStop.WaitFor(5 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		isItemsProcessed := false
 
 		// Do a non-paged fetch based on time.
@@ -180,7 +222,7 @@ func (a *SlackAdapter) shipEntries(entries []utils.Dict) (int64, error) {
 
 func (a *SlackAdapter) makeOneContentRequest(lastTime int64, page string) ([]utils.Dict, string, error) {
 	// Prepare the request.
-	req, err := http.NewRequest("GET", apiURL, &bytes.Buffer{})
+	req, err := http.NewRequest("GET", a.apiURL, &bytes.Buffer{})
 	if err != nil {
 		a.doStop.Set()
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))

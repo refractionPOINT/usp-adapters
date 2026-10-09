@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+// HTTPError represents an HTTP error with status code for proper error handling.
+// This allows callers to inspect the status code directly without parsing error strings.
+type HTTPError struct {
+	StatusCode int
+	URL        string
+	Body       string
+}
+
+func (e *HTTPError) Error() string {
+	return fmt.Sprintf("unexpected status code %d for %q: %s", e.StatusCode, e.URL, e.Body)
+}
+
 // SentinelOneClient represents a SentinelOne API SentinelOneClient
 type SentinelOneClient struct {
 	baseURL               string
@@ -27,11 +39,33 @@ func NewSentinelOneClient(baseURL, apiToken string) *SentinelOneClient {
 	}
 }
 
+// SentinelOnePagination is the envelope the Management API nests page state
+// under: {"pagination": {"totalItems": N, "nextCursor": "..."}, "data": [...]}.
+type SentinelOnePagination struct {
+	TotalItems int     `json:"totalItems"`
+	NextCursor *string `json:"nextCursor"`
+}
+
 // SentinelOnePagedData represents pagination information
 type SentinelOnePagedData struct {
 	Data       []map[string]interface{} `json:"data"`
 	TotalItems int                      `json:"totalItems"`
 	NextCursor *string                  `json:"nextCursor"`
+	Pagination *SentinelOnePagination   `json:"pagination"`
+}
+
+// NextPageCursor returns the cursor for the next page, or "" on the last
+// page. The live Management API nests the cursor under "pagination"; the
+// top-level "nextCursor" is kept as a fallback for older/other response
+// shapes.
+func (d *SentinelOnePagedData) NextPageCursor() string {
+	if d.Pagination != nil && d.Pagination.NextCursor != nil {
+		return *d.Pagination.NextCursor
+	}
+	if d.NextCursor != nil {
+		return *d.NextCursor
+	}
+	return ""
 }
 
 // GetFromAPI retrieves data from the API based on the provided options
@@ -60,7 +94,11 @@ func (c *SentinelOneClient) GetFromAPI(ctx context.Context, endpoint string, opt
 		if err != nil {
 			return nil, fmt.Errorf("failed to read response body %q: %v", req.URL.String(), err)
 		}
-		return nil, fmt.Errorf("unexpected status code %d for %q: %s", resp.StatusCode, req.URL.String(), string(body))
+		return nil, &HTTPError{
+			StatusCode: resp.StatusCode,
+			URL:        req.URL.String(),
+			Body:       string(body),
+		}
 	}
 
 	var result SentinelOnePagedData

@@ -17,9 +17,28 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
+const (
+	// defaultTokenURL is the Wiz commercial-cloud OAuth token endpoint used
+	// when the config does not override it.
+	defaultTokenURL = "https://auth.app.wiz.io/oauth/token"
+
+	// defaultPollInterval is the historical fixed wait between polls of the
+	// Wiz GraphQL API.
+	defaultPollInterval = 30 * time.Second
+)
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type WizAdapter struct {
 	conf       WizConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
 
 	chStopped chan struct{}
@@ -41,6 +60,15 @@ type WizConfig struct {
 	TimeField     string                  `json:"time_field" yaml:"time_field"` // e.g., "createdAt", "updatedAt"
 	DataPath      []string                `json:"data_path" yaml:"data_path"`   // e.g., ["data", "securityIssues", "issues"]
 	IDField       string                  `json:"id_field" yaml:"id_field"`     // e.g., "id"
+
+	// TokenURL overrides the OAuth token endpoint. Empty means the Wiz
+	// commercial cloud endpoint (https://auth.app.wiz.io/oauth/token).
+	TokenURL string `json:"token_url" yaml:"token_url"`
+
+	// PollInterval overrides the fixed wait between polls of the Wiz GraphQL
+	// API. It is not settable through a config file; it exists as a seam for
+	// tests (the production interval stays the historical 30 seconds).
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *WizConfig) Validate() error {
@@ -72,16 +100,36 @@ func (c *WizConfig) Validate() error {
 }
 
 func NewWizAdapter(ctx context.Context, conf WizConfig) (*WizAdapter, chan struct{}, error) {
-	var err error
+	return newWizAdapter(ctx, conf, nil)
+}
+
+// newWizAdapter is the implementation behind NewWizAdapter. When sink is
+// non-nil it is used in place of a real LimaCharlie client -- the seam tests
+// use to capture shipped events.
+func newWizAdapter(ctx context.Context, conf WizConfig, sink uspSink) (*WizAdapter, chan struct{}, error) {
 	a := &WizAdapter{
 		conf:   conf,
 		ctx:    context.Background(),
 		doStop: utils.NewEvent(),
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	// The runner may construct the adapter without calling Validate(), so
+	// defaults are applied here rather than relying on Validate().
+	if a.conf.TokenURL == "" {
+		a.conf.TokenURL = defaultTokenURL
+	}
+	if a.conf.PollInterval <= 0 {
+		a.conf.PollInterval = defaultPollInterval
+	}
+
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -131,7 +179,7 @@ func (a *WizAdapter) fetchToken() (string, error) {
 
 	a.conf.ClientOptions.DebugLog("fetching token")
 
-	url := "https://auth.app.wiz.io/oauth/token"
+	url := a.conf.TokenURL
 	payload := fmt.Sprintf("grant_type=client_credentials&client_id=%s&client_secret=%s&audience=wiz-api",
 		a.conf.ClientID,
 		a.conf.ClientSecret)
@@ -178,7 +226,7 @@ func (a *WizAdapter) fetchEvents() {
 	lastEventId := ""
 	since := time.Now().Add(-24 * time.Hour).Format(time.RFC3339)
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.conf.PollInterval) {
 		items, newSince, eventId, err := a.makeOneGraphQLRequest(since, lastEventId)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("error making GraphQL request: %v", err))

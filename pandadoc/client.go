@@ -17,9 +17,21 @@ import (
 )
 
 const (
-	logsEndpoint  = "https://api.pandadoc.com/public/v1/logs"
-	overlapPeriod = 30 * time.Second
+	defaultLogsEndpoint = "https://api.pandadoc.com/public/v1/logs"
+	overlapPeriod       = 30 * time.Second
+
+	// defaultPollInterval is how long fetchEvents idles between polling ticks.
+	defaultPollInterval = 30 * time.Second
 )
+
+// uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
+// it as an interface lets tests substitute an in-memory sink for the real
+// LimaCharlie client; *uspclient.Client satisfies it unchanged.
+type uspSink interface {
+	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	Drain(timeout time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
 
 type opRequest struct {
 	Limit     int    `json:"page[size],omitempty"`
@@ -29,8 +41,11 @@ type opRequest struct {
 
 type PandaDocAdapter struct {
 	conf       PandaDocConfig
-	uspClient  *uspclient.Client
+	uspClient  uspSink
 	httpClient *http.Client
+
+	logsURL      string
+	pollInterval time.Duration
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
@@ -44,6 +59,15 @@ type PandaDocAdapter struct {
 type PandaDocConfig struct {
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"api_key" yaml:"api_key"`
+
+	// URL overrides the PandaDoc audit-logs endpoint. Empty means the public
+	// PandaDoc API (https://api.pandadoc.com/public/v1/logs).
+	URL string `json:"url" yaml:"url"`
+
+	// PollInterval is the wait between polls of the logs endpoint. It is not
+	// settable through a config file; it exists as a seam for tests. Empty
+	// means the default of 30 seconds.
+	PollInterval time.Duration `json:"-" yaml:"-"`
 }
 
 func (c *PandaDocConfig) Validate() error {
@@ -58,17 +82,36 @@ func (c *PandaDocConfig) Validate() error {
 }
 
 func NewPandaDocAdapter(ctx context.Context, conf PandaDocConfig) (*PandaDocAdapter, chan struct{}, error) {
-	var err error
+	return newPandaDocAdapter(ctx, conf, nil)
+}
+
+// newPandaDocAdapter is the implementation behind NewPandaDocAdapter. When
+// sink is non-nil it is used in place of a real LimaCharlie client -- the seam
+// tests use to capture shipped events.
+func newPandaDocAdapter(ctx context.Context, conf PandaDocConfig, sink uspSink) (*PandaDocAdapter, chan struct{}, error) {
 	a := &PandaDocAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
-		dedupe: make(map[string]int64),
+		conf:         conf,
+		ctx:          context.Background(),
+		doStop:       utils.NewEvent(),
+		dedupe:       make(map[string]int64),
+		logsURL:      conf.URL,
+		pollInterval: conf.PollInterval,
+	}
+	if a.logsURL == "" {
+		a.logsURL = defaultLogsEndpoint
+	}
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
-	if err != nil {
-		return nil, nil, err
+	if sink != nil {
+		a.uspClient = sink
+	} else {
+		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
+		if err != nil {
+			return nil, nil, err
+		}
+		a.uspClient = uspClient
 	}
 
 	a.httpClient = &http.Client{
@@ -110,11 +153,11 @@ func (a *PandaDocAdapter) Close() error {
 
 func (a *PandaDocAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", logsEndpoint))
+	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.logsURL))
 
 	since := time.Now()
 
-	for !a.doStop.WaitFor(30 * time.Second) {
+	for !a.doStop.WaitFor(a.pollInterval) {
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newSince, _ := a.makeOneRequest(since)
@@ -159,8 +202,8 @@ func (a *PandaDocAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 
 	for page := 1; ; page++ {
 		// Prepare the request.
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s?since=%s&to=%s&page=%d", logsEndpoint, start, until, page))
-		req, err := http.NewRequest("GET", fmt.Sprintf("%s?since=%s&to=%s&page=%d", logsEndpoint, start, until, page), nil)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s?since=%s&to=%s&page=%d", a.logsURL, start, until, page))
+		req, err := http.NewRequest("GET", fmt.Sprintf("%s?since=%s&to=%s&page=%d", a.logsURL, start, until, page), nil)
 		if err != nil {
 			a.doStop.Set()
 			return nil, lastDetectionTime, err

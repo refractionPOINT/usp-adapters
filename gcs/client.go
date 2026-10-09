@@ -16,6 +16,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/credguard"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -50,6 +51,7 @@ func (c *GCSConfig) Validate() error {
 	if c.BucketName == "" {
 		return errors.New("missing bucket_name")
 	}
+	c.ServiceAccountCreds = strings.TrimSpace(c.ServiceAccountCreds)
 	return nil
 }
 
@@ -80,12 +82,12 @@ func NewGCSAdapter(ctx context.Context, conf GCSConfig) (*GCSAdapter, chan struc
 		if a.client, err = storage.NewClient(a.ctx, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
-	} else if !strings.HasPrefix(a.conf.ServiceAccountCreds, "{") {
-		if a.client, err = storage.NewClient(a.ctx, option.WithCredentialsFile(conf.ServiceAccountCreds)); err != nil {
-			return nil, nil, err
-		}
 	} else {
-		if a.client, err = storage.NewClient(a.ctx, option.WithCredentialsJSON([]byte(conf.ServiceAccountCreds))); err != nil {
+		credOpt, cerr := credguard.CredentialOption(conf.ServiceAccountCreds)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		if a.client, err = storage.NewClient(a.ctx, credOpt); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -206,10 +208,17 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 			}
 		}
 
-		isCompressed := false
-
-		if strings.HasSuffix(attrs.Name, ".gz") {
-			isCompressed = true
+		// PrepareBundleData routes through the parquet decoder when
+		// needed (including gzipped parquet) and otherwise returns the
+		// bytes untouched.
+		objData, isCompressed, err := utils.PrepareBundleData(attrs.Name, objData)
+		if err != nil {
+			a.conf.ClientOptions.OnError(err)
+			return &gcsLocalFile{
+				Obj:  obj,
+				Data: nil,
+				Err:  err,
+			}
 		}
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", attrs.Name, time.Since(startTime), attrs.Size))
