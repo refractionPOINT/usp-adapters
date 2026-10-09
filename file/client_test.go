@@ -898,6 +898,137 @@ drainLoop:
 	assert.True(t, logCapture.Contains("[ROTATION DETECTED] File rotated: "+file3))
 }
 
+// TestStaleHandleReopen covers a tail whose handle stops returning data
+// while the file keeps growing, which is what an SMB client's cached handle
+// does when the file is written on the server. A stopped tail stands in for
+// that handle: it reads nothing more, exactly like one stuck at EOF. The
+// poll loop must notice the file moved without data, reopen at the end of
+// the last shipped line, and ship every line exactly once, including one
+// that was only half written when the swap happened. Both change detectors
+// are covered: the default (inotify/fsnotify) and poll=true.
+func TestStaleHandleReopen(t *testing.T) {
+	for _, poll := range []bool{false, true} {
+		t.Run(fmt.Sprintf("poll=%v", poll), func(t *testing.T) {
+			t.Parallel()
+			testStaleHandleReopen(t, poll)
+		})
+	}
+}
+
+func testStaleHandleReopen(t *testing.T, poll bool) {
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "stale.log")
+	createTestFile(t, testFile, "line 1\nline 2\n")
+
+	var mu sync.Mutex
+	var received []string
+	got := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), received...)
+	}
+	logCapture := &LogCapture{}
+	dummyUSPClient, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		TestSinkMode: true,
+	})
+	require.NoError(t, err)
+
+	adapter := &FileAdapter{
+		conf: FileConfig{
+			FilePath: filepath.Join(tmpDir, "*.log"),
+			Backfill: true,
+			Poll:     poll,
+			ClientOptions: uspclient.ClientOptions{
+				OnError:  func(err error) { logCapture.Add(err.Error()) },
+				DebugLog: func(msg string) { logCapture.Add(msg) },
+			},
+		},
+		tailFiles: make(map[string]*tailInfo),
+		uspClient: dummyUSPClient,
+		lineCb: func(line string) {
+			mu.Lock()
+			received = append(received, line)
+			mu.Unlock()
+		},
+	}
+	go adapter.pollFiles()
+
+	waitFor := func(what string, timeout time.Duration, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s; received=%q", what, got())
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	waitFor("the initial lines", 5*time.Second, func() bool { return len(got()) == 2 })
+
+	// Let one poll record the file's state, so the growth below is a change.
+	var info *tailInfo
+	waitFor("a poll to observe the file", 2*defaultPollingInterval, func() bool {
+		adapter.mu.Lock()
+		defer adapter.mu.Unlock()
+		info = adapter.tailFiles[testFile]
+		return info != nil && !info.seenModTime.IsZero()
+	})
+
+	// Kill the handle, then grow the file behind its back, ending mid-line.
+	adapter.mu.Lock()
+	staleTail := info.tail
+	adapter.mu.Unlock()
+	require.NoError(t, staleTail.Stop())
+	require.NoError(t, appendToFile(testFile, "line 3\nline 4\nhalf a "))
+
+	waitFor("the lines written while stale", 2*defaultPollingInterval, func() bool { return len(got()) == 4 })
+	assert.True(t, logCapture.Contains("[STALE HANDLE] "+testFile))
+
+	require.NoError(t, appendToFile(testFile, "line\nline 5\n"))
+	waitFor("the completed line", 5*time.Second, func() bool { return len(got()) == 6 })
+
+	assert.Equal(t, []string{"line 1", "line 2", "line 3", "line 4", "half a line", "line 5"}, got())
+	adapter.mu.Lock()
+	assert.Equal(t, 1, adapter.tailFiles[testFile].staleReopens)
+	adapter.mu.Unlock()
+}
+
+type fakeFileInfo struct {
+	size    int64
+	modTime time.Time
+}
+
+func (f fakeFileInfo) Name() string       { return "fake.log" }
+func (f fakeFileInfo) Size() int64        { return f.size }
+func (f fakeFileInfo) Mode() os.FileMode  { return 0644 }
+func (f fakeFileInfo) ModTime() time.Time { return f.modTime }
+func (f fakeFileInfo) IsDir() bool        { return false }
+func (f fakeFileInfo) Sys() any           { return nil }
+
+func TestIsStaleHandle(t *testing.T) {
+	t0 := time.Unix(1700000000, 0)
+	t1 := t0.Add(5 * time.Second)
+	steps := []struct {
+		name   string
+		stat   fakeFileInfo
+		offset int64
+		stale  bool
+	}{
+		{"first look only records a baseline", fakeFileInfo{100, t0}, 100, false},
+		{"nothing moved", fakeFileInfo{100, t0}, 100, false},
+		{"mtime moved, size frozen, nothing read (stale SMB handle)", fakeFileInfo{100, t1}, 100, true},
+		{"file grew and was read", fakeFileInfo{180, t1.Add(time.Second)}, 180, false},
+		{"file grew, nothing read", fakeFileInfo{260, t1.Add(2 * time.Second)}, 180, true},
+		{"quiet again", fakeFileInfo{260, t1.Add(2 * time.Second)}, 180, false},
+	}
+	a := &FileAdapter{}
+	info := &tailInfo{}
+	for _, step := range steps {
+		info.resumeOffset.Store(step.offset)
+		assert.Equal(t, step.stale, a.isStaleHandle(info, step.stat), step.name)
+	}
+}
+
 func createTestFile(t *testing.T, filename, content string) {
 	err := os.WriteFile(filename, []byte(content), 0644)
 	assert.NoError(t, err)

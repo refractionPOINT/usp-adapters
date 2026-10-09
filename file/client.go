@@ -58,8 +58,28 @@ type tailInfo struct {
 	lastOffset int64
 	lastData   int64
 	inode      uint64       // Track which inode is being tailed to detect rotation
+	openStat   os.FileInfo  // the file as it was when the current tail opened it (see pinFileID)
 	linesRead  atomic.Int64 // Counter for health monitoring
 	bytesRead  atomic.Int64 // Counter for health monitoring
+	// resumeOffset is the byte offset just past the last line (in
+	// multi-line JSON mode, the last complete object) handed to
+	// handleLine: where a replacement tail must start so that nothing is
+	// skipped or shipped twice. tail.Tell() is not usable for this, since
+	// with CompleteLines it already counts a partial line the tail is
+	// holding back.
+	resumeOffset atomic.Int64
+	// handlerDone is closed when the handleInput goroutine reading the
+	// current tail returns, i.e. once resumeOffset can no longer move.
+	handlerDone chan struct{}
+	// Stale-handle detection, owned by the poll loop (guarded by a.mu):
+	// the file's mtime, size and our resumeOffset as of the previous poll.
+	seenModTime time.Time
+	seenSize    int64
+	seenOffset  int64
+	// reopening is set while a replacement tail is being started off the
+	// poll loop; the loop leaves the entry alone until it is cleared.
+	reopening    bool
+	staleReopens int
 	// processedAsParquet marks entries created by the Parquet decode path.
 	// These have no tail goroutine — the file was read once, decoded, and
 	// emitted as JSON lines — so the poll loop must skip tail/inactivity
@@ -227,6 +247,12 @@ func (a *FileAdapter) pollFiles() {
 					continue
 				}
 
+				// A replacement tail is being started off this loop
+				// (reopenStale); leave the entry alone until it is in place.
+				if info.reopening {
+					continue
+				}
+
 				// Log detailed file state for debugging
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("[POLL#%d] Checking file: %s | inode: tailed=%d current=%d | size=%d | mtime=%s | lastData=%s | inactive=%v",
 					pollCycle, path, info.inode, currentInode, stat.Size(), modTime.Format(time.RFC3339),
@@ -255,14 +281,8 @@ func (a *FileAdapter) pollFiles() {
 						a.conf.ClientOptions.OnError(fmt.Errorf("[REACTIVATION] File reactivated: %s | inode=%d | restarting from beginning | mtime=%s",
 							path, currentInode, modTime.Format(time.RFC3339)))
 
-						t, err := tail.TailFile(path, tail.Config{
-							ReOpen:        !a.conf.NoFollow,
-							MustExist:     true,
-							Follow:        !a.conf.NoFollow,
-							CompleteLines: true,
-							Poll:          a.conf.Poll,
-							Location:      &tail.SeekInfo{Offset: 0, Whence: io.SeekStart}, // start from beginning (safer than trying to resume)
-						})
+						// start from beginning (safer than trying to resume)
+						t, err := tail.TailFile(path, a.tailConfig(&tail.SeekInfo{Offset: 0, Whence: io.SeekStart}))
 						if err != nil {
 							a.conf.ClientOptions.OnError(fmt.Errorf("tail error on reactivation: %v", err))
 							continue
@@ -271,16 +291,12 @@ func (a *FileAdapter) pollFiles() {
 						a.conf.ClientOptions.DebugLog(fmt.Sprintf("[REACTIVATION] Successfully reopened: %s | ReOpen=%v Follow=%v Poll=%v",
 							path, !a.conf.NoFollow, !a.conf.NoFollow, a.conf.Poll))
 
-						info.tail = t
 						info.isInactive = false
 						info.lastActive = modTime
 						info.inode = currentInode // Update to current inode
-						a.wg.Add(1)
-
-						go func(t *tail.Tail) {
-							defer a.wg.Done()
-							a.handleInput(t, &info.lastData)
-						}(t)
+						info.openStat = pinFileID(stat)
+						info.seenModTime = time.Time{}
+						a.startTail(info, t, 0)
 					}
 				} else {
 					// validate if an active file has become inactive and we need to stop tailing it
@@ -312,8 +328,17 @@ func (a *FileAdapter) pollFiles() {
 						a.conf.ClientOptions.OnWarning(fmt.Sprintf("[HEALTH] File hasn't produced data in %s: %s | lines=%d bytes=%d",
 							timeSinceLastData, path, info.linesRead.Load(), info.bytesRead.Load()))
 					}
+
+					if !info.isInactive && a.isStaleHandle(info, stat) {
+						a.reopenStale(path, info)
+					}
 				}
 			} else {
+				// The entry is mid-swap (reopenStale); that goroutine
+				// drops it if the file is gone by the time it reopens.
+				if info.reopening {
+					continue
+				}
 				// Parquet entries have no live tail to stop; just drop them.
 				if info.processedAsParquet {
 					a.conf.ClientOptions.DebugLog(fmt.Sprintf("[REMOVAL] Parquet file removed from disk: %s | inode=%d | lines=%d",
@@ -398,14 +423,7 @@ func (a *FileAdapter) pollFiles() {
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("[NEW FILE] Opening: %s | inode=%d | size=%d | mtime=%s | start=%s",
 					match, fileInode, stat.Size(), stat.ModTime().Format(time.RFC3339), startMode))
 
-				t, err := tail.TailFile(match, tail.Config{
-					ReOpen:        !a.conf.NoFollow,
-					MustExist:     true,
-					Follow:        !a.conf.NoFollow,
-					CompleteLines: true,
-					Poll:          a.conf.Poll,
-					Location:      location,
-				})
+				t, err := tail.TailFile(match, a.tailConfig(location))
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("tail error: %v", err))
 					continue
@@ -415,17 +433,19 @@ func (a *FileAdapter) pollFiles() {
 					match, !a.conf.NoFollow, !a.conf.NoFollow, a.conf.Poll))
 
 				info := &tailInfo{
-					tail:       t,
 					lastActive: time.Now(),
 					isInactive: false,
 					inode:      fileInode,
+					openStat:   pinFileID(stat),
 				}
 				a.tailFiles[match] = info
-				a.wg.Add(1)
-				go func(t *tail.Tail, inode uint64) {
-					defer a.wg.Done()
-					a.handleInput(t, &info.lastData)
-				}(t, fileInode)
+				// A tail opened at the end starts where the file ended
+				// when we looked; one opened at the start, at zero.
+				startOffset := int64(0)
+				if location.Whence == io.SeekEnd {
+					startOffset = stat.Size()
+				}
+				a.startTail(info, t, startOffset)
 			}
 		}
 		a.mu.Unlock()
@@ -441,19 +461,137 @@ func (a *FileAdapter) pollFiles() {
 	}
 }
 
-func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
+// tailConfig is the tail configuration every tail in this adapter uses;
+// only where it starts reading differs.
+func (a *FileAdapter) tailConfig(location *tail.SeekInfo) tail.Config {
+	return tail.Config{
+		ReOpen:        !a.conf.NoFollow,
+		MustExist:     true,
+		Follow:        !a.conf.NoFollow,
+		CompleteLines: true,
+		Poll:          a.conf.Poll,
+		Location:      location,
+	}
+}
+
+// startTail makes t the tail behind info and starts the goroutine that
+// ships its lines. startOffset is the byte offset t begins reading at.
+// Callers hold a.mu.
+func (a *FileAdapter) startTail(info *tailInfo, t *tail.Tail, startOffset int64) {
+	info.tail = t
+	info.resumeOffset.Store(startOffset)
+	info.seenOffset = startOffset
+	done := make(chan struct{})
+	info.handlerDone = done
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		defer close(done)
+		a.handleInput(t, info)
+	}()
+}
+
+// pinFileID returns stat after making it remember which file it describes.
+// On Windows an os.FileInfo from os.Stat loads its volume and file index
+// lazily, by path, the first time os.SameFile needs them; after a rename
+// that path names a different file. Comparing stat with itself loads them
+// now. Elsewhere this is a no-op.
+func pinFileID(stat os.FileInfo) os.FileInfo {
+	os.SameFile(stat, stat)
+	return stat
+}
+
+// isStaleHandle reports whether the file changed since the previous poll
+// (its mtime or size moved) while the tail shipped nothing.
+//
+// That is what a stale handle looks like: on an SMB share, a long-lived
+// handle can keep returning EOF while the file grows, because the client
+// serves it from its cache and a write made on the server itself does not
+// invalidate that. The size seen through the path freezes along with it,
+// and only the mtime keeps moving. A freshly opened handle sees the new
+// bytes. On a local file a false positive costs one reopen at the same
+// offset (a write landing just before the poll, or a partial line).
+// Callers hold a.mu.
+func (a *FileAdapter) isStaleHandle(info *tailInfo, stat os.FileInfo) bool {
+	offset := info.resumeOffset.Load()
+	changed := !info.seenModTime.IsZero() &&
+		(!stat.ModTime().Equal(info.seenModTime) || stat.Size() != info.seenSize)
+	stale := changed && offset == info.seenOffset
+	info.seenModTime = stat.ModTime()
+	info.seenSize = stat.Size()
+	info.seenOffset = offset
+	return stale
+}
+
+// reopenStale replaces info's tail with a fresh one that resumes at
+// resumeOffset. The swap runs off the poll loop, because waiting for the
+// old handler to drain can block for as long as a Ship() does. Callers
+// hold a.mu.
+func (a *FileAdapter) reopenStale(path string, info *tailInfo) {
+	info.reopening = true
+	info.staleReopens++
+	msg := fmt.Sprintf("[STALE HANDLE] %s changed but nothing was read since the last poll | reopening at offset=%d (reopen #%d)",
+		path, info.resumeOffset.Load(), info.staleReopens)
+	// Reported once through OnError, like [ROTATION DETECTED]; a file that
+	// keeps going stale would otherwise repeat it every poll.
+	if info.staleReopens == 1 {
+		a.conf.ClientOptions.OnError(errors.New(msg))
+	} else {
+		a.conf.ClientOptions.DebugLog(msg)
+	}
+
+	old, done := info.tail, info.handlerDone
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		// No old.Cleanup(): the stopping watcher already drops its watch,
+		// and the watch is counted per file name, so a second removal
+		// would leave the replacement tail with none ("If you plan to
+		// re-read a file, don't call Cleanup in between" — tail.Cleanup).
+		if err := old.Stop(); err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("error stopping stale tail: %v", err))
+		}
+		// Once the old handler has returned, resumeOffset is final.
+		if done != nil {
+			<-done
+		}
+		offset := info.resumeOffset.Load()
+
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		info.reopening = false
+		// Close() cancels ctx before it stops the tails under a.mu, so a
+		// tail started after this check is always one it will stop.
+		if a.ctx.Err() != nil || a.tailFiles[path] != info {
+			return
+		}
+		stat, err := os.Stat(path)
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("[STALE HANDLE] cannot reopen %s: %v", path, err))
+			delete(a.tailFiles, path)
+			return
+		}
+		// A different or shorter file now sits at this path (a rotation
+		// that inode tracking cannot see, as on Windows, or a rewrite):
+		// read it from the start, as the tail itself would on a reopen.
+		if !os.SameFile(info.openStat, stat) || stat.Size() < offset {
+			offset = 0
+		}
+		t, err := tail.TailFile(path, a.tailConfig(&tail.SeekInfo{Offset: offset, Whence: io.SeekStart}))
+		if err != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("[STALE HANDLE] tail error reopening %s: %v", path, err))
+			delete(a.tailFiles, path)
+			return
+		}
+		info.openStat = pinFileID(stat)
+		a.startTail(info, t, offset)
+	}()
+}
+
+func (a *FileAdapter) handleInput(t *tail.Tail, info *tailInfo) {
 	filename := t.Filename
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf("[TAIL START] Beginning to tail: %s", filename))
-
-	// Get the tailInfo for this file to update counters
-	a.mu.Lock()
-	info, exists := a.tailFiles[filename]
-	a.mu.Unlock()
-
-	if !exists {
-		a.conf.ClientOptions.OnError(fmt.Errorf("[TAIL ERROR] tailInfo not found for: %s", filename))
-		return
-	}
+	pLastData := &info.lastData
 
 	if a.conf.SerializeFiles {
 		// If we are serializing files, we need to acquire a semaphore to ensure we only tail one file at a time.
@@ -501,6 +639,7 @@ func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 				}
 
 				a.handleLine(line.Text)
+				info.resumeOffset.Store(line.SeekInfo.Offset)
 
 			case <-logTicker.C:
 				// Periodic health log
@@ -545,6 +684,7 @@ func (a *FileAdapter) handleInput(t *tail.Tail, pLastData *int64) {
 					}
 
 					a.handleLine(string(rawJSON))
+					info.resumeOffset.Store(line.SeekInfo.Offset)
 					jsonLines = nil // Reset for the next object.
 				}
 
