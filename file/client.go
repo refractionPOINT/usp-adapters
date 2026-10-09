@@ -38,6 +38,13 @@ const (
 	// stray multi-GB drop OOM the adapter. 1 GiB is generous for
 	// typical analytics drops and still safe on small EDR hosts.
 	maxParquetFileSize = 1 << 30
+	// staleHandleCooldown is how long a file that went stale is left with
+	// no handle open before it is reopened. A Windows SMB client keeps a
+	// closed file cached, stale EOF included, for about 10 seconds after
+	// the last handle on it closes (measured: a reopen at 10s still saw the
+	// old size, one at 12s the new one), and a reopen inside that window
+	// revives the stale view and holds it again.
+	staleHandleCooldown = 15 * time.Second
 )
 
 // getFileInode returns the inode number for a given file path.
@@ -76,9 +83,13 @@ type tailInfo struct {
 	seenModTime time.Time
 	seenSize    int64
 	seenOffset  int64
-	// reopening is set while a replacement tail is being started off the
-	// poll loop; the loop leaves the entry alone until it is cleared.
+	// reopening is set while a stale tail is being stopped off the poll
+	// loop (releaseStale); the loop leaves the entry alone meanwhile.
+	// released means it has stopped and nothing holds the file open; the
+	// loop reopens it once staleCooldown has passed since releasedAt.
 	reopening    bool
+	released     bool
+	releasedAt   time.Time
 	staleReopens int
 	// processedAsParquet marks entries created by the Parquet decode path.
 	// These have no tail goroutine — the file was read once, decoded, and
@@ -118,6 +129,9 @@ type FileAdapter struct {
 	// default const". Tests set this to a small value to exercise the
 	// cap without writing 1 GiB of data to disk.
 	parquetMaxSize int64
+	// staleCooldownOverride replaces staleHandleCooldown when non-zero, so
+	// tests need not wait it out.
+	staleCooldownOverride time.Duration
 }
 
 func (c *FileConfig) Validate() error {
@@ -247,9 +261,17 @@ func (a *FileAdapter) pollFiles() {
 					continue
 				}
 
-				// A replacement tail is being started off this loop
-				// (reopenStale); leave the entry alone until it is in place.
+				// A stale tail is being stopped off this loop (releaseStale);
+				// leave the entry alone until it has.
 				if info.reopening {
+					continue
+				}
+				// Released: nothing holds the file. Reopen once the client
+				// can no longer be serving it from its cache.
+				if info.released {
+					if now.Sub(info.releasedAt) >= a.staleCooldown() {
+						a.reopenReleased(path, info, stat)
+					}
 					continue
 				}
 
@@ -330,13 +352,18 @@ func (a *FileAdapter) pollFiles() {
 					}
 
 					if !info.isInactive && a.isStaleHandle(info, stat) {
-						a.reopenStale(path, info)
+						a.releaseStale(path, info)
 					}
 				}
 			} else {
-				// The entry is mid-swap (reopenStale); that goroutine
-				// drops it if the file is gone by the time it reopens.
+				// Mid-release (releaseStale): look again next poll.
 				if info.reopening {
+					continue
+				}
+				// Released: its tail is already stopped.
+				if info.released {
+					a.conf.ClientOptions.OnError(fmt.Errorf("[REMOVAL] File removed from disk while released: %s", path))
+					delete(a.tailFiles, path)
 					continue
 				}
 				// Parquet entries have no live tail to stop; just drop them.
@@ -504,13 +531,18 @@ func pinFileID(stat os.FileInfo) os.FileInfo {
 // isStaleHandle reports whether the file changed since the previous poll
 // (its mtime or size moved) while the tail shipped nothing.
 //
-// That is what a stale handle looks like: on an SMB share, a long-lived
-// handle can keep returning EOF while the file grows, because the client
-// serves it from its cache and a write made on the server itself does not
-// invalidate that. The size seen through the path freezes along with it,
-// and only the mtime keeps moving. A freshly opened handle sees the new
-// bytes. On a local file a false positive costs one reopen at the same
-// offset (a write landing just before the poll, or a partial line).
+// That is what a stale handle looks like on an SMB share. The Windows
+// client caches an open file, end-of-file included, under the lease the
+// server granted, and a write made on the server itself (not over SMB)
+// does not break that lease, so reads keep hitting the old EOF. Unbuffered
+// opens see the same EOF, and so does a new handle opened while the old
+// one is still open or within ~10s of closing it: the client keeps the
+// file cached that long after the last close. Depending on the server,
+// the path's metadata shows the growth as a moving mtime with a frozen
+// size, or the reverse; either counts as a change here.
+//
+// On a local file a false positive costs one release and reopen at the
+// same offset (a write landing just before the poll, or a partial line).
 // Callers hold a.mu.
 func (a *FileAdapter) isStaleHandle(info *tailInfo, stat os.FileInfo) bool {
 	offset := info.resumeOffset.Load()
@@ -523,15 +555,25 @@ func (a *FileAdapter) isStaleHandle(info *tailInfo, stat os.FileInfo) bool {
 	return stale
 }
 
-// reopenStale replaces info's tail with a fresh one that resumes at
-// resumeOffset. The swap runs off the poll loop, because waiting for the
-// old handler to drain can block for as long as a Ship() does. Callers
-// hold a.mu.
-func (a *FileAdapter) reopenStale(path string, info *tailInfo) {
+// staleCooldown is how long a stale file is left with no handle open before
+// it is reopened (see staleHandleCooldown). Tests shorten it.
+func (a *FileAdapter) staleCooldown() time.Duration {
+	if a.staleCooldownOverride > 0 {
+		return a.staleCooldownOverride
+	}
+	return staleHandleCooldown
+}
+
+// releaseStale stops info's tail so that nothing holds the file open, and
+// marks the entry released; the poll loop reopens it with reopenReleased
+// once staleCooldown has passed. Stopping runs off the poll loop, because
+// waiting for the old handler to drain can block for as long as a Ship()
+// does. Callers hold a.mu.
+func (a *FileAdapter) releaseStale(path string, info *tailInfo) {
 	info.reopening = true
 	info.staleReopens++
-	msg := fmt.Sprintf("[STALE HANDLE] %s changed but nothing was read since the last poll | reopening at offset=%d (reopen #%d)",
-		path, info.resumeOffset.Load(), info.staleReopens)
+	msg := fmt.Sprintf("[STALE HANDLE] %s changed but nothing was read since the last poll | closing it for %s, then reopening at offset=%d (reopen #%d)",
+		path, a.staleCooldown(), info.resumeOffset.Load(), info.staleReopens)
 	// Reported once through OnError, like [ROTATION DETECTED]; a file that
 	// keeps going stale would otherwise repeat it every poll.
 	if info.staleReopens == 1 {
@@ -555,37 +597,37 @@ func (a *FileAdapter) reopenStale(path string, info *tailInfo) {
 		if done != nil {
 			<-done
 		}
-		offset := info.resumeOffset.Load()
 
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		info.reopening = false
-		// Close() cancels ctx before it stops the tails under a.mu, so a
-		// tail started after this check is always one it will stop.
-		if a.ctx.Err() != nil || a.tailFiles[path] != info {
-			return
-		}
-		stat, err := os.Stat(path)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("[STALE HANDLE] cannot reopen %s: %v", path, err))
-			delete(a.tailFiles, path)
-			return
-		}
-		// A different or shorter file now sits at this path (a rotation
-		// that inode tracking cannot see, as on Windows, or a rewrite):
-		// read it from the start, as the tail itself would on a reopen.
-		if !os.SameFile(info.openStat, stat) || stat.Size() < offset {
-			offset = 0
-		}
-		t, err := tail.TailFile(path, a.tailConfig(&tail.SeekInfo{Offset: offset, Whence: io.SeekStart}))
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("[STALE HANDLE] tail error reopening %s: %v", path, err))
-			delete(a.tailFiles, path)
-			return
-		}
-		info.openStat = pinFileID(stat)
-		a.startTail(info, t, offset)
+		info.released = true
+		info.releasedAt = time.Now()
 	}()
+}
+
+// reopenReleased starts a fresh tail for a released entry at resumeOffset,
+// the end of the last line shipped. Callers hold a.mu, and only call it
+// from the poll loop, so a tail started here is always one Close() stops.
+func (a *FileAdapter) reopenReleased(path string, info *tailInfo, stat os.FileInfo) {
+	info.released = false
+	offset := info.resumeOffset.Load()
+	// A different or shorter file now sits at this path (a rotation that
+	// inode tracking cannot see, as on Windows, or a rewrite): read it from
+	// the start, as the tail itself would on a reopen.
+	if !os.SameFile(info.openStat, stat) || stat.Size() < offset {
+		offset = 0
+	}
+	t, err := tail.TailFile(path, a.tailConfig(&tail.SeekInfo{Offset: offset, Whence: io.SeekStart}))
+	if err != nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("[STALE HANDLE] tail error reopening %s: %v", path, err))
+		delete(a.tailFiles, path)
+		return
+	}
+	a.conf.ClientOptions.DebugLog(fmt.Sprintf("[STALE HANDLE] reopened %s at offset=%d", path, offset))
+	info.openStat = pinFileID(stat)
+	info.seenModTime = time.Time{}
+	a.startTail(info, t, offset)
 }
 
 func (a *FileAdapter) handleInput(t *tail.Tail, info *tailInfo) {

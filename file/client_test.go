@@ -945,6 +945,8 @@ func testStaleHandleReopen(t *testing.T, poll bool) {
 		},
 		tailFiles: make(map[string]*tailInfo),
 		uspClient: dummyUSPClient,
+		// No SMB client cache to wait out here; reopen on the next poll.
+		staleCooldownOverride: time.Millisecond,
 		lineCb: func(line string) {
 			mu.Lock()
 			received = append(received, line)
@@ -981,7 +983,8 @@ func testStaleHandleReopen(t *testing.T, poll bool) {
 	require.NoError(t, staleTail.Stop())
 	require.NoError(t, appendToFile(testFile, "line 3\nline 4\nhalf a "))
 
-	waitFor("the lines written while stale", 2*defaultPollingInterval, func() bool { return len(got()) == 4 })
+	// One poll notices and releases the file, a later one reopens it.
+	waitFor("the lines written while stale", 3*defaultPollingInterval, func() bool { return len(got()) == 4 })
 	assert.True(t, logCapture.Contains("[STALE HANDLE] "+testFile))
 
 	require.NoError(t, appendToFile(testFile, "line\nline 5\n"))
