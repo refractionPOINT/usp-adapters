@@ -35,6 +35,33 @@ func IsParquetFile(name string, data []byte) bool {
 	return true
 }
 
+// GzipMagic is the 2-byte signature at the start of every gzip stream.
+// See RFC 1952 section 2.3.1.
+var GzipMagic = []byte{0x1f, 0x8b}
+
+// IsGzipData returns true when the bytes carry the gzip magic header.
+// Producers such as Zscaler write gzip objects without a .gz
+// extension, so the name alone is not a reliable signal.
+func IsGzipData(data []byte) bool {
+	return len(data) >= len(GzipMagic) && bytes.Equal(data[:len(GzipMagic)], GzipMagic)
+}
+
+// gzipHasParquetMagic reports whether a gzip stream decompresses to
+// something starting with the Parquet magic, reading only the first
+// few bytes. Invalid gzip is reported as false.
+func gzipHasParquetMagic(data []byte) bool {
+	r, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return false
+	}
+	defer r.Close()
+	buf := make([]byte, len(ParquetMagic))
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return false
+	}
+	return bytes.Equal(buf, ParquetMagic)
+}
+
 // MaxDecompressedParquetSize bounds how many bytes the in-process
 // gunzip path will accept from a compressed-parquet object before it
 // errors out. A modest gzip bomb (50 MB of zeros) decompresses to many
@@ -74,22 +101,25 @@ func gunzip(data []byte, limit int64) ([]byte, error) {
 //     delimited JSON in-process and returned with isCompressed=false.
 //   - Gzipped parquet (e.g. *.parquet.gz from Athena UNLOAD or
 //     Firehose): gunzipped, then decoded, then returned uncompressed.
-//   - Other gzipped objects (*.gz that aren't parquet underneath):
-//     returned untouched with isCompressed=true so the proxy gunzips,
-//     matching pre-parquet behaviour.
+//   - Other gzipped objects (*.gz, or gzip magic bytes regardless of
+//     name): returned untouched with isCompressed=true so the proxy
+//     gunzips, matching pre-parquet behaviour.
 //   - Everything else: returned untouched with isCompressed=false.
 //
 // The name parameter is used for extension hints and for error context;
-// pass the object key/path the adapter knows it by.
+// pass the object key/path the adapter knows it by. Gzip and parquet are
+// also detected from their magic bytes, so objects without the expected
+// extension are still handled.
 func PrepareBundleData(name string, rawData []byte) (data []byte, isCompressed bool, err error) {
 	lower := strings.ToLower(name)
 
-	if base, isGz := strings.CutSuffix(lower, ".gz"); isGz {
+	base, hasGzExt := strings.CutSuffix(lower, ".gz")
+	if hasGzExt || IsGzipData(rawData) {
 		// Only peel the gzip layer here when the underlying object is
 		// parquet, since the adapter is the only place that can decode
 		// it. Plain gzipped text files keep the existing pass-through
 		// path: the proxy gunzips and routes through its line scanner.
-		if strings.HasSuffix(base, ".parquet") {
+		if strings.HasSuffix(base, ".parquet") || gzipHasParquetMagic(rawData) {
 			decompressed, gzErr := gunzip(rawData, MaxDecompressedParquetSize)
 			if gzErr != nil {
 				return nil, false, fmt.Errorf("gunzip %s: %w", name, gzErr)
