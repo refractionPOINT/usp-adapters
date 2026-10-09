@@ -8,8 +8,11 @@ macOS binary also needs entitlements, which the service looks up as
 script builds that archive, has it signed, and writes each signed binary back
 over the original (keeping the original file's mode).
 
-The service account key comes from the CODE_SIGNING_KEY environment variable
-(base64 encoded), never from the command line.
+Credentials: when the CODE_SIGNING_KEY environment variable holds a base64
+service account key, that key is used (never passed on this script's command
+line). Without it, client.py uses the ambient credentials: the service account
+the build runs as, or a Workload Identity Federation credential file in
+GOOGLE_APPLICATION_CREDENTIALS. No key at all is the preferred setup.
 """
 from __future__ import annotations
 
@@ -84,9 +87,6 @@ def main() -> int:
     args = parser.parse_args()
 
     key = os.environ.get("CODE_SIGNING_KEY", "")
-    if not key:
-        print("CODE_SIGNING_KEY is not set", file=sys.stderr)
-        return 2
     files = [os.path.abspath(f) for f in args.files]
     for f in files:
         if not os.path.isfile(f):
@@ -96,13 +96,14 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="sign_release_") as td:
         archive = os.path.join(td, "release.zip")
         build_archive(files, args.entitlements, archive)
-        rc = subprocess.run([sys.executable, CLIENT,
-                             "--verbose",
-                             "--timeout", str(args.timeout),
-                             "--sign-type", "sensor",
-                             "--base64-key", key,
-                             "-i", archive],
-                            check=False).returncode
+        cmd = [sys.executable, CLIENT,
+               "--verbose",
+               "--timeout", str(args.timeout),
+               "--sign-type", "sensor",
+               "-i", archive]
+        if key:
+            cmd += ["--base64-key", key]
+        rc = subprocess.run(cmd, check=False).returncode
         if rc != 0:
             print(f"client.py failed with exit code {rc}", file=sys.stderr)
             return rc

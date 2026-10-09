@@ -29,6 +29,8 @@ DEF_SIGN_RETRIES = 3
 
 IS_WINDOWS = os.name == "nt"
 
+log = logging.getLogger(__name__)
+
 
 class SignFileType(enum.Enum):
     SENSOR_ARCHIVE = 1
@@ -84,7 +86,7 @@ def _long_path(p: str) -> str:
     return p
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
+def _kill_tree(proc: subprocess.Popen[bytes]) -> None:
     if IS_WINDOWS:
         subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                        stdout=subprocess.DEVNULL,
@@ -134,9 +136,19 @@ def _run_with_timeout(cmd: list[str], timeout: float,
     return proc.returncode, out, err
 
 
+def _credential_type(cred_file: str) -> str:
+    """The "type" of a Google credential file: "service_account" for a key,
+    "external_account" for a Workload Identity Federation configuration."""
+    try:
+        with open(cred_file, encoding="utf-8") as f:
+            return str(json.load(f).get("type", ""))
+    except (OSError, ValueError):
+        return ""
+
+
 class SigningPublisher:
 
-    def __init__(self, project: str, topic: str, bucket_name: str, key: str) -> None:
+    def __init__(self, project: str, topic: str, bucket_name: str, key: str | None) -> None:
         self.project = project
         self.topic = topic
         self.bucket_name = bucket_name
@@ -146,27 +158,39 @@ class SigningPublisher:
         self.env: dict[str, str] | None = None
 
     def __enter__(self) -> 'SigningPublisher':
-        logging.info(f"authenticating using {self.key}")
-
-        self._config_dir = tempfile.mkdtemp(prefix="gcloud_cfg_")
-
         env = dict(os.environ)
-        env["CLOUDSDK_CONFIG"] = self._config_dir
         env["CLOUDSDK_CORE_PROJECT"] = self.project
         env["CLOUDSDK_CORE_DISABLE_PROMPTS"] = "1"
         env["CLOUDSDK_COMPONENT_MANAGER_DISABLE_UPDATE_CHECK"] = "1"
         self.env = env
 
-        rc, out, err = _run_with_timeout(
-            [self.gcloud, "auth", "activate-service-account",
-             "--key-file", self.key, "--quiet"],
-            timeout=60.0,
-            env=self.env)
+        # No credentials given: use whatever gcloud is already logged in as
+        # (an attached service account, or a prior `gcloud auth login`).
+        key = self.key
+        if key is None:
+            log.info("authenticating with the active gcloud credentials")
+            return self
+
+        # Otherwise authenticate in a private gcloud config, so the run
+        # neither depends on nor disturbs the user's own.
+        self._config_dir = tempfile.mkdtemp(prefix="gcloud_cfg_")
+        env["CLOUDSDK_CONFIG"] = self._config_dir
+
+        if _credential_type(key) == "service_account":
+            log.info(f"authenticating with service account key {key}")
+            cmd = [self.gcloud, "auth", "activate-service-account",
+                   "--key-file", key, "--quiet"]
+        else:
+            # A credential configuration, e.g. the Workload Identity
+            # Federation file google-github-actions/auth writes and exports
+            # as GOOGLE_APPLICATION_CREDENTIALS: short-lived, no key.
+            log.info(f"authenticating with credential configuration {key}")
+            cmd = [self.gcloud, "auth", "login", "--cred-file", key, "--quiet"]
+
+        rc, out, err = _run_with_timeout(cmd, timeout=60.0, env=self.env)
 
         if rc != 0:
-            raise GcloudError(rc,
-                              [self.gcloud, "auth", "activate-service-account"],
-                              out, err)
+            raise GcloudError(rc, cmd[:3], out, err)
 
         return self
 
@@ -395,11 +419,11 @@ def main() -> int:
                         "--key",
                         type=str,
                         default=default_key,
-                        help="Google service account key file")
+                        help="Google credential file: a service account key or a Workload Identity Federation configuration. Default: $GOOGLE_APPLICATION_CREDENTIALS, else the active gcloud credentials")
 
     parser.add_argument("--base64-key",
                         type=str,
-                        help="Base64 encoded key")
+                        help="Base64 encoded service account key")
 
     parser.add_argument("-v",
                         "--verbose",
@@ -467,13 +491,13 @@ def main() -> int:
         LcUtil.printkv("Input File Hash", LcUtil.md5_file(args.input))
         LcUtil.printkv("Signing Type", args.sign_type)
 
-        if args.key is not None:
-            LcUtil.printkv("Google SA Key File", args.key)
-        elif args.base64_key is not None:
+        if args.base64_key is not None:
             LcUtil.printkv("Google SA Key String",
                            args.base64_key[:30] + "...")
+        elif args.key is not None:
+            LcUtil.printkv("Google Credential File", args.key)
         else:
-            raise InvalidArgumentError("--key or --base64-key is missing")
+            LcUtil.printkv("Google Credentials", "active gcloud account")
 
         LcUtil.printkv("Project", args.project)
         LcUtil.printkv("Topic", args.topic)
@@ -482,11 +506,13 @@ def main() -> int:
 
         with tempfile.TemporaryDirectory(prefix="pub_client_") as td:
 
-            if args.key is not None:
-                key_file = args.key
-            else:
+            key_file: str | None = None
+            base64_key: str | None = args.base64_key
+            if base64_key is not None:
                 key_file = os.path.join(td, "key.json")
-                LcUtil.b64_to_file(args.base64_key, key_file)
+                LcUtil.b64_to_file(base64_key, key_file)
+            elif args.key is not None:
+                key_file = args.key
 
             if args.sign_type == "sensor":
                 sign_type = SignFileType.SENSOR_ARCHIVE
