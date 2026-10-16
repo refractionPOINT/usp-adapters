@@ -518,8 +518,12 @@ func TestCatoRepollDoesNotReship(t *testing.T) {
 		assert.Equal(t, mockMarkerPrefix+"3", mk, "poll %d must resume from the advanced marker", i+1)
 	}
 
-	// The advanced marker is also persisted to disk between polls.
-	assert.Equal(t, mockMarkerPrefix+"3", readPersistedMarker(t))
+	// The advanced marker is also persisted to disk between polls. The adapter
+	// rewrites the file (truncate, then write) on every poll, so a read can land
+	// between the two and see it empty: wait for the content like the resume test
+	// does instead of reading it once.
+	require.Eventually(t, func() bool { return readPersistedMarker(t) == mockMarkerPrefix+"3" },
+		5*time.Second, 5*time.Millisecond, "the advanced marker must be persisted")
 }
 
 // TestCatoMidRunEventShipsExactlyOnce verifies an event appearing while the
