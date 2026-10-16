@@ -256,6 +256,10 @@ func (a *IMAPAdapter) handleConnection() {
 					continue
 				}
 				if err := a.processEvent(a.ctx, msg); err != nil {
+					if errors.Is(err, uspclient.ErrorClosed) {
+						// The adapter is shutting down, nothing to report.
+						continue
+					}
 					a.conf.ClientOptions.OnError(fmt.Errorf("processEvent(): %v", err))
 					hadError = true
 					continue
@@ -337,7 +341,7 @@ func (a *IMAPAdapter) processEvent(ctx context.Context, message *imap.Message) e
 			err = a.uspClient.Ship(d, 1*time.Hour)
 		}
 		if err != nil {
-			return fmt.Errorf("Ship(): %v", err)
+			return fmt.Errorf("Ship(): %w", err)
 		}
 	}
 	return nil

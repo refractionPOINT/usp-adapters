@@ -433,7 +433,7 @@ func (a *SentinelOneAdapter) ship(msg *protocol.DataMessage) bool {
 		err = a.uspClient.Ship(msg, 1*time.Hour)
 	}
 	if err != nil {
-		if a.conf.ClientOptions.OnError != nil {
+		if a.conf.ClientOptions.OnError != nil && err != uspclient.ErrorClosed {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
 		a.doStop.Set()

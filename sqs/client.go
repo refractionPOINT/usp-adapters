@@ -159,7 +159,9 @@ func (a *SQSAdapter) processEvent(message *string) error {
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			}
 			return err
 		}
 	}

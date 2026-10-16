@@ -266,7 +266,9 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 				err = a.uspClient.Ship(msg, 0)
 			}
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				if err != uspclient.ErrorClosed {
+					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				}
 			}
 		}
 

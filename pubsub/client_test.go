@@ -160,44 +160,57 @@ func newNeverAckServer(t *testing.T) string {
 // adapter is closing: Receive waits for every handler, so a handler stuck for
 // up to an hour keeps the adapter from ever stopping.
 func TestProcessEventReturnsWhenClosedWhileBufferFull(t *testing.T) {
-	var onErrors atomic.Int32
-	opts := uspclient.ClientOptions{
-		Identity:     uspclient.Identity{Oid: uuid.NewString(), InstallationKey: "iid"},
-		DestURL:      newNeverAckServer(t),
-		Hostname:     "host",
-		Platform:     "text",
-		Architecture: "usp_adapter",
-		OnError:      func(error) { onErrors.Add(1) },
-		DebugLog:     func(string) {},
-		OnWarning:    func(string) {},
-	}
-	client, err := uspclient.NewClient(context.Background(), opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	a := &PubSubAdapter{conf: PubSubConfig{ClientOptions: opts}, uspClient: client}
+	for _, how := range []string{"subscription stopped", "client closed"} {
+		t.Run(how, func(t *testing.T) {
+			var onErrors atomic.Int32
+			opts := uspclient.ClientOptions{
+				Identity:     uspclient.Identity{Oid: uuid.NewString(), InstallationKey: "iid"},
+				DestURL:      newNeverAckServer(t),
+				Hostname:     "host",
+				Platform:     "text",
+				Architecture: "usp_adapter",
+				OnError:      func(error) { onErrors.Add(1) },
+				DebugLog:     func(string) {},
+				OnWarning:    func(string) {},
+			}
+			client, err := uspclient.NewClient(context.Background(), opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			a := &PubSubAdapter{conf: PubSubConfig{ClientOptions: opts}, uspClient: client}
 
-	// The window starts at 1 and nothing is acked: one message fills it.
-	if err := client.Ship(&protocol.DataMessage{TextPayload: "fill"}, time.Second); err != nil {
-		t.Fatal(err)
-	}
+			// The window starts at 1 and nothing is acked: one message fills it.
+			if err := client.Ship(&protocol.DataMessage{TextPayload: "fill"}, time.Second); err != nil {
+				t.Fatal(err)
+			}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		a.processEvent(ctx, &pubsub.Message{Data: []byte("blocked")})
-	}()
-	select {
-	case <-done:
-		t.Fatal("handler returned while the buffer was full and the adapter running")
-	case <-time.After(500 * time.Millisecond):
-	}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				a.processEvent(ctx, &pubsub.Message{Data: []byte("blocked")})
+			}()
+			select {
+			case <-done:
+				t.Fatal("handler returned while the buffer was full and the adapter running")
+			case <-time.After(500 * time.Millisecond):
+			}
 
-	cancel()
-	waitClosed(t, done, 2*shipRetrySlice+time.Second, "handler after the adapter is closing")
-	if onErrors.Load() != 0 {
-		t.Fatal("a shutdown must not be reported as a Ship error")
+			if how == "client closed" {
+				// The host tears the adapter down: the client is closed while
+				// the subscription context is still live. The blocked Ship is
+				// woken at once and reports ErrorClosed.
+				client.Close()
+				waitClosed(t, done, time.Second, "handler after the client is closed")
+			} else {
+				cancel()
+				waitClosed(t, done, 2*shipRetrySlice+time.Second, "handler after the subscription is stopped")
+			}
+			if onErrors.Load() != 0 {
+				t.Fatal("a shutdown must not be reported as a Ship error")
+			}
+		})
 	}
 }

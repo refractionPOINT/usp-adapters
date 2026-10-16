@@ -179,7 +179,9 @@ func (a *PandaDocAdapter) fetchEvents() {
 				if err == nil {
 					continue
 				}
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				if err != uspclient.ErrorClosed {
+					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				}
 				a.doStop.Set()
 				return
 			}

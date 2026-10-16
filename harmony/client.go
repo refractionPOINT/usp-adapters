@@ -666,6 +666,8 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 			// they want the warnings to stop.
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — skipping window", service, canceled))
 			nextStart = endTime
+		case errors.Is(err, uspclient.ErrorClosed):
+			// The adapter is shutting down, nothing to report.
 		case err != nil:
 			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[events:%s]: %v", service, err))
 		case !newCursor.IsZero():
@@ -869,7 +871,10 @@ func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 			return
 		}
 		newCursor, err := a.runOneEntitiesQuery(q, saas, cursor)
-		if err != nil {
+		if errors.Is(err, uspclient.ErrorClosed) {
+			// The adapter is shutting down, nothing to report.
+			return
+		} else if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[entities:%s:%s]: %v", q.Name, saas, err))
 		} else if q.CursorField != "" && newCursor.After(cursor) {
 			cursor = newCursor
@@ -1077,7 +1082,9 @@ func (a *HarmonyAdapter) shipRecord(rec utils.Dict) error {
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			}
 			a.doStop.Set()
 			return err
 		}

@@ -139,7 +139,9 @@ func (a *WELAdapter) handleEvent(Action EVT_SUBSCRIBE_NOTIFY_ACTION, UserContext
 		err = a.uspClient.Ship(msg, 0)
 	}
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		if err != uspclient.ErrorClosed {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		}
 	}
 	return 0
 }

@@ -212,7 +212,9 @@ func (a *SlackAdapter) shipEntries(entries []utils.Dict) (int64, error) {
 				err = a.uspClient.Ship(msg, 1*time.Hour)
 			}
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				if err != uspclient.ErrorClosed {
+					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+				}
 				return int64(latestTs), err
 			}
 		}

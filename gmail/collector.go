@@ -383,7 +383,9 @@ func (c *mailboxCollector) shipEvent(evtType string, payload utils.Dict, tsMs ui
 		}
 	}
 	if err != nil {
-		c.a.conf.ClientOptions.OnError(fmt.Errorf("%s: Ship(): %v", c.tag, err))
+		if err != uspclient.ErrorClosed {
+			c.a.conf.ClientOptions.OnError(fmt.Errorf("%s: Ship(): %v", c.tag, err))
+		}
 		c.requestStop()
 		return false
 	}

@@ -702,7 +702,9 @@ func (a *ThreatLockerAdapter) ship(feed ThreatLockerFeed, item utils.Dict) bool 
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: Ship(): %v", err))
+			}
 			a.doStop.Set()
 			return false
 		}

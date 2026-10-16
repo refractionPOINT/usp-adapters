@@ -102,7 +102,10 @@ func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdap
 		for {
 			err = bq.lookupAndSend(bq.ctx)
 			if err != nil {
-				bq.conf.ClientOptions.OnError(fmt.Errorf("bigquery error: %v", err))
+				// A closed client is the adapter shutting down, not a failure.
+				if !errors.Is(err, uspclient.ErrorClosed) {
+					bq.conf.ClientOptions.OnError(fmt.Errorf("bigquery error: %v", err))
+				}
 				return
 			}
 			if bq.conf.IsOneTimeLoad {
@@ -186,7 +189,9 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 					err = bq.uspClient.Ship(msg, 1*time.Hour)
 				}
 				if err != nil {
-					bq.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
+					if err != uspclient.ErrorClosed {
+						bq.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
+					}
 					errChan <- err
 					return
 				}
