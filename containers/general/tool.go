@@ -42,6 +42,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
+	"github.com/refractionPOINT/usp-adapters/proofpoint_essentials"
 	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -475,6 +476,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.PandaDoc.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.PandaDoc
 		client, chRunning, err = usp_pandadoc.NewPandaDocAdapter(ctx, configs.PandaDoc)
+	} else if method == "proofpoint_essentials" {
+		configs.ProofpointEssentials.ClientOptions = applyLogging(configs.ProofpointEssentials.ClientOptions)
+		configs.ProofpointEssentials.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.ProofpointEssentials
+		client, chRunning, err = usp_proofpoint_essentials.NewProofpointEssentialsAdapter(ctx, configs.ProofpointEssentials)
 	} else if method == "proofpoint_tap" {
 		configs.ProofpointTap.ClientOptions = applyLogging(configs.ProofpointTap.ClientOptions)
 		configs.ProofpointTap.ClientOptions.Architecture = "usp_adapter"
