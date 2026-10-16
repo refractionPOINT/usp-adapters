@@ -41,9 +41,11 @@ type PubSubAdapter struct {
 
 	psClient *pubsub.Client
 
-	ctx      context.Context
-	buildSub *pubsub.Subscription
-	stopSub  context.CancelFunc
+	ctx                 context.Context
+	buildSub            *pubsub.Subscription
+	stopSub             context.CancelFunc
+	receiveStopped      <-chan struct{}
+	receiveDrainTimeout time.Duration
 }
 
 type PubSubConfig struct {
@@ -110,6 +112,8 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 	pubsubCtx, pubsubCancel := context.WithCancel(a.ctx)
 	a.stopSub = pubsubCancel
 	chStopped := make(chan struct{})
+	a.receiveStopped = chStopped
+	a.receiveDrainTimeout = 10 * time.Second
 	var (
 		subErrMu sync.Mutex
 		subErr   error
@@ -156,19 +160,26 @@ func (a *PubSubAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.stopSub()
+	var flushErr error
+	if a.receiveStopped != nil {
+		timer := time.NewTimer(a.receiveDrainTimeout)
+		select {
+		case <-a.receiveStopped:
+			timer.Stop()
+		case <-timer.C:
+			flushErr = errors.New("timed out flushing Pub/Sub acknowledgements; source delivery may repeat")
+			if a.conf.ClientOptions.OnWarning != nil {
+				a.conf.ClientOptions.OnWarning(flushErr.Error())
+			}
+		}
+	}
+	// Receive flushes source ACK/NACKs before returning. Keep its RPC transport
+	// alive until then; on the bounded fallback, Close aborts stuck source RPCs.
 	err1 := a.psClient.Close()
 	err2 := a.uspClient.Drain(1 * time.Minute)
 	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
-	if err1 != nil {
-		return err1
-	}
-
-	if err2 != nil {
-		return err2
-	}
-
-	return err3
+	return errors.Join(flushErr, err1, err2, err3)
 }
 
 func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Message) {
