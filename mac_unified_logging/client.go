@@ -124,7 +124,9 @@ func (a *MacUnifiedLoggingAdapter) handleEvent(predicate string) uintptr {
 			err = a.uspClient.Ship(msg, 0)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			}
 		}
 	}
 

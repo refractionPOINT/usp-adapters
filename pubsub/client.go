@@ -175,7 +175,9 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
 	if err := a.shipWhileRunning(ctx, msg); err != nil {
-		if ctx.Err() == nil {
+		// A closed client or a stopped subscription is the adapter shutting
+		// down, not a failure: hand the message back quietly.
+		if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
 		message.Nack()
@@ -185,9 +187,10 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 }
 
 // shipWhileRunning ships msg, waiting for room in the client's buffer for up
-// to maxShipBlock, but gives up as soon as ctx is done (the adapter is
-// closing). Pub/Sub's Receive waits for every message handler to return before
-// it returns, so a handler stuck here would keep the adapter from stopping.
+// to maxShipBlock, but gives up as soon as ctx is done or the client is closed
+// (the adapter is closing). Pub/Sub's Receive waits for every message handler
+// to return before it returns, so a handler stuck here would keep the adapter
+// from stopping.
 func (a *PubSubAdapter) shipWhileRunning(ctx context.Context, msg *protocol.DataMessage) error {
 	blockedSince := time.Now()
 	loggedBehind := false
@@ -195,16 +198,9 @@ func (a *PubSubAdapter) shipWhileRunning(ctx context.Context, msg *protocol.Data
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		start := time.Now()
 		err := a.uspClient.Ship(msg, shipRetrySlice)
 		if err != uspclient.ErrorBufferFull {
 			return err
-		}
-		// A Ship that really waited for room only returns when its timeout
-		// expires. Returning much earlier means the client was closed, and
-		// retrying would spin.
-		if time.Since(start) < shipRetrySlice/2 {
-			return errors.New("client closed while waiting for buffer space")
 		}
 		if !loggedBehind && time.Since(blockedSince) >= fallingBehindLogAfter {
 			a.conf.ClientOptions.DebugLog("stream falling behind")

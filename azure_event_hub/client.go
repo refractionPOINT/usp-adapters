@@ -129,8 +129,13 @@ func (a *EventHubAdapter) processEvent(ctx context.Context, message *eventhub.Ev
 			a.conf.ClientOptions.DebugLog("stream falling behind")
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
-		if err != nil {
+		if err != nil && err != uspclient.ErrorClosed {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		}
+		if err == uspclient.ErrorClosed {
+			// The adapter is shutting down. Do not hand the Event Hub library an
+			// error for it, that would be reported as a listener failure.
+			return nil
 		}
 		return err
 	}

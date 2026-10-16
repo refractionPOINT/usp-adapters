@@ -657,7 +657,9 @@ func (a *ServiceNowAdapter) ship(feed ServiceNowFeed, item utils.Dict, eventMs u
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("servicenow: Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("servicenow: Ship(): %v", err))
+			}
 			a.doStop.Set()
 			return false
 		}

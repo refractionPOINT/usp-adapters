@@ -482,7 +482,9 @@ func (a *CylanceAdapter) submitEvents(items []utils.Dict) {
 			if err == uspclient.ErrorBufferFull {
 				a.conf.ClientOptions.OnWarning("stream falling behind")
 				if err := a.uspClient.Ship(msg, 1*time.Hour); err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					if err != uspclient.ErrorClosed {
+						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					}
 					a.Close()
 					return
 				}
