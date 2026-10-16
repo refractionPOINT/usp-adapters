@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,9 +22,9 @@ import (
 
 // newFakePubSub starts an in-process Pub/Sub server with one topic and one
 // subscription, and points the client library at it.
-func newFakePubSub(t *testing.T) (srv *pstest.Server, topic *pubsub.Topic, project, sub string) {
+func newFakePubSub(t *testing.T, reactors ...pstest.ServerReactorOption) (srv *pstest.Server, topic *pubsub.Topic, project, sub string) {
 	t.Helper()
-	srv = pstest.NewServer()
+	srv = pstest.NewServer(reactors...)
 	t.Cleanup(func() { srv.Close() })
 	t.Setenv("PUBSUB_EMULATOR_HOST", srv.Addr)
 
@@ -211,6 +212,86 @@ func TestProcessEventReturnsWhenClosedWhileBufferFull(t *testing.T) {
 			if onErrors.Load() != 0 {
 				t.Fatal("a shutdown must not be reported as a Ship error")
 			}
+		})
+	}
+}
+
+type blockedAckReactor struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *blockedAckReactor) React(interface{}) (bool, interface{}, error) {
+	r.once.Do(func() { close(r.entered) })
+	<-r.release
+	return false, nil, nil
+}
+
+// Closing the transport before Receive joins can abandon already-buffered
+// source acknowledgements and replay the same events after lease handoff.
+func TestCloseFlushesSourceAcksBeforeClosingTransport(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		name := "ack_completes"
+		if timeout {
+			name = "ack_stalls"
+		}
+		t.Run(name, func(t *testing.T) {
+			block := &blockedAckReactor{entered: make(chan struct{}), release: make(chan struct{})}
+			var release sync.Once
+			defer release.Do(func() { close(block.release) })
+			srv, topic, project, sub := newFakePubSub(t, pstest.ServerReactorOption{FuncName: "Acknowledge", Reactor: block})
+			conf := testConfig(project, sub)
+			var warnings atomic.Int32
+			conf.ClientOptions.OnWarning = func(string) { warnings.Add(1) }
+			a, stopped, err := NewPubSubAdapter(context.Background(), conf)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, err := topic.Publish(context.Background(), &pubsub.Message{Data: []byte("source-tail")}).Get(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-block.entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("source ACK was never sent")
+			}
+			if timeout {
+				a.receiveDrainTimeout = 100 * time.Millisecond
+			}
+			done := make(chan error, 1)
+			go func() { done <- a.Close() }()
+			if timeout {
+				select {
+				case err := <-done:
+					if err == nil || warnings.Load() != 1 {
+						t.Fatalf("stalled source flush not reported: %v, warnings=%d", err, warnings.Load())
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("Close hung on source ACK RPC")
+				}
+				release.Do(func() { close(block.release) })
+			} else {
+				select {
+				case err := <-done:
+					t.Fatalf("transport closed before source ACK RPC completed: %v", err)
+				case <-time.After(80 * time.Millisecond):
+				}
+				release.Do(func() { close(block.release) })
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(2 * time.Second):
+					t.Fatal("Close did not join completed Receive")
+				}
+				if got := srv.Message(id).Acks; got != 1 {
+					t.Fatalf("source ACK count=%d want1", got)
+				}
+			}
+			waitClosed(t, stopped, time.Second, "receive stopped")
 		})
 	}
 }

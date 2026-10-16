@@ -18,6 +18,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"golang.org/x/net/context/ctxhttp"
 )
 
@@ -69,6 +70,7 @@ func (c *CatoConfig) Validate() error {
 type uspSink interface {
 	Ship(message *protocol.DataMessage, timeout time.Duration) error
 	Close() ([]*protocol.DataMessage, error)
+	Drain(time.Duration) error
 }
 
 type CatoAdapter struct {
@@ -138,6 +140,7 @@ func newCatoAdapter(ctx context.Context, conf CatoConfig, sink uspSink) (*CatoAd
 }
 
 func (a *CatoAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 
 	a.mRunning.Lock()
@@ -147,7 +150,7 @@ func (a *CatoAdapter) Close() error {
 	a.wg.Done()
 	a.wg.Wait()
 
-	_, err := a.uspClient.Close()
+	_, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions)
 	if err != nil {
 		return err
 	}

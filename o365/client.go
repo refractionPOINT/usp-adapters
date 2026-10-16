@@ -256,11 +256,12 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 }
 
 func (a *Office365Adapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.httpClient.CloseIdleConnections()
 
 	a.conf.Deduper.Close()

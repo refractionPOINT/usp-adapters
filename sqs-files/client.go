@@ -160,10 +160,11 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 }
 
 func (a *SQSFilesAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.isStop = true
 	a.wg.Wait()
-	if _, err := a.uspClient.Close(); err != nil {
+	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {
 		return err
 	}
 	return nil

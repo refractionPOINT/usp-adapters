@@ -828,22 +828,18 @@ func (a *GmailAdapter) Close() error {
 	return a.closeErr
 }
 
-// cleanupCollectors drains and closes a set of collectors concurrently (bounded
-// fan-out), returning the first error. Each collector's cleanup is idempotent.
+// cleanupCollectors drains and closes collectors concurrently, returning the
+// first error. Every existing connection must share the same drain interval. Each collector's cleanup is idempotent.
 func cleanupCollectors(cs []*mailboxCollector) error {
 	if len(cs) == 0 {
 		return nil
 	}
-	const maxConcurrentDrains = 16
-	sem := make(chan struct{}, maxConcurrentDrains)
 	errs := make([]error, len(cs))
 	var wg sync.WaitGroup
 	for i, c := range cs {
 		wg.Add(1)
 		go func(i int, c *mailboxCollector) {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 			errs[i] = c.cleanup()
 		}(i, c)
 	}

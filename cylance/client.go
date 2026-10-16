@@ -146,12 +146,13 @@ func (c *CylanceConfig) Validate() error {
 }
 
 func (a *CylanceAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	var err1, err2 error
 	a.once.Do(func() {
 		a.cancel()
 		err1 = a.uspClient.Drain(1 * time.Minute)
-		_, err2 = a.uspClient.Close()
+		_, err2 = utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 		a.httpClient.CloseIdleConnections()
 		close(a.chStopped)
 	})

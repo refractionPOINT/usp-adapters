@@ -17,6 +17,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/credguard"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 type BigQueryAdapter struct {
@@ -211,12 +212,13 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 }
 
 func (bq *BigQueryAdapter) Close() error {
+	defer utils.StopBlockedProducers(bq.uspClient)()
 	bq.conf.ClientOptions.DebugLog("closing")
 	bq.cancel() // cancel the context
 	bq.wg.Wait()
 	bq.client.Close()
 	err1 := bq.uspClient.Drain(1 * time.Minute)
-	_, err2 := bq.uspClient.Close()
+	_, err2 := utils.CloseUSP(bq.uspClient, bq.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1

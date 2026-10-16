@@ -11,6 +11,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 
 	"github.com/crowdstrike/gofalcon/falcon"
 	"github.com/crowdstrike/gofalcon/falcon/client"
@@ -94,6 +95,7 @@ func NewFalconCloudAdapter(ctx context.Context, conf FalconCloudConfig) (*Falcon
 }
 
 func (a *FalconCloudAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 
 	a.mRunning.Lock()
@@ -105,7 +107,7 @@ func (a *FalconCloudAdapter) Close() error {
 
 	a.wgSenders.Wait()
 
-	_, err := a.uspClient.Close()
+	_, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions)
 	if err != nil {
 		return err
 	}
