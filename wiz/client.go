@@ -157,7 +157,7 @@ func newWizAdapter(ctx context.Context, conf WizConfig, sink uspSink) (*WizAdapt
 }
 
 func (a *WizAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

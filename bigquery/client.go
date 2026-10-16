@@ -212,7 +212,7 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 }
 
 func (bq *BigQueryAdapter) Close() error {
-	utils.BeginDrain(bq.uspClient)
+	defer utils.StopBlockedProducers(bq.uspClient)()
 	bq.conf.ClientOptions.DebugLog("closing")
 	bq.cancel() // cancel the context
 	bq.wg.Wait()

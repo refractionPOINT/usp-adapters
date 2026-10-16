@@ -147,7 +147,7 @@ func NewImapAdapter(ctx context.Context, conf ImapConfig) (*IMAPAdapter, chan st
 }
 
 func (a *IMAPAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	close(a.chStop)
 	a.conf.ClientOptions.DebugLog("waiting for stop")

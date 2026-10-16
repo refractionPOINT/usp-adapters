@@ -100,7 +100,7 @@ func NewSQSAdapter(ctx context.Context, conf SQSConfig) (*SQSAdapter, chan struc
 }
 
 func (a *SQSAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.isStop = true
 	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {

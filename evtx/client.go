@@ -86,7 +86,7 @@ func NewEVTXAdapter(ctx context.Context, conf EVTXConfig) (*EVTXAdapter, chan st
 }
 
 func (a *EVTXAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.fClose()
 	err1 := a.uspClient.Drain(1 * time.Minute)

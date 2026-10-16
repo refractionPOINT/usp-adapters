@@ -256,7 +256,7 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 }
 
 func (a *Office365Adapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

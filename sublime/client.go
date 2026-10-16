@@ -185,7 +185,7 @@ func newSublimeAdapter(ctx context.Context, conf SublimeConfig, sink uspSink, no
 }
 
 func (a *SublimeAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

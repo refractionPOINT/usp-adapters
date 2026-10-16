@@ -367,7 +367,7 @@ func newServiceNowAdapter(ctx context.Context, conf ServiceNowConfig, sink uspSi
 // Close stops the adapter. It is idempotent: repeated calls are no-ops and
 // return the result of the first call.
 func (a *ServiceNowAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.closeOnce.Do(func() {
 		a.conf.ClientOptions.DebugLog("servicenow: closing")
 		a.doStop.Set()

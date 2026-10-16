@@ -135,7 +135,7 @@ func newHubSpotAdapter(ctx context.Context, conf HubSpotConfig, sink uspSink) (*
 }
 
 func (a *HubSpotAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

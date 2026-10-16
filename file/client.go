@@ -763,7 +763,7 @@ func (a *FileAdapter) handleLine(line string) {
 }
 
 func (a *FileAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 
 	// Cancel ctx first so pollFiles stops spawning new tail/parquet

@@ -104,7 +104,7 @@ func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdap
 }
 
 func (a *EventHubAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	for _, l := range a.listeners {
 		l.Close(a.ctx)

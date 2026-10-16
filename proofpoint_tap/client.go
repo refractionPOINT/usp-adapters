@@ -133,7 +133,7 @@ func newProofpointTapAdapter(ctx context.Context, conf ProofpointTapConfig, sink
 }
 
 func (a *ProofpointTapAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

@@ -164,7 +164,7 @@ func newSyslogAdapter(ctx context.Context, conf SyslogConfig, sink uspSink) (*Sy
 }
 
 func (a *SyslogAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	var err1 error

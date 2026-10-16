@@ -140,7 +140,7 @@ func newCatoAdapter(ctx context.Context, conf CatoConfig, sink uspSink) (*CatoAd
 }
 
 func (a *CatoAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 
 	a.mRunning.Lock()

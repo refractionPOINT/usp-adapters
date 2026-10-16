@@ -51,11 +51,19 @@ func DrainCloseUSP(c interface {
 	return messages, errors.Join(drainErr, closeErr)
 }
 
-// BeginDrain unblocks producers waiting in Ship before Close joins them. The
-// optional interface keeps injected sinks compatible; production clients expose
-// BeginDrain in the acknowledgement-aware client release.
-func BeginDrain(c interface{}) {
-	if c, ok := c.(interface{ BeginDrain() }); ok {
-		c.BeginDrain()
+// StopBlockedProducers lets healthy in-flight producers finish, while ensuring
+// a producer stuck in Ship cannot hold shutdown forever. Close cancels the
+// returned timer once producers have joined and the client has been drained.
+// The adapter must signal its own producer stop immediately after calling this.
+func StopBlockedProducers(c interface{}) func() {
+	return stopBlockedProducersAfter(c, 10*time.Second)
+}
+
+func stopBlockedProducersAfter(c interface{}, grace time.Duration) func() {
+	client, ok := c.(interface{ BeginDrain() })
+	if !ok {
+		return func() {}
 	}
+	timer := time.AfterFunc(grace, client.BeginDrain)
+	return func() { timer.Stop() }
 }

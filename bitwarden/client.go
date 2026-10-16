@@ -165,7 +165,7 @@ func newBitwardenAdapter(ctx context.Context, conf BitwardenConfig, sink uspSink
 }
 
 func (a *BitwardenAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

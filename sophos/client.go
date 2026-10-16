@@ -202,7 +202,7 @@ func newSophosAdapter(ctx context.Context, conf SophosConfig, sink uspSink) (*So
 }
 
 func (a *SophosAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

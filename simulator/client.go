@@ -88,7 +88,7 @@ func NewSimulatorAdapter(ctx context.Context, conf SimulatorConfig) (*SimulatorA
 }
 
 func (a *SimulatorAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	a.dataReader.Close()

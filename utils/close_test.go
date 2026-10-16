@@ -3,6 +3,7 @@ package utils
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,8 +19,12 @@ type shutdownSink struct {
 	pending            []*protocol.DataMessage
 }
 
-func (s *shutdownSink) BeginDrain()               { s.sealed = true }
-func (s *shutdownSink) Drain(time.Duration) error { s.drained = true; return s.drainErr }
+func (s *shutdownSink) BeginDrain() { s.sealed = true }
+func (s *shutdownSink) Drain(time.Duration) error {
+	s.drained = true
+	s.sealed = true
+	return s.drainErr
+}
 func (s *shutdownSink) Close() ([]*protocol.DataMessage, error) {
 	s.closed = true
 	return s.pending, s.closeErr
@@ -46,9 +51,45 @@ func TestShutdownReportsUnconfirmedMessagesWithoutPayloads(t *testing.T) {
 func TestShutdownDrainsAdaptersThatPreviouslyClosedImmediately(t *testing.T) {
 	expected := errors.New("drain deadline")
 	s := &shutdownSink{drainErr: expected}
-	BeginDrain(s)
+	stop := StopBlockedProducers(s)
+	defer stop()
 	_, err := DrainCloseUSP(s, uspclient.ClientOptions{})
 	if !s.sealed || !s.drained || !s.closed || !errors.Is(err, expected) {
 		t.Fatalf("shutdown sequence: %+v, %v", s, err)
 	}
+}
+
+type admissionStopSink struct {
+	stopped chan struct{}
+	once    sync.Once
+}
+
+func (s *admissionStopSink) BeginDrain() { s.once.Do(func() { close(s.stopped) }) }
+
+func TestProducerStopGraceAllowsProgressAndBoundsBlockedShip(t *testing.T) {
+	t.Run("blocked", func(t *testing.T) {
+		sink := &admissionStopSink{stopped: make(chan struct{})}
+		cancel := stopBlockedProducersAfter(sink, 80*time.Millisecond)
+		defer cancel()
+		select {
+		case <-sink.stopped:
+			t.Fatal("healthy producer admission was closed immediately")
+		case <-time.After(20 * time.Millisecond):
+		}
+		select {
+		case <-sink.stopped:
+		case <-time.After(time.Second):
+			t.Fatal("blocked producer was not released at its deadline")
+		}
+	})
+	t.Run("healthy", func(t *testing.T) {
+		sink := &admissionStopSink{stopped: make(chan struct{})}
+		cancel := stopBlockedProducersAfter(sink, 80*time.Millisecond)
+		cancel() // producers finished normally before their grace expired
+		select {
+		case <-sink.stopped:
+			t.Fatal("cancelled shutdown timer still closed admission")
+		case <-time.After(120 * time.Millisecond):
+		}
+	})
 }

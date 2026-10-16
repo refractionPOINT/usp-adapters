@@ -84,7 +84,7 @@ func NewWELAdapter(ctx context.Context, conf WELConfig) (*WELAdapter, chan struc
 }
 
 func (a *WELAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 
 	for _, hSub := range a.hSubs {

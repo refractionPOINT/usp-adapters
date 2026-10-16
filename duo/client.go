@@ -93,7 +93,7 @@ func NewDuoAdapter(ctx context.Context, conf DuoConfig) (*DuoAdapter, chan struc
 }
 
 func (a *DuoAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

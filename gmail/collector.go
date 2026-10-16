@@ -73,8 +73,9 @@ type mailboxCollector struct {
 	stopCh   chan struct{}
 	stopOnce sync.Once
 
-	stopped   chan struct{} // closed when run() returns
-	cleanOnce sync.Once
+	stopped       chan struct{} // closed when run() returns
+	cleanOnce     sync.Once
+	stopAdmission func()
 }
 
 // requestStop signals this collector to wind down. It trips the stop Event and
@@ -82,7 +83,7 @@ type mailboxCollector struct {
 // idempotent.
 func (c *mailboxCollector) requestStop() {
 	c.stopOnce.Do(func() {
-		utils.BeginDrain(c.uspClient)
+		c.stopAdmission = utils.StopBlockedProducers(c.uspClient)
 		close(c.stopCh)
 		c.stop.Set()
 		if c.apiCancel != nil {
@@ -400,6 +401,9 @@ func (c *mailboxCollector) shipEvent(evtType string, payload utils.Dict, tsMs ui
 func (c *mailboxCollector) cleanup() error {
 	var err error
 	c.cleanOnce.Do(func() {
+		if c.stopAdmission != nil {
+			defer c.stopAdmission()
+		}
 		if c.uspClient != nil {
 			err = c.uspClient.Drain(1 * time.Minute)
 			if _, e := utils.CloseUSP(c.uspClient, c.a.conf.ClientOptions); err == nil {

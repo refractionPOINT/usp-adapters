@@ -146,7 +146,7 @@ func (c *CylanceConfig) Validate() error {
 }
 
 func (a *CylanceAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	var err1, err2 error
 	a.once.Do(func() {

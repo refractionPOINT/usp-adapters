@@ -95,7 +95,7 @@ func NewFalconCloudAdapter(ctx context.Context, conf FalconCloudConfig) (*Falcon
 }
 
 func (a *FalconCloudAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 
 	a.mRunning.Lock()

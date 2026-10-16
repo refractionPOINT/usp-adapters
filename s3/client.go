@@ -266,7 +266,7 @@ func isNotFound(err error) bool {
 }
 
 func (a *S3Adapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isStop, 1)
 	a.wg.Wait()

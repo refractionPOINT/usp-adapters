@@ -479,7 +479,7 @@ func newThreatLockerAdapter(ctx context.Context, conf ThreatLockerConfig, sink u
 // Close stops the adapter. It is idempotent: repeated calls are no-ops and
 // return the result of the first call.
 func (a *ThreatLockerAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.closeOnce.Do(func() {
 		a.conf.ClientOptions.DebugLog("threatlocker: closing")
 		a.doStop.Set()

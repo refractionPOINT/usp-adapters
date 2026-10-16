@@ -153,7 +153,7 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 }
 
 func (a *PubSubAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.stopSub()
 	err1 := a.psClient.Close()

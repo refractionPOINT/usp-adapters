@@ -137,7 +137,7 @@ func newPandaDocAdapter(ctx context.Context, conf PandaDocConfig, sink uspSink) 
 }
 
 func (a *PandaDocAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

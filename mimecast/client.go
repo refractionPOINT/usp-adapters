@@ -184,7 +184,7 @@ func newMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink) 
 }
 
 func (a *MimecastAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()

@@ -92,7 +92,7 @@ func NewK8sPodsAdapter(ctx context.Context, conf K8sPodsConfig) (*K8sPodsAdapter
 }
 
 func (a *K8sPodsAdapter) Close() error {
-	utils.BeginDrain(a.uspClient)
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.engine.Close()
 	err1 := a.uspClient.Drain(1 * time.Minute)
