@@ -112,13 +112,7 @@ func (a *EventHubAdapter) Close() error {
 	err1 := a.hub.Close(a.ctx)
 	err2 := a.uspClient.Drain(1 * time.Minute)
 	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
-	if err1 != nil {
-		return err1
-	}
-	if err2 != nil {
-		return err2
-	}
-	return err3
+	return errors.Join(err1, err2, err3)
 }
 
 func (a *EventHubAdapter) processEvent(ctx context.Context, message *eventhub.Event) error {

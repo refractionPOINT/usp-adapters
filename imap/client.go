@@ -160,20 +160,7 @@ func (a *IMAPAdapter) Close() error {
 	_, err4 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.conf.ClientOptions.DebugLog("closed USP client")
 	a.wgArtifacts.Wait()
-
-	if err1 != nil {
-		return err1
-	}
-
-	if err2 != nil {
-		return err2
-	}
-
-	if err3 != nil {
-		return err3
-	}
-
-	return err4
+	return errors.Join(err1, err2, err3, err4)
 }
 
 func (a *IMAPAdapter) handleConnection() {
