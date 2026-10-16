@@ -14,6 +14,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/credguard"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -152,11 +153,12 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 }
 
 func (a *PubSubAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	a.stopSub()
 	err1 := a.psClient.Close()
 	err2 := a.uspClient.Drain(1 * time.Minute)
-	_, err3 := a.uspClient.Close()
+	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1

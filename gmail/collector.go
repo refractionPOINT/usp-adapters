@@ -82,6 +82,7 @@ type mailboxCollector struct {
 // idempotent.
 func (c *mailboxCollector) requestStop() {
 	c.stopOnce.Do(func() {
+		utils.BeginDrain(c.uspClient)
 		close(c.stopCh)
 		c.stop.Set()
 		if c.apiCancel != nil {
@@ -401,7 +402,7 @@ func (c *mailboxCollector) cleanup() error {
 	c.cleanOnce.Do(func() {
 		if c.uspClient != nil {
 			err = c.uspClient.Drain(1 * time.Minute)
-			if _, e := c.uspClient.Close(); err == nil {
+			if _, e := utils.CloseUSP(c.uspClient, c.a.conf.ClientOptions); err == nil {
 				err = e
 			}
 		}

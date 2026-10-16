@@ -10,6 +10,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -103,13 +104,14 @@ func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdap
 }
 
 func (a *EventHubAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	for _, l := range a.listeners {
 		l.Close(a.ctx)
 	}
 	err1 := a.hub.Close(a.ctx)
 	err2 := a.uspClient.Drain(1 * time.Minute)
-	_, err3 := a.uspClient.Close()
+	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	if err1 != nil {
 		return err1
 	}

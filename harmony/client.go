@@ -269,11 +269,11 @@ func (c *EventsConfig) Close() {}
 //
 // New deployments should use:
 //
-//   entities:
-//     enabled: true
-//     queries:
-//       - name: emails
-//         include_splits: true   # match the old firehose semantics
+//	entities:
+//	  enabled: true
+//	  queries:
+//	    - name: emails
+//	      include_splits: true   # match the old firehose semantics
 type EmailsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 }
@@ -620,11 +620,12 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 }
 
 func (a *HarmonyAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.httpClient.CloseIdleConnections()
 	for _, s := range a.conf.sources() {
 		s.Close()

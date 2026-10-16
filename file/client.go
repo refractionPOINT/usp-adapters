@@ -763,6 +763,7 @@ func (a *FileAdapter) handleLine(line string) {
 }
 
 func (a *FileAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 
 	// Cancel ctx first so pollFiles stops spawning new tail/parquet
@@ -795,7 +796,7 @@ func (a *FileAdapter) Close() error {
 	a.wg.Wait()
 
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1

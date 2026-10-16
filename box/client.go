@@ -142,11 +142,12 @@ func newBoxAdapter(ctx context.Context, conf BoxConfig, sink uspSink) (*BoxAdapt
 }
 
 func (a *BoxAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.httpClient.CloseIdleConnections()
 
 	if err1 != nil {

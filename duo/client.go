@@ -93,11 +93,12 @@ func NewDuoAdapter(ctx context.Context, conf DuoConfig) (*DuoAdapter, chan struc
 }
 
 func (a *DuoAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1

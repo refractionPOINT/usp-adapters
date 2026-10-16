@@ -164,6 +164,7 @@ func newSyslogAdapter(ctx context.Context, conf SyslogConfig, sink uspSink) (*Sy
 }
 
 func (a *SyslogAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	var err1 error
@@ -173,7 +174,7 @@ func (a *SyslogAdapter) Close() error {
 		err1 = a.udpListener.Close()
 	}
 	err2 := a.uspClient.Drain(1 * time.Minute)
-	_, err3 := a.uspClient.Close()
+	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1

@@ -65,6 +65,7 @@ func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 	return nil
 }
 
+func (s *captureSink) Drain(time.Duration) error               { return nil }
 func (s *captureSink) Close() ([]*protocol.DataMessage, error) { return nil, nil }
 
 func (s *captureSink) count() int {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 
 	"github.com/refractionPOINT/evtx"
 )
@@ -85,10 +86,11 @@ func NewEVTXAdapter(ctx context.Context, conf EVTXConfig) (*EVTXAdapter, chan st
 }
 
 func (a *EVTXAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	a.fClose()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1

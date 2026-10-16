@@ -19,6 +19,7 @@ import (
 	"github.com/refractionPOINT/go-limacharlie/limacharlie"
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 var (
@@ -146,6 +147,7 @@ func NewImapAdapter(ctx context.Context, conf ImapConfig) (*IMAPAdapter, chan st
 }
 
 func (a *IMAPAdapter) Close() error {
+	utils.BeginDrain(a.uspClient)
 	a.conf.ClientOptions.DebugLog("closing")
 	close(a.chStop)
 	a.conf.ClientOptions.DebugLog("waiting for stop")
@@ -155,7 +157,7 @@ func (a *IMAPAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closed")
 	err3 := a.uspClient.Drain(1 * time.Minute)
 	a.conf.ClientOptions.DebugLog("drained")
-	_, err4 := a.uspClient.Close()
+	_, err4 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.conf.ClientOptions.DebugLog("closed USP client")
 	a.wgArtifacts.Wait()
 
