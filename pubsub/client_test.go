@@ -22,7 +22,7 @@ import (
 
 // newFakePubSub starts an in-process Pub/Sub server with one topic and one
 // subscription, and points the client library at it.
-func newFakePubSub(t *testing.T, reactors ...pstest.ServerReactorOption) (srv *pstest.Server, topic *pubsub.Topic, project, sub string) {
+func newFakePubSub(t testing.TB, reactors ...pstest.ServerReactorOption) (srv *pstest.Server, topic *pubsub.Topic, project, sub string) {
 	t.Helper()
 	srv = pstest.NewServer(reactors...)
 	t.Cleanup(func() { srv.Close() })
@@ -39,6 +39,7 @@ func newFakePubSub(t *testing.T, reactors ...pstest.ServerReactorOption) (srv *p
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(topic.Stop)
 	if _, err = c.CreateSubscription(ctx, sub, pubsub.SubscriptionConfig{Topic: topic}); err != nil {
 		t.Fatal(err)
 	}

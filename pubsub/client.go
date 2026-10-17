@@ -46,6 +46,9 @@ type PubSubAdapter struct {
 	stopSub             context.CancelFunc
 	receiveStopped      <-chan struct{}
 	receiveDrainTimeout time.Duration
+	confirmationTimeout time.Duration
+	closeOnce           sync.Once
+	closeErr            error
 }
 
 type PubSubConfig struct {
@@ -114,6 +117,7 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 	chStopped := make(chan struct{})
 	a.receiveStopped = chStopped
 	a.receiveDrainTimeout = 10 * time.Second
+	a.confirmationTimeout = time.Minute
 	var (
 		subErrMu sync.Mutex
 		subErr   error
@@ -148,8 +152,8 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 	subErrMu.Unlock()
 	if startErr != nil {
 		pubsubCancel()
-		a.psClient.Close()
 		a.uspClient.Close()
+		a.psClient.Close()
 		return nil, nil, startErr
 	}
 
@@ -157,9 +161,21 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 }
 
 func (a *PubSubAdapter) Close() error {
-	defer utils.StopBlockedProducers(a.uspClient)()
+	a.closeOnce.Do(func() { a.closeErr = a.close() })
+	return a.closeErr
+}
+
+func (a *PubSubAdapter) close() error {
 	a.conf.ClientOptions.DebugLog("closing")
+	// Stop admission before canceling Receive. Its accepted callbacks keep
+	// ownership of source messages until confirmation, while blocked/new Ship
+	// calls wake and Nack messages the SDK did not accept.
+	a.uspClient.BeginDrain()
 	a.stopSub()
+	drainErr := a.uspClient.Drain(a.confirmationTimeout)
+	// Close resolves any remaining receipts only after transmission stops.
+	// Their callbacks can then Nack without this client also replaying them.
+	_, closeErr := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	var flushErr error
 	if a.receiveStopped != nil {
 		timer := time.NewTimer(a.receiveDrainTimeout)
@@ -176,10 +192,8 @@ func (a *PubSubAdapter) Close() error {
 	// Receive flushes source ACK/NACKs before returning. Keep its RPC transport
 	// alive until then; on the bounded fallback, Close aborts stuck source RPCs.
 	err1 := a.psClient.Close()
-	err2 := a.uspClient.Drain(1 * time.Minute)
-	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
-	return errors.Join(flushErr, err1, err2, err3)
+	return errors.Join(drainErr, closeErr, flushErr, err1)
 }
 
 func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Message) {
@@ -187,12 +201,20 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 		TextPayload: string(message.Data),
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
-	if err := a.shipWhileRunning(ctx, msg); err != nil {
+	receipt, err := a.shipWhileRunning(ctx, msg)
+	if err != nil {
 		// A closed client or a stopped subscription is the adapter shutting
 		// down, not a failure: hand the message back quietly.
 		if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
+		message.Nack()
+		return
+	}
+	// Receive cancels ctx when stopping pulls or encountering a source error.
+	// An admitted message is still owned by the SDK then: wait for confirmation
+	// or Close, which resolves every pending receipt and bounds shutdown.
+	if err := receipt.Wait(context.Background()); err != nil {
 		message.Nack()
 		return
 	}
@@ -204,23 +226,23 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 // (the adapter is closing). Pub/Sub's Receive waits for every message handler
 // to return before it returns, so a handler stuck here would keep the adapter
 // from stopping.
-func (a *PubSubAdapter) shipWhileRunning(ctx context.Context, msg *protocol.DataMessage) error {
+func (a *PubSubAdapter) shipWhileRunning(ctx context.Context, msg *protocol.DataMessage) (*uspclient.Receipt, error) {
 	blockedSince := time.Now()
 	loggedBehind := false
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
-		err := a.uspClient.Ship(msg, shipRetrySlice)
+		receipt, err := a.uspClient.ShipWithReceipt(msg, shipRetrySlice)
 		if err != uspclient.ErrorBufferFull {
-			return err
+			return receipt, err
 		}
 		if !loggedBehind && time.Since(blockedSince) >= fallingBehindLogAfter {
 			a.conf.ClientOptions.DebugLog("stream falling behind")
 			loggedBehind = true
 		}
 		if time.Since(blockedSince) >= maxShipBlock {
-			return err
+			return nil, err
 		}
 	}
 }
