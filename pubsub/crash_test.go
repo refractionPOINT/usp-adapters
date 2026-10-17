@@ -85,8 +85,8 @@ func TestPubSubAbruptProcessStopPreservesSourceRedelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	var killOnce sync.Once
-	var waitErr error
-	kill := func() { killOnce.Do(func() { _ = cmd.Process.Kill(); waitErr = cmd.Wait() }) }
+	var killErr, waitErr error
+	kill := func() { killOnce.Do(func() { killErr = cmd.Process.Kill(); waitErr = cmd.Wait() }) }
 	t.Cleanup(kill)
 	select {
 	case <-ready:
@@ -117,13 +117,16 @@ func TestPubSubAbruptProcessStopPreservesSourceRedelivery(t *testing.T) {
 		acked += source.Message(id).Acks
 	}
 	kill()
-	if waitErr == nil {
-		t.Fatal("adapter process exited normally instead of being terminated")
+	if killErr != nil || waitErr == nil {
+		t.Fatalf("adapter process was not deliberately terminated: kill=%v wait=%v; child output: %s", killErr, waitErr, output.String())
 	}
-	if strings.Contains(output.String(), "WARNING: DATA RACE") {
-		t.Fatalf("adapter child reported a data race: %s", output.String())
+	if runtime.GOOS == "linux" && cmd.ProcessState.String() != "signal: killed" {
+		t.Fatalf("adapter child was not killed by SIGKILL: %s; child output: %s", cmd.ProcessState, output.String())
 	}
-	t.Logf("PUBSUB-ACK-RESULT scenario=abrupt-process-stop sent=%d source_acked_before_kill=%d proxy_confirmed=0", count, acked)
+	if child := output.String(); strings.Contains(child, "WARNING: DATA RACE") || strings.Contains(child, "panic:") || strings.Contains(child, "fatal error:") {
+		t.Fatalf("adapter child reported a runtime failure: %s", child)
+	}
+	t.Logf("PUBSUB-ACK-RESULT scenario=abrupt-process-stop sent=%d source_acked_before_kill=%d proxy_confirmed=0 process_state=%q", count, acked, cmd.ProcessState.String())
 	if acked != 0 {
 		t.Fatalf("abrupt stop abandoned %d source-acknowledged events before proxy confirmation", acked)
 	}
