@@ -160,3 +160,6 @@ require (
 )
 
 replace github.com/nxadm/tail => github.com/refractionPOINT/tail v0.0.0-20211216163028-4472660a31a6
+
+// Admission can stall after a partial ACK followed by a FLOW resize.
+retract v1.32.46
