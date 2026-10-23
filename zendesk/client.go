@@ -205,8 +205,8 @@ func (a *ZendeskAdapter) fetchEvents() {
 	notBefore := time.Now().Add(-overlapPeriod)
 
 	for !a.doStop.WaitFor(a.pollInterval) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
+		// Successful pages are already marked seen. Ship them even when a
+		// later page failed or shutdown interrupted the paginated request.
 		items, _, _ := a.makeOneRequest(notBefore)
 		if items == nil {
 			continue
@@ -254,12 +254,15 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 	url := fmt.Sprintf("%s%s?filter[created_at][]=%s&filter[created_at][]=%s&page[size]=100", a.baseURL, logsEndpoint, start, until)
 
 	for {
+		if a.doStop.IsSet() {
+			return allItems, lastDetectionTime, context.Canceled
+		}
 		// Prepare the request.
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			a.doStop.Set()
-			return nil, lastDetectionTime, err
+			return allItems, lastDetectionTime, err
 		}
 
 		// Format the authentication string as "email/token:api_token"
@@ -275,24 +278,22 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 		resp, err := a.httpClient.Do(req)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-			return nil, lastDetectionTime, err
+			return allItems, lastDetectionTime, err
 		}
-		defer resp.Body.Close()
+		body, readErr := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("error: %v", readErr))
+			return allItems, lastDetectionTime, readErr
+		}
 
 		// Evaluate if success.
 		if resp.StatusCode != http.StatusOK {
-			body, _ := ioutil.ReadAll(resp.Body)
 			// err is nil here; build a real one so callers can tell a failure
 			// apart from a successful empty poll.
 			err = fmt.Errorf("zendesk api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body))
 			a.conf.ClientOptions.OnError(err)
-			return nil, lastDetectionTime, err
-		}
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error: %v", err))
-			return nil, lastDetectionTime, err
+			return allItems, lastDetectionTime, err
 		}
 
 		// Parse the response.
@@ -311,7 +312,7 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 		err = json.Unmarshal(body, &response)
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("zendesk api invalid json: %v", err))
-			return nil, lastDetectionTime, err
+			return allItems, lastDetectionTime, err
 		}
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", response))
 

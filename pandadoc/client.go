@@ -28,6 +28,9 @@ const (
 
 	// defaultPollInterval is how long fetchEvents idles between polling ticks.
 	defaultPollInterval = 30 * time.Second
+
+	logsPageSize    = 100
+	logsWindowLimit = 10000
 )
 
 // queryTimeLayout is the layout the adapter renders the since/to query bounds
@@ -38,7 +41,8 @@ const (
 const queryTimeLayout = "2006-01-02T15:04:05.000"
 
 // parseLogTime parses a PandaDoc request_time, accepting the documented
-// zone-less form and falling back to RFC3339Nano for zoned values.
+// zone-less form and falling back to RFC3339Nano for zoned values. UTC for
+// zone-less values is an adapter assumption; the API does not specify a zone.
 func parseLogTime(s string) (time.Time, error) {
 	if t, err := time.ParseInLocation(queryTimeLayout, s, time.UTC); err == nil {
 		return t, nil
@@ -190,8 +194,8 @@ func (a *PandaDocAdapter) fetchEvents() {
 	notBefore := time.Now().Add(-overlapPeriod)
 
 	for !a.doStop.WaitFor(a.pollInterval) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
+		// Successful pages are already marked seen. Ship them even when a
+		// later page failed or shutdown interrupted the paginated request.
 		items, _, _ := a.makeOneRequest(notBefore)
 		if items == nil {
 			continue
@@ -223,91 +227,117 @@ func (a *PandaDocAdapter) fetchEvents() {
 func (a *PandaDocAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Time, error) {
 	var allItems []utils.Dict
 	currentTime := time.Now()
-	var start string
+	start := currentTime.Add(-overlapPeriod)
+	if start.Before(since) {
+		start = since
+	}
+	start = start.UTC().Truncate(time.Millisecond)
+	until := currentTime.UTC().Truncate(time.Millisecond)
 	var lastDetectionTime time.Time
 
-	if t := currentTime.Add(-overlapPeriod); t.Before(since) {
-		start = since.UTC().Truncate(time.Millisecond).Format(queryTimeLayout)
-	} else {
-		start = currentTime.Add(-overlapPeriod).UTC().Truncate(time.Millisecond).Format(queryTimeLayout)
-	}
-	until := currentTime.UTC().Truncate(time.Millisecond).Format(queryTimeLayout)
-
-	for page := 1; ; page++ {
-		// Prepare the request.
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s?since=%s&to=%s&page=%d", a.logsURL, start, until, page))
-		req, err := http.NewRequest("GET", fmt.Sprintf("%s?since=%s&to=%s&page=%d", a.logsURL, start, until, page), nil)
-		if err != nil {
-			a.doStop.Set()
-			return nil, lastDetectionTime, err
-		}
-
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", fmt.Sprintf("Api-Key %s", a.conf.ApiKey))
-
-		// Issue the request.
-		resp, err := a.httpClient.Do(req)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
-			return nil, lastDetectionTime, err
-		}
-		defer resp.Body.Close()
-
-		// Evaluate if success.
-		if resp.StatusCode != http.StatusOK {
-			body, _ := ioutil.ReadAll(resp.Body)
-			// err is nil here; build a real one so callers can tell a failure
-			// apart from a successful empty poll.
-			err = fmt.Errorf("pandadoc api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, req.URL.String(), string(body))
-			a.conf.ClientOptions.OnError(err)
-			return nil, lastDetectionTime, err
-		}
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error: %v", err))
-			return nil, lastDetectionTime, err
-		}
-
-		// Parse the response.
-		var response struct {
-			Logs []utils.Dict `json:"results"`
-		}
-		err = json.Unmarshal(body, &response)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("pandadoc api invalid json: %v", err))
-			return nil, lastDetectionTime, err
-		}
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", response))
-
-		// Collect items.
-		items := response.Logs
-		var newItems []utils.Dict
-		lastDetectionTime = since
-		for _, item := range items {
-			timestamp, _ := item["request_time"].(string)
-			eventid, _ := item["id"].(string)
-			if _, ok := a.dedupe[eventid]; ok {
-				continue
+	// PandaDoc forbids count*page > 10000 and returns no total. A full
+	// final legal page is ambiguous, so revisit smaller time windows. Keep
+	// collected records (and their dedupe entries) across those revisits.
+	type logWindow struct{ start, end time.Time }
+	windows := []logWindow{{start, until}}
+	var windowErr error
+	for len(windows) != 0 {
+		window := windows[len(windows)-1]
+		windows = windows[:len(windows)-1]
+		start, until := window.start.Format(queryTimeLayout), window.end.Format(queryTimeLayout)
+		for page := 1; page <= logsWindowLimit/logsPageSize; page++ {
+			if a.doStop.IsSet() {
+				return allItems, lastDetectionTime, context.Canceled
 			}
-			epoch, perr := parseLogTime(timestamp)
-			if perr != nil {
-				// Without a usable request_time the dedupe entry would be
-				// culled immediately and the record would re-ship every poll.
-				// Stamp it with now so it survives the overlap window.
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("unparseable request_time %q: %v", timestamp, perr))
-				epoch = time.Now()
+			// Prepare the request.
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s?since=%s&to=%s&page=%d&count=%d", a.logsURL, start, until, page, logsPageSize))
+			req, err := http.NewRequest("GET", fmt.Sprintf("%s?since=%s&to=%s&page=%d&count=%d", a.logsURL, start, until, page, logsPageSize), nil)
+			if err != nil {
+				a.doStop.Set()
+				return allItems, lastDetectionTime, err
 			}
-			a.dedupe[eventid] = epoch.Unix()
-			newItems = append(newItems, item)
-			lastDetectionTime = epoch
-		}
-		allItems = append(allItems, newItems...)
 
-		// There is no paging data returned in the requests so you only know if there is more data if you iterate through
-		// additional pages after the first 100 items are returned
-		if len(items) < 100 {
-			break
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", fmt.Sprintf("Api-Key %s", a.conf.ApiKey))
+
+			// Issue the request.
+			resp, err := a.httpClient.Do(req)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
+				return allItems, lastDetectionTime, err
+			}
+			body, readErr := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("error: %v", readErr))
+				return allItems, lastDetectionTime, readErr
+			}
+
+			// Evaluate if success.
+			if resp.StatusCode != http.StatusOK {
+				// err is nil here; build a real one so callers can tell a failure
+				// apart from a successful empty poll.
+				err = fmt.Errorf("pandadoc api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, req.URL.String(), string(body))
+				a.conf.ClientOptions.OnError(err)
+				return allItems, lastDetectionTime, err
+			}
+
+			// Parse the response.
+			var response struct {
+				Logs []utils.Dict `json:"results"`
+			}
+			err = json.Unmarshal(body, &response)
+			if err != nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("pandadoc api invalid json: %v", err))
+				return allItems, lastDetectionTime, err
+			}
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", response))
+
+			// Collect items.
+			items := response.Logs
+			var newItems []utils.Dict
+			lastDetectionTime = since
+			for _, item := range items {
+				timestamp, _ := item["request_time"].(string)
+				eventid, _ := item["id"].(string)
+				if _, ok := a.dedupe[eventid]; ok {
+					continue
+				}
+				epoch, perr := parseLogTime(timestamp)
+				if perr != nil {
+					// Without a usable request_time the dedupe entry would be
+					// culled immediately and the record would re-ship every poll.
+					// Stamp it with now so it survives the overlap window.
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf("unparseable request_time %q: %v", timestamp, perr))
+					epoch = time.Now()
+				}
+				a.dedupe[eventid] = epoch.Unix()
+				newItems = append(newItems, item)
+				lastDetectionTime = epoch
+			}
+			allItems = append(allItems, newItems...)
+
+			if len(items) < logsPageSize {
+				break
+			}
+			if page == logsWindowLimit/logsPageSize {
+				if window.start.Equal(window.end) {
+					// Even exactly 10000 records is ambiguous at this precision.
+					// Report it rather than silently declaring the window complete.
+					windowErr = fmt.Errorf("pandadoc pagination limit reached at %s: cannot subdivide below one millisecond", start)
+					a.conf.ClientOptions.OnError(windowErr)
+					break
+				}
+				mid := window.start.Add(window.end.Sub(window.start) / 2).Truncate(time.Millisecond)
+				rightStart := mid
+				if mid.Equal(window.start) {
+					// Adjacent milliseconds can only be queried individually.
+					rightStart = window.end
+				}
+				// Overlap at the midpoint where possible; dedupe absorbs it.
+				// Both children strictly shrink, bounding the subdivision depth.
+				windows = append(windows, logWindow{rightStart, window.end}, logWindow{window.start, mid})
+			}
 		}
 	}
 
@@ -318,5 +348,5 @@ func (a *PandaDocAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Ti
 		}
 	}
 
-	return allItems, lastDetectionTime, nil
+	return allItems, lastDetectionTime, windowErr
 }

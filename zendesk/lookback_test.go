@@ -22,9 +22,8 @@ import (
 )
 
 // numericIDFixture builds an audit log record the way Zendesk actually returns
-// one: id typed as an integer, so it arrives as a JSON number. The shared
-// fixtures use string ids because the adapter previously could not consume
-// anything else.
+// one: id typed as an integer, so it arrives as a JSON number, as in the
+// shared fixtures.
 func numericIDFixture(id int, createdAt time.Time, action string) utils.Dict {
 	r := auditLogFixture(fmt.Sprintf("%d", id), createdAt, action)
 	r["id"] = id

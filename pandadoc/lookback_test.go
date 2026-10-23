@@ -77,7 +77,7 @@ func (m *windowRecorder) handler(t *testing.T) http.HandlerFunc {
 }
 
 // documentedEntry builds a log entry whose request_time uses the zone-less
-// form PandaDoc documents, rather than the RFC3339 form the fixtures use.
+// form PandaDoc documents, also used by the shared fixtures.
 func documentedEntry(id string, requestTime time.Time) utils.Dict {
 	e := auditLogEntry(id, requestTime)
 	e["request_time"] = requestTime.UTC().Truncate(time.Millisecond).Format(documentedTimeLayout)
@@ -177,7 +177,7 @@ func TestParseLogTimeAcceptsDocumentedForm(t *testing.T) {
 	assert.NoError(t, err)
 	assert.False(t, parsed.IsZero())
 
-	// The zoned form the fixtures use must still parse.
+	// Zoned values must still parse for compatibility.
 	parsed, err = parseLogTime("2024-07-15T18:59:38.000Z")
 	assert.NoError(t, err)
 	assert.False(t, parsed.IsZero())

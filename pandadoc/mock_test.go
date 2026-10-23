@@ -29,9 +29,7 @@ import (
 // https://developers.pandadoc.com/reference/listlogsv2); the adapter still
 // targets v1, so the mock does too.
 
-// mockPageSize mirrors the PandaDoc API's default page size of 100 records;
-// the adapter does not send a `count` parameter and assumes a short page
-// (fewer than 100 records) means the result set is exhausted.
+// mockPageSize mirrors the API default; explicit count values are validated too.
 const mockPageSize = 100
 
 // queryTimeLayout (the layout the adapter renders `since`/`to` in: ISO-8601
@@ -80,13 +78,14 @@ type recordedRequest struct {
 	since  string
 	to     string
 	page   int
+	count  int
 }
 
 // mockPandaDoc is an in-memory stand-in for the PandaDoc audit-logs API
 // (GET /public/v1/logs). It validates the `Authorization: Api-Key <key>`
 // header, honours the adapter's `since`/`to` time window and 1-based `page`
-// parameter, paginates over an in-memory log set in pages of 100 (the API's
-// default `count`), and returns the {"results": [...]} envelope.
+// parameter, honours count (default 100) and the 10000-item ceiling,
+// and returns the {"results": [...]} envelope.
 type mockPandaDoc struct {
 	mu       sync.Mutex
 	apiKey   string
@@ -149,9 +148,12 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer m.mu.Unlock()
 
 	q := r.URL.Query()
-	page := 1
-	if p, err := strconv.Atoi(q.Get("page")); err == nil && p >= 1 {
-		page = p
+	page, count := 1, mockPageSize
+	if q.Has("page") {
+		page, _ = strconv.Atoi(q.Get("page"))
+	}
+	if q.Has("count") {
+		count, _ = strconv.Atoi(q.Get("count"))
 	}
 	m.requests = append(m.requests, recordedRequest{
 		method: r.Method,
@@ -159,6 +161,7 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		since:  q.Get("since"),
 		to:     q.Get("to"),
 		page:   page,
+		count:  count,
 	})
 
 	if r.Method != http.MethodGet {
@@ -170,6 +173,11 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"type":   "authorization_error",
 			"detail": "Authentication credentials were not provided or are incorrect.",
 		})
+		return
+	}
+
+	if count < 1 || count > 1000 || page < 1 || page > 10000/count {
+		writeJSONStatus(w, http.StatusBadRequest, utils.Dict{"detail": "count must be 1..1000, page >= 1, count*page <= 10000"})
 		return
 	}
 
@@ -191,7 +199,7 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		t, perr := time.Parse(time.RFC3339Nano, rt)
+		t, perr := time.ParseInLocation(fixtureTimeLayout, rt, time.UTC)
 		if perr != nil {
 			continue
 		}
@@ -201,10 +209,10 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		window = append(window, entry)
 	}
 
-	// Paginate; page is 1-based, pages hold mockPageSize records.
+	// Paginate using the requested count, with a 1-based page.
 	var pageItems []utils.Dict
-	if start := (page - 1) * mockPageSize; start < len(window) {
-		end := start + mockPageSize
+	if start := (page - 1) * count; start < len(window) {
+		end := start + count
 		if end > len(window) {
 			end = len(window)
 		}
@@ -239,12 +247,9 @@ func writeJSONStatus(w http.ResponseWriter, status int, d utils.Dict) {
 
 // --- realistic log fixtures ---------------------------------------------------
 
-// fixtureTimeLayout renders fixture timestamps with millisecond precision and
-// an explicit zone designator. PandaDoc's documented example timestamps
-// ("2024-07-15T18:59:38.000") carry millisecond precision but no zone; the
-// fixture appends one because the adapter parses request_time with
-// time.RFC3339Nano (see makeOneRequest in client.go), which requires it.
-const fixtureTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+// fixtureTimeLayout matches PandaDoc's zone-less millisecond examples.
+// The mock assumes UTC, as the adapter does; the docs do not specify a zone.
+const fixtureTimeLayout = "2006-01-02T15:04:05.000"
 
 // auditLogEntry returns a record shaped like a documented PandaDoc API log
 // list entry (https://developers.pandadoc.com/reference/list-api-logs):
