@@ -479,12 +479,13 @@ func newThreatLockerAdapter(ctx context.Context, conf ThreatLockerConfig, sink u
 // Close stops the adapter. It is idempotent: repeated calls are no-ops and
 // return the result of the first call.
 func (a *ThreatLockerAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.closeOnce.Do(func() {
 		a.conf.ClientOptions.DebugLog("threatlocker: closing")
 		a.doStop.Set()
 		a.wgSenders.Wait()
 		err1 := a.uspClient.Drain(1 * time.Minute)
-		_, err2 := a.uspClient.Close()
+		_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 		a.client.Close()
 		if a.ownsDeduper {
 			a.deduper.Close()
@@ -702,7 +703,9 @@ func (a *ThreatLockerAdapter) ship(feed ThreatLockerFeed, item utils.Dict) bool 
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("threatlocker: Ship(): %v", err))
+			}
 			a.doStop.Set()
 			return false
 		}

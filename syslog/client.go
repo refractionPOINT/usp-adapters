@@ -164,6 +164,7 @@ func newSyslogAdapter(ctx context.Context, conf SyslogConfig, sink uspSink) (*Sy
 }
 
 func (a *SyslogAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	var err1 error
@@ -173,17 +174,8 @@ func (a *SyslogAdapter) Close() error {
 		err1 = a.udpListener.Close()
 	}
 	err2 := a.uspClient.Drain(1 * time.Minute)
-	_, err3 := a.uspClient.Close()
-
-	if err1 != nil {
-		return err1
-	}
-
-	if err2 != nil {
-		return err2
-	}
-
-	return err3
+	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
+	return errors.Join(err1, err2, err3)
 }
 
 func (a *SyslogAdapter) handleTCPConnections() {
@@ -269,6 +261,8 @@ func (a *SyslogAdapter) handleLine(line []byte) {
 		err = a.uspClient.Ship(msg, 1*time.Hour)
 	}
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		if err != uspclient.ErrorClosed {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		}
 	}
 }

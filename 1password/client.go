@@ -136,11 +136,12 @@ func NewOnePasswordpAdapter(ctx context.Context, conf OnePasswordConfig) (*OnePa
 }
 
 func (a *OnePasswordAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.httpClient.CloseIdleConnections()
 
 	if err1 != nil {
@@ -192,7 +193,9 @@ func (a *OnePasswordAdapter) fetchEvents(url string) {
 					if err == nil {
 						continue
 					}
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					if err != uspclient.ErrorClosed {
+						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					}
 					a.doStop.Set()
 					return
 				}

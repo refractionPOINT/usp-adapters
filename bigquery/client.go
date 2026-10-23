@@ -7,15 +7,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/refractionPOINT/go-uspclient"
-	"github.com/refractionPOINT/go-uspclient/protocol"
-	"strings"
 	"sync"
 	"time"
 
 	"cloud.google.com/go/bigquery"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
+
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/credguard"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 type BigQueryAdapter struct {
@@ -68,12 +70,12 @@ func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdap
 		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithoutAuthentication()); err != nil {
 			return nil, nil, err
 		}
-	} else if !strings.HasPrefix(bq.conf.ServiceAccountCreds, "{") {
-		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithCredentialsFile(bq.conf.ServiceAccountCreds)); err != nil {
-			return nil, nil, err
-		}
 	} else {
-		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, option.WithCredentialsJSON([]byte(bq.conf.ServiceAccountCreds))); err != nil {
+		credOpt, cerr := credguard.CredentialOption(bq.conf.ServiceAccountCreds)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		if bq.client, err = bigquery.NewClient(context.Background(), bq.conf.ProjectId, credOpt); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -101,7 +103,10 @@ func NewBigQueryAdapter(ctx context.Context, conf BigQueryConfig) (*BigQueryAdap
 		for {
 			err = bq.lookupAndSend(bq.ctx)
 			if err != nil {
-				bq.conf.ClientOptions.OnError(fmt.Errorf("bigquery error: %v", err))
+				// A closed client is the adapter shutting down, not a failure.
+				if !errors.Is(err, uspclient.ErrorClosed) {
+					bq.conf.ClientOptions.OnError(fmt.Errorf("bigquery error: %v", err))
+				}
 				return
 			}
 			if bq.conf.IsOneTimeLoad {
@@ -185,7 +190,9 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 					err = bq.uspClient.Ship(msg, 1*time.Hour)
 				}
 				if err != nil {
-					bq.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
+					if err != uspclient.ErrorClosed {
+						bq.conf.ClientOptions.OnError(fmt.Errorf("ship(): %v", err))
+					}
 					errChan <- err
 					return
 				}
@@ -205,12 +212,13 @@ func (bq *BigQueryAdapter) lookupAndSend(ctx context.Context) error {
 }
 
 func (bq *BigQueryAdapter) Close() error {
+	defer utils.StopBlockedProducers(bq.uspClient)()
 	bq.conf.ClientOptions.DebugLog("closing")
 	bq.cancel() // cancel the context
 	bq.wg.Wait()
 	bq.client.Close()
 	err1 := bq.uspClient.Drain(1 * time.Minute)
-	_, err2 := bq.uspClient.Close()
+	_, err2 := utils.CloseUSP(bq.uspClient, bq.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1

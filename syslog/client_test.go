@@ -105,6 +105,28 @@ func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 func (s *captureSink) Drain(time.Duration) error               { return nil }
 func (s *captureSink) Close() ([]*protocol.DataMessage, error) { return nil, nil }
 
+type unconfirmedCloseSink struct{ captureSink }
+
+func (s *unconfirmedCloseSink) Drain(time.Duration) error { return context.DeadlineExceeded }
+func (s *unconfirmedCloseSink) Close() ([]*protocol.DataMessage, error) {
+	return []*protocol.DataMessage{{SeqNum: 7, TextPayload: "unconfirmed"}}, nil
+}
+
+func TestClosePreservesUnconfirmedDeliveryWhenListenerCloseFails(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	require.NoError(t, listener.Close())
+	// No warning callback: callers must get uncertainty through the returned
+	// error even if source cleanup has already produced its own error.
+	a := &SyslogAdapter{listener: listener, uspClient: &unconfirmedCloseSink{},
+		conf: SyslogConfig{ClientOptions: uspclient.ClientOptions{DebugLog: func(string) {}}}}
+	err = a.Close()
+	var pending *utils.UnackedMessagesError
+	if !errors.Is(err, net.ErrClosed) || !errors.Is(err, context.DeadlineExceeded) || !errors.As(err, &pending) || pending.Count != 1 || pending.FirstSeq != 7 {
+		t.Fatalf("Close hid cleanup or unconfirmed delivery: %v", err)
+	}
+}
+
 func (s *captureSink) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
