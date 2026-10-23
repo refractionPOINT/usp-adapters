@@ -83,7 +83,8 @@ type ZendeskAdapter struct {
 	wgSenders sync.WaitGroup
 	doStop    *utils.Event
 
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	dedupe map[string]int64
 }
@@ -164,6 +165,7 @@ func newZendeskAdapter(ctx context.Context, conf ZendeskConfig, sink uspSink) (*
 		},
 	}
 
+	a.ctx, a.cancel = context.WithCancel(a.ctx)
 	a.now = time.Now
 	a.wait = a.doStop.WaitFor
 	a.chStopped = make(chan struct{})
@@ -183,6 +185,9 @@ func (a *ZendeskAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
+	if a.cancel != nil {
+		a.cancel()
+	}
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
@@ -199,49 +204,70 @@ func (a *ZendeskAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", logsEndpoint))
 
-	var state *utils.LogPollState
+	var state *pollState
 	delay := a.pollInterval
 	for !a.wait(delay) {
 		now := a.now()
 		if state == nil {
-			state = utils.NewLogPollState(now, overlapPeriod)
+			state = newPollState(now, overlapPeriod)
 		}
-		start, end, expired := state.Window(now)
+		if err := state.failureError(now); err != nil {
+			a.doStop.Set()
+			a.conf.ClientOptions.OnError(err)
+			return
+		}
+		start, end, expired := state.window(now)
 		if expired {
 			a.conf.ClientOptions.OnWarning("poll catch-up exceeded 24 hours; older unread records may be lost")
 		}
 		// Successful pages are already marked seen. Ship them before handling
 		// errors: the consumer's OnError callback may terminate this instance.
-		items, _, pollErr := a.requestWindow(start, end)
+		pollCtx, cancel := state.requestContext(a.ctx, now)
+		items, _, pollErr := a.requestWindowContext(pollCtx, start, end)
+		cancel()
+		// Record failure before shipping partial pages so back-pressure cannot
+		// postpone the continuous-failure deadline.
+		retryDelay, retryable := state.retryDelay(pollErr, a.now())
 
 		for _, item := range items {
 			msg := &protocol.DataMessage{
 				JsonPayload: item,
 				TimestampMs: uint64(a.now().UnixNano() / int64(time.Millisecond)),
 			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+			if err := a.uspClient.Ship(msg, state.budgetDelay(10*time.Second, a.now())); err != nil {
 				if err == uspclient.ErrorBufferFull {
 					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
+					err = a.uspClient.Ship(msg, state.budgetDelay(time.Hour, a.now()))
 				}
 				if err == nil {
 					continue
 				}
 				if err != uspclient.ErrorClosed {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					if failureErr := state.failureError(a.now()); failureErr != nil {
+						a.conf.ClientOptions.OnError(failureErr)
+					} else {
+						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					}
 				}
 				a.doStop.Set()
 				return
 			}
 		}
-		if pollErr == nil {
-			state.Complete(end)
-			delay = a.pollInterval
-		} else if a.doStop.IsSet() && errors.Is(pollErr, context.Canceled) {
+		if a.doStop.IsSet() && errors.Is(pollErr, context.Canceled) {
 			return
-		} else if retryDelay, retryable := state.RetryDelay(pollErr, a.now()); retryable {
-			delay = retryDelay
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("poll failed; retrying in %s: %v", delay, pollErr))
+		}
+		// A late successful response cannot erase a deadline already passed.
+		if err := state.failureError(a.now()); err != nil {
+			a.doStop.Set()
+			a.conf.ClientOptions.OnError(err)
+			return
+		}
+		if pollErr == nil {
+			state.complete(end)
+			delay = a.pollInterval
+		} else if retryable {
+			delay = state.budgetDelay(retryDelay, a.now())
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("poll failed; backing off for up to %s: %v", delay, pollErr))
 		} else {
 			a.doStop.Set()
 			a.conf.ClientOptions.OnError(pollErr)
@@ -259,6 +285,10 @@ func (a *ZendeskAdapter) makeOneRequest(since time.Time) ([]utils.Dict, time.Tim
 }
 
 func (a *ZendeskAdapter) requestWindow(since, currentTime time.Time) ([]utils.Dict, time.Time, error) {
+	return a.requestWindowContext(context.Background(), since, currentTime)
+}
+
+func (a *ZendeskAdapter) requestWindowContext(ctx context.Context, since, currentTime time.Time) ([]utils.Dict, time.Time, error) {
 	var allItems []utils.Dict
 	// Retain seen IDs for the entire unread range, including catch-up after
 	// an outage. Culling at now-overlap would replay already shipped pages.
@@ -279,9 +309,12 @@ func (a *ZendeskAdapter) requestWindow(since, currentTime time.Time) ([]utils.Di
 		if a.doStop.IsSet() {
 			return allItems, lastDetectionTime, context.Canceled
 		}
+		if err := ctx.Err(); err != nil {
+			return allItems, lastDetectionTime, newPollRetry(err, "")
+		}
 		// Prepare the request.
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s", url))
-		req, err := http.NewRequest("GET", url, nil)
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err == nil && ((req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.Host == "") {
 			err = errors.New("logs URL must be an absolute HTTP or HTTPS URL")
 		}
@@ -301,12 +334,12 @@ func (a *ZendeskAdapter) requestWindow(since, currentTime time.Time) ([]utils.Di
 		// Issue the request.
 		resp, err := a.httpClient.Do(req)
 		if err != nil {
-			return allItems, lastDetectionTime, utils.NewLogPollRetry(fmt.Errorf("http.Client.Do(): %w", err), "")
+			return allItems, lastDetectionTime, newPollRetry(fmt.Errorf("http.Client.Do(): %w", err), "")
 		}
 		body, readErr := ioutil.ReadAll(resp.Body)
 		resp.Body.Close()
 		if readErr != nil && resp.StatusCode == http.StatusOK {
-			return allItems, lastDetectionTime, utils.NewLogPollRetry(readErr, resp.Header.Get("Retry-After"))
+			return allItems, lastDetectionTime, newPollRetry(readErr, resp.Header.Get("Retry-After"))
 		}
 
 		// Evaluate if success.
@@ -314,8 +347,8 @@ func (a *ZendeskAdapter) requestWindow(since, currentTime time.Time) ([]utils.Di
 			// err is nil here; build a real one so callers can tell a failure
 			// apart from a successful empty poll.
 			err = fmt.Errorf("zendesk api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, url, string(body))
-			if utils.LogPollRetryableStatus(resp.StatusCode) {
-				return allItems, lastDetectionTime, utils.NewLogPollRetry(err, resp.Header.Get("Retry-After"))
+			if pollRetryableStatus(resp.StatusCode) {
+				return allItems, lastDetectionTime, newPollRetry(err, resp.Header.Get("Retry-After"))
 			}
 			return allItems, lastDetectionTime, err
 		}
@@ -335,7 +368,7 @@ func (a *ZendeskAdapter) requestWindow(since, currentTime time.Time) ([]utils.Di
 		}
 		err = json.Unmarshal(body, &response)
 		if err != nil {
-			return allItems, lastDetectionTime, utils.NewLogPollRetry(fmt.Errorf("zendesk api invalid json: %w", err), "")
+			return allItems, lastDetectionTime, newPollRetry(fmt.Errorf("zendesk api invalid json: %w", err), "")
 		}
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", response))
 
@@ -368,7 +401,7 @@ func (a *ZendeskAdapter) requestWindow(since, currentTime time.Time) ([]utils.Di
 		}
 		if response.Links.Next == "" {
 			// An incomplete page chain cannot advance the completed window.
-			return allItems, lastDetectionTime, utils.NewLogPollRetry(errors.New("zendesk pagination has_more without links.next"), "")
+			return allItems, lastDetectionTime, newPollRetry(errors.New("zendesk pagination has_more without links.next"), "")
 		}
 		url = response.Links.Next
 	}

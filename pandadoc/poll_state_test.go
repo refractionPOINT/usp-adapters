@@ -1,4 +1,4 @@
-package utils
+package usp_pandadoc
 
 import (
 	"errors"
@@ -11,17 +11,17 @@ import (
 
 func TestLogPollBoundedBackoff(t *testing.T) {
 	now := time.Date(2024, 7, 15, 19, 0, 0, 0, time.UTC)
-	state := NewLogPollState(now, 30*time.Minute)
-	err := NewLogPollRetry(errors.New("temporary"), "")
+	state := newPollState(now, 30*time.Minute)
+	err := newPollRetry(errors.New("temporary"), "")
 	for _, want := range []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
-		delay, retryable := state.RetryDelay(err, now)
+		delay, retryable := state.retryDelay(err, now)
 		require.True(t, retryable)
 		require.Equal(t, want, delay)
 	}
-	_, retryable := state.RetryDelay(errors.New("permanent"), now)
+	_, retryable := state.retryDelay(errors.New("permanent"), now)
 	require.False(t, retryable)
-	state.Complete(now)
-	delay, _ := state.RetryDelay(err, now)
+	state.complete(now)
+	delay, _ := state.retryDelay(err, now)
 	require.Equal(t, 30*time.Second, delay, "complete success resets fallback backoff")
 }
 
@@ -40,8 +40,8 @@ func TestLogPollRetryAfter(t *testing.T) {
 		{"9223372036854775807", time.Duration(1<<63 - 1)},
 	} {
 		t.Run(tc.header, func(t *testing.T) {
-			state := NewLogPollState(now, 30*time.Minute)
-			delay, retryable := state.RetryDelay(NewLogPollRetry(errors.New("temporary"), tc.header), now)
+			state := newPollState(now, 30*time.Minute)
+			delay, retryable := state.retryDelay(newPollRetry(errors.New("temporary"), tc.header), now)
 			require.True(t, retryable)
 			require.Equal(t, tc.want, delay)
 		})

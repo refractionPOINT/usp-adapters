@@ -138,13 +138,14 @@ func TestTransientPollFailuresKeepState(t *testing.T) {
 	}
 }
 
-// An unread page remains reachable after an outage longer than the overlap.
-// The next successful poll advances by its END and still reaches late arrivals.
-func TestPollCatchupAfterLongOutage(t *testing.T) {
+// Unread records can age beyond the overlap during a shorter outage. Recover
+// within the retry budget, then advance by the complete END for late arrivals.
+func TestPollCatchupWithinRetryBudget(t *testing.T) {
 	h := newPollHarness(t, twoPageAPI(t))
+	fixtureTime := h.now.Add(-20 * time.Minute)
 	mock := newMockZendesk(mockEmail, mockToken)
 	for i := 0; i < 150; i++ {
-		mock.addLog(auditLogFixture(fmt.Sprint(10000+i), h.now.Add(-20*time.Minute), "update"))
+		mock.addLog(auditLogFixture(fmt.Sprint(10000+i), fixtureTime, "update"))
 	}
 	server := httptest.NewServer(mock.handler(t))
 	defer server.Close()
@@ -166,7 +167,7 @@ func TestPollCatchupAfterLongOutage(t *testing.T) {
 	})
 	h.beforeWait = func(step int) {
 		if step == 2 {
-			h.now = h.now.Add(45 * time.Minute)
+			h.now = h.now.Add(25 * time.Minute)
 		}
 		if step == 4 {
 			mock.addLog(auditLogFixture("99999", h.now.Add(-5*time.Minute), "update"))
@@ -178,11 +179,13 @@ func TestPollCatchupAfterLongOutage(t *testing.T) {
 	require.Len(t, windows, 4)
 	require.Equal(t, windows[0][0], windows[1][0], "failure must preserve the unread start")
 	require.Equal(t, windows[0][0], windows[2][0], "repeated failures must not advance the unread start")
-	require.Greater(t, windows[1][1].Sub(windows[0][1]), overlapPeriod)
+	require.Greater(t, windows[1][1].Sub(fixtureTime), overlapPeriod)
 	require.Equal(t, windows[2][1].Add(-overlapPeriod), windows[3][0], "advance only from the completed poll END, keeping the whole overlap")
 	require.True(t, windows[3][0].After(windows[0][0]), "start must not stay frozen after success")
 }
 
+// A long pause between successful polls still bounds catch-up. This is not
+// a continuously failing instance surviving beyond the fatal threshold.
 func TestPollCatchupBoundWarns(t *testing.T) {
 	h := newPollHarness(t, twoPageAPI(t))
 	transport := h.a.httpClient.Transport
@@ -195,9 +198,6 @@ func TestPollCatchupBoundWarns(t *testing.T) {
 			start, end := pollBounds(t, r)
 			windows = append(windows, [2]time.Time{start, end})
 		}
-		if len(windows) == 1 {
-			return pollResponse(503, ""), nil
-		}
 		return transport.RoundTrip(r)
 	})
 	h.beforeWait = func(step int) {
@@ -208,7 +208,7 @@ func TestPollCatchupBoundWarns(t *testing.T) {
 	h.run(2)
 	require.Empty(t, h.fatal)
 	require.Len(t, windows, 2)
-	require.Equal(t, utils.LogPollMaxCatchup, windows[1][1].Sub(windows[1][0]))
+	require.Equal(t, pollMaxCatchup, windows[1][1].Sub(windows[1][0]))
 	require.Contains(t, strings.Join(h.warnings, " "), "catch-up exceeded 24 hours; older unread records may be lost")
 }
 
@@ -426,7 +426,7 @@ func TestIncompleteCursorRetriesWithoutAdvancing(t *testing.T) {
 	h.beforeWait = func(step int) {
 		if step == 2 {
 			require.Equal(t, 100, h.sink.count())
-			h.now = h.now.Add(45 * time.Minute)
+			h.now = h.now.Add(20 * time.Minute)
 		}
 	}
 	h.run(5)
