@@ -510,8 +510,7 @@ func TestMockPaginationFullDataset(t *testing.T) {
 }
 
 // TestMockBadCredentials pins the adapter's behavior on auth failure: nothing
-// ships, and the adapter does NOT stop -- a non-200 response only logs an
-// error and the polling loop keeps retrying on the next tick.
+// ships, and the fatal authentication error stops polling.
 func TestMockBadCredentials(t *testing.T) {
 	mock := newMockZendesk(mockEmail, mockToken)
 	mock.addLog(auditLogFixture("900000000099", fixtureTime(), "update"))
@@ -532,15 +531,11 @@ func TestMockBadCredentials(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// The mock rejects the credentials on every poll; wait for several polls
-	// to prove the adapter keeps retrying rather than shipping or crashing.
-	require.Eventually(t, func() bool { return mock.authFailureCount() >= 3 },
-		5*time.Second, 20*time.Millisecond, "adapter should keep polling on 401")
-
 	select {
 	case <-chStopped:
-		t.Fatal("adapter unexpectedly stopped on auth failure (pinned behavior: it keeps polling)")
-	default:
+	case <-time.After(3 * time.Second):
+		t.Fatal("adapter did not stop on authentication failure")
 	}
+	assert.Equal(t, 1, mock.authFailureCount())
 	assert.Equal(t, 0, sink.count(), "nothing must ship when authentication fails")
 }

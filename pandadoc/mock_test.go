@@ -466,8 +466,7 @@ func TestMockPaginationFullDataset(t *testing.T) {
 }
 
 // TestMockBadAPIKeyShipsNothing pins the adapter's actual behavior on an auth
-// failure: nothing is shipped, the error is surfaced via OnError, and the
-// adapter does not stop -- it keeps polling on its interval.
+// failure: nothing is shipped, the fatal error is surfaced once and polling stops.
 func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 	mock := newMockPandaDoc("the-correct-fake-key")
 	server := httptest.NewServer(mock)
@@ -497,20 +496,18 @@ func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// The adapter keeps polling despite the 401s...
-	require.Eventually(t, func() bool { return mock.requestCount() >= 3 },
-		5*time.Second, 10*time.Millisecond, "the adapter should keep polling after a 401")
-	// ...reports the failure...
+	// Authentication failures are permanent and must invoke the fatal
+	// callback once, after which polling stops.
+	select {
+	case <-chStopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("adapter did not stop on authentication failure")
+	}
 	mu.Lock()
 	gotErrors := apiErrors
 	mu.Unlock()
-	assert.GreaterOrEqual(t, gotErrors, 1, "a 401 must be surfaced via OnError")
-	// ...does not stop on its own...
-	select {
-	case <-chStopped:
-		t.Fatal("the adapter is not expected to stop on an auth failure (current behavior)")
-	default:
-	}
+	assert.Equal(t, 1, gotErrors)
+	assert.Equal(t, 1, mock.requestCount())
 	// ...and never ships anything.
 	assert.Equal(t, 0, sink.count(), "nothing may ship when authentication fails")
 }

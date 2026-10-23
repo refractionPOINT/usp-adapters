@@ -136,6 +136,28 @@ func TestFetchEventsShipsPartialResults(t *testing.T) {
 				handler.ServeHTTP(w, r)
 			}))
 			defer server.Close()
+			if !shutdown {
+				h := newPollHarness(t, server.Config.Handler)
+				h.now = time.Now()
+				h.beforeWait = func(step int) {
+					if step == 2 {
+						require.Equal(t, 100, h.sink.count(), "successful page must ship before retrying the failed page")
+						retryAllowed.Store(true)
+					}
+				}
+				h.run(3)
+				require.Empty(t, h.fatal)
+				require.Equal(t, 150, h.sink.count())
+				counts := map[string]int{}
+				for _, msg := range h.sink.snapshot() {
+					counts[recordID(msg.JsonPayload["id"])]++
+				}
+				require.Len(t, counts, 150)
+				for id, count := range counts {
+					assert.Equal(t, 1, count, "ID %s", id)
+				}
+				return
+			}
 			sink := &captureSink{}
 			a, _ := startMockAdapter(t, server.URL, sink)
 			if shutdown {
@@ -156,20 +178,6 @@ func TestFetchEventsShipsPartialResults(t *testing.T) {
 				}
 				require.Equal(t, 100, sink.count())
 				return
-			}
-			defer a.Close()
-			require.Eventually(t, func() bool { return sink.count() == 100 }, 3*time.Second, 5*time.Millisecond,
-				"successful page must ship while page 2 is still failing")
-			retryAllowed.Store(true)
-			require.Eventually(t, func() bool { return sink.count() == 150 }, 3*time.Second, 5*time.Millisecond)
-			counts := map[string]int{}
-			for _, msg := range sink.snapshot() {
-				item := msg.JsonPayload
-				counts[recordID(item["id"])]++
-			}
-			require.Len(t, counts, 150)
-			for id, count := range counts {
-				assert.Equal(t, 1, count, "ID %s", id)
 			}
 		})
 	}
