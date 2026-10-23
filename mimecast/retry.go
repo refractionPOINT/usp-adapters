@@ -104,7 +104,7 @@ func (a *MimecastAdapter) stopOnFailureDeadline() bool {
 // https://developer.services.mimecast.com/api-overview (Rate Limiting).
 // Retry-After is delta seconds or an HTTP-date (RFC 9110, section 10.2.3).
 // If both are supplied, honor the later deadline.
-func retryDeadline(headers http.Header, now time.Time) time.Time {
+func retryDeadline(headers http.Header, now time.Time, quotaExhausted bool) time.Time {
 	var deadline time.Time
 	addDelay := func(value string, unit time.Duration) {
 		n, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
@@ -115,7 +115,11 @@ func retryDeadline(headers http.Header, now time.Time) time.Time {
 			deadline = t
 		}
 	}
-	addDelay(headers.Get("X-RateLimit-Reset"), time.Millisecond)
+	// Reset is present even with quota remaining. It is a required wait only
+	// after throttling or an explicit exhausted-quota response.
+	if quotaExhausted {
+		addDelay(headers.Get("X-RateLimit-Reset"), time.Millisecond)
+	}
 	if value := headers.Get("Retry-After"); value != "" {
 		if date, err := http.ParseTime(value); err == nil {
 			if date.After(deadline) {
@@ -134,7 +138,7 @@ func (a *MimecastAdapter) httpFailure(resp *http.Response, oauth bool) error {
 		message: fmt.Sprintf("mimecast HTTP status %d (oauth=%v)", resp.StatusCode, oauth),
 		fatal: resp.StatusCode >= 400 && resp.StatusCode < 500 &&
 			resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests,
-		retryAt: retryDeadline(resp.Header, a.now()),
+		retryAt: retryDeadline(resp.Header, a.now(), resp.StatusCode == http.StatusTooManyRequests || strings.TrimSpace(resp.Header.Get("X-RateLimit-Remaining")) == "0"),
 	}
 }
 

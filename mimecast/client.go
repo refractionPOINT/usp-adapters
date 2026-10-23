@@ -399,7 +399,11 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 		startTime = a.lastComplete.Add(-a.overlapPeriod)
 	}
 	if floor := currentTime.Add(-maxOverlapPeriod); startTime.Before(floor) {
-		a.conf.ClientOptions.OnWarning(fmt.Sprintf("mimecast unread range %s..%s truncated to the maximum 24h recovery window; older records may be missed", startTime.Format(mimecastTimeLayout), floor.Format(mimecastTimeLayout)))
+		// A healthy poll can trim previously collected overlap at this bound.
+		// Warn only when the bound excludes history not covered by a complete poll.
+		if a.lastComplete.IsZero() || a.lastComplete.Before(floor) {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("mimecast unread range %s..%s truncated to the maximum 24h recovery window; older records may be missed", startTime.Format(mimecastTimeLayout), floor.Format(mimecastTimeLayout)))
+		}
 		startTime = floor
 	}
 	start := startTime.UTC().Format(mimecastTimeLayout)
@@ -551,7 +555,9 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 	// A poll that reads nothing at all, forever, is exactly what the too-short
 	// lookback looked like from the outside. Make the counts visible.
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf("mimecast window %s..%s: %d pages, %d records, %d new, %d tracked", start, end, pages, totalRecords, len(allItems), len(a.dedupe)))
-	if !a.lastComplete.IsZero() {
+	// Recovery reads can be old because polling failed, rather than because
+	// the vendor indexed them late. Do not diagnose indexing lag from them.
+	if !a.lastComplete.IsZero() && a.failureSince.IsZero() {
 		a.warnIfNearWindowEdge(oldestNew)
 	}
 	if pollErr == nil && a.stopOnFailureDeadline() {
