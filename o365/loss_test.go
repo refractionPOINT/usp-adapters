@@ -351,6 +351,59 @@ func TestCloseMidPageLosesNothing(t *testing.T) {
 	}
 }
 
+// blockingSink signals each Ship and waits for release before accepting it.
+type blockingSink struct {
+	captureSink
+	shipped chan struct{}
+	release chan struct{}
+}
+
+func (s *blockingSink) Ship(m *protocol.DataMessage, d time.Duration) error {
+	s.shipped <- struct{}{}
+	<-s.release
+	return s.captureSink.Ship(m, d)
+}
+
+// A stop that lands between two blobs doesn't touch the next blob, even with
+// a deduper that records a key when it checks it.
+func TestStopBetweenBlobsMarksNothing(t *testing.T) {
+	const ct = "Audit.Exchange"
+	m := newFaultMock(t)
+	recs := addBlobs(t, m, ct, 3)
+
+	dd := newLegacyDeduper()
+	sink1 := &blockingSink{shipped: make(chan struct{}, 1), release: make(chan struct{})}
+	conf1 := newTestConfig(t, m.mockO365, ct)
+	conf1.Deduper = dd
+	conf1.PollInterval = time.Hour
+	fastRetries(&conf1)
+	a1, _, close1 := startAdapter(t, conf1, sink1)
+
+	select {
+	case <-sink1.shipped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("blob-1 was never shipped")
+	}
+	// Stop the instance while blob-1's last event is being shipped.
+	closed := make(chan struct{})
+	go func() { close1(); close(closed) }()
+	require.Eventually(t, a1.doStop.IsSet, 5*time.Second, 5*time.Millisecond)
+	close(sink1.release)
+	<-closed
+	assert.Equal(t, 0, m.hit("blob-2"), "blob-2 must not be requested after the stop")
+
+	sink2 := &captureSink{}
+	conf2 := newTestConfig(t, m.mockO365, ct)
+	conf2.Deduper = dd
+	conf2.PollInterval = time.Hour
+	fastRetries(&conf2)
+	startAdapter(t, conf2, sink2)
+
+	require.Eventually(t, func() bool { return sink2.count() == 2 },
+		5*time.Second, 10*time.Millisecond, "the next instance must ship blob-2 and blob-3")
+	assert.Empty(t, lostRecords(t, recs, &sink1.captureSink, sink2))
+}
+
 // A Ship failure stops the instance without recording the unshipped events or
 // their blob as done: the next instance sharing the deduper ships the rest,
 // and doesn't re-ship what was shipped.
