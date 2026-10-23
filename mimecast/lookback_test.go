@@ -237,7 +237,7 @@ func TestNonOKReturnsAnError(t *testing.T) {
 // 30-minute window on a busy tenant paginates on every poll.
 func TestPartialPaginationFailureDoesNotLoseEvents(t *testing.T) {
 	mock, a := newIdleMock(t)
-	// 120 events at the adapter's pageSize of 50 is three pages.
+	// 120 events at the documented maximum page size of 100 span two pages.
 	base := time.Now().Add(-10 * time.Minute)
 	for i := 0; i < 120; i++ {
 		mock.addEvent(fakeLogonEvent(fmt.Sprintf("fake-audit-id-%04d", i), base.Add(time.Duration(i)*time.Millisecond)))
@@ -248,8 +248,9 @@ func TestPartialPaginationFailureDoesNotLoseEvents(t *testing.T) {
 
 	partial, err := a.makeOneRequest()
 	require.Error(t, err, "the failed page must be reported")
-	require.Len(t, partial, 50, "the page that was read successfully must still be returned, not discarded")
+	require.Len(t, partial, 100, "the page that was read successfully must still be returned, not discarded")
 
+	a.retryAt = time.Now() // Other tests verify the retry deadline itself.
 	// The API recovers. Everything not yet delivered must arrive, and nothing
 	// already delivered may repeat.
 	rest, err := a.makeOneRequest()
@@ -304,7 +305,8 @@ func TestPaginationPageCapIsReportedNotSilent(t *testing.T) {
 	a := newIdleAdapter(t, server.URL, &captureSink{}, func(c *MimecastConfig) { c.ClientOptions = opts })
 
 	items, err := a.makeOneRequest()
-	require.NoError(t, err)
+	require.Error(t, err)
+	assert.True(t, a.lastComplete.IsZero(), "an incomplete window must not be checkpointed")
 	assert.Len(t, items, maxPagesPerPoll, "the cap must stop pagination at exactly maxPagesPerPoll pages")
 	assert.Contains(t, logs.joinedWarnings(), "page cap",
 		"a truncated window must be reported")
@@ -326,7 +328,7 @@ func TestTokenIsFetchedOncePerPollNotPerPage(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, items, 120)
 
-	assert.GreaterOrEqual(t, mock.auditCount(), 3, "120 records at pageSize 50 must span at least 3 pages")
+	assert.GreaterOrEqual(t, mock.auditCount(), 2, "120 records at pageSize 100 must span at least 2 pages")
 	assert.Equal(t, 1, mock.tokenCount(), "a multi-page window must not re-authenticate per page")
 
 	// A second poll reuses the cached token: the mock advertises expires_in
@@ -481,6 +483,10 @@ func TestWarnsWhenRecordsArriveNearTheWindowEdge(t *testing.T) {
 		c.OverlapPeriod = "10m"
 	})
 
+	// Establish a complete baseline before assessing newly arriving records.
+	_, err := a.makeOneRequest()
+	require.NoError(t, err)
+
 	// 9 minutes of lag against a 10-minute window is past the 80% threshold.
 	mock.addEvent(fakeLogonEvent("fake-audit-id-late", time.Now().Add(-9*time.Minute)))
 
@@ -611,7 +617,7 @@ func (c *countingTransport) count() int {
 func TestAllRequestsUseTheConfiguredHTTPClient(t *testing.T) {
 	mock := newMockMimecast("cid", "secret")
 	base := time.Now().Add(-10 * time.Minute)
-	for i := 0; i < 120; i++ { // 3 pages at pageSize 50
+	for i := 0; i < 120; i++ { // 2 pages at pageSize 100
 		mock.addEvent(fakeLogonEvent(fmt.Sprintf("fake-audit-id-%04d", i), base.Add(time.Duration(i)*time.Millisecond)))
 	}
 	server := httptest.NewServer(mock.handler(t))
@@ -624,7 +630,7 @@ func TestAllRequestsUseTheConfiguredHTTPClient(t *testing.T) {
 	items, err := a.makeOneRequest()
 	require.NoError(t, err)
 	require.Len(t, items, 120)
-	require.GreaterOrEqual(t, mock.auditCount(), 3, "120 records at pageSize 50 must span at least 3 pages")
+	require.GreaterOrEqual(t, mock.auditCount(), 2, "120 records at pageSize 100 must span at least 2 pages")
 
 	assert.Equal(t, mock.auditCount()+mock.tokenCount(), counter.count(),
 		"every audit page and token exchange must go through the adapter's configured http.Client")
@@ -642,7 +648,8 @@ func TestPartialFailureOnA200IsReported(t *testing.T) {
 	a := newIdleAdapter(t, server.URL, &captureSink{}, func(c *MimecastConfig) { c.ClientOptions = opts })
 
 	items, err := a.makeOneRequest()
-	require.NoError(t, err, "a 200 carrying data is not a poll failure")
+	require.Error(t, err, "a fail[] response is incomplete even when it carries data")
+	assert.True(t, a.lastComplete.IsZero(), "an incomplete response must not advance the checkpoint")
 	require.Len(t, items, 1, "the data alongside the failure must still be collected")
 
 	assert.Contains(t, logs.joinedWarnings(), "partial_failure_1",

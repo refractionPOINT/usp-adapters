@@ -39,13 +39,15 @@ const (
 	maxOverlapPeriod = 24 * time.Hour
 
 	// auditPageSize is the meta.pagination.pageSize the adapter requests.
-	auditPageSize = 50
+	// Mimecast documents page sizes from 1 to 100:
+	// https://developer.services.mimecast.com/api-overview
+	auditPageSize = 100
 
 	// maxPagesPerPoll bounds one poll's pagination. Without it a server that
-	// keeps returning a meta.pagination.next token loops forever. At
-	// auditPageSize this covers 100k records in a single window, far more than
-	// any real overlap period holds.
+	// keeps returning a meta.pagination.next token loops forever. Hitting the
+	// cap leaves the window incomplete; it is retried rather than checkpointed.
 	maxPagesPerPoll = 2000
+	maxRetryBackoff = 5 * time.Minute
 
 	// tokenExpirySafetyMargin is subtracted from the token's advertised
 	// lifetime so a request is never sent with a token about to expire.
@@ -102,13 +104,22 @@ type MimecastAdapter struct {
 	wgSenders sync.WaitGroup
 	doStop    *utils.Event
 
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 
-	// dedupe maps an audit record id to its eventTime in Unix seconds. Because
-	// consecutive polls overlap by design, the same record is returned many
-	// times; this is what keeps it from shipping more than once. Entries are
-	// culled once they fall out of the poll window, which bounds the map to
-	// one overlap period of records.
+	// Poll state is owned by fetchEvents. The clock and interruptible wait are
+	// replaceable in tests; they are not configuration settings.
+	now          func() time.Time
+	wait         func(time.Duration) bool
+	initialStart time.Time
+	lastComplete time.Time
+	retryAt      time.Time
+	retryBackoff time.Duration
+
+	// dedupe maps IDs to the last time they were seen, in Unix seconds. Keep
+	// them for the actual retry window, including records the API returns
+	// outside the requested range. Refreshing on a hit prevents repeat loops
+	// for those records; entries not seen again are eventually evicted.
 	dedupe map[string]int64
 
 	// tokenMu guards the cached OAuth token. The token is fetched once per
@@ -251,7 +262,10 @@ func newMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink) 
 		baseURL:       defaultBaseURL,
 		pollInterval:  defaultPollInterval,
 		overlapPeriod: overlapPeriod,
+		now:           time.Now,
 	}
+	a.ctx, a.cancel = context.WithCancel(a.ctx)
+	a.wait = a.doStop.WaitFor
 	if conf.BaseURL != "" {
 		a.baseURL = strings.TrimRight(conf.BaseURL, "/")
 	}
@@ -264,6 +278,7 @@ func newMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink) 
 	} else {
 		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
 		if err != nil {
+			a.cancel()
 			return nil, nil, err
 		}
 		a.uspClient = uspClient
@@ -295,6 +310,7 @@ func (a *MimecastAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
+	a.cancel()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
@@ -344,25 +360,32 @@ func (a *MimecastAdapter) fetchEvents() {
 // makeOneRequest polls one window of audit events, paginating until the API
 // stops offering a next token.
 //
-// The window is always the last overlapPeriod, with no floor and no moving
-// cursor. An earlier version passed a cursor into a max(cursor, now-overlap)
-// clamp copied from the okta adapter; because that clamp keeps the *later* of
-// the two, a cursor could only ever shrink the window, never extend it, which
-// is what stopped this adapter from ever returning data. A fixed window has no
-// such failure mode: overlapPeriod alone decides the lookback, and the dedupe
-// map absorbs the overlap between consecutive polls.
-//
-// The cost of a fixed window is that a restart re-ships up to one overlap
-// period of events, since the dedupe map is in-memory, and that an outage
-// longer than one overlap period loses the records in the gap. For security
-// telemetry duplicates beat gaps.
+// Cold start reads one overlap period. Thereafter the window starts at the
+// end of the last COMPLETE poll minus overlap, preserving unread ranges over
+// outages. Recovery is bounded to 24 hours, with a warning on truncation.
+// State is in-memory: a process restart replays only the overlap period and
+// cannot recover an older outage. Replay may duplicate records after restart.
 //
 // Records may be returned alongside a non-nil error: pages read before the
 // failure are complete and are reported as seen, so the caller must ship them
 // or they are lost for good.
 func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
-	currentTime := time.Now()
-	start := currentTime.Add(-a.overlapPeriod).UTC().Format(mimecastTimeLayout)
+	if !a.waitForRetry() {
+		return nil, context.Canceled
+	}
+	currentTime := a.now().UTC().Truncate(time.Second)
+	if a.initialStart.IsZero() {
+		a.initialStart = currentTime.Add(-a.overlapPeriod)
+	}
+	startTime := a.initialStart
+	if !a.lastComplete.IsZero() {
+		startTime = a.lastComplete.Add(-a.overlapPeriod)
+	}
+	if floor := currentTime.Add(-maxOverlapPeriod); startTime.Before(floor) {
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("mimecast unread range %s..%s truncated to the maximum 24h recovery window; older records may be missed", startTime.Format(mimecastTimeLayout), floor.Format(mimecastTimeLayout)))
+		startTime = floor
+	}
+	start := startTime.UTC().Format(mimecastTimeLayout)
 	end := currentTime.UTC().Format(mimecastTimeLayout)
 
 	auditURL := a.baseURL + "/api/audit/get-audit-events"
@@ -372,8 +395,8 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 	// for each one doubles the request count against a rate-limited API.
 	token, err := a.getAuthToken()
 	if err != nil {
-		err = fmt.Errorf("mimecast auth: %v", err)
-		a.conf.ClientOptions.OnError(err)
+		err = fmt.Errorf("mimecast auth: %w", err)
+		a.reportPollFailure(err)
 		return nil, err
 	}
 	// A cached token can expire mid-poll. One re-authentication per poll is
@@ -398,11 +421,12 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 	var pollErr error
 
 	pageToken := ""
+	pageTokens := map[string]bool{}
 	for {
 		if pages >= maxPagesPerPoll {
 			// Stop rather than loop forever, but say so: silently truncating a
 			// window reads as "we collected everything" when we did not.
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("mimecast pagination hit the %d page cap for window %s..%s; the remainder of this window was not read", maxPagesPerPoll, start, end))
+			pollErr = fmt.Errorf("mimecast pagination hit the %d page cap for window %s..%s; the remainder of this window was not read", maxPagesPerPoll, start, end)
 			break
 		}
 
@@ -415,17 +439,23 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 				// retry this same page.
 				mayRetryAuth = false
 				a.invalidateAuthToken()
+				var failure *requestFailure
+				if errors.As(pageErr, &failure) && failure.retryAt.After(a.retryAt) {
+					a.retryAt = failure.retryAt
+				}
+				if !a.waitForRetry() {
+					pollErr = context.Canceled
+					break
+				}
 				newToken, authErr := a.getAuthToken()
 				if authErr != nil {
-					pollErr = fmt.Errorf("mimecast re-auth: %v", authErr)
-					a.conf.ClientOptions.OnError(pollErr)
+					pollErr = fmt.Errorf("mimecast re-auth: %w", authErr)
 					break
 				}
 				token = newToken
 				continue
 			}
 			pollErr = pageErr
-			a.conf.ClientOptions.OnError(pollErr)
 			break
 		}
 		pages++
@@ -435,6 +465,7 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 		for _, item := range response.Data {
 			eventID := item.ID
 			if _, ok := a.dedupe[eventID]; ok {
+				a.dedupe[eventID] = currentTime.Unix()
 				continue
 			}
 			if _, ok := seen[eventID]; ok {
@@ -443,17 +474,16 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 
 			epoch, perr := parseEventTime(item.EventTime)
 			if perr != nil {
-				// Without a usable eventTime the dedupe entry would be culled
-				// immediately and the record would re-ship every poll. Stamp
-				// it with now so it survives the overlap window instead.
+				// Keep the record and use discovery time for lag accounting.
+				// Dedupe retention is independent of the vendor timestamp.
 				a.conf.ClientOptions.OnWarning(fmt.Sprintf("unparseable eventTime %q: %v", item.EventTime, perr))
-				epoch = time.Now()
+				epoch = currentTime
 			}
 			if oldestNew.IsZero() || epoch.Before(oldestNew) {
 				oldestNew = epoch
 			}
 
-			seen[eventID] = epoch.Unix()
+			seen[eventID] = currentTime.Unix()
 			allItems = append(allItems, utils.Dict{
 				"id":        item.ID,
 				"auditType": item.AuditType,
@@ -463,27 +493,31 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 				"category":  item.Category,
 			})
 		}
+		if len(response.Fail) != 0 {
+			pollErr = &requestFailure{message: "mimecast api returned an incomplete fail[] response", fatal: hasAuthFailure(response.Fail)}
+			break
+		}
 
 		next := response.Meta.Pagination.Next
 		if next == "" {
 			break
 		}
-		if next == pageToken {
+		if pageTokens[next] {
 			// A token that does not advance would spin until the page cap.
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("mimecast pagination token did not advance (%q); stopping this window early", next))
+			pollErr = errors.New("mimecast pagination token did not advance or cycled; stopping this window early")
 			break
 		}
 		pageToken = next
+		pageTokens[next] = true
 	}
 
 	for k, v := range seen {
 		a.dedupe[k] = v
 	}
 
-	// Cull dedupe entries that have fallen out of the poll window. The cutoff
-	// matches the window start exactly: an entry is dropped only once the
-	// record it guards can no longer be returned.
-	cutoff := time.Now().Add(-a.overlapPeriod).Unix()
+	// Retain IDs seen within the actual retry window, including out-of-range
+	// records. Entries the server no longer returns expire at the window edge.
+	cutoff := startTime.Unix()
 	for k, v := range a.dedupe {
 		if v < cutoff {
 			delete(a.dedupe, k)
@@ -493,14 +527,22 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 	// A poll that reads nothing at all, forever, is exactly what the too-short
 	// lookback looked like from the outside. Make the counts visible.
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf("mimecast window %s..%s: %d pages, %d records, %d new, %d tracked", start, end, pages, totalRecords, len(allItems), len(a.dedupe)))
-	a.warnIfNearWindowEdge(oldestNew)
+	if !a.lastComplete.IsZero() {
+		a.warnIfNearWindowEdge(oldestNew)
+	}
+	if pollErr == nil {
+		a.lastComplete = currentTime
+		a.retryBackoff = 0
+		a.retryAt = time.Time{}
+	} else {
+		a.reportPollFailure(pollErr)
+	}
 
 	return allItems, pollErr
 }
 
 // warnOnPartialFailure surfaces the fail array Mimecast returns alongside an
-// HTTP 200. A partially-failed page still carries data, so it is not an error,
-// but reporting nothing at all is how this adapter's original silence started.
+// HTTP 200. Keep the data, but do not treat the range as completely read.
 func (a *MimecastAdapter) warnOnPartialFailure(response *ApiResponse) {
 	for _, f := range response.Fail {
 		for _, e := range f.Errors {
@@ -517,7 +559,7 @@ func (a *MimecastAdapter) warnIfNearWindowEdge(oldestNew time.Time) {
 	if oldestNew.IsZero() {
 		return
 	}
-	age := time.Since(oldestNew)
+	age := a.now().Sub(oldestNew)
 	threshold := time.Duration(float64(a.overlapPeriod) * windowEdgeWarnRatio)
 	if age < threshold {
 		return
@@ -556,7 +598,7 @@ func (a *MimecastAdapter) fetchAuditPage(auditURL, token, start, end, pageToken 
 		return nil, 0, err
 	}
 
-	req, err := http.NewRequest("POST", auditURL, bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(a.ctx, "POST", auditURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -569,13 +611,12 @@ func (a *MimecastAdapter) fetchAuditPage(auditURL, token, start, end, pageToken 
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		return nil, resp.StatusCode, a.httpFailure(resp, false)
+	}
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, resp.StatusCode, fmt.Errorf("mimecast api read body: %v", err)
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, resp.StatusCode, fmt.Errorf("mimecast api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(jsonData), string(body))
 	}
 
 	var response ApiResponse
@@ -592,7 +633,7 @@ func (a *MimecastAdapter) getAuthToken() (string, error) {
 	a.tokenMu.Lock()
 	defer a.tokenMu.Unlock()
 
-	if a.token != "" && time.Now().Before(a.tokenExpiry) {
+	if a.token != "" && a.now().Before(a.tokenExpiry) {
 		return a.token, nil
 	}
 
@@ -604,7 +645,7 @@ func (a *MimecastAdapter) getAuthToken() (string, error) {
 	form.Set("client_id", a.conf.ClientId)
 	form.Set("client_secret", a.conf.ClientSecret)
 
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(a.ctx, "POST", tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
@@ -617,7 +658,7 @@ func (a *MimecastAdapter) getAuthToken() (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("failed to get token, status code: %d", resp.StatusCode)
+		return "", a.httpFailure(resp, true)
 	}
 
 	respBody, err := ioutil.ReadAll(resp.Body)
@@ -645,7 +686,7 @@ func (a *MimecastAdapter) getAuthToken() (string, error) {
 	}
 
 	a.token = authResp.AccessToken
-	a.tokenExpiry = time.Now().Add(ttl)
+	a.tokenExpiry = a.now().Add(ttl)
 
 	return a.token, nil
 }

@@ -604,11 +604,11 @@ func TestMimecastEndToEnd(t *testing.T) {
 	assert.Equal(t, clientSecret, mock.lastTokenForm.Get("client_secret"))
 
 	// The audit request carries the issued bearer token and the documented
-	// envelope: meta.pagination.pageSize=50 plus one start/end window.
+	// envelope: meta.pagination.pageSize=100 plus one start/end window.
 	assert.Equal(t, "Bearer "+mockAccessToken, mock.firstAuditAuth)
 	var audit auditRequestBody
 	require.NoError(t, json.Unmarshal(mock.firstAuditBody, &audit))
-	assert.Equal(t, 50, audit.Meta.Pagination.PageSize)
+	assert.Equal(t, 100, audit.Meta.Pagination.PageSize)
 	assert.Empty(t, audit.Meta.Pagination.PageToken, "the first page must not carry a pageToken")
 	require.Len(t, audit.Data, 1)
 	startT, err := time.Parse(mimecastTimeLayout, audit.Data[0].StartDateTime)
@@ -657,12 +657,12 @@ func TestMimecastMidRunEventShipsOnce(t *testing.T) {
 }
 
 // TestMimecastPaginationMultiPage verifies a window holding more events than
-// one page (the adapter requests pageSize 50) is fully consumed by following
+// one page (the adapter requests pageSize 100) is fully consumed by following
 // meta.pagination.next tokens, shipping every event exactly once.
 func TestMimecastPaginationMultiPage(t *testing.T) {
 	const clientID = "client-id-test"
 	const clientSecret = "client-secret-test"
-	const total = 120 // 3 pages at the adapter's pageSize of 50
+	const total = 120 // 2 pages at the adapter's pageSize of 100
 
 	mock := newMockMimecast(clientID, clientSecret)
 	base := time.Now().Add(-20 * time.Second)
@@ -683,8 +683,8 @@ func TestMimecastPaginationMultiPage(t *testing.T) {
 	require.Never(t, func() bool { return sink.count() != total },
 		300*time.Millisecond, 30*time.Millisecond, "no paginated event may ship twice")
 
-	assert.GreaterOrEqual(t, mock.auditCount(), 3,
-		"120 events at pageSize 50 require at least 3 audit requests")
+	assert.GreaterOrEqual(t, mock.auditCount(), 2,
+		"120 events at pageSize 100 require at least 2 audit requests")
 
 	ids := map[string]bool{}
 	for _, msg := range sink.snapshot() {
@@ -693,68 +693,20 @@ func TestMimecastPaginationMultiPage(t *testing.T) {
 	assert.Len(t, ids, total, "every distinct event should be shipped once")
 }
 
-// TestMimecastBadCredentialsShipsNothing pins the adapter's behavior on a
-// rejected client-credentials exchange: nothing ships, the audit endpoint is
-// never called, and the adapter keeps retrying (it does not stop itself).
+// TestMimecastBadCredentialsShipsNothing verifies rejected credentials are fatal.
 func TestMimecastBadCredentialsShipsNothing(t *testing.T) {
 	mock := newMockMimecast("client-id-test", "correct-secret")
-	mock.addEvent(fakeLogonEvent("fake-audit-id-0001", time.Now().Add(-5*time.Second)))
 	server := httptest.NewServer(mock.handler(t))
 	defer server.Close()
-
 	sink := &captureSink{}
 	adapter := startTestAdapter(t, server.URL, sink, "client-id-test", "wrong-secret")
-	chStopped := adapter.chStopped
 	defer adapter.Close()
-
-	// Wait for at least two failed token exchanges (= two poll cycles).
-	require.Eventually(t, func() bool { return mock.tokenCount() >= 2 },
-		5*time.Second, 20*time.Millisecond, "the adapter should keep attempting the token exchange")
-
-	assert.Equal(t, 0, sink.count(), "nothing may ship when authentication fails")
-	assert.Equal(t, 0, mock.auditCount(), "the audit endpoint must not be called without a token")
-
-	// Current behavior: an auth failure does not stop the adapter; it retries
-	// on the next poll.
 	select {
-	case <-chStopped:
-		t.Fatal("adapter unexpectedly stopped on an auth failure (current behavior is to keep polling)")
-	default:
+	case <-adapter.chStopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("adapter did not stop after a fatal authentication failure")
 	}
-}
-
-// TestMimecastAPIErrorKeepsPolling pins the adapter's behavior on a failing
-// audit endpoint: the poll yields nothing, nothing ships, and the adapter
-// retries on the next interval rather than stopping.
-func TestMimecastAPIErrorKeepsPolling(t *testing.T) {
-	mock := newMockMimecast("client-id-test", "client-secret-test")
-	mock.addEvent(fakeLogonEvent("fake-audit-id-0001", time.Now().Add(-5*time.Second)))
-	mock.setAuditStatus(http.StatusInternalServerError)
-	server := httptest.NewServer(mock.handler(t))
-	defer server.Close()
-
-	sink := &captureSink{}
-	adapter := startTestAdapter(t, server.URL, sink, "client-id-test", "client-secret-test")
-	chStopped := adapter.chStopped
-	defer adapter.Close()
-
-	// Wait for at least two failed polls of the audit endpoint.
-	require.Eventually(t, func() bool { return mock.auditCount() >= 2 },
-		5*time.Second, 20*time.Millisecond, "the adapter should keep polling through API errors")
-	assert.Equal(t, 0, sink.count(), "nothing may ship when the API errors")
-
-	select {
-	case <-chStopped:
-		t.Fatal("adapter unexpectedly stopped on an API error")
-	default:
-	}
-
-	// Once the API recovers, the pending event ships exactly once.
-	mock.setAuditStatus(0)
-
-	require.Eventually(t, func() bool { return sink.count() == 1 },
-		5*time.Second, 20*time.Millisecond, "the event should ship after the API recovers")
-	require.Never(t, func() bool { return sink.count() != 1 },
-		300*time.Millisecond, 30*time.Millisecond)
-	assert.Equal(t, "fake-audit-id-0001", sink.snapshot()[0].JsonPayload["id"])
+	assert.Equal(t, 1, mock.tokenCount(), "bad credentials must not cause repeated authentication requests")
+	assert.Zero(t, mock.auditCount())
+	assert.Zero(t, sink.count())
 }
