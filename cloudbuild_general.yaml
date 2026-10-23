@@ -7,30 +7,30 @@ steps:
 # We cap Arrow-heavy compiles to 4 concurrent by chaining them into waves via
 # waitFor. The AIX build uses the parquet_unsupported.go stub and is not
 # Arrow-heavy, so it stays in wave 1.
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: run-tests
     args: ['go', 'test', './...', '-v']
 
   # Wave 1: 3 Arrow-heavy cross-compiles + AIX stub
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-linux64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_64', './containers/general']
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-win64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_windows_64.exe', './containers/general']
     env:
       - 'GOOS=windows'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-macos64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_64', './containers/general']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-aixppc64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_aix_ppc64', './containers/general']
     env:
@@ -39,14 +39,14 @@ steps:
     waitFor: ['run-tests']
 
   # Wave 2: 4 Arrow-heavy cross-compiles, after wave 1
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-macosarm64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_macos_arm64', './containers/general']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
     waitFor: ['build-linux64', 'build-win64', 'build-macos64']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-linuxarm
     args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm', './containers/general']
     env:
@@ -54,14 +54,14 @@ steps:
       - 'GOARCH=arm'
       - 'GOARM=5'
     waitFor: ['build-linux64', 'build-win64', 'build-macos64']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-linuxarm64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_linux_arm64', './containers/general']
     env:
       - 'GOOS=linux'
       - 'GOARCH=arm64'
     waitFor: ['build-linux64', 'build-win64', 'build-macos64']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-solarisamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_solaris_amd64', './containers/general']
     env:
@@ -70,21 +70,21 @@ steps:
     waitFor: ['build-linux64', 'build-win64', 'build-macos64']
 
   # Wave 3: 3 Arrow-heavy cross-compiles, after wave 2
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-freebsdamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64', './containers/general']
     env:
       - 'GOOS=freebsd'
       - 'GOARCH=amd64'
     waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-netbsdamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_netbsd_64', './containers/general']
     env:
       - 'GOOS=netbsd'
       - 'GOARCH=amd64'
     waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     id: build-openbsdamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_openbsd_64', './containers/general']
     env:
@@ -94,65 +94,65 @@ steps:
 
 
 # Connectivity Tester
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_64', './containers/connectivity']
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_windows_64.exe', './containers/connectivity']
     env:
       - 'GOOS=windows'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_64', './containers/connectivity']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_macos_arm64', './containers/connectivity']
     env:
       - 'GOOS=darwin'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm', './containers/connectivity']
     env:
       - 'GOOS=linux'
       - 'GOARCH=arm'
       - 'GOARM=5'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_linux_arm64', './containers/connectivity']
     env:
       - 'GOOS=linux'
       - 'GOARCH=arm64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_solaris_amd64', './containers/general']
     env:
       - 'GOOS=solaris'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_aix_ppc64', './containers/connectivity']
     env:
       - 'GOOS=aix'
       - 'GOARCH=ppc64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_freebsd_64', './containers/connectivity']
     env:
       - 'GOOS=freebsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_netbsd_64', './containers/connectivity']
     env:
       - 'GOOS=netbsd'
       - 'GOARCH=amd64'
     waitFor: ['run-tests']
-  - name: 'golang:1.25-bookworm'
+  - name: 'golang:1.27-bookworm'
     args: ['go', 'build', '-v', '-o', 'lc_connectivity_openbsd_64', './containers/connectivity']
     env:
       - 'GOOS=openbsd'

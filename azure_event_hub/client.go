@@ -10,6 +10,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -103,20 +104,15 @@ func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdap
 }
 
 func (a *EventHubAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	for _, l := range a.listeners {
 		l.Close(a.ctx)
 	}
 	err1 := a.hub.Close(a.ctx)
 	err2 := a.uspClient.Drain(1 * time.Minute)
-	_, err3 := a.uspClient.Close()
-	if err1 != nil {
-		return err1
-	}
-	if err2 != nil {
-		return err2
-	}
-	return err3
+	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
+	return errors.Join(err1, err2, err3)
 }
 
 func (a *EventHubAdapter) processEvent(ctx context.Context, message *eventhub.Event) error {
@@ -129,8 +125,13 @@ func (a *EventHubAdapter) processEvent(ctx context.Context, message *eventhub.Ev
 			a.conf.ClientOptions.DebugLog("stream falling behind")
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
-		if err != nil {
+		if err != nil && err != uspclient.ErrorClosed {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		}
+		if err == uspclient.ErrorClosed {
+			// The adapter is shutting down. Do not hand the Event Hub library an
+			// error for it, that would be reported as a listener failure.
+			return nil
 		}
 		return err
 	}

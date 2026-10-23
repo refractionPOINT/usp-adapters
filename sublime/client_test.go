@@ -30,8 +30,9 @@ func testClientOptions(t *testing.T) uspclient.ClientOptions {
 }
 
 // newDirectAdapter builds an adapter wired to a base URL without starting any
-// goroutines -- for unit testing makeOneRequest in isolation.
-func newDirectAdapter(t *testing.T, baseURL string) *SublimeAdapter {
+// goroutines -- for unit testing poll in isolation. It started at `start` and
+// its clock reads whatever *now holds.
+func newDirectAdapter(t *testing.T, baseURL string, start time.Time, now *time.Time) *SublimeAdapter {
 	t.Helper()
 	return &SublimeAdapter{
 		conf: SublimeConfig{
@@ -41,8 +42,24 @@ func newDirectAdapter(t *testing.T, baseURL string) *SublimeAdapter {
 		},
 		httpClient: &http.Client{Timeout: 5 * time.Second},
 		doStop:     utils.NewEvent(),
-		dedupe:     map[string]int64{},
+		now:        func() time.Time { return *now },
+		start:      start,
+		cursor:     start,
+		dedupe:     map[string]time.Time{},
 	}
+}
+
+// collect returns a ship callback that appends to *out.
+func collect(out *[]utils.Dict) func([]utils.Dict) error {
+	return func(items []utils.Dict) error {
+		*out = append(*out, items...)
+		return nil
+	}
+}
+
+// setDate stamps a response with Sublime's clock reading now.
+func setDate(w http.ResponseWriter, now time.Time) {
+	w.Header().Set("Date", now.UTC().Format(http.TimeFormat))
 }
 
 func TestValidate(t *testing.T) {
@@ -69,103 +86,160 @@ func TestValidate(t *testing.T) {
 		assert.Equal(t, "https://sublime.example.com", c.BaseURL)
 		assert.Equal(t, 5*time.Second, c.PollInterval)
 	})
+
+	t.Run("trims trailing slash from base url", func(t *testing.T) {
+		c := SublimeConfig{
+			ClientOptions: testClientOptions(t),
+			ApiKey:        "k",
+			BaseURL:       "https://platform.sublime.security/",
+		}
+		require.NoError(t, c.Validate())
+		assert.Equal(t, "https://platform.sublime.security", c.BaseURL,
+			"a trailing slash must be trimmed so the request path is not //v0/...")
+	})
 }
 
-// TestMakeOneRequestFiltersAndAdvancesSince verifies one poll: events at or
-// before `since` are dropped, events with a missing or unparseable created_at
-// are skipped, and the returned watermark advances to the newest created_at.
-func TestMakeOneRequestFiltersAndAdvancesSince(t *testing.T) {
-	now := time.Now().UTC()
-	newest := now.Add(10 * time.Minute)
+// TestPollFiltersAndAdvancesCursor verifies one poll: events created before
+// the adapter started are dropped, events with a missing or unparseable
+// created_at are still shipped (the server placed them in the window) with a
+// warning, the order is the reverse of the API's newest-first order, and the
+// cursor advances to the poll time -- which is also sent as the exclusive
+// upper bound of the requested window.
+func TestPollFiltersAndAdvancesCursor(t *testing.T) {
+	start := time.Now().UTC().Truncate(time.Second)
+	now := start.Add(10 * time.Minute)
+	var gotGTE, gotLT string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotGTE = r.URL.Query().Get("created_at[gte]")
+		gotLT = r.URL.Query().Get("created_at[lt]")
+		setDate(w, now)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		// Newest-first, as the live API returns them.
 		_, _ = w.Write([]byte(`{"events": [
-			{"id": "old", "created_at": "` + now.Add(-time.Hour).Format(time.RFC3339Nano) + `"},
-			{"id": "no-ts"},
+			{"id": "new-2", "created_at": "` + start.Add(9*time.Minute).Format(time.RFC3339Nano) + `"},
+			{"id": "new-1", "created_at": "` + start.Add(5*time.Minute).Format(time.RFC3339Nano) + `"},
 			{"id": "bad-ts", "created_at": "not a timestamp"},
-			{"id": "new-1", "created_at": "` + now.Add(5*time.Minute).Format(time.RFC3339Nano) + `"},
-			{"id": "new-2", "created_at": "` + newest.Format(time.RFC3339Nano) + `"}
+			{"id": "no-ts"},
+			{"id": "pre-start", "created_at": "` + start.Add(-10*time.Second).Format(time.RFC3339Nano) + `"}
 		], "count": 5, "total": 5}`))
 	}))
 	defer server.Close()
 
-	a := newDirectAdapter(t, server.URL)
-	items, newSince, err := a.makeOneRequest(now)
-	require.NoError(t, err)
+	a := newDirectAdapter(t, server.URL, start, &now)
+	warnings := 0
+	a.conf.ClientOptions.OnWarning = func(msg string) { warnings++; t.Logf("WRN: %s", msg) }
+	var items []utils.Dict
+	require.NoError(t, a.poll(collect(&items)))
 
 	ids := []string{}
 	for _, item := range items {
 		id, _ := item["id"].(string)
 		ids = append(ids, id)
 	}
-	assert.ElementsMatch(t, []string{"new-1", "new-2"}, ids,
-		"only events newer than since with a valid created_at are returned")
-	assert.True(t, newSince.Equal(newest), "since must advance to the newest created_at, got %v want %v", newSince, newest)
+	assert.Equal(t, []string{"no-ts", "bad-ts", "new-1", "new-2"}, ids,
+		"pre-start events are dropped, the rest ship oldest first")
+	assert.Equal(t, 2, warnings, "each event with an unusable created_at must be reported")
+	assert.True(t, a.cursor.Equal(now), "the cursor must advance to the poll time, got %v want %v", a.cursor, now)
+	assert.Equal(t, start.Add(-overlapPeriod).Format(time.RFC3339Nano), gotGTE, "the window must start one overlap before the cursor")
+	assert.Equal(t, now.Format(time.RFC3339Nano), gotLT, "the window must end at the poll time")
 }
 
-// TestMakeOneRequestDedupes verifies an event id already seen in a previous
-// poll is not returned again even when its created_at is inside the window.
-func TestMakeOneRequestDedupes(t *testing.T) {
-	now := time.Now().UTC()
+// TestPollDedupesOverlap verifies an event re-fetched in the next poll's
+// overlap is not returned twice.
+func TestPollDedupesOverlap(t *testing.T) {
+	start := time.Now().UTC().Truncate(time.Second)
+	now := start.Add(time.Minute)
+	evtAt := now.Add(-5 * time.Second) // inside the next poll's overlap
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDate(w, now)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"events": [
-			{"id": "evt-1", "created_at": "` + now.Add(5*time.Minute).Format(time.RFC3339Nano) + `"}
+			{"id": "evt-1", "created_at": "` + evtAt.Format(time.RFC3339Nano) + `"}
 		], "count": 1, "total": 1}`))
 	}))
 	defer server.Close()
 
-	a := newDirectAdapter(t, server.URL)
-
-	items, _, err := a.makeOneRequest(now)
-	require.NoError(t, err)
+	a := newDirectAdapter(t, server.URL, start, &now)
+	var items []utils.Dict
+	require.NoError(t, a.poll(collect(&items)))
 	require.Len(t, items, 1)
 
-	// Same window re-polled: the id is in the dedupe map, nothing returns.
-	items, _, err = a.makeOneRequest(now)
-	require.NoError(t, err)
-	assert.Empty(t, items, "an already-seen event id must not be returned twice")
+	now = now.Add(time.Second)
+	items = nil
+	require.NoError(t, a.poll(collect(&items)))
+	assert.Empty(t, items, "an already-shipped event id must not be returned twice")
 }
 
-// TestMakeOneRequestInvalidJSON verifies a non-JSON body surfaces an error and
-// returns no items, with the watermark unchanged.
-func TestMakeOneRequestInvalidJSON(t *testing.T) {
+// TestPollInvalidJSON verifies a non-JSON body surfaces an error, returns no
+// items and leaves the cursor unchanged.
+func TestPollInvalidJSON(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`not json`))
 	}))
 	defer server.Close()
 
-	a := newDirectAdapter(t, server.URL)
-	since := time.Now()
-	items, newSince, err := a.makeOneRequest(since)
+	start := time.Now().UTC().Truncate(time.Second)
+	now := start.Add(time.Minute)
+	a := newDirectAdapter(t, server.URL, start, &now)
+	var items []utils.Dict
+	err := a.poll(collect(&items))
 	assert.Error(t, err)
 	assert.Nil(t, items)
-	assert.True(t, newSince.Equal(since), "since must not advance on a bad response")
+	assert.True(t, a.cursor.Equal(start), "the cursor must not advance on a bad response")
 }
 
-// TestMakeOneRequestNon200 pins the adapter's behavior on a non-200: no items,
-// the watermark is preserved, and (a long-standing quirk) no error is returned
-// -- the failure is only reported through OnError.
-func TestMakeOneRequestNon200(t *testing.T) {
+// TestPollNon200 pins the adapter's behavior on a non-200: no items, the
+// cursor is preserved, the failure is reported through OnError, and an
+// explicit error is returned to the caller.
+func TestPollNon200(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = w.Write([]byte(`{"message":"boom"}`))
 	}))
 	defer server.Close()
 
+	start := time.Now().UTC().Truncate(time.Second)
+	now := start.Add(time.Minute)
 	errs := 0
-	a := newDirectAdapter(t, server.URL)
+	a := newDirectAdapter(t, server.URL, start, &now)
 	a.conf.ClientOptions.OnError = func(err error) { errs++; t.Logf("ERR: %v", err) }
 
-	since := time.Now()
-	items, newSince, err := a.makeOneRequest(since)
+	var items []utils.Dict
+	err := a.poll(collect(&items))
 	assert.Nil(t, items)
-	assert.True(t, newSince.Equal(since), "since must not advance on an error response")
+	assert.True(t, a.cursor.Equal(start), "the cursor must not advance on an error response")
 	assert.Equal(t, 1, errs, "a non-200 must be reported via OnError")
-	// Pin the current behavior: the non-200 path returns a nil error (the
-	// error variable it returns belongs to the preceding, successful, Do call).
-	assert.NoError(t, err)
+	assert.Error(t, err, "a non-200 must surface an explicit error to the caller")
+}
+
+// TestPollEventsWithoutID verifies events lacking an id are deduplicated on
+// their content: two distinct ones both ship, and neither ships again when the
+// next poll re-reads the overlap.
+func TestPollEventsWithoutID(t *testing.T) {
+	start := time.Now().UTC().Truncate(time.Second)
+	now := start.Add(time.Minute)
+	at := now.Add(-5 * time.Second).Format(time.RFC3339Nano)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		setDate(w, now)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"events": [
+			{"type": "a", "created_at": "` + at + `"},
+			{"type": "b", "created_at": "` + at + `"}
+		], "count": 2, "total": 2}`))
+	}))
+	defer server.Close()
+
+	a := newDirectAdapter(t, server.URL, start, &now)
+	var items []utils.Dict
+	require.NoError(t, a.poll(collect(&items)))
+	assert.Len(t, items, 2, "distinct events without an id must both ship")
+
+	now = now.Add(time.Second)
+	items = nil
+	require.NoError(t, a.poll(collect(&items)))
+	assert.Empty(t, items, "events without an id must not re-ship from the overlap")
 }

@@ -146,12 +146,13 @@ func (c *CylanceConfig) Validate() error {
 }
 
 func (a *CylanceAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	var err1, err2 error
 	a.once.Do(func() {
 		a.cancel()
 		err1 = a.uspClient.Drain(1 * time.Minute)
-		_, err2 = a.uspClient.Close()
+		_, err2 = utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 		a.httpClient.CloseIdleConnections()
 		close(a.chStopped)
 	})
@@ -482,7 +483,9 @@ func (a *CylanceAdapter) submitEvents(items []utils.Dict) {
 			if err == uspclient.ErrorBufferFull {
 				a.conf.ClientOptions.OnWarning("stream falling behind")
 				if err := a.uspClient.Ship(msg, 1*time.Hour); err != nil {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					if err != uspclient.ErrorClosed {
+						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+					}
 					a.Close()
 					return
 				}

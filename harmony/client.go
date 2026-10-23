@@ -269,11 +269,11 @@ func (c *EventsConfig) Close() {}
 //
 // New deployments should use:
 //
-//   entities:
-//     enabled: true
-//     queries:
-//       - name: emails
-//         include_splits: true   # match the old firehose semantics
+//	entities:
+//	  enabled: true
+//	  queries:
+//	    - name: emails
+//	      include_splits: true   # match the old firehose semantics
 type EmailsConfig struct {
 	Enabled bool `json:"enabled" yaml:"enabled"`
 }
@@ -620,11 +620,12 @@ func NewHarmonyAdapter(ctx context.Context, conf HarmonyConfig) (*HarmonyAdapter
 }
 
 func (a *HarmonyAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.httpClient.CloseIdleConnections()
 	for _, s := range a.conf.sources() {
 		s.Close()
@@ -666,6 +667,8 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 			// they want the warnings to stop.
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — skipping window", service, canceled))
 			nextStart = endTime
+		case errors.Is(err, uspclient.ErrorClosed):
+			// The adapter is shutting down, nothing to report.
 		case err != nil:
 			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[events:%s]: %v", service, err))
 		case !newCursor.IsZero():
@@ -869,7 +872,10 @@ func (a *HarmonyAdapter) fetchEntities(q *EntityQuery, saas string) {
 			return
 		}
 		newCursor, err := a.runOneEntitiesQuery(q, saas, cursor)
-		if err != nil {
+		if errors.Is(err, uspclient.ErrorClosed) {
+			// The adapter is shutting down, nothing to report.
+			return
+		} else if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("harmony[entities:%s:%s]: %v", q.Name, saas, err))
 		} else if q.CursorField != "" && newCursor.After(cursor) {
 			cursor = newCursor
@@ -1077,7 +1083,9 @@ func (a *HarmonyAdapter) shipRecord(rec utils.Dict) error {
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			}
 			a.doStop.Set()
 			return err
 		}

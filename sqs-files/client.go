@@ -160,10 +160,11 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 }
 
 func (a *SQSFilesAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.isStop = true
 	a.wg.Wait()
-	if _, err := a.uspClient.Close(); err != nil {
+	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {
 		return err
 	}
 	return nil
@@ -330,7 +331,9 @@ func (a *SQSFilesAdapter) processEvent(data []byte, isCompressed bool) bool {
 			err = a.uspClient.Ship(msg, 1*time.Hour)
 		}
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			if err != uspclient.ErrorClosed {
+				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+			}
 			return false
 		}
 	}

@@ -38,6 +38,24 @@ Other common configurations that are not required include:
 
 All other configurations in `client_options` should only be set for advanced ingestion schemes.
 
+### Graceful shutdown
+
+Adapter `Close` stops its producer and waits up to 60 seconds for the USP proxy
+to acknowledge accepted events. A producer blocked by a full buffer is unblocked
+after 10 seconds. Mailbox clients drain concurrently. Pub/Sub also gets up to
+10 seconds to flush source acknowledgements before its RPC transport closes.
+
+Current proxies acknowledge on receipt. An already-written idle tail can wait
+for their 30-second periodic ACK, so the 60-second drain timeout must remain
+comfortably above that interval. Proxies that acknowledge downstream acceptance
+provide stronger confirmation through the same protocol.
+
+If confirmation times out, `Close` returns an error and `OnWarning` reports the
+unconfirmed count and sequence range without payloads. Sources already
+acknowledged or checkpointed cannot be replayed generically; operators should
+treat this as uncertain delivery. Hosts using `go-uspclient` directly can recover
+the unacknowledged messages returned by its `Close` method.
+
 ### Multi-Adapter
 If running using a configuration file, it is possible to run multiple instances of the same adapter type within a single instance of the adapter
 process. To do this, simply make the config file multiple "documents" (in JSON or YAML format) within the same file, like:

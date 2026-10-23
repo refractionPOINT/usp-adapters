@@ -88,12 +88,13 @@ func NewSimulatorAdapter(ctx context.Context, conf SimulatorConfig) (*SimulatorA
 }
 
 func (a *SimulatorAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	atomic.StoreUint32(&a.isRunning, 0)
 	a.dataReader.Close()
 	a.wg.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := a.uspClient.Close()
+	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
 	if err1 != nil {
 		return err1
@@ -152,7 +153,9 @@ func (a *SimulatorAdapter) handleLine(line []byte) {
 		err = a.uspClient.Ship(msg, 1*time.Hour)
 	}
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		if err != uspclient.ErrorClosed {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		}
 	}
 }
 

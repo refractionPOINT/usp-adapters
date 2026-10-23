@@ -13,6 +13,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -83,6 +84,7 @@ func NewWELAdapter(ctx context.Context, conf WELConfig) (*WELAdapter, chan struc
 }
 
 func (a *WELAdapter) Close() error {
+	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 
 	for _, hSub := range a.hSubs {
@@ -97,7 +99,7 @@ func (a *WELAdapter) Close() error {
 	a.wg.Done()
 	a.wg.Wait()
 
-	_, err := a.uspClient.Close()
+	_, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions)
 	if err != nil {
 		return err
 	}
@@ -139,7 +141,9 @@ func (a *WELAdapter) handleEvent(Action EVT_SUBSCRIBE_NOTIFY_ACTION, UserContext
 		err = a.uspClient.Ship(msg, 0)
 	}
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		if err != uspclient.ErrorClosed {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		}
 	}
 	return 0
 }
