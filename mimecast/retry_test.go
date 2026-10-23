@@ -240,7 +240,7 @@ func TestPersistentAuthenticationFailureIsFatal(t *testing.T) {
 	}
 }
 
-func TestOutageRecoveryPreservesRangeAndDedupe(t *testing.T) {
+func TestPollingGapRecoveryPreservesRangeAndDedupe(t *testing.T) {
 	mock, a := newIdleMock(t)
 	clock := usePollClock(a)
 	origin := clock.current
@@ -250,12 +250,12 @@ func TestOutageRecoveryPreservesRangeAndDedupe(t *testing.T) {
 	require.Equal(t, []string{"baseline"}, itemIDs(first))
 	mock.addEvent(fakeLogonEvent("during-outage", origin.Add(20*time.Minute)))
 	mock.setAuditStatus(503)
-	clock.current = origin.Add(20 * time.Minute)
+	clock.current = origin.Add(2 * time.Hour)
 	_, err = a.makeOneRequest()
 	require.Error(t, err)
-	// Recovery after a two-hour outage must reach the unread event and retain
-	// baseline dedupe even though its eventTime is outside the initial overlap.
-	clock.current = origin.Add(2 * time.Hour)
+	// A polling gap can exceed the overlap; once failure is observed, recovery
+	// must happen within the bounded transient grace period.
+	clock.current = origin.Add(2*time.Hour + 10*time.Minute)
 	_, err = a.makeOneRequest()
 	require.Error(t, err)
 	assert.Contains(t, a.dedupe, "baseline", "an unread retry range still needs its dedupe entries")
@@ -286,16 +286,16 @@ func TestColdFailurePreservesInitialRangeAndBoundsRecovery(t *testing.T) {
 	mock.setAuditStatus(503)
 	_, err := a.makeOneRequest()
 	require.Error(t, err)
-	clock.current = origin.Add(2 * time.Hour)
+	clock.current = origin.Add(20 * time.Minute)
 	mock.setAuditStatus(0)
 	_, err = a.makeOneRequest()
 	require.NoError(t, err)
 	assert.Equal(t, origin.Add(-defaultOverlapPeriod), mock.seenWindows()[0].start.UTC())
 	mock.setAuditStatus(503)
-	clock.current = origin.Add(3 * time.Hour)
+	clock.current = origin.Add(28 * time.Hour)
 	_, err = a.makeOneRequest()
 	require.Error(t, err)
-	clock.current = origin.Add(28 * time.Hour)
+	clock.current = origin.Add(28*time.Hour + 10*time.Minute)
 	mock.setAuditStatus(0)
 	mock.addEvent(fakeLogonEvent("too-old", origin.Add(time.Hour)))
 	mock.addEvent(fakeLogonEvent("recoverable", origin.Add(5*time.Hour)))
@@ -466,7 +466,7 @@ func TestReauthenticationTransientFailureKeepsPartialPage(t *testing.T) {
 	assert.Empty(t, logs.joinedErrors(), "a token refresh outage must preserve the session")
 	assert.False(t, a.doStop.IsSet())
 	assert.True(t, a.lastComplete.IsZero())
-	clock.current = clock.current.Add(2 * time.Hour)
+	clock.current = clock.current.Add(20 * time.Minute)
 	rest, err := a.makeOneRequest()
 	require.NoError(t, err)
 	assert.Len(t, rest, 20)

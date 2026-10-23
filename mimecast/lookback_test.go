@@ -26,9 +26,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// newIdleAdapter builds an adapter pointed at serverURL whose background poll
-// loop is effectively parked, so a test can drive makeOneRequest by hand and
-// get a deterministic result. Any field set on tweak overrides the defaults.
+// newIdleAdapter builds an adapter without a background sender, so a test
+// owns polling and can replace its clock without racing another poll loop.
+// Any field set on tweak overrides the defaults.
 func newIdleAdapter(t *testing.T, serverURL string, sink uspSink, tweak ...func(*MimecastConfig)) *MimecastAdapter {
 	t.Helper()
 	conf := MimecastConfig{
@@ -42,7 +42,7 @@ func newIdleAdapter(t *testing.T, serverURL string, sink uspSink, tweak ...func(
 		f(&conf)
 	}
 	require.NoError(t, conf.Validate())
-	a, _, err := newMimecastAdapter(context.Background(), conf, sink)
+	a, _, err := buildMimecastAdapter(context.Background(), conf, sink, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = a.Close() })
 	return a

@@ -84,6 +84,12 @@ func (l *logCapture) joinedErrors() string {
 	return strings.Join(l.errors, "\n")
 }
 
+func (l *logCapture) errorCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.errors)
+}
+
 func (l *logCapture) joinedDebug() string {
 	l.mu.Lock()
 	defer l.mu.Unlock()

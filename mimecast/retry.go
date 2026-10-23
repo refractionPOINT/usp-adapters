@@ -1,6 +1,7 @@
 package usp_mimecast
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -17,13 +18,85 @@ type requestFailure struct {
 
 func (e *requestFailure) Error() string { return e.message }
 
+// Keep timers local to the sender and release them on shutdown, including
+// long server retry delays. No sleeping timer goroutine survives cancellation.
+func (a *MimecastAdapter) waitTimer(delay time.Duration) bool {
+	if a.doStop.IsSet() {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-a.ctx.Done():
+		return true
+	case <-timer.C:
+		return a.doStop.IsSet()
+	}
+}
+
 func (a *MimecastAdapter) waitForRetry() bool {
-	for a.now().Before(a.retryAt) {
-		if a.wait(a.retryAt.Sub(a.now())) {
+	for {
+		if a.stopOnFailureDeadline() {
+			return false
+		}
+		delay := a.retryAt.Sub(a.now())
+		if delay <= 0 {
+			return true
+		}
+		if a.wait(a.boundByFailureDeadline(delay)) {
 			return false
 		}
 	}
-	return !a.doStop.IsSet()
+}
+
+func (a *MimecastAdapter) waitForNextPoll() bool {
+	if a.stopOnFailureDeadline() || a.wait(a.boundByFailureDeadline(a.pollInterval)) {
+		return false
+	}
+	return !a.stopOnFailureDeadline()
+}
+
+func (a *MimecastAdapter) boundByFailureDeadline(delay time.Duration) time.Duration {
+	if !a.failureSince.IsZero() {
+		if remaining := a.failureSince.Add(maxContinuousFailure).Sub(a.now()); remaining < delay {
+			if remaining < 0 {
+				return 0
+			}
+			return remaining
+		}
+	}
+	return delay
+}
+
+// Each request is also bounded, so a request started just before escalation
+// cannot hold the sender past the deadline. Close cancels the same context.
+func (a *MimecastAdapter) requestContext() (context.Context, context.CancelFunc) {
+	if a.failureSince.IsZero() {
+		return context.WithCancel(a.ctx)
+	}
+	return context.WithTimeout(a.ctx, a.failureSince.Add(maxContinuousFailure).Sub(a.now()))
+}
+
+func (a *MimecastAdapter) fatalPollFailure(err error) {
+	if a.doStop.IsSet() {
+		return
+	}
+	// Set the terminal state before invoking the callback: a consumer can
+	// react immediately, and further polls must not repeat fatal callbacks.
+	a.doStop.Set()
+	a.cancel()
+	a.conf.ClientOptions.OnError(err)
+}
+
+func (a *MimecastAdapter) stopOnFailureDeadline() bool {
+	if a.doStop.IsSet() {
+		return true
+	}
+	if a.failureSince.IsZero() || a.now().Before(a.failureSince.Add(maxContinuousFailure)) {
+		return false
+	}
+	a.fatalPollFailure(fmt.Errorf("mimecast polling failed continuously for %s: %w", maxContinuousFailure, a.lastFailure))
+	return true
 }
 
 // Mimecast's API 2.0 overview defines X-RateLimit-Reset as a relative delay
@@ -59,16 +132,19 @@ func (a *MimecastAdapter) httpFailure(resp *http.Response, oauth bool) error {
 	return &requestFailure{
 		// Do not include response bodies: they may contain audit data or tokens.
 		message: fmt.Sprintf("mimecast HTTP status %d (oauth=%v)", resp.StatusCode, oauth),
-		fatal: resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden ||
-			(oauth && resp.StatusCode == http.StatusBadRequest),
+		fatal: resp.StatusCode >= 400 && resp.StatusCode < 500 &&
+			resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests,
 		retryAt: retryDeadline(resp.Header, a.now()),
 	}
 }
 
-// Authentication failures sometimes appear in a 200 response's fail[] array.
-func hasAuthFailure(failures []FailureDetails) bool {
+// Permanent failures can also appear in a 200 response's fail[] array.
+func hasPermanentFailure(failures []FailureDetails) bool {
 	for _, failure := range failures {
 		for _, detail := range failure.Errors {
+			if !detail.Retryable {
+				return true
+			}
 			switch detail.Code {
 			case "invalid_credentials", "invalid_access_token", "invalid_client_identifier", "invalid_client", "invalid_grant", "app_forbidden", "service_denied":
 				return true
@@ -78,16 +154,20 @@ func hasAuthFailure(failures []FailureDetails) bool {
 	return false
 }
 
-// OnError can end an adapter consumer's session. Reserve it for persistent
-// authentication failures; recoverable errors must retain in-memory state.
+// OnError can end a consumer's session. Permanent failures are fatal
+// immediately; transient errors warn and retain state for at most 30 minutes.
+// Only an entirely successful poll resets this continuous-failure clock.
 func (a *MimecastAdapter) reportPollFailure(err error) {
 	if a.doStop.IsSet() {
 		return
 	}
 	var failure *requestFailure
 	if errors.As(err, &failure) && failure.fatal {
-		a.conf.ClientOptions.OnError(err)
-		a.doStop.Set()
+		a.fatalPollFailure(err)
+		return
+	}
+	a.noteTransientFailure(err)
+	if a.stopOnFailureDeadline() {
 		return
 	}
 	if a.retryBackoff == 0 {
@@ -103,4 +183,11 @@ func (a *MimecastAdapter) reportPollFailure(err error) {
 		a.retryAt = failure.retryAt
 	}
 	a.conf.ClientOptions.OnWarning(fmt.Sprintf("%v; retrying in %s", err, a.retryAt.Sub(a.now()).Round(time.Second)))
+}
+
+func (a *MimecastAdapter) noteTransientFailure(err error) {
+	a.lastFailure = err
+	if a.failureSince.IsZero() {
+		a.failureSince = a.now()
+	}
 }

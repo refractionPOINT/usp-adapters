@@ -48,6 +48,9 @@ const (
 	// cap leaves the window incomplete; it is retried rather than checkpointed.
 	maxPagesPerPoll = 2000
 	maxRetryBackoff = 5 * time.Minute
+	// Transient failures retain session state briefly, but sustained failures
+	// must still reach the fatal callback. This is not a configuration option.
+	maxContinuousFailure = 30 * time.Minute
 
 	// tokenExpirySafetyMargin is subtracted from the token's advertised
 	// lifetime so a request is never sent with a token about to expire.
@@ -115,6 +118,8 @@ type MimecastAdapter struct {
 	lastComplete time.Time
 	retryAt      time.Time
 	retryBackoff time.Duration
+	failureSince time.Time
+	lastFailure  error
 
 	// dedupe maps IDs to the last time they were seen, in Unix seconds. Keep
 	// them for the actual retry window, including records the API returns
@@ -247,6 +252,12 @@ func NewMimecastAdapter(ctx context.Context, conf MimecastConfig) (*MimecastAdap
 // sink is non-nil it is used in place of a real LimaCharlie client -- the seam
 // tests use to capture shipped events.
 func newMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink) (*MimecastAdapter, chan struct{}, error) {
+	return buildMimecastAdapter(ctx, conf, sink, true)
+}
+
+// buildMimecastAdapter can leave the sender stopped for deterministic manual
+// polling in tests. Production always starts it through newMimecastAdapter.
+func buildMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink, start bool) (*MimecastAdapter, chan struct{}, error) {
 	// The container does not call Validate before constructing an adapter, so
 	// overlap_period is resolved here rather than trusted.
 	overlapPeriod, err := conf.resolveOverlapPeriod()
@@ -265,7 +276,7 @@ func newMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink) 
 		now:           time.Now,
 	}
 	a.ctx, a.cancel = context.WithCancel(a.ctx)
-	a.wait = a.doStop.WaitFor
+	a.wait = a.waitTimer
 	if conf.BaseURL != "" {
 		a.baseURL = strings.TrimRight(conf.BaseURL, "/")
 	}
@@ -295,13 +306,16 @@ func newMimecastAdapter(ctx context.Context, conf MimecastConfig, sink uspSink) 
 
 	a.chStopped = make(chan struct{})
 
-	a.wgSenders.Add(1)
-	go a.fetchEvents()
-
-	go func() {
-		a.wgSenders.Wait()
+	if start {
+		a.wgSenders.Add(1)
+		go a.fetchEvents()
+		go func() {
+			a.wgSenders.Wait()
+			close(a.chStopped)
+		}()
+	} else {
 		close(a.chStopped)
-	}()
+	}
 
 	return a, a.chStopped, nil
 }
@@ -327,7 +341,7 @@ func (a *MimecastAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", a.baseURL))
 
-	for !a.doStop.WaitFor(a.pollInterval) {
+	for a.waitForNextPoll() {
 		// makeOneRequest reports its own errors. It can return records
 		// alongside an error when a poll fails part-way through pagination;
 		// those records were read successfully and must still ship, because
@@ -365,6 +379,9 @@ func (a *MimecastAdapter) fetchEvents() {
 // outages. Recovery is bounded to 24 hours, with a warning on truncation.
 // State is in-memory: a process restart replays only the overlap period and
 // cannot recover an older outage. Replay may duplicate records after restart.
+// Continuous failures become fatal after 30 minutes; a consumer may then stop
+// or restart, losing this in-memory checkpoint and dedupe state. The 24-hour
+// window does not guarantee recovery across that restart or an indefinite outage.
 //
 // Records may be returned alongside a non-nil error: pages read before the
 // failure are complete and are reported as seen, so the caller must ship them
@@ -439,9 +456,16 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 				// retry this same page.
 				mayRetryAuth = false
 				a.invalidateAuthToken()
+				// A bounded refresh can still be delayed by a retry header.
+				// Arm the same failure clock so that delay cannot hide an
+				// unfinished poll indefinitely. Full success resets it below.
+				a.noteTransientFailure(pageErr)
 				var failure *requestFailure
 				if errors.As(pageErr, &failure) && failure.retryAt.After(a.retryAt) {
 					a.retryAt = failure.retryAt
+				}
+				if a.retryAt.After(a.now()) {
+					a.conf.ClientOptions.OnWarning("mimecast authentication refresh delayed by server retry deadline")
 				}
 				if !a.waitForRetry() {
 					pollErr = context.Canceled
@@ -494,7 +518,7 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 			})
 		}
 		if len(response.Fail) != 0 {
-			pollErr = &requestFailure{message: "mimecast api returned an incomplete fail[] response", fatal: hasAuthFailure(response.Fail)}
+			pollErr = &requestFailure{message: "mimecast api returned an incomplete fail[] response", fatal: hasPermanentFailure(response.Fail)}
 			break
 		}
 
@@ -530,10 +554,15 @@ func (a *MimecastAdapter) makeOneRequest() ([]utils.Dict, error) {
 	if !a.lastComplete.IsZero() {
 		a.warnIfNearWindowEdge(oldestNew)
 	}
+	if pollErr == nil && a.stopOnFailureDeadline() {
+		pollErr = context.Canceled
+	}
 	if pollErr == nil {
 		a.lastComplete = currentTime
 		a.retryBackoff = 0
 		a.retryAt = time.Time{}
+		a.failureSince = time.Time{}
+		a.lastFailure = nil
 	} else {
 		a.reportPollFailure(pollErr)
 	}
@@ -575,6 +604,9 @@ func (a *MimecastAdapter) warnIfNearWindowEdge(oldestNew time.Time) {
 // The HTTP status is returned alongside the error so the caller can tell an
 // expired token from any other failure.
 func (a *MimecastAdapter) fetchAuditPage(auditURL, token, start, end, pageToken string) (*ApiResponse, int, error) {
+	if a.stopOnFailureDeadline() {
+		return nil, 0, context.Canceled
+	}
 	pagination := map[string]interface{}{
 		"pageSize": auditPageSize,
 	}
@@ -598,7 +630,9 @@ func (a *MimecastAdapter) fetchAuditPage(auditURL, token, start, end, pageToken 
 		return nil, 0, err
 	}
 
-	req, err := http.NewRequestWithContext(a.ctx, "POST", auditURL, bytes.NewBuffer(jsonData))
+	requestCtx, cancel := a.requestContext()
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, "POST", auditURL, bytes.NewBuffer(jsonData))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -630,6 +664,9 @@ func (a *MimecastAdapter) fetchAuditPage(auditURL, token, start, end, pageToken 
 // getAuthToken returns a cached OAuth token, exchanging client credentials for
 // a new one when the cache is empty or close to expiring.
 func (a *MimecastAdapter) getAuthToken() (string, error) {
+	if a.stopOnFailureDeadline() {
+		return "", context.Canceled
+	}
 	a.tokenMu.Lock()
 	defer a.tokenMu.Unlock()
 
@@ -645,7 +682,9 @@ func (a *MimecastAdapter) getAuthToken() (string, error) {
 	form.Set("client_id", a.conf.ClientId)
 	form.Set("client_secret", a.conf.ClientSecret)
 
-	req, err := http.NewRequestWithContext(a.ctx, "POST", tokenURL, strings.NewReader(form.Encode()))
+	requestCtx, cancel := a.requestContext()
+	defer cancel()
+	req, err := http.NewRequestWithContext(requestCtx, "POST", tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
 	}
