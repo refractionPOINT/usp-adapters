@@ -148,12 +148,10 @@ func TestEventStillIndexingIsPickedUpOnALaterPoll(t *testing.T) {
 	}, 5*time.Second, 100*time.Millisecond, "the record must arrive once the index catches up")
 }
 
-// TestDedupeRetainsRealEventTimes covers the coupled defect. Mimecast returns
-// eventTime with a colonless offset, which time.RFC3339 rejects. The original
-// code discarded that parse error, stamped every dedupe entry with the zero
-// time, and culled it at the end of the same poll -- so widening the window
-// alone would have re-shipped every record on every poll.
-func TestDedupeRetainsRealEventTimes(t *testing.T) {
+// Dedupe retention now follows discovery time and the unread retry range,
+// independently of vendor timestamp parsing. Timestamp wiring is covered by
+// TestDocumentedTimestampReachesLagAccounting, through its observable warning.
+func TestDedupeRetainsIDsAcrossOverlappingPolls(t *testing.T) {
 	mock, a := newIdleMock(t)
 	mock.addEvent(fakeLogonEvent("fake-audit-id-realfmt", time.Now().Add(-2*time.Minute)))
 
@@ -303,11 +301,13 @@ func TestPaginationPageCapIsReportedNotSilent(t *testing.T) {
 	defer server.Close()
 
 	a := newIdleAdapter(t, server.URL, &captureSink{}, func(c *MimecastConfig) { c.ClientOptions = opts })
+	calls := boundAuditRequests(a, maxPagesPerPoll)
 
 	items, err := a.makeOneRequest()
 	require.Error(t, err)
 	assert.True(t, a.lastComplete.IsZero(), "an incomplete window must not be checkpointed")
 	assert.Len(t, items, maxPagesPerPoll, "the cap must stop pagination at exactly maxPagesPerPoll pages")
+	assert.Equal(t, int32(maxPagesPerPoll), calls.Load(), "the page cap must stop before exhausting the transport request budget")
 	assert.Contains(t, logs.joinedWarnings(), "page cap",
 		"a truncated window must be reported")
 }
@@ -338,10 +338,10 @@ func TestTokenIsFetchedOncePerPollNotPerPage(t *testing.T) {
 	assert.Equal(t, 1, mock.tokenCount(), "a token still within its lifetime must be reused across polls")
 }
 
-// TestExpiredTokenIsRefreshedMidPoll pins recovery from a token that expires
+// TestExpiredTokenIsRefreshedAtStartOfLaterPoll covers a token that expires
 // server-side while cached. Without it, caching would turn a transient 401 into
 // a permanently dead adapter.
-func TestExpiredTokenIsRefreshedMidPoll(t *testing.T) {
+func TestExpiredTokenIsRefreshedAtStartOfLaterPoll(t *testing.T) {
 	mock, a := newIdleMock(t)
 	mock.addEvent(fakeLogonEvent("fake-audit-id-0001", time.Now().Add(-1*time.Minute)))
 

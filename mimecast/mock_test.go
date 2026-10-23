@@ -26,6 +26,9 @@ import (
 // ships so their content -- payload, timestamp and event type -- can be
 // asserted without live credentials.
 
+// The mock owns its wire-format contract independently of production parsing.
+const mockTimeLayout = "2006-01-02T15:04:05-0700"
+
 // --- in-memory USP sink -------------------------------------------------------
 
 // captureSink is an in-memory uspSink that records every shipped message.
@@ -65,6 +68,7 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 type logCapture struct {
 	mu       sync.Mutex
 	warnings []string
+	debug    []string
 	errors   []string
 }
 
@@ -80,12 +84,23 @@ func (l *logCapture) joinedErrors() string {
 	return strings.Join(l.errors, "\n")
 }
 
+func (l *logCapture) joinedDebug() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.debug, "\n")
+}
+
 // recordingClientOptions returns test ClientOptions whose warning and error
 // callbacks are captured as well as logged.
 func recordingClientOptions(t *testing.T) (uspclient.ClientOptions, *logCapture) {
 	t.Helper()
 	capture := &logCapture{}
 	opts := testClientOptions(t)
+	opts.DebugLog = func(msg string) {
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		capture.debug = append(capture.debug, msg)
+	}
 	opts.OnWarning = func(msg string) {
 		t.Logf("WRN: %s", msg)
 		capture.mu.Lock()
@@ -391,10 +406,10 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	}
 	m.mu.Unlock()
 
-	start, errS := time.Parse(mimecastTimeLayout, req.Data[0].StartDateTime)
-	end, errE := time.Parse(mimecastTimeLayout, req.Data[0].EndDateTime)
-	if !assert.NoError(t, errS, "startDateTime must parse as %s", mimecastTimeLayout) ||
-		!assert.NoError(t, errE, "endDateTime must parse as %s", mimecastTimeLayout) {
+	start, errS := time.Parse(mockTimeLayout, req.Data[0].StartDateTime)
+	end, errE := time.Parse(mockTimeLayout, req.Data[0].EndDateTime)
+	if !assert.NoError(t, errS, "startDateTime must parse as %s", mockTimeLayout) ||
+		!assert.NoError(t, errE, "endDateTime must parse as %s", mockTimeLayout) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -410,9 +425,9 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	badTimes := []string{}
 	for _, e := range m.events {
 		raw := e["eventTime"].(string)
-		ts, perr := parseEventTime(raw)
+		ts, perr := time.Parse(mockTimeLayout, raw)
 		if perr != nil {
-			// A fixture the adapter itself could not read would silently
+			// A fixture outside the documented wire format would silently
 			// vanish here and quietly weaken every test that uses it.
 			badTimes = append(badTimes, raw)
 			continue
@@ -429,7 +444,7 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	}
 	m.mu.Unlock()
 
-	if !assert.Empty(t, badTimes, "fixture eventTime values must be in a format the adapter can parse") {
+	if !assert.Empty(t, badTimes, "fixture eventTime values must use the documented format") {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -491,7 +506,7 @@ func fakeAuditEvent(id, auditType, user, category, info string, eventTime time.T
 		"id":        id,
 		"auditType": auditType,
 		"user":      user,
-		"eventTime": eventTime.UTC().Truncate(time.Second).Format(mimecastTimeLayout),
+		"eventTime": eventTime.UTC().Truncate(time.Second).Format(mockTimeLayout),
 		"eventInfo": info,
 		"category":  category,
 	}
@@ -611,9 +626,9 @@ func TestMimecastEndToEnd(t *testing.T) {
 	assert.Equal(t, 100, audit.Meta.Pagination.PageSize)
 	assert.Empty(t, audit.Meta.Pagination.PageToken, "the first page must not carry a pageToken")
 	require.Len(t, audit.Data, 1)
-	startT, err := time.Parse(mimecastTimeLayout, audit.Data[0].StartDateTime)
+	startT, err := time.Parse(mockTimeLayout, audit.Data[0].StartDateTime)
 	require.NoError(t, err)
-	endT, err := time.Parse(mimecastTimeLayout, audit.Data[0].EndDateTime)
+	endT, err := time.Parse(mockTimeLayout, audit.Data[0].EndDateTime)
 	require.NoError(t, err)
 	assert.False(t, endT.Before(startT), "the request window must not be inverted")
 }

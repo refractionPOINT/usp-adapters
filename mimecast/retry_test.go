@@ -211,7 +211,10 @@ func TestPersistentAuthenticationFailureIsFatal(t *testing.T) {
 			var attempts atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == tc.endpoint {
-					attempts.Add(1)
+					if attempts.Add(1) > 2 {
+						w.WriteHeader(503)
+						return
+					}
 					w.WriteHeader(tc.status)
 					return
 				}
@@ -377,7 +380,7 @@ func TestIncompletePaginationDoesNotAdvanceCheckpoint(t *testing.T) {
 					fail = []FailureDetails{{Errors: []ErrorDetail{{Code: "temporary", Retryable: true}}}}
 				}
 				_ = json.NewEncoder(w).Encode(ApiResponse{Meta: MetaData{Pagination: Pagination{Next: next}}, Fail: fail,
-					Data: []AuditLog{{ID: fmt.Sprintf("page-%d", n), EventTime: time.Now().Format(mimecastTimeLayout)}}})
+					Data: []AuditLog{{ID: fmt.Sprintf("page-%d", n), EventTime: time.Now().Format(mockTimeLayout)}}})
 			}))
 			defer server.Close()
 			a := newIdleAdapter(t, server.URL, &captureSink{})
@@ -385,12 +388,18 @@ func TestIncompletePaginationDoesNotAdvanceCheckpoint(t *testing.T) {
 			_, err := a.makeOneRequest()
 			require.NoError(t, err)
 			checkpoint := a.lastComplete
+			transport := a.httpClient.Transport
+			calls := boundAuditRequests(a, maxPagesPerPoll)
 			incomplete.Store(true)
 			clock.current = clock.current.Add(2 * time.Hour)
 			items, err := a.makeOneRequest()
 			require.Error(t, err)
 			assert.NotEmpty(t, items, "successfully read records must survive an incomplete poll")
 			assert.Equal(t, checkpoint, a.lastComplete)
+			if mode == "cap" {
+				assert.Equal(t, int32(maxPagesPerPoll), calls.Load(), "cap must stop before the transport budget")
+			}
+			a.httpClient.Transport = transport
 			if mode == "cycle" {
 				assert.Equal(t, int32(3), pages.Load(), "detect a cycle without exhausting the cap")
 			}
@@ -413,6 +422,7 @@ func TestPartialPagesShipAndStopInterruptsRetryWait(t *testing.T) {
 	defer server.Close()
 	sink := &captureSink{}
 	a := startTestAdapter(t, server.URL, sink, "client-id-test", "client-secret-test")
+	defer a.Close()
 	require.Eventually(t, func() bool { return sink.count() == 100 }, 5*time.Second, 10*time.Millisecond)
 	require.Never(t, func() bool { return mock.auditCount() > 2 }, 100*time.Millisecond, 10*time.Millisecond, "retry must respect its deadline")
 	done := make(chan error, 1)
