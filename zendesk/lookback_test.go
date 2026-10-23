@@ -48,20 +48,34 @@ func newIdleAdapter(t *testing.T, serverURL string, sink uspSink) *ZendeskAdapte
 	return a
 }
 
-// TestRecordIDHandlesNumericIDs is the unit-level statement of the dedupe key
-// defect: Zendesk types id as an integer, and encoding/json decodes a JSON
-// number into a float64, so a plain string assertion yields "" for every
-// record.
+// utils.Dict preserves JSON integers as uint64, including values that would
+// collide if decoded through float64. Other decoder types remain supported.
 func TestRecordIDHandlesNumericIDs(t *testing.T) {
-	var decoded utils.Dict
-	require.NoError(t, json.Unmarshal([]byte(`{"id": 35436}`), &decoded))
-
-	_, wasString := decoded["id"].(string)
-	assert.False(t, wasString, "a JSON integer id does not assert to a string")
-
-	assert.Equal(t, "35436", recordID(decoded["id"]))
-	assert.Equal(t, "abc", recordID("abc"), "string ids must still work")
-	assert.Equal(t, "", recordID(nil))
+	for _, tc := range []struct {
+		name  string
+		value interface{}
+		want  string
+	}{
+		{"string", "abc", "abc"},
+		{"uint64", uint64(35436), "35436"},
+		{"uint64_above_float_precision", uint64(9007199254740993), "9007199254740993"},
+		{"uint64_max", uint64(18446744073709551615), "18446744073709551615"},
+		{"float64", float64(35436), "35436"},
+		{"float64_exact_large", float64(9007199254740991), "9007199254740991"},
+		{"json_number", json.Number("35436"), "35436"},
+		{"json_number_large", json.Number("18446744073709551615"), "18446744073709551615"},
+		{"nil", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) { require.Equal(t, tc.want, recordID(tc.value)) })
+	}
+	for _, id := range []string{"35436", "9007199254740993", "18446744073709551615"} {
+		t.Run("decoded_"+id, func(t *testing.T) {
+			var decoded utils.Dict
+			require.NoError(t, json.Unmarshal([]byte(`{"id":`+id+`}`), &decoded))
+			require.IsType(t, uint64(0), decoded["id"])
+			require.Equal(t, id, recordID(decoded["id"]))
+		})
+	}
 }
 
 // TestNumericIDsAllShip is the defect in practice. Every record in a batch

@@ -396,17 +396,19 @@ func TestIncompleteCursorRetriesWithoutAdvancing(t *testing.T) {
 		transport = http.DefaultTransport
 	}
 	windows := [][2]time.Time{}
-	incomplete := true
+	incompletePolls := 3
+	requests := 0
 	h.a.httpClient.Transport = pageRoundTripper(func(r *http.Request) (*http.Response, error) {
+		requests++
 		if firstPage(r) {
 			start, end := pollBounds(t, r)
 			windows = append(windows, [2]time.Time{start, end})
 		}
 		resp, err := transport.RoundTrip(r)
-		if err != nil || !incomplete {
+		if err != nil || incompletePolls == 0 || !firstPage(r) {
 			return resp, err
 		}
-		incomplete = false
+		incompletePolls--
 		var body map[string]interface{}
 		err = json.NewDecoder(resp.Body).Decode(&body)
 		resp.Body.Close()
@@ -427,10 +429,15 @@ func TestIncompleteCursorRetriesWithoutAdvancing(t *testing.T) {
 			h.now = h.now.Add(45 * time.Minute)
 		}
 	}
-	h.run(3)
+	h.run(5)
 	require.Empty(t, h.fatal)
-	require.Len(t, h.warnings, 1)
-	require.Equal(t, 150, h.sink.count())
-	require.Len(t, windows, 3)
-	require.Equal(t, windows[0][0], windows[1][0], "an incomplete page chain must remain unread")
+	require.Equal(t, 150, h.sink.count(), "incomplete pagination must recover every unread record")
+	require.Len(t, h.warnings, 3)
+	require.Len(t, windows, 5)
+	for i := 1; i <= 3; i++ {
+		require.Equal(t, windows[0][0], windows[i][0], "incomplete page chains must remain unread across retries")
+	}
+	require.Equal(t, windows[3][1].Add(-overlapPeriod), windows[4][0])
+	require.Equal(t, 6, requests, "malformed pagination must stop the current page walk, not spin")
+	require.Equal(t, []time.Duration{30 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 30 * time.Second}, h.delays)
 }

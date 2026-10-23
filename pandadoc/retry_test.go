@@ -69,9 +69,9 @@ func firstPage(r *http.Request) bool { return r.URL.Query().Get("page") == "1" }
 
 func pollBounds(t *testing.T, r *http.Request) (time.Time, time.Time) {
 	t.Helper()
-	start, err := time.ParseInLocation(queryTimeLayout, r.URL.Query().Get("since"), time.UTC)
+	start, err := time.ParseInLocation(documentedTimeLayout, r.URL.Query().Get("since"), time.UTC)
 	require.NoError(t, err)
-	end, err := time.ParseInLocation(queryTimeLayout, r.URL.Query().Get("to"), time.UTC)
+	end, err := time.ParseInLocation(documentedTimeLayout, r.URL.Query().Get("to"), time.UTC)
 	require.NoError(t, err)
 	return start, end
 }

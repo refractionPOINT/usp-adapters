@@ -34,13 +34,15 @@ const (
 )
 
 // recordID renders an audit log id as a dedupe key. Zendesk types id as an
-// integer, so a JSON number arrives as a float64 rather than a string; a
-// plain string type assertion yields "" for every record, which collapses the
-// whole batch onto one dedupe key and drops every record after the first.
+// integer, which utils.Dict decodes as uint64. A plain string assertion
+// collapses these IDs onto the empty dedupe key. Keep compatibility with
+// float64 and json.Number from other JSON decoders as well.
 func recordID(v interface{}) string {
 	switch t := v.(type) {
 	case string:
 		return t
+	case uint64:
+		return strconv.FormatUint(t, 10)
 	case float64:
 		return strconv.FormatInt(int64(t), 10)
 	case json.Number:

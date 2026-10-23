@@ -57,7 +57,7 @@ func (m *windowRecorder) handler(t *testing.T) http.HandlerFunc {
 		matched := []utils.Dict{}
 		if errS == nil && errE == nil {
 			for _, e := range m.entries {
-				ts, perr := parseLogTime(e["request_time"].(string))
+				ts, perr := time.ParseInLocation(documentedTimeLayout, e["request_time"].(string), time.UTC)
 				if perr != nil {
 					continue
 				}
