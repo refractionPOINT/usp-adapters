@@ -21,6 +21,9 @@ const (
 	logsURL             = "/api/v1/logs"
 	overlapPeriod       = 30 * time.Minute
 	defaultPollInterval = 30 * time.Second
+	// Bound one uncancellable SDK admission while preserving the original
+	// ten-second warning threshold and one-hour retry budget.
+	admissionSlice = 250 * time.Millisecond
 )
 
 type uspSink interface {
@@ -286,15 +289,9 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			entry, exists := g.live[digest]
 			if !exists {
 				msg := &protocol.DataMessage{JsonPayload: item, TimestampMs: uint64(time.Now().UnixMilli())}
-				admission, err := a.tracker.Ship(msg, 10*time.Second)
-				if errors.Is(err, uspclient.ErrorBufferFull) {
-					if a.conf.ClientOptions.OnWarning != nil {
-						a.conf.ClientOptions.OnWarning("stream falling behind")
-					}
-					admission, err = a.tracker.Ship(msg, time.Hour)
-				}
+				admission, err := a.admit(ctx, msg)
 				if err != nil {
-					if !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
+					if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
 						a.conf.ClientOptions.OnError(errors.New("okta event admission failed"))
 					}
 					return
@@ -336,6 +333,41 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 		}
 		if delay > 0 && !utils.CheckpointWait(ctx, delay) {
 			return
+		}
+	}
+}
+
+// admit retries only an unaccepted message. Successful admissions keep their
+// dependency even if cancellation races their return; the SDK is never sealed
+// here because ownership recovery reuses its buffer and sequence history.
+func (a *OktaAdapter) admit(ctx context.Context, msg *protocol.DataMessage) (utils.ACKDependency, error) {
+	started := time.Now()
+	deadline := started.Add(10*time.Second + time.Hour)
+	warned := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return utils.ACKDependency{}, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return utils.ACKDependency{}, uspclient.ErrorBufferFull
+		}
+		slice := min(admissionSlice, remaining)
+		attempted := time.Now()
+		dep, err := a.tracker.Ship(msg, slice)
+		if !errors.Is(err, uspclient.ErrorBufferFull) {
+			return dep, err
+		}
+		if !warned && time.Since(started) >= 10*time.Second {
+			warned = true
+			if a.conf.ClientOptions.OnWarning != nil {
+				a.conf.ClientOptions.OnWarning("stream falling behind")
+			}
+		}
+		// The real SDK normally consumes the slice. Avoid a hot loop if a
+		// client instead reports a full buffer before its timeout expires.
+		if delay := time.Until(attempted.Add(slice)); delay > 0 && !waitExact(ctx, delay) {
+			return utils.ACKDependency{}, ctx.Err()
 		}
 	}
 }
