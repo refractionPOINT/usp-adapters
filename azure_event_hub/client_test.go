@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	eventhub "github.com/Azure/azure-event-hubs-go/v3"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 
@@ -56,15 +55,23 @@ func TestProcessEventAfterClientClosedIsNotAnError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a := &EventHubAdapter{conf: EventHubConfig{ClientOptions: opts}, uspClient: client}
+	a, g := harness(t, client)
+	a.conf.ClientOptions = opts
+	p := &partitionState{}
+	g.parts["0"] = p
 
-	if err := a.processEvent(context.Background(), &eventhub.Event{Data: []byte("x")}); err != nil {
+	if err := a.processPartitionEvent(context.Background(), g, "0", p, fixtureEvent(100, 0)); err != nil {
 		t.Fatalf("processEvent on a live client: %v", err)
 	}
 
 	client.Close()
-	if err := a.processEvent(context.Background(), &eventhub.Event{Data: []byte("x")}); err != nil {
+	if err := a.processPartitionEvent(context.Background(), g, "0", p, fixtureEvent(101, 1)); err != nil {
 		t.Fatalf("processEvent after the client closed returned %v, want nil", err)
+	}
+	if err := a.confirm(g); err == nil {
+		if len(g.confirmed) != 0 {
+			t.Fatal("closed SDK admission advanced confirmed source progress")
+		}
 	}
 	if n := onErrors.Load(); n != 0 {
 		t.Fatalf("a closed client was reported %d times as an error", n)
