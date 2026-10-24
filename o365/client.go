@@ -668,6 +668,7 @@ func (a *Office365Adapter) updateBearerToken() error {
 	// but refresh with the current request's context (including Close).
 	a.httpClient = &http.Client{Timeout: httpTimeout, Transport: &tokenTransport{
 		conf: conf, client: a.httpClient, lock: make(chan struct{}, 1),
+		endpoint: tokenEndpointTransport{base: a.httpClient.Transport, maxRetryAfter: a.conf.maxRetryAfter},
 	}}
 
 	return nil
@@ -677,13 +678,20 @@ func (a *Office365Adapter) updateBearerToken() error {
 // token to stop at their own deadline. The token endpoint uses the same base
 // client as API requests, preserving its proxy, timeout and TLS settings.
 type tokenTransport struct {
-	conf   *clientcredentials.Config
-	client *http.Client
-	lock   chan struct{}
-	token  *oauth2.Token
+	conf     *clientcredentials.Config
+	client   *http.Client
+	lock     chan struct{}
+	token    *oauth2.Token
+	endpoint tokenEndpointTransport // accessed only while lock is held
 }
 
 func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if err := req.Context().Err(); err != nil {
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		return nil, err
+	}
 	select {
 	case t.lock <- struct{}{}:
 	case <-req.Context().Done():
@@ -693,11 +701,24 @@ func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, req.Context().Err()
 	}
 	token := t.token
-	var err error
-	if !token.Valid() {
-		token, err = t.conf.Token(context.WithValue(req.Context(), oauth2.HTTPClient, t.client))
+	err := req.Context().Err()
+	if err == nil && !token.Valid() {
+		tokenClient := *t.client
+		tokenClient.Transport = &t.endpoint
+		token, err = t.conf.Token(context.WithValue(req.Context(), oauth2.HTTPClient, &tokenClient))
 		if err == nil {
 			t.token = token
+		} else {
+			transient := !isCredentialError(err)
+			// OAuth2 loses the response on a body read failure or when a
+			// cancelled auth-style probe replaces the first error. Classify
+			// using the last headers received, without retaining its body.
+			if resp := t.endpoint.lastFailure; resp != nil {
+				transient = !isCredentialStatus(resp.StatusCode)
+				err = fmt.Errorf("token endpoint %s: %w", resp.Status, err)
+			}
+			err = &apiError{err: err, transient: transient,
+				retryAfter: max(0, time.Until(t.endpoint.notBefore))}
 		}
 	}
 	<-t.lock
@@ -708,6 +729,51 @@ func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 	return (&oauth2.Transport{Base: t.client.Transport, Source: oauth2.StaticTokenSource(token)}).RoundTrip(req)
+}
+
+// tokenEndpointTransport enforces one bounded cooldown across collectors and
+// OAuth2's internal auth-style probes. Capture headers before OAuth2 reads the
+// body: a stalled body must not lose the cooldown or the failure's status.
+// The enclosing tokenTransport lock serializes all access to this state.
+type tokenEndpointTransport struct {
+	base          http.RoundTripper
+	maxRetryAfter time.Duration
+	notBefore     time.Time
+	lastFailure   *http.Response // status only; never retain a response body
+}
+
+func (t *tokenEndpointTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	err := req.Context().Err()
+	if err == nil {
+		if wait := time.Until(t.notBefore); wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-timer.C:
+			case <-req.Context().Done():
+			}
+			timer.Stop()
+		}
+		err = req.Context().Err()
+	}
+	if err != nil {
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		return nil, err
+	}
+
+	t.notBefore = time.Time{}
+	t.lastFailure = nil
+	resp, err := t.base.RoundTrip(req)
+	if resp != nil && resp.StatusCode >= 400 {
+		t.lastFailure = &http.Response{Status: resp.Status, StatusCode: resp.StatusCode}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if delay := min(parseRetryAfter(resp.Header.Get("Retry-After")), t.maxRetryAfter); delay > 0 {
+				t.notBefore = time.Now().Add(delay)
+			}
+		}
+	}
+	return resp, err
 }
 
 func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, error) {
@@ -898,6 +964,10 @@ func (a *Office365Adapter) get(ctx context.Context, url string) ([]byte, http.He
 		if a.doStop.IsSet() {
 			return nil, nil, errStopped
 		}
+		var ae *apiError
+		if errors.As(err, &ae) {
+			return nil, nil, ae
+		}
 		return nil, nil, &apiError{
 			err:       fmt.Errorf("http.Client.Do(): %v", err),
 			transient: !isCredentialError(err),
@@ -936,7 +1006,10 @@ func isCredentialError(err error) bool {
 	if !errors.As(err, &re) || re.Response == nil {
 		return false
 	}
-	code := re.Response.StatusCode
+	return isCredentialStatus(re.Response.StatusCode)
+}
+
+func isCredentialStatus(code int) bool {
 	return code >= 400 && code < 500 && code != http.StatusTooManyRequests
 }
 
@@ -960,9 +1033,14 @@ func parseRetryAfter(v string) time.Duration {
 	if v == "" {
 		return 0
 	}
-	if secs, err := strconv.Atoi(v); err == nil {
+	if secs, err := strconv.ParseInt(v, 10, 64); err == nil {
 		if secs < 0 {
 			return 0
+		}
+		// Saturate before converting seconds so a large valid header cannot
+		// overflow and bypass the caller's Retry-After cap.
+		if secs > int64(time.Duration(1<<63-1)/time.Second) {
+			return time.Duration(1<<63 - 1)
 		}
 		return time.Duration(secs) * time.Second
 	}
