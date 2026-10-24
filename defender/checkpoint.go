@@ -28,7 +28,7 @@ type savedID struct {
 }
 type liveID struct {
 	dependency utils.ACKDependency
-	serial     uint64
+	admission  uint64
 	expiry     int64
 }
 
@@ -40,9 +40,18 @@ type liveID struct {
 type defenderPosition struct {
 	Boundary, WindowEnd, Coverage, Replay, ReplayEnd, Unverified int64
 	IDs                                                          []savedID
+	omittedPast                                                  int64 // transient encoder input; never serialized
 }
 type defenderGeneration struct {
 	id, serial           uint64
+	admitted             uint64 // collector-owned successful admissions, independent of source serial
+	acked                atomic.Uint64
+	forgottenBefore      int64 // collector-owned: scans cannot restart across reclaimed exact history
+	forgottenGapAt       int64 // actual discarded ID at or after the advertised suffix
+	pruneAfter           time.Time
+	pruneSource          int64
+	pruneACK             uint64
+	pruneACKRetry        bool
 	session              *utils.CheckpointSession
 	position             defenderPosition
 	live                 map[[16]byte]liveID
@@ -51,6 +60,8 @@ type defenderGeneration struct {
 	hasDependency        bool
 	confirmed            atomic.Uint64
 	liveScan, replayScan *graphScan
+	liveProof            *graphScan // aliases the settled lane's bounded proof, including between intervals
+	lostBefore           int64      // retired identities without a carried settled proof
 	tailScan             *graphScan
 	latest               []byte // manager-owned; Confirm consumes even if persistence fails
 }
@@ -103,16 +114,18 @@ func encodePosition(p defenderPosition) ([]byte, error) {
 		count = max
 	}
 	coverage := p.Coverage
-	if count < len(ids) {
-		// Exclude the entire timestamp tie containing any omitted entry.
-		suffix := ids[count].expiry - int64(historyHorizon) + 1
-		if suffix > coverage {
-			coverage = suffix
-		}
-		if coverage > p.Boundary {
-			coverage = p.Boundary
+	omitted := p.omittedPast
+	for _, entry := range ids[count:] {
+		created := entry.expiry - int64(historyHorizon)
+		if created < p.Boundary && created > omitted {
+			omitted = created
 		}
 	}
+	// Future-only omissions say nothing about completed historical coverage.
+	if omitted >= coverage && omitted < p.Boundary {
+		coverage = omitted + 1
+	}
+
 	if coverage > p.Coverage && (p.Unverified == 0 || p.Coverage < p.Unverified) {
 		p.Unverified = p.Coverage
 	}
@@ -177,6 +190,12 @@ func (a *DefenderAdapter) saveConfirmed(ctx context.Context, g *defenderGenerati
 	if err != nil {
 		a.issue("ack_observation_failed")
 		return err
+	}
+	// This independent stream certifies only a completed admission prefix. It
+	// carries no source bounds, ID summary or persistent state. Failed/in-flight
+	// pages can never become source candidates through this observation.
+	if raw := confirmed["admissions"]; len(raw) == 16 && binary.BigEndian.Uint64(raw) == g.id {
+		g.acked.Store(binary.BigEndian.Uint64(raw[8:]))
 	}
 	if raw := confirmed["alerts"]; len(raw) >= 16 && binary.BigEndian.Uint64(raw) == g.id {
 		serial := binary.BigEndian.Uint64(raw[8:])

@@ -257,6 +257,13 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 }
 
 func (a *DefenderAdapter) shipItem(ctx context.Context, g *defenderGeneration, item map[string]interface{}, start, end int64) error {
+	return a.shipScanItem(ctx, g, item, start, end, nil)
+}
+
+func (a *DefenderAdapter) shipScanItem(ctx context.Context, g *defenderGeneration, item map[string]interface{}, start, end int64, work *graphScan) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
 	id, ok := item["id"].(string)
 	stamp, okTime := item["createdDateTime"].(string)
 	created, err := time.Parse(time.RFC3339Nano, stamp)
@@ -270,14 +277,22 @@ func (a *DefenderAdapter) shipItem(ctx context.Context, g *defenderGeneration, i
 		return nil
 	}
 	digest := eventDigest(a.sourceFingerprint(), id)
+	if g.liveProof != nil {
+		if _, known := g.liveProof.retained[digest]; known {
+			return nil
+		}
+	}
 	entry, exists := g.live[digest]
 	if !exists {
-		if len(g.live) >= liveIDLimit {
-			for key, v := range g.live {
-				if v.expiry < a.runtime.now().UnixNano() && v.serial <= g.confirmed.Load() {
-					delete(g.live, key)
-				}
+		// After reclamation this bounded set still proves earlier IDs in this exact
+		// opaque traversal were consumed. Pending entries remain in g.live.
+		if work != nil {
+			if _, consumed := work.ids[digest]; consumed {
+				return nil
 			}
+		}
+		if len(g.live) >= liveIDLimit {
+			a.reclaim(g, work)
 			if len(g.live) >= liveIDLimit {
 				return errPressure
 			}
@@ -308,11 +323,19 @@ func (a *DefenderAdapter) shipItem(ctx context.Context, g *defenderGeneration, i
 		}
 		// Single traversal serializes dedupe with admission. No other traversal may
 		// suppress this ID until its Ship has returned successfully.
-		entry = liveID{dependency: dep, serial: g.serial + 1, expiry: t + int64(historyHorizon)}
+		g.admitted++
+		// A one-record admission prefix is complete after successful Ship, even
+		// when its source page is incomplete. This stream is never persisted and
+		// cannot certify a source frontier or suppression summary. Confirm snapshots
+		// it before GetUnsent, so concurrent/newer admissions cannot bless it.
+		if err := a.tracker.Candidate("admissions", candidateBytes(g.id, g.admitted, nil), dep); err != nil {
+			return err
+		}
+		entry = liveID{dependency: dep, admission: g.admitted, expiry: t + int64(historyHorizon)}
 		g.live[digest] = entry
 		g.remember(savedID{digest: digest, expiry: entry.expiry})
 	}
-	if entry.serial > g.confirmed.Load() {
+	if entry.admission > g.acked.Load() {
 		dep, err := g.dependency.Include(entry.dependency)
 		if err != nil {
 			return err
@@ -323,15 +346,181 @@ func (a *DefenderAdapter) shipItem(ctx context.Context, g *defenderGeneration, i
 	return nil
 }
 
+// Prefer optional ACKed history behind the settled frontier and outside the
+// recent prompt overlap. An old source timestamp alone does not make an ID
+// safe to forget: each current traversal still needs its unconsumed IDs.
+func (a *DefenderAdapter) reclaim(g *defenderGeneration, work *graphScan) {
+	now, acked := a.runtime.now().UnixNano(), g.acked.Load()
+	wall := time.Now()
+	sourceDelta := now - g.pruneSource
+	if wall.Before(g.pruneAfter) && sourceDelta < int64(a.runtime.window) && sourceDelta > -int64(a.runtime.window) {
+		// At most one additional ACK-triggered walk per cooldown. A full protected
+		// set cannot cause 65k-entry map walks on every idle scheduler turn.
+		if acked <= g.pruneACK || g.pruneACKRetry {
+			return
+		}
+		g.pruneACKRetry = true
+	} else {
+		interval := a.pollInterval
+		if interval < time.Second {
+			interval = time.Second
+		}
+		g.pruneAfter = wall.Add(interval)
+		g.pruneSource = now
+		g.pruneACKRetry = false
+	}
+	g.pruneACK = acked
+	protected := now - int64(a.runtime.window+a.runtime.settle)
+	if protected > g.position.Boundary {
+		protected = g.position.Boundary
+	}
+	const batch = liveIDLimit / 16
+	removed := 0
+	scans := [3]*graphScan{g.liveScan, g.replayScan, g.tailScan}
+	// First discard optional history. Only when that yields nothing retire
+	// expired, consumed settled IDs, then expired history that compromises an
+	// old traversal. This last tier keeps fresh traffic available at a stalled
+	// source boundary without pretending that the old interval completed.
+	for tier := 0; tier < 3 && removed == 0; tier++ {
+		if tier == 1 && work != nil {
+			removed = a.retainSettledProof(g, work, now, acked, batch)
+			if removed != 0 {
+				break
+			}
+		}
+		for key, v := range g.live {
+			if v.admission > acked {
+				continue
+			}
+			created := v.expiry - int64(historyHorizon)
+			if work != nil && created >= work.start && created < work.end {
+				if _, consumed := work.ids[key]; !consumed {
+					continue
+				}
+			}
+			if tier == 0 {
+				if created >= protected {
+					continue
+				}
+			} else {
+				if v.expiry >= now {
+					continue
+				}
+				if tier == 1 {
+					live := g.liveScan
+					if live == nil || created < live.start || created >= live.end {
+						continue
+					}
+					if _, consumed := live.ids[key]; !consumed {
+						continue
+					}
+				}
+			}
+			harmless := true
+			for _, scan := range scans {
+				if scan != nil && !scan.blocked && created >= scan.start && created < scan.end {
+					if _, consumed := scan.ids[key]; !consumed {
+						harmless = false
+						break
+					}
+				}
+			}
+			if tier < 2 && !harmless {
+				continue
+			}
+			// A production traversal cannot destroy an ahead-of-frontier identity
+			// when the bounded settled proof could not retain it.
+			if work != nil && created >= g.position.Boundary {
+				continue
+			}
+			delete(g.live, key)
+			if before := created + int64(graphTimeQuantum); before > g.lostBefore {
+				g.lostBefore = before
+			}
+			if created >= g.position.Coverage && (g.forgottenGapAt == 0 || created < g.forgottenGapAt) {
+				g.forgottenGapAt = created
+			}
+			removed++
+			if before := created + int64(graphTimeQuantum); before > g.forgottenBefore {
+				g.forgottenBefore = before
+			}
+			for _, scan := range scans {
+				if scan != nil && scan != work && created >= scan.start && created < scan.end {
+					if _, consumed := scan.ids[key]; !consumed {
+						scan.blocked = true
+						scan.page = nil // this exact traversal can no longer resume safely
+					}
+				}
+			}
+			if removed >= batch {
+				break
+			}
+		}
+	}
+	if removed == 0 {
+		return
+	}
+	// A full batch paid for this walk with thousands of successful admissions.
+	// Permit another productive batch without an artificial intake rate ceiling;
+	// failed or tiny walks retain their cooldown against idle pressure loops.
+	if removed == batch {
+		g.pruneAfter = time.Time{}
+	}
+	// Every remaining active traversal either retained each necessary ID or
+	// consumed it already. The global historical cutoff cannot block that exact
+	// continuation merely because another lane performed the reclamation.
+	for _, scan := range scans {
+		if scan != nil && !scan.blocked {
+			scan.reclaimed = true
+		}
+	}
+	if work != nil && !work.blocked {
+		work.reclaimed = true
+	}
+	g.narrowHistory()
+	a.issue("coverage_limited")
+}
+
+// Narrowing a suffix excludes an explicitly unverified gap. It never advances
+// Boundary or claims that an abandoned reconciliation prefix was delivered.
+func (g *defenderGeneration) narrowHistory() {
+	if g.forgottenBefore == 0 || g.forgottenGapAt == 0 || g.forgottenGapAt >= g.position.Boundary {
+		return
+	}
+	coverage := g.forgottenBefore
+	if coverage > g.position.Boundary {
+		coverage = g.position.Boundary
+	}
+	if coverage > g.position.Coverage {
+		if g.position.Unverified == 0 || g.position.Coverage < g.position.Unverified {
+			g.position.Unverified = g.position.Coverage
+		}
+		g.position.Coverage = coverage
+	}
+}
+
 // scanWindow streams pages and yields a COMPLETE prefix. A terminal full page,
 // count shortfall, repeated link, or page budget is never a complete interval.
 // Split the SAME fixed interval; timestamp ties cannot be skipped by a max cursor.
+type retainedID struct {
+	created  int64
+	consumed bool
+}
+
 type graphScan struct {
 	start, targetEnd, end int64
 	next                  string // only in memory; restart re-runs the exact saved interval bounds
 	links                 map[[32]byte]struct{}
 	ids                   map[[16]byte]struct{}
 	expected              int64
+	page                  *graphPage // at most one validated page per lane, retained on pressure
+	offset                int
+	blocked               bool                    // exact history was reclaimed by a different traversal
+	reclaimed             bool                    // this traversal owns a safe retained continuation past reclaimed IDs
+	retained              map[[16]byte]retainedID // shares the existing 65,536-key lane budget with ids
+	seenRetained          int
+	finished              bool
+	terminalTie           bool
 }
 
 func (a *DefenderAdapter) newScan(start, targetEnd, end int64) *graphScan {
@@ -354,6 +543,9 @@ const (
 )
 
 func (a *DefenderAdapter) scanPages(ctx context.Context, g *defenderGeneration, start, end int64, mode scanMode, pageBudget int, requests *graphRequests) (int64, error) {
+	if mode == scanLive {
+		defer func() { g.liveProof = g.liveScan }()
+	}
 	slot := &g.liveScan
 	if mode == scanReplay {
 		slot = &g.replayScan
@@ -361,10 +553,38 @@ func (a *DefenderAdapter) scanPages(ctx context.Context, g *defenderGeneration, 
 	if mode == scanTail {
 		slot = &g.tailScan
 	}
+	if mode == scanLive && g.liveProof != nil {
+		*slot = g.liveProof
+	}
+	cutoff := g.forgottenBefore
+	if mode == scanLive {
+		cutoff = g.lostBefore
+	}
 	if *slot == nil || (*slot).start != start || (*slot).targetEnd != end {
-		*slot = a.newScan(start, end, end)
+		if *slot != nil {
+			(*slot).page = nil
+		}
+		if start < cutoff {
+			return start, errIncomplete
+		}
+		if mode == scanLive && g.liveProof != nil {
+			*slot = a.restartProofScan(g.liveProof, start, end, end)
+		} else {
+			*slot = a.newScan(start, end, end)
+		}
 	}
 	work := *slot
+	if mode == scanLive {
+		g.liveProof = work
+	}
+	if work.blocked || (start < cutoff && !work.reclaimed) {
+		work.page = nil
+		return start, errIncomplete
+	}
+	if work.finished {
+		return work.end, nil
+	}
+
 	for used := 0; ; {
 		if used >= pageBudget {
 			return start, errYield
@@ -373,48 +593,102 @@ func (a *DefenderAdapter) scanPages(ctx context.Context, g *defenderGeneration, 
 		_, repeated := work.links[key]
 		incomplete := repeated || len(work.links) >= 128
 		if !incomplete {
-			page, err := a.requestPage(ctx, work.next, mode == scanReplay, requests)
-			if err != nil {
-				return start, err
-			}
-			used++
-			if page.Count != nil && *page.Count > work.expected {
-				work.expected = *page.Count
-			}
-			for _, item := range page.Items {
-				if err := a.shipItem(ctx, g, item, start, work.end); err != nil {
+			if work.page == nil {
+				page, err := a.requestPage(ctx, work.next, mode == scanReplay, requests)
+				if err != nil {
 					return start, err
 				}
-				id, _ := item["id"].(string)
-				work.ids[eventDigest(a.sourceFingerprint(), id)] = struct{}{}
-				if len(work.ids) > liveIDLimit {
-					return start, errPressure
+				work.page = &page
+				work.offset = 0
+				if page.Count != nil && *page.Count > work.expected {
+					work.expected = *page.Count
 				}
 			}
+			used++ // a retained page also consumes this turn's work budget
+			page := work.page
+			for work.offset < len(page.Items) {
+				if err := a.shipScanItem(ctx, g, page.Items[work.offset], start, work.end, work); err != nil {
+					if errors.Is(err, errPage) {
+						work.page = nil
+					} // refetch; successful prefix remains suppressed
+					return start, err
+				}
+				id, _ := page.Items[work.offset]["id"].(string)
+				created, _ := time.Parse(time.RFC3339Nano, page.Items[work.offset]["createdDateTime"].(string))
+				if created.UnixNano() >= start && created.UnixNano() < work.end {
+					key := eventDigest(a.sourceFingerprint(), id)
+					if proof, ok := work.retained[key]; ok {
+						if !proof.consumed {
+							proof.consumed = true
+							work.retained[key] = proof
+							work.seenRetained++
+						}
+					} else if len(work.ids)+len(work.retained) < liveIDLimit {
+						work.ids[key] = struct{}{}
+					}
+				}
+
+				work.offset++
+			}
 			work.links[key] = struct{}{}
+			work.page = nil
+			if len(work.retained) > 0 && len(page.Items) == 1000 && page.Next == "" {
+				stamp, _ := page.Items[0]["createdDateTime"].(string)
+				work.terminalTie = true
+				for _, item := range page.Items {
+					if item["createdDateTime"] != stamp {
+						work.terminalTie = false
+						break
+					}
+				}
+			}
 			if page.Next != "" {
 				work.next = page.Next
 				continue
 			}
-			if len(page.Items) < 1000 && int64(len(work.ids)) >= work.expected {
-				*slot = nil
+			if len(page.Items) < 1000 && int64(len(work.ids)+work.seenRetained) >= work.expected {
+				if mode == scanLive && len(work.retained) > 0 {
+					work.finished = true
+				} else {
+					*slot = nil
+					if mode == scanLive {
+						g.liveProof = nil
+					}
+				}
 				return work.end, nil
 			}
 		}
 		// A full terminal page/count shortfall/cycle is not complete. Narrow the
 		// same fixed interval; retain this smaller attempt across scheduling yields.
+		// Restarting this interval after forgetting its digests would repeat old
+		// deliveries. Keep the exact unresolved scan, even for ambiguous pages.
+		if work.expected > liveIDLimit || work.terminalTie || start < cutoff {
+			return start, errIncomplete
+		}
 		if work.end-start <= int64(graphTimeQuantum) {
-			*slot = a.newScan(start, end, work.end)
+			if mode == scanLive {
+				*slot = a.restartProofScan(work, start, end, work.end)
+			} else {
+				*slot = a.newScan(start, end, work.end)
+			}
 			return start, errIncomplete
 		}
 		midpoint := start + (work.end-start)/2
 		midpoint -= midpoint % int64(graphTimeQuantum)
 		if midpoint <= start {
-			*slot = a.newScan(start, end, work.end)
+			if mode == scanLive {
+				*slot = a.restartProofScan(work, start, end, work.end)
+			} else {
+				*slot = a.newScan(start, end, work.end)
+			}
 			return start, errIncomplete
 		}
 		a.issue("interval_split")
-		work = a.newScan(start, end, midpoint)
+		if mode == scanLive {
+			work = a.restartProofScan(work, start, end, midpoint)
+		} else {
+			work = a.newScan(start, end, midpoint)
+		}
 		*slot = work
 	}
 }
@@ -431,8 +705,27 @@ func (a *DefenderAdapter) complete(g *defenderGeneration, end int64, replay bool
 			g.position.WindowEnd = end + int64(a.runtime.window)
 		}
 	}
+	if !replay && g.liveProof != nil {
+		for key, proof := range g.liveProof.retained {
+			if proof.created < g.position.Boundary {
+				delete(g.liveProof.retained, key)
+				if proof.consumed {
+					g.liveProof.seenRetained--
+				}
+				if before := proof.created + int64(graphTimeQuantum); before > g.lostBefore {
+					g.lostBefore = before
+				}
+			}
+		}
+		if g.liveProof.finished && len(g.liveProof.retained) == 0 {
+			g.liveProof = nil
+			g.liveScan = nil
+		}
+	}
+	g.narrowHistory()
 	g.serial++
 	g.position.IDs = append([]savedID(nil), g.recent...)
+	g.position.omittedPast = g.summaryOmission()
 	raw, err := encodePosition(g.position)
 	if err != nil {
 		return err
@@ -617,4 +910,130 @@ func (a *DefenderAdapter) collectionFailure(ctx context.Context, err error) bool
 		return false
 	}
 	return true
+}
+
+// Retain an ACKed identity in the settled lane before releasing its live slot.
+// This is suppression proof only: unconsumed keys never contribute to count or
+// certify a source boundary. The map moves with that lane into its next window.
+func (a *DefenderAdapter) retainSettledProof(g *defenderGeneration, work *graphScan, now int64, acked uint64, batch int) int {
+	owner := g.liveProof
+	if owner == nil {
+		owner = g.liveScan
+		if owner == nil {
+			owner = a.newScan(g.position.Boundary, g.position.WindowEnd, g.position.WindowEnd)
+			g.liveScan = owner
+		}
+		g.liveProof = owner
+	}
+	// A partially observed pending set stays pinned. Once cumulatively ACKed,
+	// a finite burst can be moved without waiting for a completed source window.
+	for _, entry := range g.live {
+		if entry.admission > acked {
+			return 0
+		}
+	}
+	if owner.retained == nil {
+		owner.retained = make(map[[16]byte]retainedID)
+	}
+	removed := 0
+	compacted := false
+	floor := now - int64(a.runtime.window+a.runtime.settle)
+	for key, entry := range g.live {
+		created := entry.expiry - int64(historyHorizon)
+		if created < g.position.Boundary || created >= floor {
+			continue
+		}
+		_, consumed := owner.ids[key]
+		if !consumed && len(owner.ids)+len(owner.retained) >= liveIDLimit {
+			// At most one bounded compaction walk per reclamation attempt. Retired
+			// proofs are never victims; ordinary markers still have live identities.
+			if !compacted {
+				compacted = true
+				freed := 0
+				for prior := range owner.ids {
+					if _, present := g.live[prior]; present {
+						delete(owner.ids, prior)
+						freed++
+						if freed >= batch {
+							break
+						}
+					}
+				}
+			}
+			if len(owner.ids)+len(owner.retained) >= liveIDLimit {
+				continue
+			}
+		}
+
+		if consumed {
+			delete(owner.ids, key)
+			owner.seenRetained++
+		}
+		owner.retained[key] = retainedID{created: created, consumed: consumed}
+		delete(g.live, key)
+		if before := created + int64(graphTimeQuantum); before > g.forgottenBefore {
+			g.forgottenBefore = before
+		}
+		if created >= g.position.Coverage && (g.forgottenGapAt == 0 || created < g.forgottenGapAt) {
+			g.forgottenGapAt = created
+		}
+		for _, scan := range []*graphScan{g.replayScan, g.tailScan} {
+			if scan != nil && scan != work && created >= scan.start && created < scan.end {
+				if _, seen := scan.ids[key]; !seen {
+					scan.blocked = true
+					scan.page = nil
+				}
+			}
+		}
+		removed++
+		if removed >= batch {
+			break
+		}
+	}
+	return removed
+}
+
+// recent keeps only 257 newest IDs. Older real omissions can still be present
+// in live/settled proof, so inspect those bounded sets before encoding history.
+func (g *defenderGeneration) summaryOmission() int64 {
+	selected := make(map[[16]byte]struct{}, savedIDLimit)
+	for i, entry := range g.recent {
+		if i < savedIDLimit {
+			selected[entry.digest] = struct{}{}
+		}
+	}
+	var omitted int64
+	note := func(key [16]byte, created int64) {
+		if _, saved := selected[key]; !saved && created < g.position.Boundary && created > omitted {
+			omitted = created
+		}
+	}
+	for key, entry := range g.live {
+		note(key, entry.expiry-int64(historyHorizon))
+	}
+	if g.liveProof != nil {
+		for key, proof := range g.liveProof.retained {
+			note(key, proof.created)
+		}
+	}
+	for _, entry := range g.recent {
+		note(entry.digest, entry.expiry-int64(historyHorizon))
+	}
+	return omitted
+}
+
+// Reset source observations while moving the same bounded suppression proof.
+// Retained identities outside a narrowed prefix remain available to its suffix.
+func (a *DefenderAdapter) restartProofScan(old *graphScan, start, target, end int64) *graphScan {
+	fresh := a.newScan(start, target, end)
+	if old != nil && len(old.retained) > 0 {
+		fresh.retained = old.retained
+		for key, proof := range fresh.retained {
+			proof.consumed = false
+			fresh.retained[key] = proof
+		}
+		*old = *fresh
+		return old
+	}
+	return fresh
 }

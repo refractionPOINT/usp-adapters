@@ -224,7 +224,7 @@ func newDefenderAdapterWithRuntime(ctx context.Context, conf DefenderConfig, sin
 		sink = client
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
-	tracker, err := utils.NewACKTracker(sink, 1, checkpointPositionLimit+16)
+	tracker, err := utils.NewACKTracker(sink, 2, checkpointPositionLimit+16)
 	if err != nil {
 		cancel()
 		_, _ = sink.Close()
