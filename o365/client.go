@@ -52,6 +52,9 @@ const (
 	// a poll before the adapter moves on to the rest of the page. The blob
 	// isn't recorded as done, so the next poll tries it again.
 	defaultContentRetryLimit = 10 * time.Minute
+
+	// Bound per-collector bookkeeping even if a listing contains many failures.
+	maxLeftBlobs = 4096
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -105,6 +108,7 @@ type Office365Adapter struct {
 	conf       Office365Config
 	uspClient  uspSink
 	httpClient *http.Client
+	transport  *http.Transport
 
 	endpoint     string
 	endpointType string
@@ -260,14 +264,11 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 		}
 	}
 
-	a.httpClient = &http.Client{
-		Timeout: httpTimeout,
-		Transport: &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout: 10 * time.Second,
-			}).Dial,
-		},
-	}
+	// Retain proxy settings, idle expiry and TLS defaults. DialContext also
+	// lets Close cancel a connection attempt before the dial timeout.
+	a.transport = http.DefaultTransport.(*http.Transport).Clone()
+	a.transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	a.httpClient = &http.Client{Timeout: httpTimeout, Transport: a.transport}
 
 	a.chStopped = make(chan struct{})
 
@@ -327,7 +328,8 @@ func (a *Office365Adapter) Close() error {
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
-	a.httpClient.CloseIdleConnections()
+	// oauth2.Transport doesn't forward CloseIdleConnections to its base.
+	a.transport.CloseIdleConnections()
 
 	a.conf.Deduper.Close()
 
@@ -360,8 +362,10 @@ func (a *Office365Adapter) fetchEvents(url string) {
 }
 
 // pollOnce lists every page of the window and ships the content of every blob
-// not already done. It returns true when the whole window was processed.
+// not already done. It returns false when transient failures remain, so only
+// those failures keep the continuous-outage clock running across polls.
 func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
+	a.expireLeftBlobs(fs, time.Now())
 	complete := true
 	for pageURL != "" {
 		body, header, err := a.getWithRetry(pageURL, "list api", fs, 0)
@@ -394,15 +398,16 @@ func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
 // a CheckingDeduper, a blob is recorded as done only once all of its events
 // were shipped, so a blob interrupted by an error or by Close is fetched again
 // by the next poll, or by the next instance sharing the deduper. complete is
-// false when a blob was left for the next poll; abort is true when the poll
-// must stop.
+// false when transient retries were exhausted; abort is true when the poll
+// must stop. Other unprocessed blobs have a separate failure clock.
 func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (complete bool, abort bool) {
 	nFetched := 0
 	nShipped := 0
 	nSkipped := 0
 	nLeft := 0
+	transientLeft := false
 	defer func() {
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d left for next poll: %d", nFetched, nShipped, nSkipped, nLeft))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d left unprocessed: %d", nFetched, nShipped, nSkipped, nLeft))
 	}()
 
 	for _, item := range items {
@@ -410,6 +415,7 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 			return false, true
 		}
 		if a.isDone(item.ContentID) {
+			delete(fs.leftBlobs, item.ContentID)
 			nSkipped++
 			continue
 		}
@@ -421,10 +427,12 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 			}
 			var ae *apiError
 			if errors.As(err, &ae) && (ae.gone || ae.transient) {
-				// The blob is missing or expired, or kept failing: move on to
-				// the rest of the page. With a CheckingDeduper the blob isn't
-				// recorded as done, so it is tried again while it is listed.
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api, leaving blob for the next poll: %v", err))
+				if ae.transient {
+					transientLeft = true
+				} else {
+					delete(fs.leftBlobs, item.ContentID)
+				}
+				a.leaveBlob(item, fs, ae.transient, err)
 				nLeft++
 				continue
 			}
@@ -432,7 +440,7 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 			return false, true
 		}
 		if !gjson.ValidBytes(content) {
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api returned invalid json, leaving blob for the next poll: %s", item.ContentURI))
+			a.leaveBlob(item, fs, true, errors.New("content api returned invalid json"))
 			nLeft++
 			continue
 		}
@@ -446,9 +454,73 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 			return false, true
 		}
 		a.markDone(item.ContentID)
+		delete(fs.leftBlobs, item.ContentID)
 		nFetched++
 	}
-	return nLeft == 0, false
+	return !transientLeft, false
+}
+
+// leaveBlob reports a blob left unprocessed. Invalid JSON and exhausted
+// transient retries also get an independent clock: other successful blobs
+// must not hide one that keeps failing until it ages out of the listing.
+func (a *Office365Adapter) leaveBlob(item listItem, fs *failureState, track bool, err error) {
+	if a.checker == nil {
+		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api: blob was recorded as seen before download and cannot be retried on the next poll with this deduper: %v", err))
+		return
+	}
+	a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api, leaving blob for the next poll: %v", err))
+	if !track {
+		return
+	}
+	now := time.Now()
+	left, exists := fs.leftBlobs[item.ContentID]
+	if !exists {
+		if len(fs.leftBlobs) >= maxLeftBlobs {
+			a.reportLeftBlobs(fs, now, "too many unprocessed content blobs to track; some content may age out before recovery")
+			return
+		}
+		if fs.leftBlobs == nil {
+			fs.leftBlobs = make(map[string]leftBlob)
+		}
+		left = leftBlob{since: now, expires: now.Add(3 * time.Hour)}
+		// Once outside the rolling listing window or vendor retention, the
+		// entry can't be retried here. Missing dates use the bounded fallback.
+		if created, err := time.Parse(time.RFC3339, item.ContentCreated); err == nil {
+			left.expires = created.Add(3 * time.Hour)
+		}
+		if expiry, err := time.Parse(time.RFC3339, item.ContentExpiration); err == nil && expiry.Before(left.expires) {
+			left.expires = expiry
+		}
+		fs.leftBlobs[item.ContentID] = left
+	}
+	if now.Sub(left.since) >= a.conf.failureEscalation {
+		a.reportLeftBlobs(fs, now, "content blob remains unprocessed despite repeated polls")
+	}
+}
+
+func (a *Office365Adapter) expireLeftBlobs(fs *failureState, now time.Time) {
+	for key, left := range fs.leftBlobs {
+		if !now.Before(left.expires) {
+			// A blob first seen near the end of its window can expire before
+			// the escalation period. Don't silently forget that lost retry.
+			a.reportLeftBlobs(fs, now, "unprocessed content blob left the listing window or expired before recovery")
+			delete(fs.leftBlobs, key)
+			continue
+		}
+		if now.Sub(left.since) >= a.conf.failureEscalation {
+			a.reportLeftBlobs(fs, now, "content blob remains unprocessed despite repeated polls")
+		}
+	}
+}
+
+func (a *Office365Adapter) reportLeftBlobs(fs *failureState, now time.Time, message string) {
+	// Aggregate overdue/capacity reports once per period, rather than one
+	// OnError per blob or poll when an on-prem host keeps running.
+	if !fs.lastBlobError.IsZero() && now.Sub(fs.lastBlobError) < a.conf.failureEscalation {
+		return
+	}
+	fs.lastBlobError = now
+	a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api: %s", message))
 }
 
 // shipContent ships every event of a content blob. There is apparently no
@@ -508,6 +580,8 @@ func (a *Office365Adapter) isDone(key string) bool {
 // from that buffer is not re-fetched.
 func (a *Office365Adapter) markDone(key string) {
 	if a.checker != nil {
+		// Overlapping instances can duplicate work between Check and this
+		// commit. Preserving unshipped data takes priority over that race.
 		a.checker.CheckAndAdd(key)
 	}
 }
@@ -637,7 +711,14 @@ func (e *apiError) Error() string { return e.err.Error() }
 // cleared when a content blob is downloaded or a whole poll completes, not by
 // a successful listing alone, so a content outage still escalates.
 type failureState struct {
-	since time.Time
+	since         time.Time
+	leftBlobs     map[string]leftBlob
+	lastBlobError time.Time
+}
+
+type leftBlob struct {
+	since   time.Time
+	expires time.Time
 }
 
 // failingFor marks the loop as failing and returns for how long it has been.

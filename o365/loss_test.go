@@ -714,24 +714,24 @@ func failFor(d time.Duration, ids ...string) func(key string, hit int, w http.Re
 func TestIntermittentFailuresDontEscalate(t *testing.T) {
 	const ct = "Audit.Exchange"
 	m := newFaultMock(t)
-	recs := addBlobs(t, m, ct, 3)
-	m.setFault(failFor(200*time.Millisecond, "blob-1", "blob-2", "blob-3"))
+	recs := addBlobs(t, m, ct, 4)
+	m.setFault(failFor(200*time.Millisecond, "blob-1", "blob-2", "blob-3", "blob-4"))
 
 	cb := &callbacks{}
 	sink := &captureSink{}
 	conf := newTestConfig(t, m.mockO365, ct)
 	conf.PollInterval = time.Hour
 	fastRetries(&conf)
-	conf.failureEscalation = 350 * time.Millisecond
+	conf.failureEscalation = 600 * time.Millisecond
 	cb.install(t, &conf)
 	startAdapter(t, conf, sink)
 
-	require.Eventually(t, func() bool { return sink.count() == 3 },
+	require.Eventually(t, func() bool { return sink.count() == 4 },
 		5*time.Second, 10*time.Millisecond, "all blobs must ship")
 	assert.Empty(t, lostRecords(t, recs, sink))
-	times := m.hitTimes("blob-3")
+	times := m.hitTimes("blob-4")
 	require.NotEmpty(t, times)
-	assert.Greater(t, time.Since(m.hitTimes("blob-1")[0]), 350*time.Millisecond, "the failures must span more than the escalation time")
+	assert.Greater(t, time.Since(m.hitTimes("blob-1")[0]), 600*time.Millisecond, "the failures must span more than the escalation time")
 	assert.Empty(t, cb.errors(), "failures between successful downloads must not escalate")
 }
 
