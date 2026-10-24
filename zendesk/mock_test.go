@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync"
 	"testing"
@@ -63,11 +64,8 @@ func basicAuthFor(email, token string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s/token:%s", email, token)))
 }
 
-// cursorState remembers where a paginated walk left off so the next page can
-// resume from the same created_at window.
+// cursorState remembers the offset. The query must still carry its filters.
 type cursorState struct {
-	start  time.Time
-	until  time.Time
 	offset int
 }
 
@@ -84,18 +82,18 @@ type cursorState struct {
 //     sends the Rails array spelling "filter[created_at][]", which the mock
 //     mirrors. The docs do not say whether the bounds are inclusive; the mock
 //     treats them as inclusive.
-//   - The real API's links.next is a full URL carrying a page[after] cursor
-//     (https://developer.zendesk.com/api-reference/introduction/pagination/).
-//     This adapter instead feeds links.next back verbatim as the *first*
-//     filter[created_at][] value of the next request (see makeOneRequest), so
-//     the mock returns an opaque token and recognizes it there -- matching how
-//     the adapter actually consumes pagination.
+//   - links.next is a full URL carrying a page[after] cursor
+//     (https://developer.zendesk.com/api-reference/introduction/pagination/),
+//     which the mock returns and recognizes. The adapter previously fed
+//     links.next back verbatim as the *first* filter[created_at][] value of
+//     the next request, which built a malformed follow-up request; it now
+//     requests the URL directly.
 type mockZendesk struct {
 	mu    sync.Mutex
 	email string
 	token string
 
-	logs []utils.Dict // insertion order; created_at drives window matching
+	logs []utils.Dict // sorted by created_at descending when queried
 
 	cursors    map[string]cursorState
 	nextCursor int
@@ -183,35 +181,33 @@ func (m *mockZendesk) handler(t *testing.T) http.HandlerFunc {
 		}
 
 		created := q["filter[created_at][]"]
+		if !assert.Len(t, created, 2, "every page must preserve both created_at filters") {
+			http.Error(w, `{"error":"InvalidPaginationParameter"}`, http.StatusBadRequest)
+			return
+		}
+		start, err1 := time.Parse(time.RFC3339, created[0])
+		until, err2 := time.Parse(time.RFC3339, created[1])
+		if !assert.NoError(t, err1) || !assert.NoError(t, err2) {
+			http.Error(w, `{"error":"InvalidValue"}`, http.StatusBadRequest)
+			return
+		}
 		var cs cursorState
-		isCursor := false
-		m.mu.Lock()
-		if len(created) >= 1 {
-			if state, ok := m.cursors[created[0]]; ok {
-				cs, isCursor = state, true
+		if after := q.Get("page[after]"); after != "" {
+			m.mu.Lock()
+			state, ok := m.cursors[after]
+			if ok {
+				cs = state
 				m.cursorRequests++
 			}
-		}
-		m.mu.Unlock()
-
-		if !isCursor {
-			// A fresh window query carries exactly two created_at bounds.
-			if !assert.Len(t, created, 2, "window query must carry two filter[created_at][] values") {
+			m.mu.Unlock()
+			if !assert.True(t, ok, "page[after] must be a cursor previously returned in links.next") {
 				http.Error(w, `{"error":"InvalidPaginationParameter"}`, http.StatusBadRequest)
 				return
 			}
-			start, err1 := time.Parse(time.RFC3339, created[0])
-			until, err2 := time.Parse(time.RFC3339, created[1])
-			if !assert.NoError(t, err1, "start bound must be RFC3339") ||
-				!assert.NoError(t, err2, "until bound must be RFC3339") {
-				http.Error(w, `{"error":"InvalidValue"}`, http.StatusBadRequest)
-				return
-			}
-			cs = cursorState{start: start, until: until}
 		}
 
-		// Select the logs inside the window (inclusive bounds) in insertion
-		// order, then serve the requested page.
+		// Select the logs inside the window (inclusive bounds assumed).
+		// Cursor pagination defaults to sort=-created_at.
 		m.mu.Lock()
 		var matching []utils.Dict
 		for _, rec := range m.logs {
@@ -220,10 +216,14 @@ func (m *mockZendesk) handler(t *testing.T) http.HandlerFunc {
 			if !assert.NoError(t, err, "fixture created_at must be RFC3339") {
 				continue
 			}
-			if !ts.Before(cs.start) && !ts.After(cs.until) {
+			if !ts.Before(start) && !ts.After(until) {
 				matching = append(matching, rec)
 			}
 		}
+
+		sort.SliceStable(matching, func(i, j int) bool {
+			return matching[i]["created_at"].(string) > matching[j]["created_at"].(string)
+		})
 
 		page := []utils.Dict{}
 		if cs.offset < len(matching) {
@@ -234,11 +234,16 @@ func (m *mockZendesk) handler(t *testing.T) http.HandlerFunc {
 			page = matching[cs.offset:end]
 		}
 		hasMore := cs.offset+len(page) < len(matching)
-		next := ""
+		cursor := ""
+		nextURL := ""
 		if hasMore {
 			m.nextCursor++
-			next = fmt.Sprintf("cursor_%06d", m.nextCursor)
-			m.cursors[next] = cursorState{start: cs.start, until: cs.until, offset: cs.offset + len(page)}
+			cursor = fmt.Sprintf("cursor_%06d", m.nextCursor)
+			m.cursors[cursor] = cursorState{offset: cs.offset + len(page)}
+			// The real API returns links.next as a complete URL carrying the
+			// page[after] cursor, not a bare token.
+			q.Set("page[after]", cursor)
+			nextURL = fmt.Sprintf("http://%s%s?%s", r.Host, logsEndpoint, q.Encode())
 		}
 		m.mu.Unlock()
 
@@ -248,11 +253,11 @@ func (m *mockZendesk) handler(t *testing.T) http.HandlerFunc {
 			"audit_logs": page,
 			"meta": map[string]interface{}{
 				"has_more":      hasMore,
-				"after_cursor":  next,
+				"after_cursor":  cursor,
 				"before_cursor": "",
 			},
 			"links": map[string]interface{}{
-				"next": next,
+				"next": nextURL,
 				"prev": "",
 			},
 		})
@@ -271,14 +276,10 @@ const (
 // (the documented fields of GET /api/v2/audit_logs, per
 // https://developer.zendesk.com/api-reference/ticketing/account-configuration/audit_logs/).
 //
-// NOTE: the docs type "id" (like actor_id/source_id) as an integer, i.e. a
-// JSON number. The adapter dedupes on `item["id"].(string)`, so string ids are
-// required for it to function; the fixtures use string ids to match what the
-// adapter can actually consume (see the caveat in the test report / adapter
-// review). actor_id/source_id stay numeric as documented.
+// IDs are JSON integers, matching the vendor response rather than strings.
 func auditLogFixture(id string, createdAt time.Time, action string) utils.Dict {
 	return utils.Dict{
-		"id":                 id,
+		"id":                 json.Number(id),
 		"url":                fmt.Sprintf("https://%s/api/v2/audit_logs/%s.json", mockDomain, id),
 		"action_label":       "Updated",
 		"actor_id":           11111111,
@@ -422,14 +423,14 @@ func TestMockAuditLogsEndToEnd(t *testing.T) {
 		assert.LessOrEqual(t, msg.TimestampMs, uint64(time.Now().UnixMilli()))
 
 		require.NotNil(t, msg.JsonPayload)
-		id, _ := msg.JsonPayload["id"].(string)
+		id := recordID(msg.JsonPayload["id"])
 		require.NotEmpty(t, id)
 		byID[id] = msg
 	}
 	require.Len(t, byID, 3, "each record must ship exactly once")
 
 	for _, src := range want {
-		id := src["id"].(string)
+		id := recordID(src["id"])
 		msg := byID[id]
 		require.NotNil(t, msg, "record %s was not shipped", id)
 		// The payload is shipped verbatim.
@@ -465,7 +466,7 @@ func TestMockNewEntryShipsOnce(t *testing.T) {
 
 	shippedPerID := map[string]int{}
 	for _, msg := range sink.snapshot() {
-		shippedPerID[msg.JsonPayload["id"].(string)]++
+		shippedPerID[recordID(msg.JsonPayload["id"])]++
 	}
 	assert.Equal(t, map[string]int{
 		"900000000010": 1,
@@ -503,14 +504,13 @@ func TestMockPaginationFullDataset(t *testing.T) {
 
 	ids := map[string]bool{}
 	for _, msg := range sink.snapshot() {
-		ids[msg.JsonPayload["id"].(string)] = true
+		ids[recordID(msg.JsonPayload["id"])] = true
 	}
 	assert.Len(t, ids, total, "every distinct record should be shipped once")
 }
 
 // TestMockBadCredentials pins the adapter's behavior on auth failure: nothing
-// ships, and the adapter does NOT stop -- a non-200 response only logs an
-// error and the polling loop keeps retrying on the next tick.
+// ships, and the fatal authentication error stops polling.
 func TestMockBadCredentials(t *testing.T) {
 	mock := newMockZendesk(mockEmail, mockToken)
 	mock.addLog(auditLogFixture("900000000099", fixtureTime(), "update"))
@@ -531,15 +531,11 @@ func TestMockBadCredentials(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// The mock rejects the credentials on every poll; wait for several polls
-	// to prove the adapter keeps retrying rather than shipping or crashing.
-	require.Eventually(t, func() bool { return mock.authFailureCount() >= 3 },
-		5*time.Second, 20*time.Millisecond, "adapter should keep polling on 401")
-
 	select {
 	case <-chStopped:
-		t.Fatal("adapter unexpectedly stopped on auth failure (pinned behavior: it keeps polling)")
-	default:
+	case <-time.After(3 * time.Second):
+		t.Fatal("adapter did not stop on authentication failure")
 	}
+	assert.Equal(t, 1, mock.authFailureCount())
 	assert.Equal(t, 0, sink.count(), "nothing must ship when authentication fails")
 }

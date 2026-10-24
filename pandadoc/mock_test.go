@@ -29,14 +29,12 @@ import (
 // https://developers.pandadoc.com/reference/listlogsv2); the adapter still
 // targets v1, so the mock does too.
 
-// mockPageSize mirrors the PandaDoc API's default page size of 100 records;
-// the adapter does not send a `count` parameter and assumes a short page
-// (fewer than 100 records) means the result set is exhausted.
+// mockPageSize mirrors the API default; explicit count values are validated too.
 const mockPageSize = 100
 
-// queryTimeLayout is the layout the adapter renders `since`/`to` in: ISO-8601
-// with millisecond precision and no zone designator (interpreted as UTC).
-const queryTimeLayout = "2006-01-02T15:04:05.000"
+// queryTimeLayout (the layout the adapter renders `since`/`to` in: ISO-8601
+// with millisecond precision and no zone designator, interpreted as UTC) is
+// declared alongside the parser in client.go.
 
 // --- in-memory USP sink -----------------------------------------------------
 
@@ -80,13 +78,14 @@ type recordedRequest struct {
 	since  string
 	to     string
 	page   int
+	count  int
 }
 
 // mockPandaDoc is an in-memory stand-in for the PandaDoc audit-logs API
 // (GET /public/v1/logs). It validates the `Authorization: Api-Key <key>`
 // header, honours the adapter's `since`/`to` time window and 1-based `page`
-// parameter, paginates over an in-memory log set in pages of 100 (the API's
-// default `count`), and returns the {"results": [...]} envelope.
+// parameter, honours count (default 100) and the 10000-item ceiling,
+// and returns the {"results": [...]} envelope.
 type mockPandaDoc struct {
 	mu       sync.Mutex
 	apiKey   string
@@ -149,9 +148,12 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer m.mu.Unlock()
 
 	q := r.URL.Query()
-	page := 1
-	if p, err := strconv.Atoi(q.Get("page")); err == nil && p >= 1 {
-		page = p
+	page, count := 1, mockPageSize
+	if q.Has("page") {
+		page, _ = strconv.Atoi(q.Get("page"))
+	}
+	if q.Has("count") {
+		count, _ = strconv.Atoi(q.Get("count"))
 	}
 	m.requests = append(m.requests, recordedRequest{
 		method: r.Method,
@@ -159,6 +161,7 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		since:  q.Get("since"),
 		to:     q.Get("to"),
 		page:   page,
+		count:  count,
 	})
 
 	if r.Method != http.MethodGet {
@@ -170,6 +173,11 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"type":   "authorization_error",
 			"detail": "Authentication credentials were not provided or are incorrect.",
 		})
+		return
+	}
+
+	if count < 1 || count > 1000 || page < 1 || page > 10000/count {
+		writeJSONStatus(w, http.StatusBadRequest, utils.Dict{"detail": "count must be 1..1000, page >= 1, count*page <= 10000"})
 		return
 	}
 
@@ -191,7 +199,7 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if !ok {
 			continue
 		}
-		t, perr := time.Parse(time.RFC3339Nano, rt)
+		t, perr := time.ParseInLocation(fixtureTimeLayout, rt, time.UTC)
 		if perr != nil {
 			continue
 		}
@@ -201,10 +209,10 @@ func (m *mockPandaDoc) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		window = append(window, entry)
 	}
 
-	// Paginate; page is 1-based, pages hold mockPageSize records.
+	// Paginate using the requested count, with a 1-based page.
 	var pageItems []utils.Dict
-	if start := (page - 1) * mockPageSize; start < len(window) {
-		end := start + mockPageSize
+	if start := (page - 1) * count; start < len(window) {
+		end := start + count
 		if end > len(window) {
 			end = len(window)
 		}
@@ -239,12 +247,9 @@ func writeJSONStatus(w http.ResponseWriter, status int, d utils.Dict) {
 
 // --- realistic log fixtures ---------------------------------------------------
 
-// fixtureTimeLayout renders fixture timestamps with millisecond precision and
-// an explicit zone designator. PandaDoc's documented example timestamps
-// ("2024-07-15T18:59:38.000") carry millisecond precision but no zone; the
-// fixture appends one because the adapter parses request_time with
-// time.RFC3339Nano (see makeOneRequest in client.go), which requires it.
-const fixtureTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+// fixtureTimeLayout matches PandaDoc's zone-less millisecond examples.
+// The mock assumes UTC, as the adapter does; the docs do not specify a zone.
+const fixtureTimeLayout = "2006-01-02T15:04:05.000"
 
 // auditLogEntry returns a record shaped like a documented PandaDoc API log
 // list entry (https://developers.pandadoc.com/reference/list-api-logs):
@@ -422,11 +427,11 @@ func TestMockMidRunEventShipsOnce(t *testing.T) {
 }
 
 // TestMockPaginationFullDataset verifies a window holding more than one page of
-// records (the adapter assumes 100-record pages) is walked completely and every
+// records (the adapter requests 1000-record pages) is walked completely and every
 // record ships exactly once.
 func TestMockPaginationFullDataset(t *testing.T) {
 	const apiKey = "fake-test-api-key-3333333333333333"
-	const total = 250 // 3 pages: 100 + 100 + 50
+	const total = 2250 // 3 pages: 1000 + 1000 + 250
 
 	mock := newMockPandaDoc(apiKey)
 	server := httptest.NewServer(mock)
@@ -456,13 +461,12 @@ func TestMockPaginationFullDataset(t *testing.T) {
 		assert.Equalf(t, 1, n, "record %s shipped %d times", id, n)
 	}
 
-	// The adapter walked past page 2: a 100-record page means "maybe more".
-	assert.GreaterOrEqual(t, mock.maxPageSeen(), 3, "a 250-record window requires 3 pages")
+	// The adapter walked past page 2: a 1000-record page means "maybe more".
+	assert.Equal(t, 3, mock.maxPageSeen(), "a 2250-record window requires 3 pages of 1000")
 }
 
 // TestMockBadAPIKeyShipsNothing pins the adapter's actual behavior on an auth
-// failure: nothing is shipped, the error is surfaced via OnError, and the
-// adapter does not stop -- it keeps polling on its interval.
+// failure: nothing is shipped, the fatal error is surfaced once and polling stops.
 func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 	mock := newMockPandaDoc("the-correct-fake-key")
 	server := httptest.NewServer(mock)
@@ -492,20 +496,18 @@ func TestMockBadAPIKeyShipsNothing(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// The adapter keeps polling despite the 401s...
-	require.Eventually(t, func() bool { return mock.requestCount() >= 3 },
-		5*time.Second, 10*time.Millisecond, "the adapter should keep polling after a 401")
-	// ...reports the failure...
+	// Authentication failures are permanent and must invoke the fatal
+	// callback once, after which polling stops.
+	select {
+	case <-chStopped:
+	case <-time.After(3 * time.Second):
+		t.Fatal("adapter did not stop on authentication failure")
+	}
 	mu.Lock()
 	gotErrors := apiErrors
 	mu.Unlock()
-	assert.GreaterOrEqual(t, gotErrors, 1, "a 401 must be surfaced via OnError")
-	// ...does not stop on its own...
-	select {
-	case <-chStopped:
-		t.Fatal("the adapter is not expected to stop on an auth failure (current behavior)")
-	default:
-	}
+	assert.Equal(t, 1, gotErrors)
+	assert.Equal(t, 1, mock.requestCount())
 	// ...and never ships anything.
 	assert.Equal(t, 0, sink.count(), "nothing may ship when authentication fails")
 }
