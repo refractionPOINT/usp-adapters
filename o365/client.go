@@ -264,8 +264,8 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 		}
 	}
 
-	// Retain proxy settings, idle expiry and TLS defaults. DialContext also
-	// lets Close cancel a connection attempt before the dial timeout.
+	// Retain proxy settings, idle expiry and TLS defaults. Shorten the dial
+	// timeout to ten seconds while keeping context cancellation.
 	a.transport = http.DefaultTransport.(*http.Transport).Clone()
 	a.transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	a.httpClient = &http.Client{Timeout: httpTimeout, Transport: a.transport}

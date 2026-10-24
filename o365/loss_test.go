@@ -787,30 +787,32 @@ func TestContentOutageEscalates(t *testing.T) {
 // A content blob whose body isn't valid JSON (a truncated response) isn't
 // recorded as done: it is fetched again on the next poll.
 func TestInvalidContentIsFetchedAgain(t *testing.T) {
-	const ct = "Audit.Exchange"
-	m := newFaultMock(t)
-	recs := addBlobs(t, m, ct, 1)
-	m.setFault(func(key string, hit int, w http.ResponseWriter, _ *http.Request) bool {
-		if key == "blob-1" && hit == 1 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`[{"Id":"cccccccc-0000-0000-0000-0000`))
-			return true
-		}
-		return false
-	})
-
-	cb := &callbacks{}
-	sink := &captureSink{}
-	conf := newTestConfig(t, m.mockO365, ct)
-	fastRetries(&conf)
-	cb.install(t, &conf)
-	startAdapter(t, conf, sink)
-
-	require.Eventually(t, func() bool { return sink.payloadCounts()[recs["blob-1"]] == 1 },
-		5*time.Second, 10*time.Millisecond, "the blob must ship on the next poll")
-	assert.Equal(t, 2, m.hit("blob-1"))
-	assert.Empty(t, cb.errors())
+	for _, body := range []string{`[{"Id":"cccccccc-0000-0000-0000-0000`, ""} {
+		t.Run(fmt.Sprintf("body_length_%d", len(body)), func(t *testing.T) {
+			const ct = "Audit.Exchange"
+			m := newFaultMock(t)
+			recs := addBlobs(t, m, ct, 1)
+			m.setFault(func(key string, hit int, w http.ResponseWriter, _ *http.Request) bool {
+				if key == "blob-1" && hit == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(body))
+					return true
+				}
+				return false
+			})
+			cb := &callbacks{}
+			sink := &captureSink{}
+			conf := newTestConfig(t, m.mockO365, ct)
+			fastRetries(&conf)
+			cb.install(t, &conf)
+			startAdapter(t, conf, sink)
+			require.Eventually(t, func() bool { return sink.payloadCounts()[recs["blob-1"]] == 1 },
+				5*time.Second, 10*time.Millisecond, "a truncated or zero-byte body must not mark the blob done")
+			assert.Equal(t, 2, m.hit("blob-1"))
+			assert.Empty(t, cb.errors())
+		})
+	}
 }
 
 // Close interrupts a token request that hangs.

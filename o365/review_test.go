@@ -377,3 +377,48 @@ func TestLegacyDeduperReportsUnretryableBlob(t *testing.T) {
 		})
 	}
 }
+
+func TestBackoffJitterAndBounds(t *testing.T) {
+	a := &Office365Adapter{conf: Office365Config{
+		retryBaseDelay: defaultRetryBaseDelay,
+		retryMaxDelay:  defaultRetryMaxDelay,
+		maxRetryAfter:  defaultMaxRetryAfter,
+	}}
+	for _, tc := range []struct {
+		attempt int
+		ceiling time.Duration
+	}{
+		{1, time.Second}, {2, 2 * time.Second}, {3, 4 * time.Second},
+		{9, 256 * time.Second}, {10, 5 * time.Minute}, {100, 5 * time.Minute},
+	} {
+		t.Run(fmt.Sprint(tc.attempt), func(t *testing.T) {
+			seen := make(map[time.Duration]bool)
+			for i := 0; i < 64; i++ {
+				d := a.backoff(tc.attempt, 0)
+				assert.GreaterOrEqual(t, d, tc.ceiling/2)
+				assert.LessOrEqual(t, d, tc.ceiling)
+				seen[d] = true
+			}
+			assert.Greater(t, len(seen), 1, "jitter must spread retry times rather than retry in lockstep")
+		})
+	}
+	assert.Equal(t, 10*time.Minute, a.backoff(1, 10*time.Minute), "respect longer Retry-After")
+	assert.Equal(t, defaultMaxRetryAfter, a.backoff(1, time.Hour), "cap excessive Retry-After")
+}
+
+func TestEmptyJSONArrayCompletesBlob(t *testing.T) {
+	a, base := pollFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/list" {
+			writeJSON(w, http.StatusOK, []listItem{{ContentID: "empty-array", ContentURI: "http://" + r.Host + "/blob"}})
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	cb := &callbacks{}
+	cb.install(t, &a.conf)
+	fs := &failureState{}
+	assert.True(t, a.pollOnce(base+"/list", fs))
+	assert.True(t, a.checker.Check("empty-array"), "valid empty content must be marked complete")
+	assert.Empty(t, fs.leftBlobs)
+	assert.Empty(t, cb.errors())
+}
