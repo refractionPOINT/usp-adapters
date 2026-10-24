@@ -87,7 +87,7 @@ func TestTransientPollFailuresKeepState(t *testing.T) {
 	h := newPollHarness(t, twoPageAPI(t))
 	// Use fixtures relative to the harness clock, through the same vendor mock.
 	mock := newMockPandaDoc("test-api-key")
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprintf("log-%d", i), h.now.Add(-20*time.Minute)))
 	}
 	server := httptest.NewServer(mock)
@@ -124,12 +124,12 @@ func TestTransientPollFailuresKeepState(t *testing.T) {
 	require.GreaterOrEqual(t, roots[1].Sub(roots[0]), 2*time.Minute)
 	require.GreaterOrEqual(t, roots[2].Sub(roots[1]), 3*time.Minute)
 	require.GreaterOrEqual(t, roots[3].Sub(roots[2]), 2*time.Minute)
-	require.Equal(t, 150, h.sink.count(), "dedupe state must survive transient failures")
+	require.Equal(t, 1050, h.sink.count(), "dedupe state must survive transient failures")
 	ids := map[string]int{}
 	for _, msg := range h.sink.snapshot() {
 		ids[msg.JsonPayload["id"].(string)]++
 	}
-	require.Len(t, ids, 150)
+	require.Len(t, ids, 1050)
 	for id, count := range ids {
 		assert.Equal(t, 1, count, "ID %s", id)
 	}
@@ -141,7 +141,7 @@ func TestPollCatchupWithinRetryBudget(t *testing.T) {
 	h := newPollHarness(t, twoPageAPI(t))
 	fixtureTime := h.now.Add(-20 * time.Minute)
 	mock := newMockPandaDoc("test-api-key")
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprintf("log-%d", i), fixtureTime))
 	}
 	server := httptest.NewServer(mock)
@@ -172,7 +172,7 @@ func TestPollCatchupWithinRetryBudget(t *testing.T) {
 	}
 	h.run(4)
 	require.Empty(t, h.fatal)
-	require.Equal(t, 151, h.sink.count(), "all unread and late records must ship without replaying the partial page")
+	require.Equal(t, 1051, h.sink.count(), "all unread and late records must ship without replaying the partial page")
 	require.Len(t, windows, 4)
 	require.Equal(t, windows[0][0], windows[1][0], "failure must preserve the unread start")
 	require.Equal(t, windows[0][0], windows[2][0], "repeated failures must not advance the unread start")
@@ -245,7 +245,7 @@ func TestPermanentPollFailuresAreFatal(t *testing.T) {
 func TestPartialPagesShipBeforeFatalCallback(t *testing.T) {
 	h := newPollHarness(t, twoPageAPI(t))
 	mock := newMockPandaDoc("test-api-key")
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprintf("log-%d", i), h.now.Add(-20*time.Minute)))
 	}
 	server := httptest.NewServer(mock)
@@ -263,13 +263,13 @@ func TestPartialPagesShipBeforeFatalCallback(t *testing.T) {
 	})
 	onError := h.a.conf.ClientOptions.OnError
 	h.a.conf.ClientOptions.OnError = func(err error) {
-		require.Equal(t, 100, h.sink.count(), "deliver partial pages before invoking a fatal callback")
+		require.Equal(t, 1000, h.sink.count(), "deliver partial pages before invoking a fatal callback")
 		onError(err)
 	}
 	h.run(3)
 	require.Len(t, h.fatal, 1)
 	require.Empty(t, h.warnings)
-	require.Equal(t, 100, h.sink.count())
+	require.Equal(t, 1000, h.sink.count())
 }
 
 type trackedPageBody struct {
@@ -282,7 +282,7 @@ func (b trackedPageBody) Close() error { *b.closed = true; return b.ReadCloser.C
 func TestPageBodiesCloseBeforeNextRequest(t *testing.T) {
 	h := newPollHarness(t, twoPageAPI(t))
 	mock := newMockPandaDoc("test-api-key")
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprintf("log-%d", i), h.now.Add(-20*time.Minute)))
 	}
 	server := httptest.NewServer(mock)
@@ -306,7 +306,7 @@ func TestPageBodiesCloseBeforeNextRequest(t *testing.T) {
 	})
 	h.run(2)
 	require.Empty(t, h.fatal)
-	require.GreaterOrEqual(t, requests, 4)
+	require.Equal(t, 4, requests, "two two-page polls must close every body")
 	require.True(t, closed)
 }
 
@@ -352,7 +352,7 @@ func TestTransientReadAndDecodeKeepState(t *testing.T) {
 		t.Run(fault, func(t *testing.T) {
 			mock := newMockPandaDoc("test-api-key")
 			h := newPollHarness(t, mock)
-			for i := 0; i < 150; i++ {
+			for i := 0; i < 1050; i++ {
 				mock.addLogs(auditLogEntry(fmt.Sprint(i), h.now.Add(-time.Minute)))
 			}
 			transport := h.a.httpClient.Transport
@@ -376,7 +376,7 @@ func TestTransientReadAndDecodeKeepState(t *testing.T) {
 			h.run(3)
 			require.Empty(t, h.fatal)
 			require.Len(t, h.warnings, 1)
-			require.Equal(t, 150, h.sink.count())
+			require.Equal(t, 1050, h.sink.count())
 			require.Equal(t, []time.Duration{30 * time.Second, 30 * time.Second, 30 * time.Second}, h.delays)
 		})
 	}

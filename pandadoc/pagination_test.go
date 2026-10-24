@@ -29,7 +29,7 @@ func (brokenPageBody) Close() error             { return nil }
 func twoPageAPI(t *testing.T) http.Handler {
 	mock := newMockPandaDoc("test-api-key")
 	base := time.Now().Add(-time.Minute)
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprintf("log-%d", i), base))
 	}
 	return mock
@@ -73,7 +73,7 @@ func TestPaginationPreservesPartialResults(t *testing.T) {
 			first, _, err := a.makeOneRequest(since)
 			require.Error(t, err)
 			require.True(t, failed)
-			require.Len(t, first, 100, "page 1 must survive the later failure")
+			require.Len(t, first, 1000, "page 1 must survive the later failure")
 			if fault == "shutdown" {
 				require.ErrorIs(t, err, context.Canceled)
 				a.doStop.Clear()
@@ -85,7 +85,7 @@ func TestPaginationPreservesPartialResults(t *testing.T) {
 			for _, item := range append(first, second...) {
 				counts[item["id"].(string)]++
 			}
-			require.Len(t, counts, 150)
+			require.Len(t, counts, 1050)
 			for id, count := range counts {
 				assert.Equal(t, 1, count, "ID %s", id)
 			}
@@ -119,18 +119,18 @@ func TestFetchEventsShipsPartialResults(t *testing.T) {
 				h.now = time.Now()
 				h.beforeWait = func(step int) {
 					if step == 2 {
-						require.Equal(t, 100, h.sink.count(), "successful page must ship before retrying the failed page")
+						require.Equal(t, 1000, h.sink.count(), "successful page must ship before retrying the failed page")
 						retryAllowed.Store(true)
 					}
 				}
 				h.run(3)
 				require.Empty(t, h.fatal)
-				require.Equal(t, 150, h.sink.count())
+				require.Equal(t, 1050, h.sink.count())
 				counts := map[string]int{}
 				for _, msg := range h.sink.snapshot() {
 					counts[msg.JsonPayload["id"].(string)]++
 				}
-				require.Len(t, counts, 150)
+				require.Len(t, counts, 1050)
 				for id, count := range counts {
 					assert.Equal(t, 1, count, "ID %s", id)
 				}
@@ -154,7 +154,7 @@ func TestFetchEventsShipsPartialResults(t *testing.T) {
 				case <-time.After(3 * time.Second):
 					t.Fatal("Close did not drain partial results")
 				}
-				require.Equal(t, 100, sink.count())
+				require.Equal(t, 1000, sink.count())
 				return
 			}
 		})
@@ -162,7 +162,7 @@ func TestFetchEventsShipsPartialResults(t *testing.T) {
 }
 
 // A full final legal page must be subdivided, never followed by forbidden
-// page 101 or treated as proof that the time window is exhausted.
+// page 11 or treated as proof that the time window is exhausted.
 func TestPaginationWindowCeiling(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -249,13 +249,14 @@ func TestPaginationWindowCeiling(t *testing.T) {
 				require.Equal(t, 1, count, "ID %s", id)
 			}
 			requests := mock.requestsSnapshot()
-			require.Greater(t, len(requests), 100, "a full last legal page must trigger subdivision")
+			require.Greater(t, len(requests), 10, "a full last legal page must trigger subdivision")
 			for _, r := range requests {
+				require.Equal(t, 1000, r.count, "use the documented maximum page size")
 				require.LessOrEqual(t, r.page*r.count, 10000, "never request a forbidden page")
 			}
 			// A thirty-minute window needs at most 21 bisections to reach
 			// milliseconds. A single saturated timestamp must terminate.
-			require.Less(t, len(requests), 5000, "subdivision must be bounded")
+			require.Less(t, len(requests), 500, "subdivision must be bounded")
 		})
 	}
 }

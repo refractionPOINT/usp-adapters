@@ -29,7 +29,9 @@ const (
 	// defaultPollInterval is how long fetchEvents idles between polling ticks.
 	defaultPollInterval = 30 * time.Second
 
-	logsPageSize    = 100
+	// Reduce pagination requests with the documented maximum. Windows that
+	// reach count*page == 10000 still require subdivision.
+	logsPageSize    = 1000
 	logsWindowLimit = 10000
 )
 

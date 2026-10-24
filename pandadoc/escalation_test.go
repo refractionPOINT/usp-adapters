@@ -132,7 +132,7 @@ func TestCompletePollResetsFailureClock(t *testing.T) {
 func TestPartialPollDoesNotResetFailureClock(t *testing.T) {
 	mock := newMockPandaDoc("test-api-key")
 	h := newPollHarness(t, mock)
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprint(i), h.now.Add(-time.Minute)))
 	}
 	transport := h.a.httpClient.Transport
@@ -153,7 +153,7 @@ func TestPartialPollDoesNotResetFailureClock(t *testing.T) {
 	})
 	onError := h.a.conf.ClientOptions.OnError
 	h.a.conf.ClientOptions.OnError = func(err error) {
-		require.Equal(t, 100, h.sink.count(), "ship partial pages before fatal escalation")
+		require.Equal(t, 1000, h.sink.count(), "ship partial pages before fatal escalation")
 		onError(err)
 	}
 	h.run(10)
@@ -161,7 +161,7 @@ func TestPartialPollDoesNotResetFailureClock(t *testing.T) {
 	require.Equal(t, failedAt.Add(pollFailureLimit), h.now, "partial pages are not complete recovery")
 	require.Equal(t, 3, roots)
 	require.Len(t, h.warnings, 3)
-	require.Equal(t, 100, h.sink.count())
+	require.Equal(t, 1000, h.sink.count())
 }
 
 func TestFailureClockStartsWhenPollFails(t *testing.T) {
@@ -216,7 +216,7 @@ func (s *failureBudgetSink) Ship(_ *protocol.DataMessage, timeout time.Duration)
 func TestPartialShippingUsesRemainingFailureBudget(t *testing.T) {
 	mock := newMockPandaDoc("test-api-key")
 	h := newPollHarness(t, mock)
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprint(i), h.now.Add(-time.Minute)))
 	}
 	transport := h.a.httpClient.Transport
@@ -332,7 +332,7 @@ func TestShutdownInterruptsInFlightRetry(t *testing.T) {
 func TestPartialShippingAtDeadlineNeverUsesUnlimitedTimeout(t *testing.T) {
 	mock := newMockPandaDoc("test-api-key")
 	h := newPollHarness(t, mock)
-	for i := 0; i < 150; i++ {
+	for i := 0; i < 1050; i++ {
 		mock.addLogs(auditLogEntry(fmt.Sprint(i), h.now.Add(-time.Minute)))
 	}
 	transport := h.a.httpClient.Transport

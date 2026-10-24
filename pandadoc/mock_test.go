@@ -427,11 +427,11 @@ func TestMockMidRunEventShipsOnce(t *testing.T) {
 }
 
 // TestMockPaginationFullDataset verifies a window holding more than one page of
-// records (the adapter assumes 100-record pages) is walked completely and every
+// records (the adapter requests 1000-record pages) is walked completely and every
 // record ships exactly once.
 func TestMockPaginationFullDataset(t *testing.T) {
 	const apiKey = "fake-test-api-key-3333333333333333"
-	const total = 250 // 3 pages: 100 + 100 + 50
+	const total = 2250 // 3 pages: 1000 + 1000 + 250
 
 	mock := newMockPandaDoc(apiKey)
 	server := httptest.NewServer(mock)
@@ -461,8 +461,8 @@ func TestMockPaginationFullDataset(t *testing.T) {
 		assert.Equalf(t, 1, n, "record %s shipped %d times", id, n)
 	}
 
-	// The adapter walked past page 2: a 100-record page means "maybe more".
-	assert.GreaterOrEqual(t, mock.maxPageSeen(), 3, "a 250-record window requires 3 pages")
+	// The adapter walked past page 2: a 1000-record page means "maybe more".
+	assert.Equal(t, 3, mock.maxPageSeen(), "a 2250-record window requires 3 pages of 1000")
 }
 
 // TestMockBadAPIKeyShipsNothing pins the adapter's actual behavior on an auth
