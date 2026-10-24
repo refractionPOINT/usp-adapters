@@ -11,6 +11,15 @@ type Deduper interface {
 	Close()
 }
 
+// CheckingDeduper is a Deduper that can also report whether a key was already
+// recorded without recording it. It lets a caller skip work that was already
+// done, and record the key only once the work has succeeded, so that a failure
+// leaves the work to be retried instead of marking it done.
+type CheckingDeduper interface {
+	Deduper
+	Check(key string) (exists bool)
+}
+
 type localDeduper struct {
 	window   time.Duration
 	ttl      time.Duration
@@ -75,6 +84,18 @@ func (d *localDeduper) CheckAndAdd(key string) bool {
 	// Add the key to the current bucket.
 	d.windows[d.nCurrent][key] = struct{}{}
 
+	return false
+}
+
+func (d *localDeduper) Check(key string) bool {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	for i := 0; i < d.nBuckets; i++ {
+		if _, ok := d.windows[i][key]; ok {
+			return true
+		}
+	}
 	return false
 }
 

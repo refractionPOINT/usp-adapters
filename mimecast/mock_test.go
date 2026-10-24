@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/assert"
@@ -24,6 +25,9 @@ import (
 // API 2.0 (https://api.services.mimecast.com), capturing the exact messages it
 // ships so their content -- payload, timestamp and event type -- can be
 // asserted without live credentials.
+
+// The mock owns its wire-format contract independently of production parsing.
+const mockTimeLayout = "2006-01-02T15:04:05-0700"
 
 // --- in-memory USP sink -------------------------------------------------------
 
@@ -57,16 +61,73 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 	return out
 }
 
+// --- captured adapter logging -------------------------------------------------
+
+// logCapture records the warnings and errors an adapter reports, so a test can
+// assert on a signal that has no other observable effect.
+type logCapture struct {
+	mu       sync.Mutex
+	warnings []string
+	debug    []string
+	errors   []string
+}
+
+func (l *logCapture) joinedWarnings() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.warnings, "\n")
+}
+
+func (l *logCapture) joinedErrors() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.errors, "\n")
+}
+
+func (l *logCapture) errorCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.errors)
+}
+
+func (l *logCapture) joinedDebug() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.debug, "\n")
+}
+
+// recordingClientOptions returns test ClientOptions whose warning and error
+// callbacks are captured as well as logged.
+func recordingClientOptions(t *testing.T) (uspclient.ClientOptions, *logCapture) {
+	t.Helper()
+	capture := &logCapture{}
+	opts := testClientOptions(t)
+	opts.DebugLog = func(msg string) {
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		capture.debug = append(capture.debug, msg)
+	}
+	opts.OnWarning = func(msg string) {
+		t.Logf("WRN: %s", msg)
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		capture.warnings = append(capture.warnings, msg)
+	}
+	opts.OnError = func(err error) {
+		t.Logf("ERR: %v", err)
+		capture.mu.Lock()
+		defer capture.mu.Unlock()
+		capture.errors = append(capture.errors, err.Error())
+	}
+	return opts, capture
+}
+
 // --- mock Mimecast API 2.0 ----------------------------------------------------
 
-// mimecastRequestTimeLayout is the format the adapter renders startDateTime /
-// endDateTime in ("2006-01-02T15:04:05-0700"). It matches the documented
-// format for those fields, yyyy-MM-dd'T'HH:mm:ssZ with a colonless offset
-// (e.g. "2011-12-03T10:15:30+0000").
-const mimecastRequestTimeLayout = "2006-01-02T15:04:05-0700"
-
-// mockAccessToken is the bearer token the mock issues on a successful
-// client-credentials exchange. Clearly fake.
+// mockAccessToken is the first bearer token the mock issues on a successful
+// client-credentials exchange. Later exchanges append a serial (see
+// rotateToken), so a test can tell a re-authentication from a cache hit.
+// Clearly fake.
 const mockAccessToken = "fake-mimecast-access-token-1111111111111111"
 
 // mockMimecast is an in-memory stand-in for the Mimecast API 2.0. It exposes
@@ -84,6 +145,9 @@ type mockMimecast struct {
 	clientID     string
 	clientSecret string
 	events       []utils.Dict // audit logs, oldest first
+	// unfilteredEvents are returned on every first page regardless of the
+	// window; see addEventUnfiltered.
+	unfilteredEvents []utils.Dict
 
 	tokenRequests int
 	auditRequests int
@@ -97,10 +161,104 @@ type mockMimecast struct {
 	// auditStatus, when non-zero, forces the audit endpoint to return that
 	// HTTP status (the token endpoint keeps working).
 	auditStatus int
+
+	// auditStatusQueue forces a status for the next N audit requests, one
+	// entry consumed per request, 0 meaning "respond normally". It models a
+	// failure that hits partway through a multi-page window.
+	auditStatusQueue []int
+
+	// indexDelay models the behaviour that broke this adapter: an audit record
+	// with eventTime T is not retrievable until T+indexDelay, even for a
+	// request whose window contains T. Zero means instantly retrievable.
+	indexDelay time.Duration
+
+	// windows records the (startDateTime, endDateTime) pair of every audit
+	// request, plus the wall-clock time it arrived, so a test can assert how
+	// far back the adapter actually reached.
+	windows []window
+
+	// currentToken is the bearer token the audit endpoint currently accepts.
+	// rotateToken invalidates it, which is how token expiry is simulated.
+	currentToken string
+	tokenSerial  int
+
+	// tokenExpiresIn is the expires_in the token endpoint advertises, in
+	// seconds. Zero means the field is omitted entirely.
+	tokenExpiresIn int
+}
+
+// window is one observed (startDateTime, endDateTime) pair as rendered by the
+// adapter, plus the wall-clock time the request arrived.
+type window struct {
+	start, end, seen time.Time
 }
 
 func newMockMimecast(clientID, clientSecret string) *mockMimecast {
-	return &mockMimecast{clientID: clientID, clientSecret: clientSecret}
+	return &mockMimecast{
+		clientID:       clientID,
+		clientSecret:   clientSecret,
+		currentToken:   mockAccessToken,
+		tokenExpiresIn: 1800,
+	}
+}
+
+// rotateToken invalidates the token the audit endpoint accepts, the way a real
+// token expiring server-side would. The adapter should notice the resulting
+// 401 and re-authenticate.
+func (m *mockMimecast) rotateToken() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokenSerial++
+	m.currentToken = fmt.Sprintf("%s-%d", mockAccessToken, m.tokenSerial)
+}
+
+func (m *mockMimecast) activeToken() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.currentToken
+}
+
+// failNextAuditRequests forces a status for the next len(statuses) audit
+// requests; a 0 entry responds normally.
+func (m *mockMimecast) failNextAuditRequests(statuses ...int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditStatusQueue = append(m.auditStatusQueue, statuses...)
+}
+
+// addEventUnfiltered adds a record the mock returns on every page-1 response
+// regardless of the requested window. It exists for fixtures whose eventTime is
+// deliberately unusable, which by definition cannot be placed on a timeline.
+func (m *mockMimecast) addEventUnfiltered(e utils.Dict) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unfilteredEvents = append(m.unfilteredEvents, e)
+}
+
+func (m *mockMimecast) setIndexDelay(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.indexDelay = d
+}
+
+func (m *mockMimecast) setAuditStatus(status int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditStatus = status
+}
+
+func (m *mockMimecast) setTokenExpiresIn(seconds int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokenExpiresIn = seconds
+}
+
+func (m *mockMimecast) seenWindows() []window {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]window, len(m.windows))
+	copy(out, m.windows)
+	return out
 }
 
 func (m *mockMimecast) addEvent(e utils.Dict) {
@@ -170,13 +328,22 @@ func (m *mockMimecast) handleToken(t *testing.T, w http.ResponseWriter, r *http.
 		return
 	}
 
+	m.mu.Lock()
+	issued := m.currentToken
+	expiresIn := m.tokenExpiresIn
+	m.mu.Unlock()
+
+	resp := map[string]interface{}{
+		"access_token": issued,
+		"token_type":   "Bearer",
+	}
+	if expiresIn > 0 {
+		resp["expires_in"] = expiresIn
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"access_token": mockAccessToken,
-		"token_type":   "Bearer",
-		"expires_in":   1800,
-	})
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // auditRequestBody mirrors the request envelope the adapter sends to
@@ -198,6 +365,13 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	m.mu.Lock()
 	m.auditRequests++
 	forcedStatus := m.auditStatus
+	if len(m.auditStatusQueue) > 0 {
+		if queued := m.auditStatusQueue[0]; queued != 0 {
+			forcedStatus = queued
+		}
+		m.auditStatusQueue = m.auditStatusQueue[1:]
+	}
+	expectedAuth := "Bearer " + m.currentToken
 	m.mu.Unlock()
 
 	if !assert.Equal(t, http.MethodPost, r.Method, "get-audit-events must be a POST") {
@@ -205,7 +379,7 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 		return
 	}
 
-	if r.Header.Get("Authorization") != "Bearer "+mockAccessToken {
+	if r.Header.Get("Authorization") != expectedAuth {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = w.Write([]byte(`{"meta":{"status":401},"data":[],"fail":[{"errors":[{"code":"invalid_access_token","message":"Access token is invalid","retryable":false}]}]}`))
@@ -238,28 +412,48 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 	}
 	m.mu.Unlock()
 
-	start, errS := time.Parse(mimecastRequestTimeLayout, req.Data[0].StartDateTime)
-	end, errE := time.Parse(mimecastRequestTimeLayout, req.Data[0].EndDateTime)
-	if !assert.NoError(t, errS, "startDateTime must parse as %s", mimecastRequestTimeLayout) ||
-		!assert.NoError(t, errE, "endDateTime must parse as %s", mimecastRequestTimeLayout) {
+	start, errS := time.Parse(mockTimeLayout, req.Data[0].StartDateTime)
+	end, errE := time.Parse(mockTimeLayout, req.Data[0].EndDateTime)
+	if !assert.NoError(t, errS, "startDateTime must parse as %s", mockTimeLayout) ||
+		!assert.NoError(t, errE, "endDateTime must parse as %s", mockTimeLayout) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
+	now := time.Now()
+
 	// Filter the dataset to the requested window (inclusive bounds), the way
-	// the real API constrains results to startDateTime..endDateTime.
+	// the real API constrains results to startDateTime..endDateTime, and hold
+	// back anything the index has not caught up to yet.
 	m.mu.Lock()
+	m.windows = append(m.windows, window{start: start, end: end, seen: now})
 	var matched []utils.Dict
+	badTimes := []string{}
 	for _, e := range m.events {
-		ts, perr := time.Parse(time.RFC3339, e["eventTime"].(string))
+		raw := e["eventTime"].(string)
+		ts, perr := time.Parse(mockTimeLayout, raw)
 		if perr != nil {
+			// A fixture outside the documented wire format would silently
+			// vanish here and quietly weaken every test that uses it.
+			badTimes = append(badTimes, raw)
+			continue
+		}
+		if now.Before(ts.Add(m.indexDelay)) {
 			continue
 		}
 		if !ts.Before(start) && !ts.After(end) {
 			matched = append(matched, e)
 		}
 	}
+	if pageToken := req.Meta.Pagination.PageToken; pageToken == "" {
+		matched = append(matched, m.unfilteredEvents...)
+	}
 	m.mu.Unlock()
+
+	if !assert.Empty(t, badTimes, "fixture eventTime values must use the documented format") {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 
 	pageSize := req.Meta.Pagination.PageSize
 	if pageSize <= 0 {
@@ -309,16 +503,16 @@ func (m *mockMimecast) handleAuditEvents(t *testing.T, w http.ResponseWriter, r 
 //
 // NOTE on eventTime format: the official API 2.0 spec documents eventTime as
 // ISO 8601 in the yyyy-MM-dd'T'HH:mm:ssZ pattern, i.e. a colonless numeric
-// offset like "2026-06-11T10:00:00+0000". The adapter parses eventTime with
-// time.RFC3339, which requires a colon in the offset (or "Z") and so rejects
-// the documented form; fixtures use the RFC3339 "Z" form so the adapter's
-// dedupe bookkeeping behaves as designed.
+// offset like "2026-06-11T10:00:00+0000", which time.RFC3339 rejects. Fixtures
+// render that documented form, so the whole suite runs against the format the
+// live API actually returns rather than one the adapter merely happens to
+// parse. See TestEventTimeFormats for the RFC3339 variants also accepted.
 func fakeAuditEvent(id, auditType, user, category, info string, eventTime time.Time) utils.Dict {
 	return utils.Dict{
 		"id":        id,
 		"auditType": auditType,
 		"user":      user,
-		"eventTime": eventTime.UTC().Truncate(time.Second).Format(time.RFC3339),
+		"eventTime": eventTime.UTC().Truncate(time.Second).Format(mockTimeLayout),
 		"eventInfo": info,
 		"category":  category,
 	}
@@ -431,16 +625,16 @@ func TestMimecastEndToEnd(t *testing.T) {
 	assert.Equal(t, clientSecret, mock.lastTokenForm.Get("client_secret"))
 
 	// The audit request carries the issued bearer token and the documented
-	// envelope: meta.pagination.pageSize=50 plus one start/end window.
+	// envelope: meta.pagination.pageSize=100 plus one start/end window.
 	assert.Equal(t, "Bearer "+mockAccessToken, mock.firstAuditAuth)
 	var audit auditRequestBody
 	require.NoError(t, json.Unmarshal(mock.firstAuditBody, &audit))
-	assert.Equal(t, 50, audit.Meta.Pagination.PageSize)
+	assert.Equal(t, 100, audit.Meta.Pagination.PageSize)
 	assert.Empty(t, audit.Meta.Pagination.PageToken, "the first page must not carry a pageToken")
 	require.Len(t, audit.Data, 1)
-	startT, err := time.Parse(mimecastRequestTimeLayout, audit.Data[0].StartDateTime)
+	startT, err := time.Parse(mockTimeLayout, audit.Data[0].StartDateTime)
 	require.NoError(t, err)
-	endT, err := time.Parse(mimecastRequestTimeLayout, audit.Data[0].EndDateTime)
+	endT, err := time.Parse(mockTimeLayout, audit.Data[0].EndDateTime)
 	require.NoError(t, err)
 	assert.False(t, endT.Before(startT), "the request window must not be inverted")
 }
@@ -484,12 +678,12 @@ func TestMimecastMidRunEventShipsOnce(t *testing.T) {
 }
 
 // TestMimecastPaginationMultiPage verifies a window holding more events than
-// one page (the adapter requests pageSize 50) is fully consumed by following
+// one page (the adapter requests pageSize 100) is fully consumed by following
 // meta.pagination.next tokens, shipping every event exactly once.
 func TestMimecastPaginationMultiPage(t *testing.T) {
 	const clientID = "client-id-test"
 	const clientSecret = "client-secret-test"
-	const total = 120 // 3 pages at the adapter's pageSize of 50
+	const total = 120 // 2 pages at the adapter's pageSize of 100
 
 	mock := newMockMimecast(clientID, clientSecret)
 	base := time.Now().Add(-20 * time.Second)
@@ -510,8 +704,8 @@ func TestMimecastPaginationMultiPage(t *testing.T) {
 	require.Never(t, func() bool { return sink.count() != total },
 		300*time.Millisecond, 30*time.Millisecond, "no paginated event may ship twice")
 
-	assert.GreaterOrEqual(t, mock.auditCount(), 3,
-		"120 events at pageSize 50 require at least 3 audit requests")
+	assert.GreaterOrEqual(t, mock.auditCount(), 2,
+		"120 events at pageSize 100 require at least 2 audit requests")
 
 	ids := map[string]bool{}
 	for _, msg := range sink.snapshot() {
@@ -520,70 +714,20 @@ func TestMimecastPaginationMultiPage(t *testing.T) {
 	assert.Len(t, ids, total, "every distinct event should be shipped once")
 }
 
-// TestMimecastBadCredentialsShipsNothing pins the adapter's behavior on a
-// rejected client-credentials exchange: nothing ships, the audit endpoint is
-// never called, and the adapter keeps retrying (it does not stop itself).
+// TestMimecastBadCredentialsShipsNothing verifies rejected credentials are fatal.
 func TestMimecastBadCredentialsShipsNothing(t *testing.T) {
 	mock := newMockMimecast("client-id-test", "correct-secret")
-	mock.addEvent(fakeLogonEvent("fake-audit-id-0001", time.Now().Add(-5*time.Second)))
 	server := httptest.NewServer(mock.handler(t))
 	defer server.Close()
-
 	sink := &captureSink{}
 	adapter := startTestAdapter(t, server.URL, sink, "client-id-test", "wrong-secret")
-	chStopped := adapter.chStopped
 	defer adapter.Close()
-
-	// Wait for at least two failed token exchanges (= two poll cycles).
-	require.Eventually(t, func() bool { return mock.tokenCount() >= 2 },
-		5*time.Second, 20*time.Millisecond, "the adapter should keep attempting the token exchange")
-
-	assert.Equal(t, 0, sink.count(), "nothing may ship when authentication fails")
-	assert.Equal(t, 0, mock.auditCount(), "the audit endpoint must not be called without a token")
-
-	// Current behavior: an auth failure does not stop the adapter; it retries
-	// on the next poll.
 	select {
-	case <-chStopped:
-		t.Fatal("adapter unexpectedly stopped on an auth failure (current behavior is to keep polling)")
-	default:
+	case <-adapter.chStopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("adapter did not stop after a fatal authentication failure")
 	}
-}
-
-// TestMimecastAPIErrorKeepsPolling pins the adapter's behavior on a failing
-// audit endpoint: the poll yields nothing, nothing ships, and the adapter
-// retries on the next interval rather than stopping.
-func TestMimecastAPIErrorKeepsPolling(t *testing.T) {
-	mock := newMockMimecast("client-id-test", "client-secret-test")
-	mock.addEvent(fakeLogonEvent("fake-audit-id-0001", time.Now().Add(-5*time.Second)))
-	mock.auditStatus = http.StatusInternalServerError
-	server := httptest.NewServer(mock.handler(t))
-	defer server.Close()
-
-	sink := &captureSink{}
-	adapter := startTestAdapter(t, server.URL, sink, "client-id-test", "client-secret-test")
-	chStopped := adapter.chStopped
-	defer adapter.Close()
-
-	// Wait for at least two failed polls of the audit endpoint.
-	require.Eventually(t, func() bool { return mock.auditCount() >= 2 },
-		5*time.Second, 20*time.Millisecond, "the adapter should keep polling through API errors")
-	assert.Equal(t, 0, sink.count(), "nothing may ship when the API errors")
-
-	select {
-	case <-chStopped:
-		t.Fatal("adapter unexpectedly stopped on an API error")
-	default:
-	}
-
-	// Once the API recovers, the pending event ships exactly once.
-	mock.mu.Lock()
-	mock.auditStatus = 0
-	mock.mu.Unlock()
-
-	require.Eventually(t, func() bool { return sink.count() == 1 },
-		5*time.Second, 20*time.Millisecond, "the event should ship after the API recovers")
-	require.Never(t, func() bool { return sink.count() != 1 },
-		300*time.Millisecond, 30*time.Millisecond)
-	assert.Equal(t, "fake-audit-id-0001", sink.snapshot()[0].JsonPayload["id"])
+	assert.Equal(t, 1, mock.tokenCount(), "bad credentials must not cause repeated authentication requests")
+	assert.Zero(t, mock.auditCount())
+	assert.Zero(t, sink.count())
 }
