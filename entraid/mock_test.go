@@ -50,7 +50,7 @@ const (
 	// uses for its initial "since" value.
 	graphTimeLayout = "2006-01-02T15:04:05.000000Z"
 
-	// testPollInterval keeps the e2e tests fast; production default is 30s.
+	// testPollInterval keeps the HTTP fixture tests fast; production default is 30s.
 	testPollInterval = 50 * time.Millisecond
 )
 
@@ -60,17 +60,36 @@ const (
 type captureSink struct {
 	mu       sync.Mutex
 	messages []*protocol.DataMessage
+	pending  []*protocol.DataMessage
+	withheld bool
 }
 
 func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	m.SeqNum = uint64(len(s.messages) + 1)
 	s.messages = append(s.messages, m)
+	if s.withheld {
+		s.pending = append(s.pending, m)
+	}
 	return nil
 }
 
+func (s *captureSink) GetUnsent() ([]*protocol.DataMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*protocol.DataMessage(nil), s.pending...), nil
+}
+func (s *captureSink) ack(n uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.pending) > 0 && s.pending[0].SeqNum <= n {
+		s.pending = s.pending[1:]
+	}
+}
+
 func (s *captureSink) Drain(time.Duration) error               { return nil }
-func (s *captureSink) Close() ([]*protocol.DataMessage, error) { return nil, nil }
+func (s *captureSink) Close() ([]*protocol.DataMessage, error) { return s.GetUnsent() }
 
 func (s *captureSink) count() int {
 	s.mu.Lock()
@@ -337,7 +356,7 @@ func (m *mockMicrosoft) handleToken(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleCollection implements a GET on a Graph collection with the $filter the
-// adapter sends: "<tsField> ge <timestamp>". Truncated responses advertise an
+// adapter sends: "<tsField> ge <start> and <tsField> lt <end>". Truncated responses advertise an
 // @odata.nextLink whose $skiptoken encodes the offset into the matched set,
 // like the real API's server-driven paging.
 func (m *mockMicrosoft) handleCollection(w http.ResponseWriter, r *http.Request, dataset func() []map[string]interface{}, tsField string) {
@@ -381,7 +400,8 @@ func (m *mockMicrosoft) handleCollection(w http.ResponseWriter, r *http.Request,
 		if err != nil {
 			continue
 		}
-		if !at.Before(since) {
+		until, _ := parseUntilFilter(r.URL.Query().Get("$filter"), tsField)
+		if !at.Before(since) && (until.IsZero() || at.Before(until)) {
 			matched = append(matched, d)
 		}
 	}
@@ -445,11 +465,19 @@ func parseTimestampFilter(filter string, tsField string) (time.Time, bool) {
 	if !strings.HasPrefix(filter, prefix) {
 		return time.Time{}, false
 	}
-	ts, err := time.Parse(time.RFC3339, strings.TrimSpace(strings.TrimPrefix(filter, prefix)))
+	ts, err := time.Parse(time.RFC3339, strings.TrimSpace(strings.Split(strings.TrimPrefix(filter, prefix), " and ")[0]))
 	if err != nil {
 		return time.Time{}, false
 	}
 	return ts, true
+}
+
+func parseUntilFilter(filter, field string) (time.Time, error) {
+	parts := strings.Split(filter, " and "+field+" lt ")
+	if len(parts) != 2 {
+		return time.Time{}, fmt.Errorf("missing upper bound")
+	}
+	return time.Parse(time.RFC3339Nano, parts[1])
 }
 
 // writeGraphError writes a Microsoft Graph error envelope.
@@ -470,12 +498,9 @@ func writeGraphError(w http.ResponseWriter, status int, code, message string) {
 
 // --- fixtures -------------------------------------------------------------------
 
-// fixtureBaseTime returns a base time for fixture activityDateTime values. The
-// adapter's initial "since" is the local wall-clock rendered with a Z suffix,
-// so fixtures sit a full day in the future to be on the late side of that
-// filter in any timezone.
+// fixtureBaseTime is the virtual clock used by the HTTP collection fixtures.
 func fixtureBaseTime() time.Time {
-	return time.Now().UTC().Add(24 * time.Hour).Truncate(time.Second)
+	return time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC)
 }
 
 // realisticRiskDetection builds a record shaped like a Microsoft Graph
@@ -606,7 +631,9 @@ func mustJSON(t *testing.T, v interface{}) string {
 // testConfig returns an adapter config pointed at the mock server.
 func testConfig(t *testing.T, serverURL string) EntraIDConfig {
 	t.Helper()
+	rt := fixtureRuntime()
 	return EntraIDConfig{
+		runtime:       &rt,
 		ClientOptions: testClientOptions(t),
 		TenantID:      testTenantID,
 		ClientID:      testClientID,
@@ -856,7 +883,7 @@ func TestBadClientSecretShipsNothing(t *testing.T) {
 	// on the next interval rather than stopping.
 	require.Eventually(t, func() bool { return mock.tokenRequestCount() >= 2 },
 		10*time.Second, 20*time.Millisecond, "the adapter should retry the token exchange on later polls")
-	require.Eventually(t, func() bool { return rec.anyContains("error fetching token") },
+	require.Eventually(t, func() bool { return rec.anyContains("Entra API rejected") },
 		10*time.Second, 20*time.Millisecond, "the token failure should be reported via OnError")
 
 	select {
@@ -870,7 +897,7 @@ func TestBadClientSecretShipsNothing(t *testing.T) {
 
 // TestGraphRejectsTokenShipsNothing verifies that when Graph rejects the bearer
 // token (e.g. missing IdentityRiskEvent.Read.All), the adapter retries the call
-// up to 3 times per poll, reports the failure, ships nothing, and stays alive.
+// under the request budget, reports the failure, ships nothing, and stays alive.
 func TestGraphRejectsTokenShipsNothing(t *testing.T) {
 	mock := newMockMicrosoft()
 	mock.revokeGraphAccess = true
@@ -891,10 +918,10 @@ func TestGraphRejectsTokenShipsNothing(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// Each poll retries the Graph call up to 3 times before giving up.
+	// Later scheduling turns retry the rejected call under the request budget.
 	require.Eventually(t, func() bool { return mock.graphRequestCount() >= 3 },
-		10*time.Second, 20*time.Millisecond, "the adapter should retry the Graph call within a poll")
-	require.Eventually(t, func() bool { return rec.anyContains("error response from Microsoft API") },
+		10*time.Second, 20*time.Millisecond, "the adapter should retry the rejected Graph call")
+	require.Eventually(t, func() bool { return rec.anyContains("Entra API rejected") },
 		10*time.Second, 20*time.Millisecond, "the Graph rejection should be reported via OnError")
 
 	select {
