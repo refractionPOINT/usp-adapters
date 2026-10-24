@@ -234,10 +234,10 @@ func (a *ZendeskAdapter) fetchEvents() {
 				JsonPayload: item,
 				TimestampMs: uint64(a.now().UnixNano() / int64(time.Millisecond)),
 			}
-			if err := a.uspClient.Ship(msg, state.budgetDelay(10*time.Second, a.now())); err != nil {
+			if err := a.uspClient.Ship(msg, state.shipTimeout(10*time.Second, a.now())); err != nil {
 				if err == uspclient.ErrorBufferFull {
 					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, state.budgetDelay(time.Hour, a.now()))
+					err = a.uspClient.Ship(msg, state.shipTimeout(time.Hour, a.now()))
 				}
 				if err == nil {
 					continue

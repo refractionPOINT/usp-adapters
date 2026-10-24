@@ -125,6 +125,15 @@ func (p *pollState) budgetDelay(delay time.Duration, now time.Time) time.Duratio
 	return delay
 }
 
+// USP interprets a zero shipping timeout as unlimited. Keep an expired
+// budget strictly positive so a full buffer cannot prevent fatal escalation.
+func (p *pollState) shipTimeout(delay time.Duration, now time.Time) time.Duration {
+	if bounded := p.budgetDelay(delay, now); bounded > 0 {
+		return bounded
+	}
+	return time.Nanosecond
+}
+
 func (p *pollState) requestContext(parent context.Context, now time.Time) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()

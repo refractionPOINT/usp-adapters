@@ -326,3 +326,44 @@ func TestShutdownInterruptsInFlightRetry(t *testing.T) {
 	require.Empty(t, h.fatal)
 	require.EqualValues(t, 2, requests.Load())
 }
+
+// A page can time out exactly at the fatal deadline after earlier pages were
+// read. A zero Ship timeout would wait forever with a full USP buffer.
+func TestPartialShippingAtDeadlineNeverUsesUnlimitedTimeout(t *testing.T) {
+	mock := newMockPandaDoc("test-api-key")
+	h := newPollHarness(t, mock)
+	for i := 0; i < 150; i++ {
+		mock.addLogs(auditLogEntry(fmt.Sprint(i), h.now.Add(-time.Minute)))
+	}
+	transport := h.a.httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+
+	roots := 0
+	var failedAt time.Time
+	h.a.httpClient.Transport = pageRoundTripper(func(r *http.Request) (*http.Response, error) {
+		if firstPage(r) {
+			roots++
+			if roots == 1 {
+				failedAt = h.now
+				return pollResponse(503, ""), nil
+			}
+			return transport.RoundTrip(r)
+		}
+		h.now = failedAt.Add(pollFailureLimit)
+		return nil, context.DeadlineExceeded
+	})
+	timeouts := []time.Duration{}
+	h.a.uspClient = &failureBudgetSink{ship: func(timeout time.Duration) error {
+		require.Greater(t, timeout, time.Duration(0), "zero means unlimited in the USP client")
+		timeouts = append(timeouts, timeout)
+		h.now = h.now.Add(timeout)
+		return uspclient.ErrorBufferFull
+	}}
+	h.run(4)
+	require.Equal(t, []time.Duration{time.Nanosecond, time.Nanosecond}, timeouts)
+	require.Len(t, h.fatal, 1)
+	require.Contains(t, h.fatal[0].Error(), "failed continuously for at least 30 minutes")
+	require.Equal(t, failedAt.Add(pollFailureLimit+2*time.Nanosecond), h.now)
+}
