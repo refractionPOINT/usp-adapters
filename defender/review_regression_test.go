@@ -52,14 +52,62 @@ func TestDefenderOpenTailShipsPromptlyWithoutCommittingUnsettledWindow(t *testin
 }
 
 func TestDefenderReplayFailureYieldsAndRetainsContinuationForFreshTraffic(t *testing.T) {
+	t.Run("local-backoff", func(t *testing.T) {
+		var failures atomic.Int32
+		server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("$skiptoken") == "held" {
+				failures.Add(1)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			sendPage(w, nil, "")
+		})
+		a, g := harness(t, server, &captureSink{})
+		require.Zero(t, a.runtime.replaySpacing, "class spacing must not mask a missing retry guard")
+		live := a.windowURL(g.position.Boundary, g.position.WindowEnd)
+		history := live + "&%24skiptoken=held"
+		requests := &graphRequests{}
+		_, err := a.requestPage(context.Background(), history, true, requests)
+		require.ErrorIs(t, err, errYield)
+		require.Equal(t, 2*time.Second, requests.replayBackoff, "the first replay 503 must arm exponential backoff")
+		require.False(t, requests.replayRetry.Before(requests.failureStart.Add(time.Second)), "a replay 503 must install at least one second of backoff")
+		require.True(t, requests.globalNext.IsZero(), "a replay 503 without Retry-After must not pause fresh traffic")
+
+		// Control eligibility directly, without an upper wall-time assumption.
+		// This exercises the retry guard with class spacing disabled even if the
+		// test goroutine is descheduled beyond the original one-second backoff.
+		deferred := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+		requests.replayRetry = deferred
+		for turn := 0; turn < 3; turn++ {
+			_, err = a.requestPage(context.Background(), history, true, requests)
+			require.ErrorIs(t, err, errYield)
+		}
+		require.Equal(t, int32(1), failures.Load(), "deferred replay turns must not issue another HTTP request")
+		_, err = a.requestPage(context.Background(), live, false, requests)
+		require.NoError(t, err, "local replay backoff must leave fresh requests eligible")
+		require.Equal(t, deferred, requests.replayRetry, "fresh success must retain the replay deadline")
+		requests.replayRetry = time.Time{}
+		_, err = a.requestPage(context.Background(), history, true, requests)
+		require.ErrorIs(t, err, errYield)
+		require.Equal(t, int32(2), failures.Load(), "eligible replay must retry its failing continuation")
+	})
+
 	base := time.Date(2026, 1, 2, 3, 0, 0, 0, time.UTC)
 	var fresh atomic.Bool
 	var failures atomic.Int32
 	failed := make(chan struct{}, 1)
+	continuation := make(chan string, 1)
+	heldAt := make(chan time.Time, 2)
 	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
 		start, end := windowBounds(t, r)
 		if start.Before(base) {
 			if r.URL.Query().Get("$skiptoken") == "held" {
+				// Record before responding or notifying: the client's retry deadline
+				// is armed later, so scheduling delays can only widen this interval.
+				select {
+				case heldAt <- time.Now():
+				default:
+				}
 				failures.Add(1)
 				w.WriteHeader(503)
 				select {
@@ -74,6 +122,10 @@ func TestDefenderReplayFailureYieldsAndRetainsContinuationForFreshTraffic(t *tes
 			q := next.Query()
 			q.Set("$skiptoken", "held")
 			next.RawQuery = q.Encode()
+			select {
+			case continuation <- next.String():
+			default:
+			}
 			sendPage(w, nil, next.String())
 			return
 		}
@@ -104,15 +156,23 @@ func TestDefenderReplayFailureYieldsAndRetainsContinuationForFreshTraffic(t *tes
 	case <-time.After(5 * time.Second):
 		t.Fatal("reconciliation did not reach its failing continuation")
 	}
-	time.Sleep(20 * time.Millisecond)
-	require.Equal(t, int32(1), failures.Load(), "replay backoff must prevent a retry on each scheduler turn")
+	// Deliberately delay this test goroutine until a legitimate replay retry.
+	// Fresh admission need not finish inside any particular replay backoff
+	// interval on a slow runner.
+	select {
+	case <-failed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("reconciliation did not retry its retained failing continuation")
+	}
+	first, second := <-heldAt, <-heldAt
+	require.GreaterOrEqual(t, second.Sub(first), time.Second, "the scheduler must retain replay backoff across turns")
 	fresh.Store(true)
 	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, time.Millisecond, "a replay-specific 503/backoff must yield to fresh/live traffic")
 	cancel()
 	<-done
-	require.Equal(t, int32(1), failures.Load(), "replay backoff must survive scheduler turns")
+	require.GreaterOrEqual(t, failures.Load(), int32(2), "the collection fixture must exercise a legitimate replay retry")
 	require.NotNil(t, g.replayScan)
-	require.Contains(t, g.replayScan.next, "held")
+	require.Equal(t, <-continuation, g.replayScan.next, "replay must retain the exact opaque failing continuation")
 	require.Equal(t, base.Add(-10*time.Minute).UnixNano(), g.replayScan.start)
 	require.Equal(t, base.Add(-5*time.Minute).UnixNano(), g.replayScan.targetEnd)
 }
