@@ -10,59 +10,109 @@ import (
 
 const settleLookback = 5 * time.Minute
 
-// reclaimExpiredHistory releases only ACK-confirmed, expired historical IDs
-// below a complete live boundary. Before removing their dedupe protection, it
-// records the lost historical suffix in Unverified and truncates affected replay
-// work. Complete live boundaries never move, and pending dependencies survive.
-// This is an explicit coverage reduction under pressure, not successful replay.
+// Maintenance is collector-owned. Each sweep visits at most twice the bounded
+// cache plus its retained entries during compaction. Idle polling does not scan
+// the map: obsolete history is checked every 30s, pressure at most once a second.
+type historyMaintenance struct {
+	pressureWall, pruneWall                        time.Time
+	pressureSource, pruneSource                    int64
+	dependency                                     utils.ACKDependency
+	peak, sweeps, visited, maxVisited, compactions int
+}
+
+// reclaimExpiredHistory prioritizes live collection over optional historical
+// coverage, including unexpired history. Older history yields before the complete
+// settle tail; only unfinished live work and unACKed admissions are mandatory. Reducing optional
+// coverage explicitly leaves Unverified; it never completes a source window.
 func (a *EntraIDAdapter) reclaimExpiredHistory(g *entraGeneration) {
-	now := a.runtime.now().UnixNano()
-	cutoffs := make(map[string]int64)
-	coverageReduced := false
-	remove := make([][16]byte, 0)
-	for key, v := range g.live {
-		if v.expiry >= now || v.serial > g.confirmed.Load() {
-			continue
-		}
-		stamp := v.expiry - int64(historyHorizon)
-		eligible := true
-		for name, s := range g.position {
-			if v.stream != 0 && v.stream != streamCode(name) {
-				continue
-			}
-			if stamp >= s.Boundary {
-				eligible = false
-				break
-			}
-		}
-		if !eligible {
-			continue
-		}
-		remove = append(remove, key)
-		cutoff := stamp + int64(graphTimeQuantum) - stamp%int64(graphTimeQuantum)
-		for name := range g.position {
-			if v.stream != 0 && v.stream != streamCode(name) {
-				continue
-			}
-			if cutoff > cutoffs[name] {
-				cutoffs[name] = cutoff
-			}
-		}
+	a.maintainHistory(g, true)
+}
+
+func (a *EntraIDAdapter) maintainHistory(g *entraGeneration, pressure bool) {
+	m := &g.maintenance
+	now, wall := a.runtime.now().UnixNano(), time.Now()
+	lastWall, lastSource, interval := m.pruneWall, m.pruneSource, 30*time.Second
+	if pressure {
+		lastWall, lastSource, interval = m.pressureWall, m.pressureSource, time.Second
 	}
-	if len(remove) == 0 {
-		// An incomplete page may be holding admissions which have since ACKed.
-		// Publish their dependency without advancing any incomplete source boundary.
-		if a.candidate(g) != nil {
-			a.issue("candidate_rejected")
-		}
+	if !lastWall.IsZero() && wall.Sub(lastWall) < interval && now >= lastSource && now-lastSource < int64(interval) {
+		a.exposeAdmissions(g, pressure)
 		return
 	}
+	if pressure {
+		m.pressureWall, m.pressureSource = wall, now
+	} else {
+		m.pruneWall, m.pruneSource = wall, now
+	}
+	if len(g.live) > m.peak {
+		m.peak = len(g.live)
+	}
+	confirmed := g.confirmed.Load()
+	// Classify against one pre-reclamation snapshot. Updating Coverage below must
+	// not change which tier is removed during the second bounded map pass.
+	before := make(entraPosition, len(g.position))
+	for name, position := range g.position {
+		before[name] = position
+	}
+	tier := func(v liveID) int {
+		if v.serial > confirmed {
+			return 0
+		}
+		stamp := v.expiry - int64(historyHorizon)
+		rank := 1
+		for name, position := range before {
+			if v.stream != 0 && v.stream != streamCode(name) {
+				continue
+			}
+			// The unfinished live window is never optional, even after ACK.
+			if stamp >= position.Boundary {
+				return 0
+			}
+			if stamp >= position.Coverage {
+				if !pressure {
+					return 0
+				}
+				if stamp >= position.Boundary-int64(settleLookback) {
+					rank = 2
+				}
+			}
+		}
+		return rank
+	}
+	cutoffsByTier := [3]map[string]int64{nil, {}, {}}
+	counts := [3]int{}
+	visits := 0
+	for _, v := range g.live {
+		visits++
+		rank := tier(v)
+		if rank == 0 {
+			continue
+		}
+		counts[rank]++
+		stamp := v.expiry - int64(historyHorizon)
+		cutoff := stamp + int64(graphTimeQuantum) - stamp%int64(graphTimeQuantum)
+		for name := range before {
+			if v.stream != 0 && v.stream != streamCode(name) {
+				continue
+			}
+			if cutoff > cutoffsByTier[rank][name] {
+				cutoffsByTier[rank][name] = cutoff
+			}
+		}
+	}
+	selected := 1
+	if pressure && counts[1] == 0 {
+		selected = 2
+	}
+	cutoffs := cutoffsByTier[selected]
+
+	reduced := false
 	for name, cutoff := range cutoffs {
 		s := g.position[name]
 		if cutoff <= s.Coverage {
 			continue
 		}
-		coverageReduced = true
+		reduced = true
 		lost := s.Coverage
 		if s.Replay != 0 && s.Replay < lost {
 			lost = s.Replay
@@ -78,26 +128,68 @@ func (a *EntraIDAdapter) reclaimExpiredHistory(g *entraGeneration) {
 			}
 		}
 		g.position[name] = s
+		// Discard delayed old traversals before removing any dedupe protection.
 		delete(g.scans, name+"/replay")
 		delete(g.scans, name+"/settle")
 	}
-	for _, key := range remove {
-		delete(g.live, key)
-	}
-	for name, ids := range g.recent {
-		kept := ids[:0]
-		for _, id := range ids {
-			if _, ok := g.live[id.digest]; ok {
-				kept = append(kept, id)
-			}
+	removed := 0
+	for key, v := range g.live {
+		visits++
+		if tier(v) == selected {
+			delete(g.live, key)
+			removed++
 		}
-		g.recent[name] = kept
 	}
-	if coverageReduced {
+	if removed > 0 {
+		for name, ids := range g.recent {
+			kept := ids[:0]
+			for _, id := range ids {
+				if _, ok := g.live[id.digest]; ok {
+					kept = append(kept, id)
+				}
+			}
+			g.recent[name] = kept
+		}
+	}
+	// Go's delete retains buckets. Rebuilding a substantially smaller map releases
+	// the old allocation after GC, temporarily retaining old and new maps together.
+	if m.peak >= 4096 && len(g.live) <= m.peak/4 {
+		compact := make(map[[16]byte]liveID, len(g.live))
+		for key, v := range g.live {
+			compact[key] = v
+			visits++
+		}
+		g.live = compact
+		m.peak = len(g.live)
+		m.compactions++
+	}
+	m.sweeps++
+	m.visited += visits
+	if visits > m.maxVisited {
+		m.maxVisited = visits
+	}
+	if reduced {
 		a.issue("history_coverage_reduced")
 	}
-	if a.candidate(g) != nil {
-		a.issue("candidate_rejected")
+	if removed > 0 {
+		if a.candidate(g) != nil {
+			a.issue("candidate_rejected")
+		}
+	} else {
+		a.exposeAdmissions(g, pressure)
+	}
+}
+
+// A partial page's admitted prefix can ACK before its source window completes.
+// Publish those actual tracker dependencies with the unchanged complete boundary;
+// this proves admission ACKs without fabricating source progress. Coalesce repeats.
+func (a *EntraIDAdapter) exposeAdmissions(g *entraGeneration, pressure bool) {
+	if pressure && g.hasDependency && g.maintenance.dependency != g.dependency {
+		if a.candidate(g) != nil {
+			a.issue("candidate_rejected")
+		} else {
+			g.maintenance.dependency = g.dependency
+		}
 	}
 }
 
@@ -198,6 +290,7 @@ func (a *EntraIDAdapter) collect(ctx context.Context, g *entraGeneration) {
 	liveTurn, replayTurn := 0, 0
 	for ctx.Err() == nil {
 		now := a.runtime.now()
+		a.maintainHistory(g, false)
 		liveStart := liveTurn
 		for i := range a.streams {
 			index := (liveStart + i) % len(a.streams)
@@ -211,6 +304,8 @@ func (a *EntraIDAdapter) collect(ctx context.Context, g *entraGeneration) {
 				}
 				s.Coverage = floor
 				g.position[stream.name] = s
+				delete(g.scans, stream.name+"/settle")
+				delete(g.scans, stream.name+"/replay")
 			}
 			a.clampReplay(g, stream)
 			before := requests.serial

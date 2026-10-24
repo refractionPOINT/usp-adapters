@@ -53,6 +53,7 @@ type entraGeneration struct {
 	hasDependency bool
 	confirmed     atomic.Uint64
 	scans         map[string]*graphScan
+	maintenance   historyMaintenance
 	latest        []byte // manager-owned: consumed Confirm results survive failed saves
 }
 
@@ -73,8 +74,8 @@ func (a *EntraIDAdapter) sourceFingerprint() [32]byte {
 		names = append(names, s.name)
 	}
 	sort.Strings(names)
-	// Credentials, including application ID, are deliberately excluded. The host
-	// binds this source identity to the authoritative record incarnation.
+	// Credentials, including application ID, are deliberately excluded so that
+	// credential rotation preserves this collection identity.
 	fields := []string{"entraid", a.conf.endpoint(), strings.TrimRight(a.conf.graphEndpoint(), "/"), a.conf.TenantID, a.conf.scope()}
 	fields = append(fields, names...)
 	raw, _ := json.Marshal(fields)
@@ -280,13 +281,18 @@ func (g *entraGeneration) remember(name string, entry savedID) {
 			return
 		}
 	}
-	ids = append(ids, entry)
-	sort.Slice(ids, func(i, j int) bool { return ids[i].expiry > ids[j].expiry })
-	// One omitted ID is necessary to compute the first incomplete timestamp tie.
+	// Keep only the newest bounded summary plus the first omitted timestamp.
+	// Insert in order instead of sorting a thousand IDs on every admission.
 	quota := savedIDLimit / len(g.position)
-	if len(ids) > quota+1 {
-		ids = ids[:quota+1]
+	at := sort.Search(len(ids), func(i int) bool { return ids[i].expiry <= entry.expiry })
+	if at > quota {
+		return
 	}
+	if len(ids) < quota+1 {
+		ids = append(ids, savedID{})
+	}
+	copy(ids[at+1:], ids[at:len(ids)-1])
+	ids[at] = entry
 	g.recent[name] = ids
 }
 func (a *EntraIDAdapter) candidate(g *entraGeneration) error {

@@ -144,10 +144,13 @@ type graphRequests struct {
 	liveNext, replayNext, globalNext, blockedUntil time.Time
 	liveCalls, replayCalls                         []time.Time
 	episodes                                       map[string]*failureEpisode
+	permanentNext                                  map[string]time.Time
 }
 type requestFailure struct {
 	retryAt time.Time
 	delay   time.Duration
+	// Invalid data pins this traversal, even when other lanes remain available.
+	invalid failureEpisode
 }
 type failureEpisode struct {
 	since    time.Time
@@ -194,13 +197,13 @@ func (a *EntraIDAdapter) reserveRequest(replay bool, state *graphRequests) bool 
 	state.globalNext = now.Add(a.runtime.globalSpacing)
 	return true
 }
-func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, raw string, replay bool, state *graphRequests, failure *requestFailure) (graphPage, error) {
+func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, raw string, replay bool, state *graphRequests, failure *requestFailure, validate ...func(graphPage) error) (graphPage, error) {
 	var page graphPage
 	if a.validateContinuation(raw, stream) != nil {
 		return page, errPage
 	}
 	now := a.runtime.now()
-	if now.Before(failure.retryAt) || !a.reserveRequest(replay, state) {
+	if now.Before(failure.retryAt) || now.Before(state.permanentNext[stream.name]) || !a.reserveRequest(replay, state) {
 		return page, errYield
 	}
 	var token struct {
@@ -214,7 +217,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 	// A delay on a successful token exchange must also postpone the collection.
 	// Keep no bearer token in persistent state; retry the exchange after the delay.
 	if err == nil && token.AccessToken == "" {
-		err = errVendor
+		err = errPage
 	}
 	if err == nil && delay > 0 {
 		return page, errYield
@@ -230,8 +233,29 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 	}
 	if err == nil {
 		if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next, stream) != nil) {
-			return graphPage{}, errPage
+			err = errPage
 		}
+		if err == nil {
+			for _, item := range page.Items {
+				id, ok := item["id"].(string)
+				stamp, okTime := item[stream.tsField].(string)
+				_, parseErr := time.Parse(time.RFC3339Nano, stamp)
+				if !ok || id == "" || !okTime || parseErr != nil {
+					err = errPage
+					break
+				}
+			}
+		}
+		if err == nil {
+			for _, check := range validate {
+				if check(page) != nil {
+					err = errPage
+					break
+				}
+			}
+		}
+	}
+	if err == nil {
 		*failure = requestFailure{}
 		// A real page from either lane proves this collection is available.
 		// The other lane's retry deadline/backoff remains independent.
@@ -239,22 +263,33 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		return page, nil
 	}
 	if errors.Is(err, errVendor) {
+		if delay < a.pollInterval {
+			delay = a.pollInterval
+		}
+		failure.retryAt = a.runtime.now().Add(delay)
+		if state.permanentNext == nil {
+			state.permanentNext = make(map[string]time.Time)
+		}
+		state.permanentNext[stream.name] = failure.retryAt
 		if a.conf.ClientOptions.OnError != nil {
 			a.conf.ClientOptions.OnError(errVendor)
 		}
 		return graphPage{}, errVendor
 	}
-	if !errors.Is(err, errRetry) {
+	if !errors.Is(err, errRetry) && !errors.Is(err, errPage) {
 		return graphPage{}, err
 	}
 	now = a.runtime.now()
 	episode := state.episode(stream.name)
+	if errors.Is(err, errPage) {
+		episode = &failure.invalid
+	}
 	if episode.since.IsZero() {
 		episode.since = now
 	}
 	if !episode.reported && now.Sub(episode.since) >= a.runtime.failureLimit {
 		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(errors.New("Entra API unavailable for a continuous retry interval"))
+			a.conf.ClientOptions.OnError(errors.New("Entra collection unavailable or invalid for a continuous retry interval"))
 		}
 		episode.reported = true
 	}
@@ -275,7 +310,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		}
 	}
 	a.issue("vendor_retry")
-	return graphPage{}, errRetry
+	return graphPage{}, err
 }
 
 func (a *EntraIDAdapter) shipItem(ctx context.Context, g *entraGeneration, stream entraStream, item map[string]interface{}, start, end int64) error {
@@ -286,6 +321,9 @@ func (a *EntraIDAdapter) shipItem(ctx context.Context, g *entraGeneration, strea
 		return errPage
 	}
 	t := created.UnixNano()
+	if start < g.position[stream.name].Coverage {
+		return errPressure
+	}
 	if t < start || t >= end {
 		return nil
 	}
@@ -325,8 +363,8 @@ func (a *EntraIDAdapter) shipItem(ctx context.Context, g *entraGeneration, strea
 		// its collection-qualified dedupe map.
 		entry = liveID{dependency: dep, serial: g.serial + 1, expiry: t + int64(historyHorizon), stream: streamCode(stream.name)}
 		g.live[digest] = entry
+		g.remember(stream.name, savedID{digest: digest, expiry: entry.expiry})
 	}
-	g.remember(stream.name, savedID{digest: digest, expiry: entry.expiry})
 	if entry.serial > g.confirmed.Load() {
 		dep, err := g.dependency.Include(entry.dependency)
 		if err != nil {
@@ -345,6 +383,8 @@ type graphScan struct {
 	ids                   map[[16]byte]struct{}
 	expected              int64
 	failure               requestFailure
+	page                  *graphPage
+	offset                int
 }
 
 func (a *EntraIDAdapter) newScan(stream entraStream, start, target, end int64) *graphScan {
@@ -362,6 +402,9 @@ func (a *EntraIDAdapter) scanWindow(ctx context.Context, g *entraGeneration, str
 }
 func (a *EntraIDAdapter) scanLane(ctx context.Context, g *entraGeneration, stream entraStream, start, end int64, lane string, requests *graphRequests) (int64, error) {
 	key := stream.name + "/" + lane
+	if start < g.position[stream.name].Coverage {
+		return start, errPressure
+	}
 	work := g.scans[key]
 	if work == nil || work.start != start || work.targetEnd != end {
 		work = a.newScan(stream, start, end, end)
@@ -371,23 +414,42 @@ func (a *EntraIDAdapter) scanLane(ctx context.Context, g *entraGeneration, strea
 	_, repeated := work.links[hash]
 	incomplete := repeated || len(work.links) >= 128
 	if !incomplete {
-		page, err := a.requestPage(ctx, stream, work.next, lane == "replay", requests, &work.failure)
-		if err != nil {
-			return start, err
+		if work.page == nil {
+			page, err := a.requestPage(ctx, stream, work.next, lane == "replay", requests, &work.failure, func(page graphPage) error {
+				if page.Next != "" {
+					nextHash := sha256.Sum256([]byte(page.Next))
+					if _, seen := work.links[nextHash]; seen || nextHash == hash {
+						return errPage
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return start, err
+			}
+			work.page = &page
+			if page.Count != nil && *page.Count > work.expected {
+				work.expected = *page.Count
+			}
 		}
-		if page.Count != nil && *page.Count > work.expected {
-			work.expected = *page.Count
-		}
-		for _, item := range page.Items {
+		page := work.page
+		for work.offset < len(page.Items) {
+			if ctx.Err() != nil {
+				return start, ctx.Err()
+			}
+			item := page.Items[work.offset]
 			if err := a.shipItem(ctx, g, stream, item, start, work.end); err != nil {
 				return start, err
 			}
 			id, _ := item["id"].(string)
 			work.ids[eventDigest(a.sourceFingerprint(), stream.name, id)] = struct{}{}
-			if len(work.ids) > liveIDLimit {
-				return start, errPressure
+			work.offset++ // only a successful admission/suppression consumes this item
+			if len(work.ids) > 128000 {
+				return start, errIncomplete
 			}
 		}
+		work.page = nil
+		work.offset = 0
 		work.links[hash] = struct{}{}
 		if page.Next != "" {
 			work.next = page.Next

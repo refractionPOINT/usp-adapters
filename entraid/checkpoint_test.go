@@ -843,12 +843,12 @@ func TestEntraDefaultMissingAndNilStartAtConstructorBoundary(t *testing.T) {
 
 func TestEntraReconciliationYieldsToLiveAndHonorsCoverage(t *testing.T) {
 	var livePages, replayPages atomic.Int32
-	var clock atomic.Int64
+	var clock, maxLiveEnd atomic.Int64
 	clock.Store(fixtureBaseTime().UnixNano())
 	base := fixtureBaseTime()
 	replayFloor := base.Add(-72 * time.Hour).UnixNano()
 	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
-		start, _ := bounds(t, r)
+		start, end := bounds(t, r)
 		clock.Add(int64(10 * time.Second))
 		if start.Before(base) {
 			replayPages.Add(1)
@@ -862,6 +862,11 @@ func TestEntraReconciliationYieldsToLiveAndHonorsCoverage(t *testing.T) {
 			return
 		}
 		livePages.Add(1)
+		for old := maxLiveEnd.Load(); end.UnixNano() > old; old = maxLiveEnd.Load() {
+			if maxLiveEnd.CompareAndSwap(old, end.UnixNano()) {
+				break
+			}
+		}
 		sendPage(w, nil, "")
 	})
 	a, g, _ := harness(t, server, &captureSink{})
@@ -882,7 +887,8 @@ func TestEntraReconciliationYieldsToLiveAndHonorsCoverage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { defer close(done); a.collect(ctx, g) }()
-	require.Eventually(t, func() bool { return livePages.Load() >= 4 && replayPages.Load() >= 4 }, time.Second, time.Millisecond)
+	defer func() { cancel(); <-done }()
+	require.Eventually(t, func() bool { return maxLiveEnd.Load() >= base.Add(5*time.Second).UnixNano() && replayPages.Load() >= 4 }, time.Second, time.Millisecond)
 	cancel()
 	<-done
 	require.GreaterOrEqual(t, g.position[a.streams[0].name].Boundary, base.Add(4*time.Second).UnixNano())
