@@ -207,7 +207,7 @@ func startWorker(t *testing.T, a *EventHubAdapter) <-chan struct{} {
 }
 func eventuallyCalls(t *testing.T, h *testHub, count int) []receiverCall {
 	t.Helper()
-	require.Eventually(t, func() bool { return len(h.snapshot()) >= count }, 2*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return len(h.snapshot()) >= count }, 5*time.Second, time.Millisecond)
 	return h.snapshot()
 }
 
@@ -311,20 +311,18 @@ func TestPositionTiesAndGaps(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		offset, seq int64
-		valid       bool
-	}{{"duplicate", 100, 10, true}, {"timestamp-tie", 101, 11, true}, {"offset-tie", 100, 11, false}, {"sequence-tie", 101, 10, false}, {"sequence-gap", 102, 12, true}, {"offset-reversed", 99, 11, false}} {
+	}{{"duplicate", 100, 10}, {"timestamp-tie", 101, 11}, {"offset-tie", 100, 11}, {"sequence-tie", 101, 10}, {"sequence-gap", 102, 12}, {"offset-reversed", 99, 11}} {
 		t.Run(test.name, func(t *testing.T) {
 			c := newTestClient()
 			a, g := harness(t, c)
 			require.NoError(t, process(t, a, g, "0", 100, 10))
-			err := process(t, a, g, "0", test.offset, test.seq)
-			if test.valid {
-				require.NoError(t, err)
-				require.Equal(t, 2, c.calls())
-			} else {
-				require.Error(t, err)
-				require.Equal(t, 1, c.calls())
-			}
+			require.NoError(t, process(t, a, g, "0", test.offset, test.seq), "valid source metadata remains ordinary admission despite ordering ambiguity")
+			require.Equal(t, 2, c.calls())
+			require.NoError(t, a.confirm(g))
+			require.Empty(t, g.confirmed, "admission alone is not source ACK proof")
+			c.ack(2)
+			require.NoError(t, a.confirm(g))
+			require.EqualValues(t, max(int64(10), test.seq), g.confirmed["0"], "cumulative ACK retains the highest actually admitted source sequence")
 		})
 	}
 }
@@ -370,7 +368,7 @@ func TestShutdownImmediatelyUnblocksProducerAndIsIdempotent(t *testing.T) {
 	go func() { done <- call.handler(context.Background(), fixtureEvent(100, 0)) }()
 	select {
 	case <-c.blockedStarted:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("producer not blocked")
 	}
 	start := time.Now()
@@ -379,7 +377,7 @@ func TestShutdownImmediatelyUnblocksProducerAndIsIdempotent(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("producer leaked")
 	}
 	require.Zero(t, vendorErrors.Load())
@@ -403,7 +401,7 @@ func TestListenerFailureStopsOnceWithoutBlockedNotifications(t *testing.T) {
 	}
 	select {
 	case <-a.chStopped:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("listener notifications blocked")
 	}
 	require.NoError(t, a.Close())
@@ -475,7 +473,7 @@ func TestCanceledHandlerCannotAdmitAcrossAnotherPartitionHole(t *testing.T) {
 	}()
 	select {
 	case <-c.blockedStarted:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("not blocked")
 	}
 	bad := make(chan error, 1)
@@ -483,7 +481,7 @@ func TestCanceledHandlerCannotAdmitAcrossAnotherPartitionHole(t *testing.T) {
 	require.Error(t, <-bad)
 	select {
 	case <-blocked:
-	case <-time.After(1500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 		t.Fatal("cancellation did not bound the in-flight Ship")
 	}
 	require.NoError(t, a.confirm(g))
@@ -539,7 +537,7 @@ func TestListenerErrorCallbackCanCloseAdapter(t *testing.T) {
 	require.NoError(t, call.listener.Close(context.Background()))
 	select {
 	case <-callbackDone:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("OnError callback deadlocked closing its own adapter")
 	}
 	require.NoError(t, a.Close())

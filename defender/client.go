@@ -99,6 +99,8 @@ type DefenderAdapter struct {
 	closeErr      error
 	runtime       defenderRuntime
 	startedAt     int64
+	identityOnce  sync.Once
+	identity      [32]byte
 	collectionURL *url.URL
 }
 
@@ -231,6 +233,7 @@ func newDefenderAdapterWithRuntime(ctx context.Context, conf DefenderConfig, sin
 	if a.pollInterval <= 0 {
 		a.pollInterval = defaultPollInterval
 	}
+	_ = a.sourceFingerprint() // immutable source identity, outside the item hot path
 	a.httpClient = &http.Client{Timeout: 10 * time.Second,
 		Transport:     &http.Transport{DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },

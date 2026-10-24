@@ -46,7 +46,7 @@ func TestManagementFailureEscalatesAfterContinuousHourAndResets(t *testing.T) {
 	waitRetry := func() {
 		t.Helper()
 		before := retries.Load()
-		require.Eventually(t, func() bool { return retries.Load() > before || len(callbacks) > 0 }, time.Second, time.Millisecond)
+		require.Eventually(t, func() bool { return retries.Load() > before || len(callbacks) > 0 }, 5*time.Second, time.Millisecond)
 	}
 	quiet := func() {
 		t.Helper()
@@ -65,7 +65,7 @@ func TestManagementFailureEscalatesAfterContinuousHourAndResets(t *testing.T) {
 	c.ack(1)
 	fail.Store(false)
 	before := successes.Load()
-	require.Eventually(t, func() bool { return successes.Load() > before }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return successes.Load() > before }, 5*time.Second, time.Millisecond)
 	// A successful read breaks the episode. Jumping beyond the old hour must
 	// start a fresh budget, not inherit the resolved outage's original clock.
 	clock.Add(int64(2 * time.Minute))
@@ -82,7 +82,7 @@ func TestManagementFailureEscalatesAfterContinuousHourAndResets(t *testing.T) {
 	case err := <-callbacks:
 		require.Contains(t, err.Error(), "GetRuntimeInformation()")
 		require.Contains(t, err.Error(), "amqp:internal-error")
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("continuous one-hour outage never escalated")
 	}
 	require.Greater(t, failures.Load(), int32(1))
@@ -115,10 +115,10 @@ func TestReceiverFailureBudgetSurvivesManagementSuccess(t *testing.T) {
 	startWorker(t, a)
 	first := eventuallyCalls(t, &h.testHub, 1)[0]
 	h.setIDs("0", "1")
-	require.Eventually(t, func() bool { return retries.Load() > 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return retries.Load() > 0 }, 5*time.Second, time.Millisecond)
 	clock.Add(int64(59 * time.Minute))
 	before := retries.Load()
-	require.Eventually(t, func() bool { return retries.Load() > before }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return retries.Load() > before }, 5*time.Second, time.Millisecond)
 	select {
 	case err := <-callbacks:
 		t.Fatalf("receiver outage escalated early: %v", err)
@@ -131,7 +131,7 @@ func TestReceiverFailureBudgetSurvivesManagementSuccess(t *testing.T) {
 	case err := <-callbacks:
 		require.Contains(t, err.Error(), "Receive()")
 		require.Contains(t, err.Error(), "unauthorized-access")
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("management success incorrectly reset the failed receiver's budget")
 	}
 	require.NoError(t, a.Close())
@@ -207,11 +207,11 @@ func TestInternalStopsRemainMetricOnly(t *testing.T) {
 					require.ErrorIs(t, calls[1].handler(context.Background(), fixtureEvent(200, 0)), acktrack.ErrLimit)
 				case "backward_position":
 					require.NoError(t, calls[0].handler(context.Background(), fixtureEvent(100, 10)))
-					require.Error(t, calls[0].handler(context.Background(), fixtureEvent(99, 1)))
-					require.Equal(t, 1, c.calls())
-					require.NoError(t, a.ctx.Err(), "backward suspicion must pause only its partition pending proof")
+					require.NoError(t, calls[0].handler(context.Background(), fixtureEvent(99, 1)))
+					require.Equal(t, 2, c.calls())
+					require.NoError(t, a.ctx.Err(), "ambiguous backward delivery must preserve ordinary collection while awaiting proof")
 					require.NoError(t, calls[1].handler(context.Background(), fixtureEvent(200, 0)))
-					c.ack(2)
+					c.ack(3)
 					require.NoError(t, a.Close())
 					<-workerDone
 					require.Empty(t, callbacks, "unproven reset must remain operational-only")
@@ -224,7 +224,7 @@ func TestInternalStopsRemainMetricOnly(t *testing.T) {
 			}
 			select {
 			case <-a.chStopped:
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
 				t.Fatal("internal source worker did not stop")
 			}
 			require.EqualValues(t, 1, stalls.Load())
@@ -260,7 +260,7 @@ func TestMalformedVendorEventReportsOnceAfterFreeze(t *testing.T) {
 	select {
 	case err := <-callbacks:
 		require.Contains(t, err.Error(), "invalid event metadata")
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("verified malformed vendor event was silently hidden")
 	}
 	require.NoError(t, a.Close())

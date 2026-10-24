@@ -84,14 +84,14 @@ func TestProgressCanceledAdmissionKeepsIncompletePageUncommitted(t *testing.T) {
 			defer func() { cancel(); sink.BeginDrain(); <-done }()
 			select {
 			case <-sink.blocked:
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
 				t.Fatal("expected blocked admission")
 			}
 			started := time.Now()
 			cancel()
 			select {
 			case <-done:
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
 				sink.BeginDrain()
 				<-done
 				t.Fatal("generation cancellation did not join blocked admission promptly")

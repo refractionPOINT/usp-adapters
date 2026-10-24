@@ -301,9 +301,11 @@ func (a *DefenderAdapter) shipScanItem(ctx context.Context, g *defenderGeneratio
 			return ctx.Err()
 		}
 		msg := &protocol.DataMessage{JsonPayload: item, TimestampMs: uint64(time.Now().UnixMilli())}
+		warned := false
 		dep, err := a.tracker.Ship(msg, time.Second)
 		for errors.Is(err, uspclient.ErrorBufferFull) && ctx.Err() == nil {
-			if a.conf.ClientOptions.OnWarning != nil {
+			if !warned && a.conf.ClientOptions.OnWarning != nil {
+				warned = true
 				a.conf.ClientOptions.OnWarning("stream falling behind")
 			}
 			dep, err = a.tracker.Ship(msg, time.Second)

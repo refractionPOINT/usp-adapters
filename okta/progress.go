@@ -37,8 +37,9 @@ func eventDigest(id string) [16]byte {
 }
 func (g *oktaGeneration) makeRoom(now time.Time) bool {
 	confirmed := g.confirmed.Load()
+	pressure := len(g.live) >= liveIDLimit
 	for id, entry := range g.live {
-		if entry.expiry <= now.Unix() && entry.page <= confirmed {
+		if entry.page <= confirmed && (pressure || entry.expiry <= now.Unix()) {
 			delete(g.live, id)
 		}
 	}

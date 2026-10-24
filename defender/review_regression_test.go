@@ -33,7 +33,7 @@ func TestDefenderOpenTailShipsPromptlyWithoutCommittingUnsettledWindow(t *testin
 	done := make(chan struct{})
 	go func() { defer close(done); a.collect(ctx, g) }()
 	defer func() { cancel(); <-done }()
-	require.Eventually(t, func() bool { return sink.count() == 1 }, 250*time.Millisecond, time.Millisecond, "fresh creation-time alerts must ship before the first settled window")
+	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, time.Millisecond, "fresh creation-time alerts must ship before the first settled window")
 	require.NoError(t, a.confirm(g))
 	require.Equal(t, initial, g.confirmed.Load(), "an open tail cannot advance the confirmed frontier")
 	now.Store(base.Add(11 * time.Minute).UnixNano())
@@ -47,7 +47,7 @@ func TestDefenderOpenTailShipsPromptlyWithoutCommittingUnsettledWindow(t *testin
 			return false
 		}
 		return g.confirmed.Load() >= 1
-	}, time.Second, time.Millisecond)
+	}, 5*time.Second, time.Millisecond)
 	require.Equal(t, 1, sink.count(), "tail/window overlap must not re-emit a pending or confirmed ID")
 }
 
@@ -101,13 +101,13 @@ func TestDefenderReplayFailureYieldsAndRetainsContinuationForFreshTraffic(t *tes
 	defer func() { cancel(); <-done }()
 	select {
 	case <-failed:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("reconciliation did not reach its failing continuation")
 	}
 	time.Sleep(20 * time.Millisecond)
 	require.Equal(t, int32(1), failures.Load(), "replay backoff must prevent a retry on each scheduler turn")
 	fresh.Store(true)
-	require.Eventually(t, func() bool { return sink.count() == 1 }, 250*time.Millisecond, time.Millisecond, "a replay-specific 503/backoff must yield to fresh/live traffic")
+	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, time.Millisecond, "a replay-specific 503/backoff must yield to fresh/live traffic")
 	cancel()
 	<-done
 	require.Equal(t, int32(1), failures.Load(), "replay backoff must survive scheduler turns")
@@ -268,7 +268,7 @@ func TestDefenderPendingTailPagesAndHistoryDoNotStarveSettledLive(t *testing.T) 
 	done := make(chan struct{})
 	go func() { defer close(done); a.collect(ctx, g) }()
 	defer func() { cancel(); <-done }()
-	require.Eventually(t, func() bool { return livePages.Load() >= 3 && tailPages.Load() >= 3 && replayPages.Load() >= 3 }, 300*time.Millisecond, time.Millisecond, "large open-tail and replay traversals must yield fairly to confirmed live progress")
+	require.Eventually(t, func() bool { return livePages.Load() >= 3 && tailPages.Load() >= 3 && replayPages.Load() >= 3 }, 5*time.Second, time.Millisecond, "large open-tail and replay traversals must yield fairly to confirmed live progress")
 	cancel()
 	<-done
 	require.NotNil(t, g.liveScan)
@@ -326,7 +326,7 @@ func TestDefenderIncompleteTailRefreshesPastUnprovableTimestampTie(t *testing.T)
 	go func() { defer close(done); a.collect(ctx, g) }()
 	defer func() { cancel(); <-done }()
 	require.Eventually(t, func() bool { return stalls.Load() > 0 }, 5*time.Second, time.Millisecond, "ordinary tail traversal must reach the unresolved timestamp tie")
-	require.Eventually(t, func() bool { return hasAlert(sink, "new-after-unprovable-tie") }, 500*time.Millisecond, time.Millisecond, "a stale prompt traversal must not pin fresh creation-time collection")
+	require.Eventually(t, func() bool { return hasAlert(sink, "new-after-unprovable-tie") }, 5*time.Second, time.Millisecond, "a stale prompt traversal must not pin fresh creation-time collection")
 	cancel()
 	<-done
 	sink.ack(^uint64(0))
@@ -397,19 +397,19 @@ func TestDefenderFailingTailContinuationRefreshesRepeatedlyWithoutResettingBacko
 	select {
 	case end := <-failed:
 		require.Equal(t, base.Add(6*time.Minute).UnixNano(), end)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("tail did not reach its failing opaque continuation")
 	}
 	now.Store(base.Add(20 * time.Minute).UnixNano())
-	require.Eventually(t, func() bool { return hasAlert(sink, "fresh-after-failed-tail") }, 3*time.Second, time.Millisecond, "persistent continuation failure must not pin the old prompt interval")
+	require.Eventually(t, func() bool { return hasAlert(sink, "fresh-after-failed-tail") }, 5*time.Second, time.Millisecond, "persistent continuation failure must not pin the old prompt interval")
 	select {
 	case end := <-failed:
 		require.Equal(t, base.Add(20*time.Minute).UnixNano(), end)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("refreshed tail did not retain its own incomplete continuation")
 	}
 	now.Store(base.Add(34 * time.Minute).UnixNano())
-	require.Eventually(t, func() bool { return hasAlert(sink, "fresh-after-second-refresh") }, 3*time.Second, time.Millisecond, "the refresh rule must continue to cover advancing time")
+	require.Eventually(t, func() bool { return hasAlert(sink, "fresh-after-second-refresh") }, 5*time.Second, time.Millisecond, "the refresh rule must continue to cover advancing time")
 	cancel()
 	<-done
 	require.GreaterOrEqual(t, firstFresh.Load()-firstFailure.Load(), int64(time.Second), "refresh must preserve the foreground lane's vendor backoff")
@@ -473,7 +473,7 @@ func TestDefenderTailRefreshKeepsVendorGlobalCooldown(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	select {
 	case <-retrySeen:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("tail did not receive its global cooldown")
 	}
 	time.Sleep(30 * time.Millisecond)

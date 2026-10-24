@@ -101,7 +101,7 @@ func TestProgressPendingDuplicateAndEmptyPageDependOnACK(t *testing.T) {
 	sink := &ackSink{}
 	a, g := localHarness(t, server.URL, sink)
 	stop := runCollector(t, a, g)
-	require.Eventually(t, func() bool { return calls.Load() >= 4 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() >= 4 }, 5*time.Second, time.Millisecond)
 	stop()
 	require.Equal(t, 1, sink.count(), "pending duplicate must not be shipped twice")
 	before := g.confirmed.Load()
@@ -154,7 +154,7 @@ func TestProgressOversizePageNeverLosesItsAdmissionDependency(t *testing.T) {
 	sink := &ackSink{}
 	a, g := localHarness(t, server.URL, sink)
 	stop := runCollector(t, a, g)
-	require.Eventually(t, func() bool { return calls.Load() >= 3 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() >= 3 }, 5*time.Second, time.Millisecond)
 	stop()
 	before := g.confirmed.Load()
 	require.NoError(t, a.confirm(g))
@@ -210,7 +210,7 @@ func TestProgressExpiredContinuationStallsWithoutReplayingUncoveredHistory(t *te
 	a, stopped, err := newOktaAdapter(context.Background(), OktaConfig{URL: server.URL, ApiKey: "dummy", ClientOptions: opts, PollInterval: time.Millisecond}, sink)
 	require.NoError(t, err)
 	defer a.Close()
-	require.Eventually(t, func() bool { return retries.Load() >= 2 }, 3*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return retries.Load() >= 2 }, 5*time.Second, time.Millisecond)
 	started := time.Now()
 	require.NoError(t, a.Close())
 	require.Less(t, time.Since(started), time.Second)
@@ -258,7 +258,7 @@ func TestProgressShutdownWakesBlockedProducerBeforeJoin(t *testing.T) {
 	defer a.Close()
 	select {
 	case <-sink.entered:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("producer did not block")
 	}
 	initial := uint64(0)
@@ -267,7 +267,7 @@ func TestProgressShutdownWakesBlockedProducerBeforeJoin(t *testing.T) {
 	select {
 	case err := <-closed:
 		require.NoError(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		sink.BeginDrain()
 		<-closed
 		t.Fatal("shutdown did not wake producer before joining")

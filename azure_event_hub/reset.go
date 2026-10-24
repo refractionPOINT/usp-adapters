@@ -133,7 +133,7 @@ func (a *EventHubAdapter) finishPartitionReset(g *generation, id string, r *part
 }
 
 // Periodic discovery checks at
-// most one, prioritizing an unresolved reset or paused backward observation;
+// most one, prioritizing an unresolved reset or backward observation;
 // otherwise it rotates through known partitions. No unbounded query fan-out.
 func (a *EventHubAdapter) inspectOnePartition(g *generation, ids []string) {
 	for _, id := range ids {

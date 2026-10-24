@@ -102,15 +102,21 @@ func newAdapter(ctx context.Context, conf EventHubConfig, hub adapterHub, client
 }
 
 type partitionState struct {
-	mu       sync.Mutex // serializes same-partition handlers, including synchronous freeze
-	retired  bool
-	suspect  bool
-	tag      uint64
-	last     *partitionPosition
-	listener hubListener
-	ctx      context.Context
-	cancel   context.CancelFunc
+	mu           sync.Mutex // serializes same-partition handlers, including synchronous freeze
+	retired      bool
+	highSequence int64 // maximum admitted sequence; last remains the exact SDK cursor
+	tag          uint64
+	last         *partitionPosition
+	listener     hubListener
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
+type partitionRetry struct {
+	position     partitionPosition
+	highSequence int64
+}
+
+// Both facts survive partial setup on this same receiver incarnation.
 type generation struct {
 	tags              map[string]uint64
 	resets            map[string]*partitionReset
@@ -128,7 +134,7 @@ type generation struct {
 	retiring          atomic.Bool
 	managementFailure failureEpisode
 	receiverFailures  map[string]failureEpisode
-	retryPositions    map[string]partitionPosition
+	retryPositions    map[string]partitionRetry
 }
 
 func (a *EventHubAdapter) run() {
@@ -244,7 +250,7 @@ func (a *EventHubAdapter) discover(g *generation, initial bool) error {
 
 	if g.receiverFailures == nil {
 		g.receiverFailures = make(map[string]failureEpisode)
-		g.retryPositions = make(map[string]partitionPosition)
+		g.retryPositions = make(map[string]partitionRetry)
 	}
 	for id := range g.receiverFailures {
 		if _, ok := seen[id]; !ok {
@@ -278,9 +284,10 @@ func (a *EventHubAdapter) discover(g *generation, initial bool) error {
 			// A partially opened receiver may already have admitted this exact
 			// position. Its messages still belong to this same SDK/tracker, so
 			// preserve that in-process boundary across the setup retry.
-			copy := admitted
+			copy := admitted.position
 			p.last = &copy
-			start.Offset = admitted.Offset
+			p.highSequence = admitted.highSequence
+			start.Offset = admitted.position.Offset
 		}
 		// Each sequential setup gets its own complete budget. This setup context
 		// does not own SDK listener lifetime (the pinned SDK uses Background there).
@@ -305,7 +312,7 @@ func (a *EventHubAdapter) discover(g *generation, initial bool) error {
 			p.mu.Lock()
 			p.retired = true
 			if p.last != nil {
-				g.retryPositions[id] = *p.last
+				g.retryPositions[id] = partitionRetry{position: *p.last, highSequence: p.highSequence}
 			}
 			p.mu.Unlock()
 			if g.ctx.Err() != nil {
@@ -466,7 +473,7 @@ func (a *EventHubAdapter) processPartitionEvent(ctx context.Context, g *generati
 	if p.ctx != nil {
 		sourceCtx = p.ctx
 	}
-	if p.retired || p.suspect || sourceCtx.Err() != nil {
+	if p.retired || sourceCtx.Err() != nil {
 		return context.Canceled
 	}
 	// The SDK cancels ctx on eventFromMsg failure but still invokes the handler.
@@ -486,17 +493,15 @@ func (a *EventHubAdapter) processPartitionEvent(ctx context.Context, g *generati
 		after, _ := strconv.ParseInt(position.Offset, 10, 64)
 		if position.Sequence != p.last.Sequence || position.Offset != p.last.Offset {
 			if position.Sequence <= p.last.Sequence || after <= before {
-				// A backward delivery alone proves no reset. Pause only this source
-				// under its handler lock and ask the worker for fresh runtime evidence.
-				p.suspect = true
+				// Reordering and recreation are ambiguous. Ship the valid record
+				// normally: the SDK moves past rejected callbacks. Only fresh
+				// positive runtime evidence may retire/reset this receiver.
 				a.issue("position_order_invalid")
 				select {
 				case g.resetRequested <- id:
 				default:
 				}
-				return errPositionInvalid
-			}
-			if position.Sequence-p.last.Sequence != 1 {
+			} else if position.Sequence-p.last.Sequence != 1 {
 				a.issue("sequence_gap") // a discontinuity is not evidence of recovered history
 			}
 		}
@@ -536,12 +541,17 @@ func (a *EventHubAdapter) processPartitionEvent(ctx context.Context, g *generati
 	}
 	// Only the source sequence is needed by live reset checks, never a restart offset.
 	candidate := binary.BigEndian.AppendUint64(nil, tag)
-	candidate = binary.BigEndian.AppendUint64(candidate, uint64(position.Sequence))
+	highSequence := max(p.highSequence, position.Sequence)
+	if p.last != nil {
+		highSequence = max(highSequence, p.last.Sequence)
+	}
+	candidate = binary.BigEndian.AppendUint64(candidate, uint64(highSequence))
 
 	if err = a.tracker.Candidate(id, candidate, dep); err != nil {
 		a.freeze(p, "tracker_limit")
 		return err
 	}
+	p.highSequence = highSequence
 	copy := position
 	p.last = &copy
 	return nil

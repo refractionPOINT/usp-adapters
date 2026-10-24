@@ -56,11 +56,14 @@ func newGeneration(id uint64, p defenderPosition) *defenderGeneration {
 }
 
 func (a *DefenderAdapter) sourceFingerprint() [32]byte {
-	// Structured encoding prevents ambiguous tenant/endpoint delimiters. Client
-	// credentials and the token endpoint do not identify the alert stream.
-	fields := []string{"defender", a.conf.endpoint(), strings.ToLower(a.collectionURL.Scheme + "://" + a.collectionURL.Host), a.collectionURL.EscapedPath(), a.conf.TenantID, "alerts_v2/createdDateTime"}
-	raw, _ := json.Marshal(fields)
-	return sha256.Sum256(raw)
+	a.identityOnce.Do(func() {
+		// Structured encoding prevents ambiguous tenant/endpoint delimiters. Client
+		// credentials and the token endpoint do not identify the alert stream.
+		fields := []string{"defender", a.conf.endpoint(), strings.ToLower(a.collectionURL.Scheme + "://" + a.collectionURL.Host), a.collectionURL.EscapedPath(), a.conf.TenantID, "alerts_v2/createdDateTime"}
+		raw, _ := json.Marshal(fields)
+		a.identity = sha256.Sum256(raw)
+	})
+	return a.identity
 }
 func eventDigest(source [32]byte, id string) [16]byte {
 	h := sha256.New()

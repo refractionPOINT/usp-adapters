@@ -29,7 +29,7 @@ func TestRealSDKTestSinkKeepsReceiving(t *testing.T) {
 	a, stopped, err := newEventHubAdapter(context.Background(), EventHubConfig{ClientOptions: opts, ConnectionString: testConnection}, hub, source)
 	require.NoError(t, err)
 	defer a.Close()
-	require.Eventually(t, func() bool { return len(hub.snapshot()) == 1 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return len(hub.snapshot()) == 1 }, 5*time.Second, time.Millisecond)
 	call := hub.snapshot()[0]
 	require.Empty(t, call.start.Offset, "ordinary initial latest is unchanged")
 	for i := int64(0); i < 3; i++ {

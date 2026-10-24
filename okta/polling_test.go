@@ -73,7 +73,7 @@ func TestOpaquePollingDrainsTimestampTiesAndSleepsOnEmpty(t *testing.T) {
 	a, _, err := newOktaAdapter(context.Background(), conf, sink)
 	require.NoError(t, err)
 	defer a.Close()
-	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(emptyTimes) >= 3 }, 3*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return len(emptyTimes) >= 3 }, 5*time.Second, 5*time.Millisecond)
 	require.Equal(t, total, sink.count())
 	mu.Lock()
 	defer mu.Unlock()

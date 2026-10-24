@@ -136,12 +136,11 @@ func TestLivePartitionResetRetainsPendingHistoryAndRejectsLateOldACK(t *testing.
 func TestBackwardEventNeedsPositiveRuntimeProofBeforePartitionReset(t *testing.T) {
 	a, g, h, c := resetHarness(t)
 	old, other := callFor(t, &h.testHub, "0", 1), callFor(t, &h.testHub, "1", 1)
-	require.Error(t, old.handler(context.Background(), fixtureEvent(50, 11)))
-	require.True(t, g.parts["0"].suspect)
+	require.NoError(t, old.handler(context.Background(), fixtureEvent(50, 11)))
 	require.NoError(t, a.discover(g, false))
 	require.Len(t, h.snapshot(), 2, "backward observation is not reset proof")
 	require.NoError(t, a.ctx.Err())
-	require.Error(t, old.handler(context.Background(), fixtureEvent(1001, 101)))
+	require.NoError(t, old.handler(context.Background(), fixtureEvent(1001, 101)))
 	require.NoError(t, other.handler(context.Background(), fixtureEvent(5001, 501)))
 	h.runtime = func(_ context.Context, id string) (*eventhub.HubPartitionRuntimeInformation, error) {
 		return runtimePosition(id, 10), nil
@@ -151,7 +150,7 @@ func TestBackwardEventNeedsPositiveRuntimeProofBeforePartitionReset(t *testing.T
 	replacement := callFor(t, &h.testHub, "0", 2)
 	require.Empty(t, replacement.start.Offset)
 	require.NoError(t, replacement.handler(context.Background(), fixtureEvent(51, 12)))
-	c.ack(4)
+	c.ack(6)
 	require.NoError(t, a.confirm(g))
 	require.EqualValues(t, 12, g.confirmed["0"])
 }

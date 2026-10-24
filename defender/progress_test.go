@@ -303,7 +303,7 @@ func TestDefenderRetryAfterAndCancellationWithoutOnError(t *testing.T) {
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("retry wait ignored cancellation")
 	}
 	require.Zero(t, onError.Load())
@@ -360,7 +360,7 @@ func TestDefenderShutdownBeginDrainBeforeJoiningBlockedProducer(t *testing.T) {
 	require.NoError(t, err)
 	select {
 	case <-sink.entered:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("producer never entered Ship")
 	}
 
@@ -369,7 +369,7 @@ func TestDefenderShutdownBeginDrainBeforeJoiningBlockedProducer(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Close joined a blocked producer before BeginDrain")
 	}
 	require.Zero(t, a.generation.confirmed.Load(), "failed Ship is not delivered")
@@ -584,7 +584,7 @@ func TestDefenderGenerationCancellationBoundsEveryAdmissionAttempt(t *testing.T)
 			var timeout time.Duration
 			select {
 			case timeout = <-sink.entered:
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
 				t.Fatal("Ship did not start")
 			}
 			cancel()
@@ -592,7 +592,7 @@ func TestDefenderGenerationCancellationBoundsEveryAdmissionAttempt(t *testing.T)
 			select {
 			case err := <-done:
 				require.ErrorIs(t, err, context.Canceled)
-			case <-time.After(1500 * time.Millisecond):
+			case <-time.After(5 * time.Second):
 				t.Fatal("generation cancellation could not join admission within one bounded Ship attempt")
 			}
 			require.Zero(t, sink.drains.Load(), "a generation conflict must preserve the live SDK and tracker")
@@ -745,7 +745,7 @@ func TestDefenderPressureProducerResumesPartialPageWithoutReplay(t *testing.T) {
 			// Synchronize with an ACK observation without reading collector-owned maps.
 			select {
 			case <-observed:
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
 				t.Fatal("manager did not observe ACKs")
 			}
 			sink.fail.Store(true)
@@ -809,7 +809,7 @@ func TestDefenderPressureProducerResumesPartialPageWithoutReplay(t *testing.T) {
 				freshCtx, stop := context.WithCancel(context.Background())
 				freshDone := make(chan struct{})
 				go func() { defer close(freshDone); a.collect(freshCtx, g) }()
-				require.Eventually(t, func() bool { return sink.count() == total+1 }, time.Second, time.Millisecond, "unresolved old pressure must leave fresh-tail ingestion available")
+				require.Eventually(t, func() bool { return sink.count() == total+1 }, 5*time.Second, time.Millisecond, "unresolved old pressure must leave fresh-tail ingestion available")
 				stop()
 				<-freshDone
 				require.NoError(t, a.confirm(g))

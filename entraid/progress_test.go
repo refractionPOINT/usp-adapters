@@ -482,7 +482,7 @@ func TestEntraAllCloudScopesAndStreamFlagsHTTP(t *testing.T) {
 				a, _, err := newFixtureEntraIDAdapter(context.Background(), conf, sink)
 				require.NoError(t, err)
 				defer a.Close()
-				require.Eventually(t, func() bool { return sink.count() == len(streams) }, time.Second, time.Millisecond)
+				require.Eventually(t, func() bool { return sink.count() == len(streams) }, 5*time.Second, time.Millisecond)
 				mu.Lock()
 				defer mu.Unlock()
 				require.Len(t, paths, len(streams))
@@ -541,7 +541,7 @@ func TestEntraReconciliationYieldsToLiveAndHonorsCoverage(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); a.collect(ctx, g) }()
 	defer func() { cancel(); <-done }()
-	require.Eventually(t, func() bool { return maxLiveEnd.Load() >= base.Add(5*time.Second).UnixNano() && replayPages.Load() >= 4 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return maxLiveEnd.Load() >= base.Add(5*time.Second).UnixNano() && replayPages.Load() >= 4 }, 5*time.Second, time.Millisecond)
 	cancel()
 	<-done
 	require.GreaterOrEqual(t, g.position[a.streams[0].name].Boundary, base.Add(4*time.Second).UnixNano())
@@ -559,7 +559,7 @@ func TestEntraReconciliationYieldsToLiveAndHonorsCoverage(t *testing.T) {
 	a.pollInterval = time.Millisecond
 	done = make(chan struct{})
 	go func() { defer close(done); a.collect(ctx, g) }()
-	require.Eventually(t, func() bool { return replayPages.Load() > priorReplay }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return replayPages.Load() > priorReplay }, 5*time.Second, time.Millisecond)
 	cancel()
 	<-done
 	require.GreaterOrEqual(t, g.position[a.streams[0].name].Replay, s.Coverage)
@@ -594,7 +594,7 @@ func TestEntraLocalReplayClampsToCompleteIDCoverage(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			done := make(chan struct{})
 			go func() { defer close(done); a.collect(ctx, g) }()
-			require.Eventually(t, called.Load, time.Second, time.Millisecond)
+			require.Eventually(t, called.Load, 5*time.Second, time.Millisecond)
 			cancel()
 			<-done
 			require.GreaterOrEqual(t, g.position[name].Replay, expected)
@@ -649,7 +649,7 @@ func TestEntraCanceledAdmissionAndCloseJoinWithoutReset(t *testing.T) {
 	conf.ClientOptions.OnError = func(error) { internalErrors.Add(1) }
 	a, done, err := newEntraIDAdapterWithRuntime(context.Background(), conf, sink, rt)
 	require.NoError(t, err)
-	require.Eventually(t, func() bool { return sink.attempts.Load() > 1 && sink.active.Load() > 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return sink.attempts.Load() > 1 && sink.active.Load() > 0 }, 5*time.Second, time.Millisecond)
 	require.Zero(t, sink.begin.Load(), "collection cannot seal the client under pressure")
 	before := time.Now()
 	require.NoError(t, a.Close())

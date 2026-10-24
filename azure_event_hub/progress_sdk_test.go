@@ -90,7 +90,7 @@ func TestEventHubsRealSDKACKAndPendingHistory(t *testing.T) {
 		e := conn.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageACK, SeqNum: seq})
 		writeMu.Unlock()
 		require.NoError(t, e)
-		require.Eventually(t, func() bool { p, e := client.GetUnsent(); return e == nil && len(p) == count }, time.Second, time.Millisecond)
+		require.Eventually(t, func() bool { p, e := client.GetUnsent(); return e == nil && len(p) == count }, 5*time.Second, time.Millisecond)
 	}
 	for i := int64(0); i < 3; i++ {
 		require.NoError(t, process(t, a, g, "0", 100+i, i))

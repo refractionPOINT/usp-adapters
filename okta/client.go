@@ -231,7 +231,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			entry, exists := g.live[digest]
 			if !exists {
 				// A page may straddle the live bound. Retain its exact offset
-				// while older ACKed history expires; never drop a pending ID.
+				// while completed ACKed pages yield; never drop a current/pending ID.
 				for len(g.live) >= liveIDLimit && !g.makeRoom(time.Now()) {
 					a.issue("live_history_pressure")
 					if !acktrack.Wait(ctx, a.pollInterval) {
@@ -255,6 +255,12 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				}
 				entry = liveID{dependency: admission, page: g.page, expiry: time.Now().Add(overlapPeriod).Unix()}
 				g.live[digest] = entry // A failed/in-flight Ship is never suppression.
+			}
+			// A referenced prior-page ID also protects duplicates later in this
+			// current page. Pressure must not retire it before page completion.
+			if exists && entry.page != g.page {
+				entry.page = g.page
+				g.live[digest] = entry
 			}
 			if entry.page > g.confirmed.Load() {
 				var err error

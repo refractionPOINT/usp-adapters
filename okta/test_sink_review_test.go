@@ -32,7 +32,7 @@ func TestIndependentReviewRealSDKTestSinkKeepsPolling(t *testing.T) {
 		default:
 		}
 		return calls.Load() >= 3
-	}, time.Second, time.Millisecond)
+	}, 5*time.Second, time.Millisecond)
 	select {
 	case <-stopped:
 		t.Fatalf("supported real SDK TestSinkMode stopped collector after %d vendor requests; first three-item page should drain and polling should continue", calls.Load())

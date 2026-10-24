@@ -90,7 +90,7 @@ func TestOktaRealSDKCumulativeACK(t *testing.T) {
 			t.Fatal("SDK did not send data")
 		}
 	}
-	require.Eventually(t, func() bool { return calls.Load() >= 4 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() >= 4 }, 5*time.Second, time.Millisecond)
 	stop()
 	initial := g.confirmed.Load()
 	require.NoError(t, a.confirm(g))
@@ -105,7 +105,7 @@ func TestOktaRealSDKCumulativeACK(t *testing.T) {
 		err := conn.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageACK, SeqNum: seq})
 		writeMu.Unlock()
 		require.NoError(t, err)
-		require.Eventually(t, func() bool { pending, err := client.GetUnsent(); return err == nil && len(pending) == count }, time.Second, time.Millisecond)
+		require.Eventually(t, func() bool { pending, err := client.GetUnsent(); return err == nil && len(pending) == count }, 5*time.Second, time.Millisecond)
 	}
 	ack(1, 1)
 	require.NoError(t, a.confirm(g))

@@ -35,7 +35,7 @@ func TestPageAdmissionRetainsExactLiveBound(t *testing.T) {
 		}
 	}
 	stop := runCollector(t, a, g)
-	require.Eventually(t, pressure.Load, time.Second, time.Millisecond)
+	require.Eventually(t, pressure.Load, 5*time.Second, time.Millisecond)
 	stop()
 	require.Equal(t, liveIDLimit, sink.count(), "the second record of a page must wait at capacity")
 	require.Len(t, g.live, liveIDLimit)

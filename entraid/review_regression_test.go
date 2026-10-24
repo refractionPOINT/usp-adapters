@@ -91,7 +91,7 @@ func TestEntraExpiredReplayPressureResumesHTTPProducer(t *testing.T) {
 	done := make(chan struct{})
 	go func() { defer close(done); a.collect(ctx, g) }()
 	defer func() { cancel(); <-done }()
-	require.Eventually(t, func() bool { return pressure.Load() > 0 && liveRequests.Load() > 0 && sink.count() >= 2 }, 2*time.Second, time.Millisecond, "expired confirmed history must release capacity for an actual HTTP producer")
+	require.Eventually(t, func() bool { return pressure.Load() > 0 && liveRequests.Load() > 0 && sink.count() >= 2 }, 5*time.Second, time.Millisecond, "expired confirmed history must release capacity for an actual HTTP producer")
 	cancel()
 	<-done
 

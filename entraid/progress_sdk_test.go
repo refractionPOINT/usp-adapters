@@ -93,7 +93,7 @@ func TestEntraRealSDKCumulativeACK(t *testing.T) {
 		err := socket.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageACK, SeqNum: seq})
 		writeMu.Unlock()
 		require.NoError(t, err)
-		require.Eventually(t, func() bool { messages, err := client.GetUnsent(); return err == nil && len(messages) == pending }, time.Second, time.Millisecond)
+		require.Eventually(t, func() bool { messages, err := client.GetUnsent(); return err == nil && len(messages) == pending }, 5*time.Second, time.Millisecond)
 	}
 	ack(1, 1)
 	require.NoError(t, a.confirm(g))

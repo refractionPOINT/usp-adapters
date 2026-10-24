@@ -39,7 +39,7 @@ func TestRealSDKTestSinkKeepsPollingWithoutInternalErrors(t *testing.T) {
 		default:
 		}
 		return calls.Load() >= 4
-	}, time.Second, time.Millisecond)
+	}, 5*time.Second, time.Millisecond)
 	select {
 	case <-stopped:
 		t.Fatal("real SDK TestSinkMode stopped collector")

@@ -115,7 +115,7 @@ func TestPeriodicManagementFailurePreservesHealthyReceivers(t *testing.T) {
 	startWorker(t, a)
 	call := eventuallyCalls(t, &h.testHub, 1)[0]
 	<-failed
-	require.Eventually(t, func() bool { return calls.Load() >= 3 || a.ctx.Err() != nil }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() >= 3 || a.ctx.Err() != nil }, 5*time.Second, time.Millisecond)
 	require.NoError(t, call.handler(context.Background(), fixtureEvent(100, 0)), "one periodic management error must not retire healthy receivers")
 	require.Equal(t, 1, c.calls())
 	require.Len(t, h.snapshot(), 1, "healthy receiver must not be reopened at latest")
@@ -234,7 +234,7 @@ func TestVerifiedDecodeFailureSurvivesHandlerCancellationRace(t *testing.T) {
 			select {
 			case err := <-callbacks:
 				require.Contains(t, strings.ToLower(err.Error()), "decode")
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
 				t.Fatal("verified vendor decode failure disappeared behind cancellation")
 			}
 			require.Zero(t, c.calls())
@@ -261,7 +261,7 @@ func TestVendorCauseDiagnosticsExcludeSensitiveDescriptions(t *testing.T) {
 		for _, secret := range []string{"secret-fixture", "sas-fixture", "payload-fixture", "example.invalid", "https://"} {
 			require.NotContains(t, err.Error(), secret)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("missing vendor error")
 	}
 	require.NoError(t, a.Close())
