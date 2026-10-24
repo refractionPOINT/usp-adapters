@@ -50,7 +50,8 @@ const (
 
 	// defaultContentRetryLimit is how long one content blob is retried within
 	// a poll before the adapter moves on to the rest of the page. The blob
-	// isn't recorded as done, so the next poll tries it again.
+	// isn't recorded as done, so a later poll tries it again after any
+	// outstanding Retry-After.
 	defaultContentRetryLimit = 10 * time.Minute
 
 	// Bound per-collector bookkeeping even if a listing contains many failures.
@@ -420,6 +421,15 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 			continue
 		}
 
+		left, tracked := fs.leftBlobs[item.ContentID]
+		if time.Now().Before(left.notBefore) || (!tracked && time.Now().Before(fs.untrackedNotBefore)) {
+			// Keep the vendor's retry time across polls without blocking
+			// other blobs on this page or recording this one as done.
+			transientLeft = true
+			nLeft++
+			continue
+		}
+
 		content, _, err := a.getWithRetry(item.ContentURI, "content api", fs, a.conf.contentRetryLimit)
 		if err != nil {
 			if err == errStopped {
@@ -477,6 +487,12 @@ func (a *Office365Adapter) leaveBlob(item listItem, fs *failureState, track bool
 	if !exists {
 		if len(fs.leftBlobs) >= maxLeftBlobs {
 			a.reportLeftBlobs(fs, now, "too many unprocessed content blobs to track; some content may age out before recovery")
+			var ae *apiError
+			if errors.As(err, &ae) && ae.notBefore.After(fs.untrackedNotBefore) {
+				// No room for another key: conservatively defer untracked
+				// blobs rather than forget a vendor's retry time.
+				fs.untrackedNotBefore = ae.notBefore
+			}
 			return
 		}
 		if fs.leftBlobs == nil {
@@ -491,8 +507,12 @@ func (a *Office365Adapter) leaveBlob(item listItem, fs *failureState, track bool
 		if expiry, err := time.Parse(time.RFC3339, item.ContentExpiration); err == nil && expiry.Before(left.expires) {
 			left.expires = expiry
 		}
-		fs.leftBlobs[item.ContentID] = left
 	}
+	var ae *apiError
+	if errors.As(err, &ae) && ae.notBefore.After(left.notBefore) {
+		left.notBefore = ae.notBefore
+	}
+	fs.leftBlobs[item.ContentID] = left
 	if now.Sub(left.since) >= a.conf.failureEscalation {
 		a.reportLeftBlobs(fs, now, "content blob remains unprocessed despite repeated polls")
 	}
@@ -504,7 +524,11 @@ func (a *Office365Adapter) expireLeftBlobs(fs *failureState, now time.Time) {
 			// A blob first seen near the end of its window can expire before
 			// the escalation period. Don't silently forget that lost retry.
 			a.reportLeftBlobs(fs, now, "unprocessed content blob left the listing window or expired before recovery")
-			delete(fs.leftBlobs, key)
+			// Retain a pending retry time even if the vendor still lists
+			// this expired blob. Capacity remains bounded by maxLeftBlobs.
+			if !now.Before(left.notBefore) {
+				delete(fs.leftBlobs, key)
+			}
 			continue
 		}
 		if now.Sub(left.since) >= a.conf.failureEscalation {
@@ -639,19 +663,56 @@ func (a *Office365Adapter) updateBearerToken() error {
 		}
 	}
 
-	// Token requests and API requests go through the client built by the
-	// constructor, keeping its timeouts.
-	// Token requests are also cancelled by Close.
-	client := conf.Client(context.WithValue(a.stopCtx, oauth2.HTTPClient, a.httpClient))
-	client.Timeout = httpTimeout
-	a.httpClient = client
+	// OAuth2's default transport refreshes tokens with a fixed context, so
+	// a content deadline would not interrupt a refresh. Share cached tokens,
+	// but refresh with the current request's context (including Close).
+	a.httpClient = &http.Client{Timeout: httpTimeout, Transport: &tokenTransport{
+		conf: conf, client: a.httpClient, lock: make(chan struct{}, 1),
+	}}
 
 	return nil
 }
 
+// tokenTransport serializes refreshes while allowing requests waiting for a
+// token to stop at their own deadline. The token endpoint uses the same base
+// client as API requests, preserving its proxy, timeout and TLS settings.
+type tokenTransport struct {
+	conf   *clientcredentials.Config
+	client *http.Client
+	lock   chan struct{}
+	token  *oauth2.Token
+}
+
+func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	select {
+	case t.lock <- struct{}{}:
+	case <-req.Context().Done():
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		return nil, req.Context().Err()
+	}
+	token := t.token
+	var err error
+	if !token.Valid() {
+		token, err = t.conf.Token(context.WithValue(req.Context(), oauth2.HTTPClient, t.client))
+		if err == nil {
+			t.token = token
+		}
+	}
+	<-t.lock
+	if err != nil {
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		return nil, err
+	}
+	return (&oauth2.Transport{Base: t.client.Transport, Source: oauth2.StaticTokenSource(token)}).RoundTrip(req)
+}
+
 func (a *Office365Adapter) makeOneRegistrationRequest(url string) (utils.Dict, error) {
 	// Prepare the request.
-	req, err := http.NewRequest("POST", url, &bytes.Buffer{})
+	req, err := http.NewRequestWithContext(a.stopCtx, "POST", url, &bytes.Buffer{})
 	if err != nil {
 		a.doStop.Set()
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.NewRequest(): %v", err))
@@ -701,6 +762,8 @@ type apiError struct {
 	transient bool
 	// retryAfter is the delay the server asked for, 0 if none.
 	retryAfter time.Duration
+	// notBefore preserves the selected retry time when a content budget ends.
+	notBefore time.Time
 	// gone is set when the content doesn't exist or has expired.
 	gone bool
 }
@@ -711,14 +774,16 @@ func (e *apiError) Error() string { return e.err.Error() }
 // cleared when a content blob is downloaded or a whole poll completes, not by
 // a successful listing alone, so a content outage still escalates.
 type failureState struct {
-	since         time.Time
-	leftBlobs     map[string]leftBlob
-	lastBlobError time.Time
+	since              time.Time
+	leftBlobs          map[string]leftBlob
+	lastBlobError      time.Time
+	untrackedNotBefore time.Time // bounded fallback when leftBlobs is full
 }
 
 type leftBlob struct {
-	since   time.Time
-	expires time.Time
+	since     time.Time
+	expires   time.Time
+	notBefore time.Time
 }
 
 // failingFor marks the loop as failing and returns for how long it has been.
@@ -735,19 +800,33 @@ func (f *failureState) reset() { f.since = time.Time{} }
 
 // getWithRetry issues a GET until it succeeds, fails with a non-transient
 // error, the adapter stops (errStopped), or, when giveUpAfter isn't 0, it has
-// failed transiently for giveUpAfter (the last error is returned). Transient
+// spent giveUpAfter on requests and waits (the last error is returned). Transient
 // failures are retried with exponential backoff and jitter, honouring
 // Retry-After. They are reported with OnWarning until the loop has been
 // failing for failureEscalation, then with OnError: OnError stops a hosted
 // adapter, so raising it on the first 429 would restart a healthy adapter,
 // while an outage that lasts must still be reported.
 func (a *Office365Adapter) getWithRetry(url string, what string, fs *failureState, giveUpAfter time.Duration) ([]byte, http.Header, error) {
-	var firstFailure time.Time
+	ctx := a.stopCtx
+	var deadline time.Time
+	if giveUpAfter > 0 {
+		deadline = time.Now().Add(giveUpAfter)
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+	var lastErr error
 	for attempt := 1; ; attempt++ {
 		if a.doStop.IsSet() {
 			return nil, nil, errStopped
 		}
-		body, header, err := a.get(url)
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			if lastErr == nil {
+				lastErr = &apiError{err: context.DeadlineExceeded, transient: true}
+			}
+			return nil, nil, lastErr
+		}
+		body, header, err := a.get(ctx, url)
 		var ae *apiError
 		if err == nil || !errors.As(err, &ae) || !ae.transient {
 			return body, header, err
@@ -755,9 +834,8 @@ func (a *Office365Adapter) getWithRetry(url string, what string, fs *failureStat
 
 		wait := a.backoff(attempt, ae.retryAfter)
 		now := time.Now()
-		if firstFailure.IsZero() {
-			firstFailure = now
-		}
+		ae.notBefore = now.Add(wait)
+		lastErr = err
 		escalated := false
 		if d := fs.failingFor(now); d >= a.conf.failureEscalation {
 			a.conf.ClientOptions.OnError(fmt.Errorf("office365 %s failing for %s: %v", what, d.Round(time.Second), err))
@@ -766,13 +844,20 @@ func (a *Office365Adapter) getWithRetry(url string, what string, fs *failureStat
 			fs.restart(now)
 			escalated = true
 		}
-		if giveUpAfter > 0 && now.Sub(firstFailure) >= giveUpAfter {
-			return nil, nil, err
+		pause := wait
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return nil, nil, err
+			}
+			if pause > remaining {
+				pause = remaining
+			}
 		}
 		if !escalated {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 %s failed, retrying in %s: %v", what, wait.Round(time.Millisecond), err))
 		}
-		if a.doStop.WaitFor(wait) {
+		if a.doStop.WaitFor(pause) {
 			return nil, nil, errStopped
 		}
 	}
@@ -801,8 +886,8 @@ func (a *Office365Adapter) backoff(n int, retryAfter time.Duration) time.Duratio
 }
 
 // get issues one GET to the Management API and classifies its failure.
-func (a *Office365Adapter) get(url string) ([]byte, http.Header, error) {
-	req, err := http.NewRequestWithContext(a.stopCtx, "GET", url, nil)
+func (a *Office365Adapter) get(ctx context.Context, url string) ([]byte, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, nil, &apiError{err: fmt.Errorf("http.NewRequest(): %v", err)}
 	}
@@ -824,7 +909,11 @@ func (a *Office365Adapter) get(url string) ([]byte, http.Header, error) {
 		if a.doStop.IsSet() {
 			return nil, nil, errStopped
 		}
-		return nil, nil, &apiError{err: fmt.Errorf("failed to read response body: %v", err), transient: true}
+		return nil, nil, &apiError{
+			err:        fmt.Errorf("failed to read response body: %v", err),
+			transient:  true,
+			retryAfter: parseRetryAfter(resp.Header.Get("Retry-After")),
+		}
 	}
 
 	if resp.StatusCode == http.StatusOK {
