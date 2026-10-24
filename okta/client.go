@@ -241,10 +241,11 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			if ctx.Err() != nil {
 				return
 			}
-			if errors.Is(err, errInvalidContinuation) && next != g.position.Boundary {
-				// Re-scan only the saved complete boundary, never published or now.
-				a.issue("continuation_restart")
-				next = g.position.Boundary
+			if errors.Is(err, errInvalidContinuation) {
+				// The original scan can precede restored ID coverage by hours.
+				// Without a proven replay anchor, retain and retry this cursor:
+				// rewinding could duplicate uncovered history, and now could skip it.
+				a.issue("continuation_stalled")
 			} else if errors.Is(err, errVendorCredential) {
 				if a.conf.ClientOptions.OnError != nil {
 					a.conf.ClientOptions.OnError(errors.New("okta API credentials or permission rejected"))

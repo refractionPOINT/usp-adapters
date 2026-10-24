@@ -66,7 +66,14 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 		return page, errRequestRetry
 	} // url.Error can contain a cursor.
 	defer resp.Body.Close()
-	page.delay = rateDelay(resp.Header, time.Now())
+	now := time.Now()
+	page.delay = rateDelay(resp.Header, now)
+	// Header delays apply even when the error body is truncated or oversized.
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		if d := retryAfter(resp.Header.Get("Retry-After"), now); d > page.delay {
+			page.delay = d
+		}
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil || len(body) > 16<<20 {
 		return page, errRequestRetry
@@ -75,9 +82,6 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 		return page, errVendorCredential
 	}
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		if d := retryAfter(resp.Header.Get("Retry-After"), time.Now()); d > page.delay {
-			page.delay = d
-		}
 		return page, errRequestRetry
 	}
 	if resp.StatusCode == http.StatusBadRequest && req.URL.Query().Get("after") != "" {

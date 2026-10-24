@@ -203,3 +203,37 @@ func TestTransportAndBackoffCancellation(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errRequestRetry))
 }
+
+func TestRetryAfterSurvivesTruncatedOrOversizeErrorBody(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		for _, body := range []string{"truncated", "oversize"} {
+			t.Run(fmt.Sprintf("%d/%s", status, body), func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Retry-After", "120")
+					if body == "truncated" {
+						w.Header().Set("Content-Length", "100")
+						w.WriteHeader(status)
+						fmt.Fprint(w, "short")
+						return
+					}
+					w.WriteHeader(status)
+					var block [4096]byte
+					for remaining := (16 << 20) + 1; remaining > 0; {
+						n := min(remaining, len(block))
+						if _, err := w.Write(block[:n]); err != nil {
+							return
+						}
+						remaining -= n
+					}
+				}))
+				defer server.Close()
+				a := directAdapter(t, server.URL)
+				page, err := a.requestPage(context.Background(), server.URL+logsURL)
+				require.ErrorIs(t, err, errRequestRetry)
+				require.GreaterOrEqual(t, page.delay, 120*time.Second, "body failure must not discard a vendor header delay")
+				require.Empty(t, page.items)
+				require.Empty(t, page.next)
+			})
+		}
+	}
+}

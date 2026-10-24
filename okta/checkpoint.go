@@ -28,8 +28,9 @@ type liveID struct {
 	expiry     int64
 }
 type oktaPosition struct {
-	// Boundary is the original complete scan request, retained for an explicitly
-	// rejected continuation. Published time is never a continuation boundary.
+	// Boundary records the original complete scan request. It is not a safe
+	// replay anchor when restored ID coverage is incomplete. Published time is
+	// never a continuation boundary.
 	Boundary, Next string
 	IDs            []savedID // newest first, only persisted after the whole page is ACKed
 	// Coverage is an admission-time suffix of complete saved history, not a

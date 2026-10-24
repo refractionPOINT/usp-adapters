@@ -429,34 +429,76 @@ func TestCheckpointFailedAdmissionCannotAdvancePage(t *testing.T) {
 	require.Equal(t, before, store.snapshot().Position)
 }
 
-func TestCheckpointInvalidContinuationRestartsSavedBoundaryWithoutClockAdvance(t *testing.T) {
-	requests := make(chan string, 8)
+func TestCheckpointExpiredContinuationStallsWithoutReplayingUncoveredHistory(t *testing.T) {
+	var attempts, boundaryRequests, stalls, vendorErrors atomic.Int32
+	requests := make(chan string, 16)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts.Add(1)
 		select {
 		case requests <- r.URL.RequestURI():
 		default:
 		}
 		if r.URL.Query().Get("after") == "expired" {
-			w.WriteHeader(400)
-			_, _ = w.Write([]byte(`{"errorCode":"E0000001"}`))
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"errorCode":"E0000001"}`)
 			return
 		}
+		boundaryRequests.Add(1)
 		w.Header().Set("Link", fmt.Sprintf("<http://%s%s?after=fresh>; rel=\"next\"", r.Host, logsURL))
-		_, _ = w.Write([]byte(`[]`))
+		// This event was delivered before the retained suffix. Rewinding to the
+		// original boundary would re-emit it because its ID is no longer saved.
+		fmt.Fprint(w, `[{"uuid":"delivered-outside-saved-coverage"}]`)
 	}))
 	defer server.Close()
-	a, g, _ := checkpointHarness(t, server.URL, &ackSink{})
-	g.position.Boundary = server.URL + logsURL + "?since=2020-01-01T00%3A00%3A00Z&sortOrder=ASCENDING"
-	g.position.Next = server.URL + logsURL + "?after=expired"
-	stop := runCollector(t, a, g)
-	defer stop()
-	require.Contains(t, <-requests, "after=expired")
-	select {
-	case raw := <-requests:
-		require.Contains(t, raw, "since=2020-01-01T00%3A00%3A00Z")
-	case <-time.After(2 * time.Second):
-		t.Fatal("saved boundary was not retried")
+	a := directAdapter(t, server.URL)
+	source := sha256.Sum256([]byte(strings.ToLower(a.endpoint.Scheme+"://"+a.endpoint.Host) + logsURL))
+	p := oktaPosition{
+		Boundary: server.URL + logsURL + "?since=" + time.Now().Add(-2*time.Hour).UTC().Format(time.RFC3339) + "&sortOrder=ASCENDING",
+		Next:     server.URL + logsURL + "?after=expired",
 	}
+	for i := 0; i < savedIDLimit; i++ {
+		p.IDs = append(p.IDs, savedID{digest: eventDigest(fmt.Sprintf("recent-%d", i)), expiry: time.Now().Add(overlapPeriod).Unix()})
+	}
+	raw, err := encodeOktaPosition(p)
+	require.NoError(t, err)
+	store := &oktaMemoryStore{found: true, value: utils.Checkpoint{
+		SchemaVersion: 1, SourceFingerprint: source, Position: raw,
+		CheckpointFence: utils.CheckpointFence{Nonce: "prior", Revision: "prior"},
+	}}
+	sink := &captureSink{}
+	opts := testClientOptions(t)
+	opts.OnError = func(error) { vendorErrors.Add(1) }
+	adapter, stopped, err := newOktaAdapter(context.Background(), OktaConfig{
+		URL: server.URL, ApiKey: "dummy", ClientOptions: opts, PollInterval: time.Millisecond, CheckpointStore: store,
+		CheckpointIssue: func(code string) {
+			if code == "continuation_stalled" {
+				stalls.Add(1)
+			}
+		},
+	}, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+	// Observe a retry as well as the initial rejection. Every request must keep
+	// the exact saved continuation; neither a newer clock nor Boundary is safe.
+	require.Eventually(t, func() bool { return attempts.Load() >= 2 }, 3*time.Second, time.Millisecond)
+	closing := time.Now()
+	require.NoError(t, adapter.Close())
+	require.Less(t, time.Since(closing), time.Second, "cancellation must join stalled collection")
+	select {
+	case <-stopped:
+	default:
+		t.Fatal("collection is still running after Close")
+	}
+	server.Close()
+	close(requests)
+	for request := range requests {
+		require.Equal(t, logsURL+"?after=expired", request)
+	}
+	require.Zero(t, boundaryRequests.Load())
+	require.Zero(t, sink.count(), "uncovered delivered history must not replay")
+	require.Zero(t, vendorErrors.Load(), "an internal recovery stall is not a vendor failure")
+	require.Positive(t, stalls.Load())
+	require.Equal(t, raw, store.snapshot().Position, "the saved complete checkpoint must remain intact")
 }
 
 type shutdownSink struct {
