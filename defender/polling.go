@@ -2,6 +2,7 @@ package usp_defender
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,7 @@ const graphTimeLayout = "2006-01-02T15:04:05.0000000Z"
 
 var (
 	errRetry      = errors.New("Defender request temporarily unavailable")
+	errThrottle   = fmt.Errorf("Defender request throttled: %w", errRetry)
 	errCredential = errors.New("Defender credentials or permissions rejected")
 	errPage       = errors.New("Defender page invalid")
 	errIncomplete = errors.New("Defender interval completeness unproven")
@@ -106,7 +108,10 @@ func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer 
 	}
 	defer resp.Body.Close()
 	delay := retryAfter(resp.Header.Get("Retry-After"), time.Now())
-	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+	if resp.StatusCode == 429 {
+		return delay, errThrottle
+	}
+	if resp.StatusCode >= 500 {
 		return delay, errRetry
 	}
 	if resp.StatusCode == 401 || resp.StatusCode == 403 || (method == http.MethodPost && resp.StatusCode == 400) {
@@ -131,85 +136,124 @@ type graphPage struct {
 	Count *int64                   `json:"@odata.count"`
 }
 type graphRequests struct {
-	failureStart         time.Time
-	reported             bool
-	liveNext, replayNext time.Time
+	failureStart                      time.Time
+	reported                          bool
+	liveNext, replayNext, globalNext  time.Time
+	liveRetry, replayRetry            time.Time
+	liveBackoff, replayBackoff        time.Duration
+	foregroundAttempts, totalAttempts uint64
 }
 
+func jitterDelay(minimum time.Duration) time.Duration {
+	var b [1]byte
+	_, _ = rand.Read(b[:])
+	return minimum + time.Duration(b[0])*(minimum/2560)
+}
+func later(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+// Each call makes at most one request attempt. Rate limits and transient retry
+// deadlines are retained by the scheduler, so a failing history page cannot
+// occupy the worker while independent fresh/live intervals are eligible.
 func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bool, state *graphRequests) (graphPage, error) {
 	var page graphPage
+	if ctx.Err() != nil {
+		return page, ctx.Err()
+	}
 	if a.validateContinuation(raw) != nil {
 		return page, errPage
 	}
-	backoff := time.Second
-	for ctx.Err() == nil {
-		next := &state.liveNext
-		spacing := a.runtime.liveSpacing
-		if replay {
-			next = &state.replayNext
-			spacing = a.runtime.replaySpacing
-		}
-		if wait := time.Until(*next); wait > 0 && !utils.CheckpointWait(ctx, wait) {
-			return page, ctx.Err()
-		}
-		*next = time.Now().Add(spacing)
-		var token struct {
-			AccessToken string `json:"access_token"`
-		}
-		form := url.Values{"client_id": {a.conf.ClientID}, "client_secret": {a.conf.ClientSecret}, "scope": {a.conf.scope()}, "grant_type": {"client_credentials"}}
-		delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token)
-		if err == nil && token.AccessToken == "" {
-			err = errCredential
-		}
-		if err == nil {
-			page = graphPage{}
-			delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page)
-		}
-		if err == nil {
-			if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
-				return graphPage{}, errPage
-			}
-			if delay > 0 && !utils.CheckpointWait(ctx, delay) {
-				return graphPage{}, ctx.Err()
-			}
-			return page, nil
-		}
-		if ctx.Err() != nil {
-			return graphPage{}, ctx.Err()
-		}
-		if errors.Is(err, errCredential) {
-			if a.conf.ClientOptions.OnError != nil {
-				a.conf.ClientOptions.OnError(errCredential)
-			}
-			return graphPage{}, errCredential
-		}
-		if !errors.Is(err, errRetry) {
-			return graphPage{}, err
-		}
-		if state.failureStart.IsZero() {
-			state.failureStart = time.Now()
-		}
-		if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
-			if a.conf.ClientOptions.OnError != nil {
-				a.conf.ClientOptions.OnError(errors.New("Defender API unavailable for a continuous retry interval"))
-			}
-			state.reported = true
-		}
-		a.issue("vendor_retry")
-		if delay < backoff {
-			delay = backoff
-		}
-		if !utils.CheckpointWait(ctx, delay) {
-			return graphPage{}, ctx.Err()
-		}
-		if backoff < 30*time.Second {
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
+	next, retry, backoff := &state.liveNext, &state.liveRetry, &state.liveBackoff
+	spacing := a.runtime.liveSpacing
+	if replay {
+		next, retry, backoff = &state.replayNext, &state.replayRetry, &state.replayBackoff
+		spacing = a.runtime.replaySpacing
+	}
+	now := time.Now()
+	if now.Before(later(state.globalNext, later(*next, *retry))) {
+		return page, errYield
+	}
+	*next = now.Add(spacing)
+	state.totalAttempts++
+	if !replay {
+		state.foregroundAttempts++
+	}
+	var token struct {
+		AccessToken string `json:"access_token"`
+	}
+	form := url.Values{"client_id": {a.conf.ClientID}, "client_secret": {a.conf.ClientSecret}, "scope": {a.conf.scope()}, "grant_type": {"client_credentials"}}
+	delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token)
+	if delay > 0 {
+		state.globalNext = later(state.globalNext, time.Now().Add(delay))
+	}
+	if err == nil && token.AccessToken == "" {
+		err = errCredential
+	}
+	if err == nil && delay > 0 {
+		return page, errYield
+	} // honor a token endpoint's cooldown before another request
+	if err == nil {
+		delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page)
+		if delay > 0 {
+			state.globalNext = later(state.globalNext, time.Now().Add(delay))
 		}
 	}
-	return graphPage{}, ctx.Err()
+	if ctx.Err() != nil {
+		return graphPage{}, ctx.Err()
+	}
+	if err == nil {
+		if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
+			return graphPage{}, errPage
+		}
+		// Valid page collection, rather than an entire interval, breaks a continuous
+		// vendor failure episode. Its opaque continuation may still be outstanding.
+		state.failureStart = time.Time{}
+		state.reported = false
+		*retry = time.Time{}
+		*backoff = 0
+		return page, nil
+	}
+	if errors.Is(err, errCredential) {
+		if a.conf.ClientOptions.OnError != nil {
+			a.conf.ClientOptions.OnError(errCredential)
+		}
+		*retry = time.Now().Add(jitterDelay(a.pollInterval))
+		return graphPage{}, errCredential
+	}
+	if !errors.Is(err, errRetry) {
+		return graphPage{}, err
+	}
+	if state.failureStart.IsZero() {
+		state.failureStart = time.Now()
+	}
+	if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
+		if a.conf.ClientOptions.OnError != nil {
+			a.conf.ClientOptions.OnError(errors.New("Defender API unavailable for a continuous retry interval"))
+		}
+		state.reported = true
+	}
+	a.issue("vendor_retry")
+	if *backoff == 0 {
+		*backoff = time.Second
+	}
+	if delay < *backoff {
+		delay = *backoff
+	}
+	*retry = time.Now().Add(jitterDelay(delay))
+	// Retry-After applies across lanes; an unqualified 429 also pauses all lanes.
+	// A replay-specific 5xx/transport backoff alone does not pause fresh traffic.
+	if errors.Is(err, errThrottle) {
+		state.globalNext = later(state.globalNext, *retry)
+	}
+	*backoff *= 2
+	if *backoff > 30*time.Second {
+		*backoff = 30 * time.Second
+	}
+	return graphPage{}, errYield
 }
 
 func (a *DefenderAdapter) shipItem(ctx context.Context, g *defenderGeneration, item map[string]interface{}, start, end int64) error {
@@ -294,11 +338,28 @@ func (a *DefenderAdapter) newScan(start, targetEnd, end int64) *graphScan {
 	return &graphScan{start: start, targetEnd: targetEnd, end: end, next: a.windowURL(start, end), links: make(map[[32]byte]struct{}), ids: make(map[[16]byte]struct{})}
 }
 func (a *DefenderAdapter) scanWindow(ctx context.Context, g *defenderGeneration, start, end int64, replay bool, requests *graphRequests) (int64, error) {
-	slot := &g.liveScan
-	pageBudget := 24
+	mode, budget := scanLive, 24
 	if replay {
+		mode, budget = scanReplay, 6
+	}
+	return a.scanPages(ctx, g, start, end, mode, budget, requests)
+}
+
+type scanMode uint8
+
+const (
+	scanLive scanMode = iota
+	scanReplay
+	scanTail
+)
+
+func (a *DefenderAdapter) scanPages(ctx context.Context, g *defenderGeneration, start, end int64, mode scanMode, pageBudget int, requests *graphRequests) (int64, error) {
+	slot := &g.liveScan
+	if mode == scanReplay {
 		slot = &g.replayScan
-		pageBudget = 6
+	}
+	if mode == scanTail {
+		slot = &g.tailScan
 	}
 	if *slot == nil || (*slot).start != start || (*slot).targetEnd != end {
 		*slot = a.newScan(start, end, end)
@@ -312,7 +373,7 @@ func (a *DefenderAdapter) scanWindow(ctx context.Context, g *defenderGeneration,
 		_, repeated := work.links[key]
 		incomplete := repeated || len(work.links) >= 128
 		if !incomplete {
-			page, err := a.requestPage(ctx, work.next, replay, requests)
+			page, err := a.requestPage(ctx, work.next, mode == scanReplay, requests)
 			if err != nil {
 				return start, err
 			}
@@ -383,6 +444,9 @@ func (a *DefenderAdapter) complete(g *defenderGeneration, end int64, replay bool
 	}
 	return a.tracker.Candidate("alerts", candidateBytes(g.id, g.serial, raw))
 }
+
+// collect interleaves one page per lane. The open tail ships promptly but never
+// stages a durable frontier; only completely drained, settled live windows do.
 func (a *DefenderAdapter) collect(ctx context.Context, g *defenderGeneration) {
 	if !utils.CheckpointWait(ctx, a.pollInterval) {
 		return
@@ -392,41 +456,93 @@ func (a *DefenderAdapter) collect(ctx context.Context, g *defenderGeneration) {
 	if g.position.Replay != 0 {
 		nextReplay = time.Now()
 	}
+	var nextTail time.Time
+	tailFirst := true
 	for ctx.Err() == nil {
 		now := a.runtime.now().UTC()
-		// Expiry describes a creation-time horizon, independent of the saved cap.
 		floor := now.Add(-historyHorizon).UnixNano()
 		if floor > g.position.Coverage && floor < g.position.Boundary && g.position.Replay == 0 {
 			g.position.Coverage = floor
 		}
-		liveEnd := g.position.WindowEnd
-		didWork := false
-		if liveEnd <= now.Add(-a.runtime.settle).UnixNano() {
-			end, err := a.scanWindow(ctx, g, g.position.Boundary, liveEnd, false, requests)
+		before, foregroundBefore := requests.totalAttempts, requests.foregroundAttempts
+		live := func() bool {
+			if g.position.WindowEnd > now.Add(-a.runtime.settle).UnixNano() {
+				return true
+			}
+			end, err := a.scanPages(ctx, g, g.position.Boundary, g.position.WindowEnd, scanLive, 1, requests)
 			if errors.Is(err, errYield) {
-				didWork = true
-			} else if err != nil {
-				if !a.collectionFailure(ctx, err) {
-					return
+				return true
+			}
+			if err != nil {
+				return a.collectionFailure(ctx, err)
+			}
+			if a.complete(g, end, false) != nil {
+				a.issue("candidate_rejected")
+				return false
+			}
+			return true
+		}
+		tail := func() bool {
+			work := g.tailScan
+			// A prompt scan is opportunistic: after one poll of source-time lag,
+			// refresh even an unfinishable tie/continuation. The settled and
+			// history lanes retain their exact unresolved bounds and alone own
+			// completeness. Keep all admitted IDs, ACK dependencies and quota
+			// deadlines; replacing this single scan never certifies its end.
+			if work != nil && now.Sub(time.Unix(0, work.targetEnd)) >= a.pollInterval {
+				g.tailScan = nil
+				work = nil
+			}
+			if work == nil {
+				if time.Now().Before(nextTail) {
+					return true
 				}
+				end := now.UnixNano()
+				end -= end % int64(graphTimeQuantum)
+				start := end - int64(a.runtime.window+a.runtime.settle)
+				if start < g.position.Boundary {
+					start = g.position.Boundary
+				}
+				if start >= end {
+					return true
+				}
+				work = a.newScan(start, end, end)
+				g.tailScan = work
+			}
+			end, err := a.scanPages(ctx, g, work.start, work.targetEnd, scanTail, 1, requests)
+			if errors.Is(err, errYield) {
+				return true
+			}
+			if err != nil {
+				return a.collectionFailure(ctx, err)
+			}
+			if end < work.targetEnd {
+				g.tailScan = a.newScan(end, work.targetEnd, work.targetEnd)
 			} else {
-				if err = a.complete(g, end, false); err != nil {
-					a.issue("candidate_rejected")
-					return
-				}
-				requests.failureStart = time.Time{}
-				requests.reported = false
-				didWork = true
+				nextTail = time.Now().Add(a.pollInterval)
+			}
+			// No Candidate/complete call here: even ACKed tail records do not prove a
+			// settled source boundary or that another tail page/window is complete.
+			return true
+		}
+		if tailFirst {
+			if !tail() || !live() {
+				return
+			}
+		} else {
+			if !live() || !tail() {
+				return
 			}
 		}
-		// One small reconciliation chunk per live chunk, at most 6 requests/minute.
-		// Rechecks use complete retained ID coverage, never a broad missing-state replay.
+		if requests.foregroundAttempts != foregroundBefore {
+			tailFirst = !tailFirst
+		}
 		if !time.Now().Before(nextReplay) {
 			if g.position.Replay == 0 {
 				start := g.position.Coverage
 				if start < g.position.Boundary {
 					g.position.Replay, g.position.ReplayEnd = start, g.position.Boundary
-					if err := a.complete(g, g.position.Boundary, false); err != nil {
+					if a.complete(g, g.position.Boundary, false) != nil {
 						a.issue("candidate_rejected")
 						return
 					}
@@ -451,32 +567,40 @@ func (a *DefenderAdapter) collect(ctx context.Context, g *defenderGeneration) {
 				if end > g.position.ReplayEnd {
 					end = g.position.ReplayEnd
 				}
-				end, err := a.scanWindow(ctx, g, g.position.Replay, end, true, requests)
-				if errors.Is(err, errYield) {
-					didWork = true
-				} else if err != nil {
-					if !a.collectionFailure(ctx, err) {
+				end, err := a.scanPages(ctx, g, g.position.Replay, end, scanReplay, 1, requests)
+				if err != nil {
+					if !errors.Is(err, errYield) && !a.collectionFailure(ctx, err) {
 						return
 					}
 				} else {
-					if err = a.complete(g, end, true); err != nil {
+					if a.complete(g, end, true) != nil {
 						a.issue("candidate_rejected")
 						return
 					}
-					requests.failureStart = time.Time{}
-					requests.reported = false
-					didWork = true
 					if g.position.Replay == 0 {
 						nextReplay = time.Now().Add(a.runtime.reconcileInterval)
 					}
 				}
 			}
 		}
-		if !didWork && !utils.CheckpointWait(ctx, a.pollInterval) {
+		// One immediate turn can follow progress. With all lanes deferred, sleep to
+		// the earliest rate/backoff/poll deadline instead of spinning on errYield.
+		if requests.totalAttempts != before {
+			continue
+		}
+		wait := a.pollInterval
+		wall := time.Now()
+		for _, deadline := range []time.Time{requests.liveNext, requests.replayNext, requests.globalNext, requests.liveRetry, requests.replayRetry, nextTail, nextReplay} {
+			if d := deadline.Sub(wall); d > 0 && d < wait {
+				wait = d
+			}
+		}
+		if !utils.CheckpointWait(ctx, wait) {
 			return
 		}
 	}
 }
+
 func (a *DefenderAdapter) collectionFailure(ctx context.Context, err error) bool {
 	if ctx.Err() != nil || errors.Is(err, uspclient.ErrorClosed) {
 		return false
@@ -492,5 +616,5 @@ func (a *DefenderAdapter) collectionFailure(ctx context.Context, err error) bool
 	default:
 		return false
 	}
-	return utils.CheckpointWait(ctx, a.pollInterval)
+	return true
 }

@@ -51,6 +51,7 @@ type defenderGeneration struct {
 	hasDependency        bool
 	confirmed            atomic.Uint64
 	liveScan, replayScan *graphScan
+	tailScan             *graphScan
 	latest               []byte // manager-owned; Confirm consumes even if persistence fails
 }
 

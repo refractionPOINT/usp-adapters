@@ -531,6 +531,9 @@ func TestDefenderRetryAfterAndCancellationWithoutOnError(t *testing.T) {
 	}))
 	defer server.Close()
 	a, g, _ := harness(t, server, &captureSink{})
+	// Exercise cancellation during a substantial scheduler cooldown, rather
+	// than a millisecond poll that would hide a non-cancellable wait.
+	a.pollInterval = 2 * time.Second
 	var onError atomic.Int32
 	a.conf.ClientOptions.OnError = func(error) { onError.Add(1) }
 	retrySeen := make(chan struct{}, 1)
@@ -543,17 +546,27 @@ func TestDefenderRetryAfterAndCancellationWithoutOnError(t *testing.T) {
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
+	base := time.Unix(0, g.position.Boundary)
+	a.runtime.now = func() time.Time { return base.Add(6 * time.Minute) }
+	done := make(chan struct{})
 	go func() {
-		_, err := a.scanWindow(ctx, g, g.position.Boundary, g.position.WindowEnd, false, &graphRequests{})
-		done <- err
+		defer close(done)
+		a.collect(ctx, g)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
 	}()
 	<-requested
 	<-retrySeen
+	// Let the yielded request reach its rate/backoff scheduler wait.
+	time.Sleep(20 * time.Millisecond)
 	cancel()
 	select {
-	case err := <-done:
-		require.ErrorIs(t, err, context.Canceled)
+	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("retry wait ignored cancellation")
 	}
