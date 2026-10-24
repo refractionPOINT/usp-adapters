@@ -43,9 +43,15 @@ const (
 	defaultMaxRetryAfter = 15 * time.Minute
 
 	// defaultFailureEscalation is how long a collection loop may keep failing
-	// with transient errors (throttling, 5xx, network) before the failure is
-	// reported with OnError instead of OnWarning.
+	// with transient errors (throttling, 5xx, network), without downloading
+	// any content, before the failure is reported with OnError instead of
+	// OnWarning.
 	defaultFailureEscalation = 30 * time.Minute
+
+	// defaultContentRetryLimit is how long one content blob is retried within
+	// a poll before the adapter moves on to the rest of the page. The blob
+	// isn't recorded as done, so the next poll tries it again.
+	defaultContentRetryLimit = 10 * time.Minute
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -147,6 +153,7 @@ type Office365Config struct {
 	retryMaxDelay     time.Duration
 	maxRetryAfter     time.Duration
 	failureEscalation time.Duration
+	contentRetryLimit time.Duration
 }
 
 func (c *Office365Config) Validate() error {
@@ -209,6 +216,9 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 	}
 	if conf.failureEscalation <= 0 {
 		conf.failureEscalation = defaultFailureEscalation
+	}
+	if conf.contentRetryLimit <= 0 {
+		conf.contentRetryLimit = defaultContentRetryLimit
 	}
 
 	// If no deduper is provided, use a local one.
@@ -352,8 +362,9 @@ func (a *Office365Adapter) fetchEvents(url string) {
 // pollOnce lists every page of the window and ships the content of every blob
 // not already done. It returns true when the whole window was processed.
 func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
+	complete := true
 	for pageURL != "" {
-		body, header, err := a.getWithRetry(pageURL, "list api", fs)
+		body, header, err := a.getWithRetry(pageURL, "list api", fs, 0)
 		if err != nil {
 			if err != errStopped {
 				a.conf.ClientOptions.OnError(fmt.Errorf("office365 list api: %v", err))
@@ -370,63 +381,74 @@ func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("listed %d events (with page: %v)", len(items), pageURL != ""))
 
-		if !a.processItems(items, fs) {
+		pageComplete, abort := a.processItems(items, fs)
+		if abort {
 			return false
 		}
+		complete = complete && pageComplete
 	}
-	return true
+	return complete
 }
 
-// processItems downloads and ships the content blobs of one listing page. A
-// blob is recorded as done only once all of its events were shipped, so a
-// blob interrupted by an error or by Close is fetched again by the next poll,
-// or by the next instance when the deduper is shared. It returns false when
-// the page could not be finished.
-func (a *Office365Adapter) processItems(items []listItem, fs *failureState) bool {
+// processItems downloads and ships the content blobs of one listing page. With
+// a CheckingDeduper, a blob is recorded as done only once all of its events
+// were shipped, so a blob interrupted by an error or by Close is fetched again
+// by the next poll, or by the next instance sharing the deduper. complete is
+// false when a blob was left for the next poll; abort is true when the poll
+// must stop.
+func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (complete bool, abort bool) {
 	nFetched := 0
 	nShipped := 0
 	nSkipped := 0
-	nGone := 0
+	nLeft := 0
 	defer func() {
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d gone: %d", nFetched, nShipped, nSkipped, nGone))
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d left for next poll: %d", nFetched, nShipped, nSkipped, nLeft))
 	}()
 
 	for _, item := range items {
 		if a.doStop.IsSet() {
-			return false
+			return false, true
 		}
 		if a.isDone(item.ContentID) {
 			nSkipped++
 			continue
 		}
 
-		content, _, err := a.getWithRetry(item.ContentURI, "content api", fs)
+		content, _, err := a.getWithRetry(item.ContentURI, "content api", fs, a.conf.contentRetryLimit)
 		if err != nil {
 			if err == errStopped {
-				return false
+				return false, true
 			}
 			var ae *apiError
-			if errors.As(err, &ae) && ae.gone {
-				// The blob can't be retrieved (missing or expired). It is not
+			if errors.As(err, &ae) && (ae.gone || ae.transient) {
+				// The blob is missing or expired, or kept failing: move on to
+				// the rest of the page. With a CheckingDeduper the blob isn't
 				// recorded as done, so it is tried again while it is listed.
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api: %v", err))
-				nGone++
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api, leaving blob for the next poll: %v", err))
+				nLeft++
 				continue
 			}
 			a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api: %v", err))
-			return false
+			return false, true
 		}
+		if !gjson.ValidBytes(content) {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api returned invalid json, leaving blob for the next poll: %s", item.ContentURI))
+			nLeft++
+			continue
+		}
+		// Content is flowing again: the failure clock restarts.
+		fs.reset()
 
 		shipped, skipped, ok := a.shipContent(content)
 		nShipped += shipped
 		nSkipped += skipped
 		if !ok {
-			return false
+			return false, true
 		}
 		a.markDone(item.ContentID)
 		nFetched++
 	}
-	return true
+	return nLeft == 0, false
 }
 
 // shipContent ships every event of a content blob. There is apparently no
@@ -481,7 +503,9 @@ func (a *Office365Adapter) isDone(key string) bool {
 	return a.conf.Deduper.CheckAndAdd(key)
 }
 
-// markDone records a content blob or event as shipped.
+// markDone records a content blob or event as shipped. Shipped means accepted
+// by the USP client, which delivers it from its buffer: what a Close drops
+// from that buffer is not re-fetched.
 func (a *Office365Adapter) markDone(key string) {
 	if a.checker != nil {
 		a.checker.CheckAndAdd(key)
@@ -543,7 +567,8 @@ func (a *Office365Adapter) updateBearerToken() error {
 
 	// Token requests and API requests go through the client built by the
 	// constructor, keeping its timeouts.
-	client := conf.Client(context.WithValue(context.Background(), oauth2.HTTPClient, a.httpClient))
+	// Token requests are also cancelled by Close.
+	client := conf.Client(context.WithValue(a.stopCtx, oauth2.HTTPClient, a.httpClient))
 	client.Timeout = httpTimeout
 	a.httpClient = client
 
@@ -609,8 +634,8 @@ type apiError struct {
 func (e *apiError) Error() string { return e.err.Error() }
 
 // failureState tracks how long a collection loop has been failing. It is
-// cleared only when a whole poll completes, so a loop that keeps getting
-// partway through and failing still escalates.
+// cleared when a content blob is downloaded or a whole poll completes, not by
+// a successful listing alone, so a content outage still escalates.
 type failureState struct {
 	since time.Time
 }
@@ -628,12 +653,15 @@ func (f *failureState) restart(now time.Time) { f.since = now }
 func (f *failureState) reset() { f.since = time.Time{} }
 
 // getWithRetry issues a GET until it succeeds, fails with a non-transient
-// error, or the adapter stops (errStopped). Transient failures are retried with
-// exponential backoff and jitter, honouring Retry-After. They are reported with
-// OnWarning until the loop has been failing for failureEscalation, then with
-// OnError: OnError stops a hosted adapter, so raising it on the first 429 would
-// restart a healthy adapter, while an outage that lasts must still be reported.
-func (a *Office365Adapter) getWithRetry(url string, what string, fs *failureState) ([]byte, http.Header, error) {
+// error, the adapter stops (errStopped), or, when giveUpAfter isn't 0, it has
+// failed transiently for giveUpAfter (the last error is returned). Transient
+// failures are retried with exponential backoff and jitter, honouring
+// Retry-After. They are reported with OnWarning until the loop has been
+// failing for failureEscalation, then with OnError: OnError stops a hosted
+// adapter, so raising it on the first 429 would restart a healthy adapter,
+// while an outage that lasts must still be reported.
+func (a *Office365Adapter) getWithRetry(url string, what string, fs *failureState, giveUpAfter time.Duration) ([]byte, http.Header, error) {
+	var firstFailure time.Time
 	for attempt := 1; ; attempt++ {
 		if a.doStop.IsSet() {
 			return nil, nil, errStopped
@@ -646,12 +674,21 @@ func (a *Office365Adapter) getWithRetry(url string, what string, fs *failureStat
 
 		wait := a.backoff(attempt, ae.retryAfter)
 		now := time.Now()
+		if firstFailure.IsZero() {
+			firstFailure = now
+		}
+		escalated := false
 		if d := fs.failingFor(now); d >= a.conf.failureEscalation {
 			a.conf.ClientOptions.OnError(fmt.Errorf("office365 %s failing for %s: %v", what, d.Round(time.Second), err))
 			// Start a new period so a host that keeps the adapter running
 			// after OnError isn't flooded with errors.
 			fs.restart(now)
-		} else {
+			escalated = true
+		}
+		if giveUpAfter > 0 && now.Sub(firstFailure) >= giveUpAfter {
+			return nil, nil, err
+		}
+		if !escalated {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 %s failed, retrying in %s: %v", what, wait.Round(time.Millisecond), err))
 		}
 		if a.doStop.WaitFor(wait) {

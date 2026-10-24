@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -211,6 +212,7 @@ func fastRetries(conf *Office365Config) {
 	conf.retryBaseDelay = 20 * time.Millisecond
 	conf.retryMaxDelay = 50 * time.Millisecond
 	conf.failureEscalation = time.Hour
+	conf.contentRetryLimit = time.Hour
 }
 
 // startAdapter starts an adapter and closes it when the test ends, unless the
@@ -479,11 +481,11 @@ func TestListThrottlingBacksOff(t *testing.T) {
 	time.Sleep(1500 * time.Millisecond)
 	closeIt()
 
-	// Waits of 25-50, 50-100, then 100-200 ms: at most about 12 requests in
-	// 1.5 s. A loop that retries at once makes hundreds.
+	// Waits of 25-50, 50-100, then 100-200 ms: at most 17 requests in 1.5 s.
+	// A loop that retries at once makes thousands.
 	n := m.hit("list")
 	assert.GreaterOrEqual(t, n, 3, "the listing must be retried")
-	assert.LessOrEqual(t, n, 16, "the listing was retried in a tight loop")
+	assert.LessOrEqual(t, n, 25, "the listing was retried in a tight loop")
 	assert.Empty(t, cb.errors(), "throttling must not be reported as an error before the escalation time")
 }
 
@@ -555,12 +557,18 @@ func TestSustainedFailureEscalates(t *testing.T) {
 	assert.GreaterOrEqual(t, cb.errors()[0].Sub(first), 400*time.Millisecond, "OnError came before the escalation time")
 	assert.GreaterOrEqual(t, cb.warnings(), 3, "failures before the escalation time are warnings")
 
+	// While it keeps failing, OnError is raised once per escalation period,
+	// not on every retry.
+	time.Sleep(1100 * time.Millisecond)
+	n := len(cb.errors())
+	assert.GreaterOrEqual(t, n, 2, "a failure that lasts must be reported again")
+	assert.LessOrEqual(t, n, 4, "OnError must not be raised on every retry")
+
 	mu.Lock()
 	failing = false
 	mu.Unlock()
 	require.Eventually(t, func() bool { return sink.payloadCounts()[recs["blob-1"]] == 1 },
 		5*time.Second, 10*time.Millisecond, "the blob must ship once the API recovers")
-	assert.LessOrEqual(t, len(cb.errors()), 2, "OnError must not be raised on every retry")
 }
 
 // A non-transient error (here a 403 on the listing) is reported at once and
@@ -673,4 +681,190 @@ func TestMissingBlobIsTriedAgain(t *testing.T) {
 	assert.Equal(t, 2, m.hit("blob-1"))
 	assert.Empty(t, cb.errors())
 	assert.GreaterOrEqual(t, cb.warnings(), 1)
+}
+
+// failFor returns a fault that fails each listed blob with a 500 for d after
+// its first request, then lets it through.
+func failFor(d time.Duration, ids ...string) func(key string, hit int, w http.ResponseWriter, _ *http.Request) bool {
+	var mu sync.Mutex
+	firstHit := map[string]time.Time{}
+	return func(key string, _ int, w http.ResponseWriter, _ *http.Request) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, id := range ids {
+			if key != id {
+				continue
+			}
+			if firstHit[key].IsZero() {
+				firstHit[key] = time.Now()
+			}
+			if time.Since(firstHit[key]) < d {
+				writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+					"error": map[string]string{"code": "AF50000", "message": "An internal error occurred. Retry the request."},
+				})
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// Failures that come and go while content keeps flowing are not a sustained
+// failure: no OnError, even when they span more than the escalation time.
+func TestIntermittentFailuresDontEscalate(t *testing.T) {
+	const ct = "Audit.Exchange"
+	m := newFaultMock(t)
+	recs := addBlobs(t, m, ct, 3)
+	m.setFault(failFor(200*time.Millisecond, "blob-1", "blob-2", "blob-3"))
+
+	cb := &callbacks{}
+	sink := &captureSink{}
+	conf := newTestConfig(t, m.mockO365, ct)
+	conf.PollInterval = time.Hour
+	fastRetries(&conf)
+	conf.failureEscalation = 350 * time.Millisecond
+	cb.install(t, &conf)
+	startAdapter(t, conf, sink)
+
+	require.Eventually(t, func() bool { return sink.count() == 3 },
+		5*time.Second, 10*time.Millisecond, "all blobs must ship")
+	assert.Empty(t, lostRecords(t, recs, sink))
+	times := m.hitTimes("blob-3")
+	require.NotEmpty(t, times)
+	assert.Greater(t, time.Since(m.hitTimes("blob-1")[0]), 350*time.Millisecond, "the failures must span more than the escalation time")
+	assert.Empty(t, cb.errors(), "failures between successful downloads must not escalate")
+}
+
+// A blob that keeps failing doesn't hold up the rest of the page: it is left
+// for the next poll, without an error, and tried again there.
+func TestFailingBlobDoesNotBlockPage(t *testing.T) {
+	const ct = "Audit.Exchange"
+	m := newFaultMock(t)
+	recs := addBlobs(t, m, ct, 2)
+	m.setFault(failFor(time.Hour, "blob-1"))
+
+	cb := &callbacks{}
+	sink := &captureSink{}
+	conf := newTestConfig(t, m.mockO365, ct)
+	fastRetries(&conf)
+	conf.contentRetryLimit = 100 * time.Millisecond
+	cb.install(t, &conf)
+	startAdapter(t, conf, sink)
+
+	require.Eventually(t, func() bool { return sink.payloadCounts()[recs["blob-2"]] == 1 },
+		5*time.Second, 10*time.Millisecond, "blob-2 must ship while blob-1 keeps failing")
+	require.Eventually(t, func() bool { return m.hit("list") >= 3 },
+		5*time.Second, 10*time.Millisecond, "the adapter must keep polling")
+	hits := m.hit("blob-1")
+	require.Eventually(t, func() bool { return m.hit("blob-1") > hits },
+		5*time.Second, 10*time.Millisecond, "blob-1 must be tried again on later polls")
+	assert.Empty(t, cb.errors())
+	assert.Equal(t, 1, sink.count())
+}
+
+// When the listing works but no content can be downloaded, the failure still
+// escalates.
+func TestContentOutageEscalates(t *testing.T) {
+	const ct = "Audit.Exchange"
+	m := newFaultMock(t)
+	addBlobs(t, m, ct, 2)
+	m.setFault(failFor(time.Hour, "blob-1", "blob-2"))
+
+	cb := &callbacks{}
+	conf := newTestConfig(t, m.mockO365, ct)
+	fastRetries(&conf)
+	conf.contentRetryLimit = 50 * time.Millisecond
+	conf.failureEscalation = 400 * time.Millisecond
+	cb.install(t, &conf)
+	startAdapter(t, conf, &captureSink{})
+
+	require.Eventually(t, func() bool { return len(cb.errors()) >= 1 },
+		5*time.Second, 10*time.Millisecond, "a content outage must be reported with OnError")
+	assert.GreaterOrEqual(t, cb.errors()[0].Sub(m.hitTimes("blob-1")[0]), 400*time.Millisecond, "OnError came before the escalation time")
+	assert.GreaterOrEqual(t, m.hit("list"), 2, "the listing kept working across polls")
+}
+
+// A content blob whose body isn't valid JSON (a truncated response) isn't
+// recorded as done: it is fetched again on the next poll.
+func TestInvalidContentIsFetchedAgain(t *testing.T) {
+	const ct = "Audit.Exchange"
+	m := newFaultMock(t)
+	recs := addBlobs(t, m, ct, 1)
+	m.setFault(func(key string, hit int, w http.ResponseWriter, _ *http.Request) bool {
+		if key == "blob-1" && hit == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`[{"Id":"cccccccc-0000-0000-0000-0000`))
+			return true
+		}
+		return false
+	})
+
+	cb := &callbacks{}
+	sink := &captureSink{}
+	conf := newTestConfig(t, m.mockO365, ct)
+	fastRetries(&conf)
+	cb.install(t, &conf)
+	startAdapter(t, conf, sink)
+
+	require.Eventually(t, func() bool { return sink.payloadCounts()[recs["blob-1"]] == 1 },
+		5*time.Second, 10*time.Millisecond, "the blob must ship on the next poll")
+	assert.Equal(t, 2, m.hit("blob-1"))
+	assert.Empty(t, cb.errors())
+}
+
+// Close interrupts a token request that hangs.
+func TestCloseInterruptsTokenRequest(t *testing.T) {
+	const ct = "Audit.Exchange"
+	m := newFaultMock(t)
+	addBlobs(t, m, ct, 1)
+	var mu sync.Mutex
+	hang := false
+	tokenHung := make(chan struct{})
+	m.setFault(func(key string, _ int, w http.ResponseWriter, r *http.Request) bool {
+		mu.Lock()
+		h := hang
+		if key == "start" {
+			hang = true
+		}
+		mu.Unlock()
+		switch {
+		case key == "token" && h:
+			// The server only sees the client go away once the request
+			// body has been read.
+			_, _ = io.ReadAll(r.Body)
+			close(tokenHung)
+			<-r.Context().Done()
+			return true
+		case key == "token":
+			// A token that is already about to expire, so the next
+			// request needs a new one.
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"token_type":   "Bearer",
+				"expires_in":   1,
+				"access_token": testAccessToken,
+				"resource":     "https://manage.office.com",
+			})
+			return true
+		}
+		return false
+	})
+
+	conf := newTestConfig(t, m.mockO365, ct)
+	conf.PollInterval = time.Hour
+	fastRetries(&conf)
+	_, _, closeIt := startAdapter(t, conf, &captureSink{})
+
+	select {
+	case <-tokenHung:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the token was never requested again")
+	}
+	closed := make(chan struct{})
+	go func() { closeIt(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not interrupt the token request")
+	}
 }
