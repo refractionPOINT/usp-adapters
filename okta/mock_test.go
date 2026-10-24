@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -21,19 +22,9 @@ import (
 // API (GET /api/v1/logs), capturing the exact messages it ships so their
 // content -- timestamp and verbatim payload -- can be asserted.
 //
-// Mock fidelity notes:
-//   - Authentication is the SSWS API token scheme: `Authorization: SSWS <token>`;
-//     a bad token gets Okta's E0000011 error body with HTTP 401.
-//   - The mock honours the `since`/`until` query parameters the adapter sends
-//     (both RFC3339): only events whose `published` falls inside the inclusive
-//     window are returned, exactly like the real System Log bounded query.
-//   - The response is a bare JSON array of System Log events. The mock also
-//     sets a `Link: rel="self"` header like the real API. It does NOT emulate
-//     Link rel="next" pagination: the real API caps a response (default 100,
-//     max 1000 events) and exposes the rest through an `after` cursor in a
-//     Link header -- but the adapter performs exactly one request per poll and
-//     never follows Link headers, so the mock returns the full window in a
-//     single response, matching how the adapter consumes the API.
+// The fixture models ascending polling with an opaque next link, including
+// the next link on empty pages. More hostile pagination fixtures live in
+// polling_test.go.
 
 // --- in-memory USP sink -------------------------------------------------------
 
@@ -46,9 +37,12 @@ type captureSink struct {
 func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	m.SeqNum = uint64(len(s.messages))
 	s.messages = append(s.messages, m)
 	return nil
 }
+
+func (s *captureSink) GetUnsent() ([]*protocol.DataMessage, error) { return nil, nil }
 
 func (s *captureSink) Drain(time.Duration) error               { return nil }
 func (s *captureSink) Close() ([]*protocol.DataMessage, error) { return nil, nil }
@@ -155,16 +149,15 @@ func (m *mockOktaSystemLog) handler() http.HandlerFunc {
 			oktaError(w, http.StatusBadRequest, "E0000001", "Api validation failed: 'since': The date format in your query is not recognized. Please enter dates using ISO8601 string format.")
 			return
 		}
-		until, err := time.Parse(time.RFC3339, q.Get("until"))
-		if err != nil {
-			oktaError(w, http.StatusBadRequest, "E0000001", "Api validation failed: 'until': The date format in your query is not recognized. Please enter dates using ISO8601 string format.")
+		until := time.Now().Add(24 * time.Hour)
+		if q.Get("until") != "" || q.Get("sortOrder") != "ASCENDING" {
+			oktaError(w, http.StatusBadRequest, "E0000001", "Polling query required")
 			return
 		}
 
-		// A bounded query returns the events whose `published` falls inside
-		// the inclusive [since, until] window. Bounded requests are
-		// "guaranteed to be in order according to the published field"
-		// (default sortOrder is ASCENDING), so the mock sorts the page.
+		// This fixture approximates the initial floor with published time.
+		// Production polling uses vendor persistence order, not a timestamp
+		// reconstructed by the adapter; polling_test.go pins opaque cursors.
 		page := []utils.Dict{}
 		for _, e := range events {
 			published, perr := time.Parse(time.RFC3339, fmt.Sprintf("%v", e["published"]))
@@ -180,8 +173,18 @@ func (m *mockOktaSystemLog) handler() http.HandlerFunc {
 			return fmt.Sprintf("%v", page[i]["published"]) < fmt.Sprintf("%v", page[j]["published"])
 		})
 
+		offset, _ := strconv.Atoi(q.Get("after"))
+		if offset < 0 || offset > len(page) {
+			offset = len(page)
+		}
+		end := offset + 100
+		if end > len(page) {
+			end = len(page)
+		}
+		page = page[offset:end]
+		q.Set("after", strconv.Itoa(end))
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("Link", fmt.Sprintf("<http://%s%s?since=%s&until=%s>; rel=\"self\"", r.Host, logsURL, q.Get("since"), q.Get("until")))
+		w.Header().Set("Link", fmt.Sprintf("<http://%s%s?%s>; rel=\"next\"", r.Host, logsURL, q.Encode()))
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(page)
 	}
@@ -367,8 +370,7 @@ func TestMockSystemLogEndToEnd(t *testing.T) {
 
 // TestMockRequestContract verifies the request the adapter sends matches the
 // System Log API contract: GET /api/v1/logs with an `Authorization: SSWS <token>`
-// header and RFC3339 `since`/`until` bounds where since <= until and since is
-// clamped to no earlier than the adapter's start.
+// header, ascending polling and a fixed RFC3339 since floor, with no until.
 func TestMockRequestContract(t *testing.T) {
 	const token = "contract-test-token"
 
@@ -391,15 +393,12 @@ func TestMockRequestContract(t *testing.T) {
 
 	since, err := time.Parse(time.RFC3339, sinceStr)
 	require.NoError(t, err, "since must be RFC3339")
-	until, err := time.Parse(time.RFC3339, untilStr)
-	require.NoError(t, err, "until must be RFC3339")
+	assert.Empty(t, untilStr, "polling must not set until")
 
-	assert.False(t, until.Before(since), "since must be <= until")
 	// On a fresh adapter the 30-minute overlap window is clamped to the
 	// adapter's start time (RFC3339 truncates to the second, hence the slack).
 	assert.False(t, since.Before(testStart.Add(-2*time.Second).UTC()),
 		"since %v must be clamped to the adapter start (~%v), not 30 minutes back", since, testStart.UTC())
-	assert.False(t, until.After(time.Now().UTC().Add(2*time.Second)), "until must be ~now")
 }
 
 // TestMockEventMidRunShipsExactlyOnce verifies an event that appears while the
@@ -443,15 +442,9 @@ func TestMockEventMidRunShipsExactlyOnce(t *testing.T) {
 	}, shippedPerUUID, "every event must ship exactly once")
 }
 
-// TestMockLargeBatchShipsOnce verifies a large window of events is fully
-// consumed in one poll and each event ships exactly once across re-polls.
+// TestMockLargeBatchShipsOnce drains capped pages without duplicating events.
 //
-// Note on pagination fidelity: the real System Log API caps a response (100 by
-// default, 1000 max) and exposes the remainder through Link rel="next"
-// after-cursors. This adapter performs a single request per poll and does not
-// follow Link headers, so the mock -- mirroring how the adapter consumes the
-// API -- returns the entire window in one response. This test therefore covers
-// "large dataset fully consumed" as far as the adapter's design allows.
+// The separate opaque-pagination regression caps pages and exercises ties.
 func TestMockLargeBatchShipsOnce(t *testing.T) {
 	const token = "tok-large-batch"
 	const total = 250

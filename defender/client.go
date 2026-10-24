@@ -2,19 +2,17 @@ package usp_defender
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -77,7 +75,7 @@ const (
 // it as an interface lets tests substitute an in-memory sink for the real
 // LimaCharlie client; *uspclient.Client satisfies it unchanged.
 type uspSink interface {
-	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	acktrack.Client
 	Drain(timeout time.Duration) error
 	Close() ([]*protocol.DataMessage, error)
 }
@@ -92,9 +90,16 @@ type DefenderAdapter struct {
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
-	doStop    *utils.Event
 
-	ctx context.Context
+	ctx           context.Context
+	cancel        context.CancelFunc
+	tracker       *acktrack.ACKTracker
+	generation    *defenderGeneration
+	closeOnce     sync.Once
+	closeErr      error
+	runtime       defenderRuntime
+	startedAt     int64
+	collectionURL *url.URL
 }
 
 type DefenderConfig struct {
@@ -190,279 +195,69 @@ func NewDefenderAdapter(ctx context.Context, conf DefenderConfig) (*DefenderAdap
 	return newDefenderAdapter(ctx, conf, nil)
 }
 
-// newDefenderAdapter is the implementation behind NewDefenderAdapter. When
-// sink is non-nil it is used in place of a real LimaCharlie client -- the seam
-// tests use to capture shipped events.
 func newDefenderAdapter(ctx context.Context, conf DefenderConfig, sink uspSink) (*DefenderAdapter, chan struct{}, error) {
-	var err error
+	return newDefenderAdapterWithRuntime(ctx, conf, sink, defaultRuntime())
+}
 
-	// Resolve and validate the endpoint up front. Nothing on the runtime path
-	// (containers/general/tool.go) calls Validate(), so guard here too: a
-	// non-empty but unknown endpoint would otherwise resolve to empty URLs and
-	// scope and silently poll nothing.
+// Private runtime injection keeps clock/rate tests independent of wall-clock waits.
+func newDefenderAdapterWithRuntime(ctx context.Context, conf DefenderConfig, sink uspSink, runtime defenderRuntime) (*DefenderAdapter, chan struct{}, error) {
 	if _, ok := environments[conf.endpoint()]; !ok {
-		return nil, nil, fmt.Errorf("not a valid api endpoint: %s", conf.Endpoint)
+		return nil, nil, errors.New("invalid Defender environment")
 	}
-
-	a := &DefenderAdapter{
-		conf:         conf,
-		ctx:          context.Background(),
-		doStop:       utils.NewEvent(),
-		endpoint:     conf.endpoint(),
-		pollInterval: conf.PollInterval,
+	endpoint, err := collectionEndpoint(conf.alertsURL())
+	if err != nil {
+		return nil, nil, err
 	}
-	if a.pollInterval <= 0 {
-		a.pollInterval = defaultPollInterval
+	if _, err := collectionEndpoint(conf.tokenURL()); err != nil {
+		return nil, nil, errors.New("invalid Defender token endpoint")
 	}
-
-	if sink != nil {
-		a.uspClient = sink
-	} else {
-		a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	if sink == nil {
+		client, err := acktrack.NewClient(ctx, conf.ClientOptions)
 		if err != nil {
 			return nil, nil, err
 		}
+		sink = client
 	}
-
-	a.httpClient = &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			Dial: (&net.Dialer{
-				Timeout: 10 * time.Second,
-			}).Dial,
-		},
+	workerCtx, cancel := context.WithCancel(ctx)
+	tracker, err := acktrack.NewACKTracker(sink, 2, 16)
+	if err != nil {
+		cancel()
+		_, _ = sink.Close()
+		return nil, nil, err
 	}
-
-	a.chStopped = make(chan struct{})
-
-	a.conf.ClientOptions.DebugLog(fmt.Sprintf("starting to fetch alerts"))
-
+	a := &DefenderAdapter{conf: conf, ctx: workerCtx, cancel: cancel, uspClient: sink, tracker: tracker,
+		endpoint: conf.endpoint(), collectionURL: endpoint, runtime: runtime,
+		pollInterval: conf.PollInterval, startedAt: runtime.now().UTC().UnixNano(), chStopped: make(chan struct{})}
+	if a.pollInterval <= 0 {
+		a.pollInterval = defaultPollInterval
+	}
+	a.httpClient = &http.Client{Timeout: 10 * time.Second,
+		Transport:     &http.Transport{DialContext: (&net.Dialer{Timeout: 10 * time.Second}).DialContext},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	a.wgSenders.Add(1)
-	go a.fetchEvents(a.conf.alertsURL())
-
-	go func() {
-		a.wgSenders.Wait()
-		close(a.chStopped)
-	}()
-
+	go func() { defer a.wgSenders.Done(); defer close(a.chStopped); a.run() }()
 	return a, a.chStopped, nil
 }
 
 func (a *DefenderAdapter) Close() error {
-	defer utils.StopBlockedProducers(a.uspClient)()
-	a.conf.ClientOptions.DebugLog("closing")
-	a.doStop.Set()
-	a.wgSenders.Wait()
-	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
-	a.httpClient.CloseIdleConnections()
-
-	if err1 != nil {
-		return err1
-	}
-
-	return err2
+	a.closeOnce.Do(func() {
+		a.cancel()
+		// Seal admission before joining a producer blocked on SDK backpressure.
+		if client, ok := a.uspClient.(interface{ BeginDrain() }); ok {
+			client.BeginDrain()
+		}
+		a.wgSenders.Wait()
+		err1 := a.uspClient.Drain(time.Minute)
+		_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
+		a.httpClient.CloseIdleConnections()
+		a.closeErr = errors.Join(err1, err2)
+	})
+	return a.closeErr
 }
 
-func (a *DefenderAdapter) fetchToken() (string, error) {
-
-	tokenURL := a.conf.tokenURL()
-	form := url.Values{}
-	form.Set("client_id", a.conf.ClientID)
-	form.Set("scope", a.conf.scope())
-	form.Set("grant_type", "client_credentials")
-	form.Set("client_secret", a.conf.ClientSecret)
-
-	req, err := http.NewRequest("POST", tokenURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+func (a *DefenderAdapter) issue(code string) {
+	if a.conf.ClientOptions.DebugLog != nil {
+		a.conf.ClientOptions.DebugLog("defender collection: " + code)
 	}
-
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	// Use the adapter's httpClient (10s timeout): a bare http.Client{} has no
-	// timeout, so a token host that accepts the TCP connection but never
-	// responds would hang the poll goroutine forever.
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
-	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
-	}
-
-	accessToken, ok := result["access_token"].(string)
-	if !ok {
-		return "", fmt.Errorf("no bearer token returned: %#v", result)
-	}
-
-	return accessToken, nil
-
-}
-
-func (a *DefenderAdapter) fetchEvents(url string) {
-	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
-
-	lastEventId := ""
-	// since := time.Date(2022, time.June, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000000Z")
-	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
-
-	for !a.doStop.WaitFor(a.pollInterval) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
-		items, newSince, eventId, _ := a.makeOneListRequest(url, since, lastEventId)
-		since = newSince
-		lastEventId = eventId
-		if items == nil {
-			continue
-		}
-
-		for _, item := range items {
-			msg := &protocol.DataMessage{
-				JsonPayload: item,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
-				}
-				if err == nil {
-					continue
-				}
-				if err != uspclient.ErrorClosed {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				}
-				a.doStop.Set()
-				return
-			}
-		}
-	}
-}
-
-func (a *DefenderAdapter) makeOneListRequest(eventsUrl string, since string, lastEventId string) ([]map[string]interface{}, string, string, error) {
-	var alerts []map[string]interface{}
-	var lastDetectionTime, eventId string
-
-	// Retry up to 3 times
-	for attempt := 1; attempt <= 3; attempt++ {
-		// Create query parameters
-		filter := "%24"
-		query := "%20ge%20"
-		date_filter := fmt.Sprintf("?%sfilter=createdDateTime%s%s", filter, query, strings.Replace(since, ":", "%3A", -1))
-
-		// Create the full request URL with query parameters (don't modify eventsUrl to avoid corruption on retries)
-		requestUrl := eventsUrl + date_filter
-
-		authToken, err := a.fetchToken()
-		if err != nil {
-			// Retry if token fetch failed, but continue to the next iteration
-			if attempt < 3 {
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("error fetching token (attempt %d), retrying: %s", attempt, err))
-				time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
-				continue
-			}
-			// Return after 3 failed attempts
-			a.conf.ClientOptions.OnError(fmt.Errorf("error fetching token after 3 attempts: %s", err))
-			return nil, since, "", fmt.Errorf("error fetching token after 3 attempts: %s", err)
-		}
-
-		req, err := http.NewRequest("GET", requestUrl, nil)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error creating request: %s\n", err))
-			return nil, since, "", err
-		}
-
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
-		req.Header.Set("Content-Type", "application/json")
-
-		// Use the adapter's httpClient (10s timeout) rather than a bare
-		// http.Client{}, which has no timeout and would hang the poll goroutine
-		// forever against an endpoint that never responds.
-		resp, err := a.httpClient.Do(req)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error making request: %s\n", err))
-			return nil, since, "", err
-		}
-		defer resp.Body.Close()
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error reading response: %s\n", err))
-			return nil, since, "", err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			// Check for retryable status codes (503, 504) - likely Microsoft infrastructure issues
-			isRetryable := resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout
-
-			if isRetryable {
-				// Retry for transient infrastructure errors
-				if attempt < 3 {
-					a.conf.ClientOptions.OnWarning(fmt.Sprintf("Microsoft API returned %d (attempt %d), retrying: %s\n", resp.StatusCode, attempt, body))
-					time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
-					continue
-				}
-				// Final attempt for retryable error
-				a.conf.ClientOptions.OnError(fmt.Errorf("Microsoft API returned %d after 3 attempts: %s\n", resp.StatusCode, body))
-				return nil, since, "", fmt.Errorf("Microsoft API returned %d after 3 attempts: %s\n", resp.StatusCode, body)
-			} else {
-				// Non-retryable error (auth, permission, etc) - fail immediately
-				a.conf.ClientOptions.OnError(fmt.Errorf("Error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s\n", body))
-				return nil, since, "", fmt.Errorf("Error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s\n", body)
-			}
-		}
-
-		// If the response is OK, parse the body and process detections
-		var data map[string]interface{}
-		err = json.Unmarshal(body, &data)
-		detections, _ := data["value"].([]interface{})
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Error parsing JSON: %v", err))
-			return nil, since, "", err
-		}
-
-		items := detections
-
-		lastDetectionTime = since
-		for _, detection := range items {
-			detectMap, ok := detection.(map[string]interface{})
-			if !ok {
-				a.conf.ClientOptions.DebugLog("Error parsing detectMap JSON")
-				continue
-			}
-
-			id, ok := detectMap["id"].(string)
-			if !ok {
-				a.conf.ClientOptions.DebugLog("Error parsing ID from detectMap JSON")
-				continue
-			}
-			eventId = id
-
-			if id != lastEventId {
-				createdDateTime, ok := detectMap["createdDateTime"].(string)
-				if !ok {
-					a.conf.ClientOptions.DebugLog("Error parsing createdDateTime from detectMap JSON")
-					continue
-				}
-
-				lastDetectionTime = createdDateTime
-				alerts = append(alerts, detectMap)
-			}
-		}
-
-		// Break out of the loop if successful
-		break
-	}
-
-	return alerts, lastDetectionTime, eventId, nil
 }
