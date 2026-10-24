@@ -8,8 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,9 +25,8 @@ import (
 // the MS Graph security alerts_v2 endpoint -- capturing the exact messages it
 // ships so their content can be asserted.
 
-// graphTimestampLayout matches how MS Graph renders alerts_v2 timestamps
-// (seven fractional digits, Z suffix). The trailing Z is a literal in this
-// layout, mirroring how the adapter itself renders its `since` watermark.
+// graphTimestampLayout renders UTC fixture activity timestamps with the seven
+// fractional digits commonly returned by Graph.
 const graphTimestampLayout = "2006-01-02T15:04:05.0000000Z"
 
 const (
@@ -44,17 +45,37 @@ const (
 type captureSink struct {
 	mu       sync.Mutex
 	messages []*protocol.DataMessage
+	pending  []*protocol.DataMessage
+	withheld bool
+	next     uint64
 }
 
 func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.next++
+	m.SeqNum = s.next
 	s.messages = append(s.messages, m)
+	if s.withheld {
+		s.pending = append(s.pending, m)
+	}
 	return nil
 }
 
+func (s *captureSink) GetUnsent() ([]*protocol.DataMessage, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]*protocol.DataMessage(nil), s.pending...), nil
+}
+func (s *captureSink) ack(seq uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for len(s.pending) > 0 && s.pending[0].SeqNum <= seq {
+		s.pending = s.pending[1:]
+	}
+}
 func (s *captureSink) Drain(time.Duration) error               { return nil }
-func (s *captureSink) Close() ([]*protocol.DataMessage, error) { return nil, nil }
+func (s *captureSink) Close() ([]*protocol.DataMessage, error) { return s.GetUnsent() }
 
 func (s *captureSink) count() int {
 	s.mu.Lock()
@@ -248,7 +269,7 @@ func (m *mockMicrosoft) handleToken(t *testing.T, w http.ResponseWriter, r *http
 }
 
 // handleAlerts implements GET /v1.0/security/alerts_v2 with the
-// `$filter=createdDateTime ge <ts>` filter the adapter sends.
+// half-open creation-time filter the adapter sends.
 func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *http.Request) {
 	m.mu.Lock()
 	m.alertRequests++
@@ -285,7 +306,17 @@ func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *htt
 		})
 		return
 	}
-	since, err := time.Parse(time.RFC3339Nano, strings.TrimPrefix(filter, prefix))
+	bounds := strings.Split(strings.TrimPrefix(filter, prefix), " and createdDateTime lt ")
+	if !assert.Len(t, bounds, 2) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	since, err := time.Parse(time.RFC3339Nano, bounds[0])
+	until, uerr := time.Parse(time.RFC3339Nano, bounds[1])
+	if !assert.NoError(t, uerr) {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
 	if !assert.NoError(t, err, "unparseable $filter timestamp in %q", filter) {
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -301,7 +332,7 @@ func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *htt
 		if !assert.NoError(t, perr) {
 			continue
 		}
-		if !created.Before(since) {
+		if !created.Before(since) && created.Before(until) {
 			matching = append(matching, alert)
 		}
 	}
@@ -311,11 +342,16 @@ func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *htt
 	envelope := map[string]interface{}{
 		"@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/alerts_v2",
 	}
+	offset, _ := strconv.Atoi(r.URL.Query().Get("$skiptoken"))
+	if offset > len(matching) {
+		offset = len(matching)
+	}
+	matching = matching[offset:]
 	if pageSize > 0 && len(matching) > pageSize {
 		matching = matching[:pageSize]
 		envelope["@odata.nextLink"] = fmt.Sprintf(
-			"https://graph.microsoft.com/v1.0/security/alerts_v2?$filter=%s&$skiptoken=fakeSkipToken%d",
-			url.QueryEscape(filter), pageSize)
+			"http://%s/v1.0/security/alerts_v2?$filter=%s&$skiptoken=%d",
+			r.Host, url.QueryEscape(filter), offset+pageSize)
 		m.mu.Lock()
 		m.nextLinks++
 		m.mu.Unlock()
@@ -337,7 +373,7 @@ func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *htt
 // processEvidence, nulls, ints, arrays and nested objects. All identifiers
 // are clearly fake.
 func realisticAlert(id string, createdDateTime time.Time) map[string]interface{} {
-	created := createdDateTime.Format(graphTimestampLayout)
+	created := createdDateTime.UTC().Format(time.RFC3339Nano)
 	return map[string]interface{}{
 		"@odata.type":        "#microsoft.graph.security.alert",
 		"id":                 id,
@@ -365,7 +401,7 @@ func realisticAlert(id string, createdDateTime time.Time) map[string]interface{}
 		"createdDateTime":    created,
 		"lastUpdateDateTime": created,
 		"resolvedDateTime":   nil,
-		"firstActivityDateTime": createdDateTime.Add(-2 * time.Minute).
+		"firstActivityDateTime": createdDateTime.Add(-2 * time.Minute).UTC().
 			Format(graphTimestampLayout),
 		"lastActivityDateTime": created,
 		"comments":             []interface{}{},
@@ -471,7 +507,7 @@ func startMockAdapter(t *testing.T, serverURL string, sink uspSink, clientSecret
 		PollInterval:  30 * time.Millisecond,
 	}
 	require.NoError(t, conf.Validate())
-	adapter, chStopped, err := newDefenderAdapter(context.Background(), conf, sink)
+	adapter, chStopped, err := newDefenderAdapterWithRuntime(context.Background(), conf, sink, mockRuntime())
 	require.NoError(t, err)
 	return adapter, chStopped
 }
@@ -584,7 +620,7 @@ func TestMockAlertsGovEndpoint(t *testing.T) {
 		PollInterval:  30 * time.Millisecond,
 	}
 	require.NoError(t, conf.Validate())
-	adapter, _, err := newDefenderAdapter(context.Background(), conf, sink)
+	adapter, _, err := newDefenderAdapterWithRuntime(context.Background(), conf, sink, mockRuntime())
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -637,11 +673,9 @@ func TestMockNewAlertMidRunShipsOnce(t *testing.T) {
 }
 
 // TestMockPaginatedDatasetFullyConsumed verifies a result set larger than one
-// Graph page is fully collected. The adapter does not follow @odata.nextLink;
-// it makes progress because each poll advances the createdDateTime watermark
-// to the last alert it saw, so successive polls drain the remainder. The mock
-// truncates to a page size and emits @odata.nextLink exactly like Graph does;
-// every alert must still ship exactly once.
+// Graph page is fully collected by following @odata.nextLink. The mock emits
+// working opaque continuations inside one fixed creation interval; every alert
+// must ship exactly once before the interval can complete.
 func TestMockPaginatedDatasetFullyConsumed(t *testing.T) {
 	const total = 12
 	base := time.Now().Add(1 * time.Hour)
@@ -676,12 +710,12 @@ func TestMockPaginatedDatasetFullyConsumed(t *testing.T) {
 	assert.GreaterOrEqual(t, mock.nextLinkCount(), 1,
 		"the mock must actually have truncated (served @odata.nextLink) for this test to be meaningful")
 	assert.GreaterOrEqual(t, mock.alertRequestCount(), 3,
-		"consuming 12 alerts at page size 5 requires at least 3 polls")
+		"consuming 12 alerts at page size 5 requires at least 3 pages")
 }
 
 // TestMockBadCredentialsShipNothing verifies the adapter's error handling for
 // rejected credentials: the token endpoint rejects the client secret, the
-// adapter retries the token fetch 3 times then reports an error for the poll,
+// adapter reports a vendor credential error for the poll,
 // nothing is ever shipped, the Graph endpoint is never called, and -- per the
 // adapter's design -- it keeps running (it does not stop itself on auth
 // failure; it retries on the next poll).
@@ -710,17 +744,17 @@ func TestMockBadCredentialsShipNothing(t *testing.T) {
 		errs = append(errs, err.Error())
 		errMu.Unlock()
 	}
-	adapter, chStopped, err := newDefenderAdapter(context.Background(), conf, sink)
+	adapter, chStopped, err := newDefenderAdapterWithRuntime(context.Background(), conf, sink, mockRuntime())
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// The token fetch retries 3 times (with 1s+2s backoff) before reporting
-	// the poll as failed.
+	// Credential rejection is a vendor error immediately; transient outages use
+	// the separate cancellable retry path.
 	require.Eventually(t, func() bool {
 		errMu.Lock()
 		defer errMu.Unlock()
 		for _, e := range errs {
-			if strings.Contains(e, "error fetching token after 3 attempts") {
+			if strings.Contains(e, "credentials or permissions rejected") {
 				return true
 			}
 		}
@@ -729,7 +763,7 @@ func TestMockBadCredentialsShipNothing(t *testing.T) {
 
 	assert.Equal(t, 0, sink.count(), "nothing may ship when credentials are rejected")
 	assert.Equal(t, 0, mock.alertRequestCount(), "the Graph endpoint must not be called without a token")
-	assert.GreaterOrEqual(t, mock.tokenRequestCount(), 3, "the token fetch is retried 3 times")
+	assert.GreaterOrEqual(t, mock.tokenRequestCount(), 1, "credential rejection is reported immediately")
 
 	// The adapter does not stop itself on bad credentials -- it keeps polling.
 	select {
@@ -765,7 +799,7 @@ func TestMockNoAlertsShipsNothing(t *testing.T) {
 		errs = append(errs, err.Error())
 		errMu.Unlock()
 	}
-	adapter, _, err := newDefenderAdapter(context.Background(), conf, sink)
+	adapter, _, err := newDefenderAdapterWithRuntime(context.Background(), conf, sink, mockRuntime())
 	require.NoError(t, err)
 	defer adapter.Close()
 
@@ -776,4 +810,23 @@ func TestMockNoAlertsShipsNothing(t *testing.T) {
 	errMu.Lock()
 	defer errMu.Unlock()
 	assert.Empty(t, errs, "an empty result set is not an error")
+}
+
+// Long windows and an advancing source clock keep national-cloud end-to-end
+// fixtures fast while exercising the same bounded half-open collection path.
+func mockRuntime() defenderRuntime {
+	rt := defaultRuntime()
+	var calls atomic.Int64
+	rt.now = func() time.Time {
+		if calls.Add(1) == 1 {
+			return time.Now()
+		}
+		return time.Now().Add(3 * time.Hour)
+	}
+	rt.window = 2 * time.Hour
+	rt.settle = 0
+	rt.liveSpacing = 0
+	rt.replaySpacing = 0
+	rt.reconcileInterval = 30 * time.Millisecond
+	return rt
 }
