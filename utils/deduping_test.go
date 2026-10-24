@@ -39,3 +39,28 @@ func TestLocalDeduper_CheckAndAdd(t *testing.T) {
 
 	d.Close()
 }
+
+func TestLocalDeduper_CheckDoesNotRecord(t *testing.T) {
+	d, err := NewLocalDeduper(time.Hour, 24*time.Hour)
+	if err != nil {
+		t.Fatalf("error creating deduper: %v", err)
+	}
+	defer d.Close()
+
+	cd, ok := d.(CheckingDeduper)
+	if !ok {
+		t.Fatal("the local deduper must implement CheckingDeduper")
+	}
+	if cd.Check("key1") {
+		t.Error("key1 should not exist")
+	}
+	if cd.Check("key1") {
+		t.Error("Check must not record key1")
+	}
+	if cd.CheckAndAdd("key1") {
+		t.Error("key1 should not exist before it is added")
+	}
+	if !cd.Check("key1") {
+		t.Error("key1 should exist once added")
+	}
+}
