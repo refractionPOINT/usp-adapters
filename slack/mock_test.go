@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -570,8 +571,8 @@ func TestNewestFirstPaginationReships(t *testing.T) {
 
 // TestBadTokenShipsNothing pins the adapter's actual behavior on auth failure:
 // the Audit Logs API answers 401, the adapter reports the error and ships
-// nothing -- but it does NOT stop; it keeps polling (a non-200 is reported via
-// OnError and surfaced as a nil-error empty result to the poll loop).
+// nothing -- but it does NOT stop; it keeps polling, backing off between
+// failed requests.
 func TestBadTokenShipsNothing(t *testing.T) {
 	const token = "xoxp-1111111111-fake-test-token"
 	base := time.Now().Unix() + 5
@@ -606,26 +607,276 @@ func TestBadTokenShipsNothing(t *testing.T) {
 	}
 }
 
-// TestUnreachableAPIStopsAdapter pins the adapter's behavior on transport
-// errors: a failed HTTP request terminates the polling loop (chStopped closes)
-// and nothing ships.
-func TestUnreachableAPIStopsAdapter(t *testing.T) {
-	// Grab a URL that refuses connections.
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	deadURL := server.URL
-	server.Close()
+// failingServer answers the first failN requests with the given failure and
+// then delegates to next. It counts every request it sees, with its time.
+type failingServer struct {
+	mu       sync.Mutex
+	failN    int
+	failAt   map[int]bool             // also fail these requests (1-based)
+	failIf   func(*http.Request) bool // also fail requests matching this
+	fail     func(w http.ResponseWriter)
+	next     http.HandlerFunc
+	requests []time.Time
+}
+
+func (f *failingServer) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.requests = append(f.requests, time.Now())
+		failing := len(f.requests) <= f.failN || f.failAt[len(f.requests)]
+		f.mu.Unlock()
+		if f.failIf != nil && f.failIf(r) {
+			failing = true
+		}
+		if failing {
+			f.fail(w)
+			return
+		}
+		f.next(w, r)
+	}
+}
+
+func (f *failingServer) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests)
+}
+
+func (f *failingServer) gaps() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []time.Duration
+	for i := 1; i < len(f.requests); i++ {
+		out = append(out, f.requests[i].Sub(f.requests[i-1]))
+	}
+	return out
+}
+
+// dropConnection makes the HTTP client see a transport error, as it would on
+// a failed TLS handshake.
+func dropConnection(w http.ResponseWriter) {
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err == nil {
+		conn.Close()
+	}
+}
+
+// TestTransportErrorsRetriedWithBackoff covers the API being unreachable (e.g.
+// TLS failing): the adapter keeps running, reports each failure, and waits
+// longer after each consecutive failure instead of retrying every poll.
+func TestTransportErrorsRetriedWithBackoff(t *testing.T) {
+	fs := &failingServer{failN: 1 << 30, fail: dropConnection}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	var reported atomic.Int32
+	conf := testConf(t, server.URL, "xoxp-1111111111-fake-test-token")
+	conf.ClientOptions.OnError = func(err error) {
+		t.Logf("ERR: %v", err)
+		reported.Add(1)
+	}
 
 	sink := &captureSink{}
-	adapter, chStopped, err := newSlackAdapter(t.Context(),
-		testConf(t, deadURL, "xoxp-1111111111-fake-test-token"), sink)
+	adapter, chStopped, err := newSlackAdapter(t.Context(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// Wait on what the server and the adapter observed, not on a fixed
+	// time: 4 failed requests, all reported.
+	require.Eventually(t, func() bool { return fs.count() >= 4 }, 10*time.Second, 10*time.Millisecond,
+		"the adapter must keep retrying")
+	require.Eventually(t, func() bool { return reported.Load() >= 4 }, 10*time.Second, 10*time.Millisecond,
+		"every failure is reported")
+
+	// The waits double (50, 100, 200ms between the first requests with a
+	// 50ms poll interval), where retrying every poll would leave ~50ms gaps.
+	// Lower bounds only: a slow runner can make a gap longer, never shorter
+	// than the wait before it.
+	gaps := fs.gaps()[:3]
+	assert.GreaterOrEqual(t, gaps[1], 80*time.Millisecond, "waits must grow: %v", gaps)
+	assert.GreaterOrEqual(t, gaps[2], 160*time.Millisecond, "waits must grow: %v", gaps)
+
+	select {
+	case <-chStopped:
+		t.Fatal("a transport error must not stop the adapter")
+	default:
+	}
+	assert.Equal(t, 0, sink.count())
+}
+
+// TestRecoversAfterFailures covers the API coming back: entries ship once
+// requests succeed, and polling returns to the normal interval.
+func TestRecoversAfterFailures(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	mock := newMockSlack(token, 100)
+	mock.addEntry(auditEntry(fixtureID(1), time.Now().Unix()+5, "user_login"))
+
+	// 6 failures back off to 1.6s; a poll after recovering that kept that
+	// wait would come at 3.2s, one back at the poll interval within 50ms.
+	const failN = 6
+	fs := &failingServer{failN: failN, fail: dropConnection, next: mock.handler()}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _, err := newSlackAdapter(t.Context(), testConf(t, server.URL, token), sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 1 }, 15*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return fs.count() >= failN+3 }, 15*time.Second, 10*time.Millisecond)
+
+	gaps := fs.gaps()
+	for _, g := range gaps[failN : failN+2] {
+		assert.Less(t, g, time.Second, "polling must return to the normal interval after a success: %v", gaps)
+	}
+}
+
+// TestNon200BodyTruncatedInError covers a TLS-inspecting proxy answering with
+// a large HTML error page: the status and the start of the body are reported,
+// the rest is cut.
+func TestNon200BodyTruncatedInError(t *testing.T) {
+	page := "<html>" + strings.Repeat("x", 10*1024) + "</html>"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(page))
+	}))
+	defer server.Close()
+
+	errs := make(chan error, 10)
+	conf := testConf(t, server.URL, "xoxp-1111111111-fake-test-token")
+	conf.ClientOptions.OnError = func(err error) {
+		select {
+		case errs <- err:
+		default:
+		}
+	}
+
+	sink := &captureSink{}
+	adapter, _, err := newSlackAdapter(t.Context(), conf, sink)
 	require.NoError(t, err)
 	defer adapter.Close()
 
 	select {
-	case <-chStopped:
-		// Expected: a transport error terminates the fetch loop.
+	case err := <-errs:
+		msg := err.Error()
+		assert.Contains(t, msg, "403 Forbidden")
+		assert.Contains(t, msg, "<html>xxx")
+		assert.True(t, strings.HasSuffix(msg, "... (truncated)"), "end of message: %q", msg[len(msg)-40:])
+		assert.Less(t, len(msg), 1200)
 	case <-time.After(5 * time.Second):
-		t.Fatal("adapter should stop when the API is unreachable")
+		t.Fatal("the non-200 must be reported")
 	}
-	assert.Equal(t, 0, sink.count())
+}
+
+func TestErrorBackoff(t *testing.T) {
+	assert.Equal(t, 5*time.Second, errorBackoff(5*time.Second, 1))
+	assert.Equal(t, 10*time.Second, errorBackoff(5*time.Second, 2))
+	assert.Equal(t, 40*time.Second, errorBackoff(5*time.Second, 4))
+	assert.Equal(t, maxErrorBackoff, errorBackoff(5*time.Second, 10))
+	assert.Equal(t, maxErrorBackoff, errorBackoff(5*time.Second, 1000), "no overflow")
+	assert.Equal(t, maxErrorBackoff, errorBackoff(10*time.Minute, 1), "capped even on the first failure")
+}
+
+func serverError(w http.ResponseWriter) {
+	http.Error(w, "internal error", http.StatusInternalServerError)
+}
+
+// newestFirstMock returns a mock serving n entries newest-first, 2 per page.
+func newestFirstMock(token string, n int) *mockSlack {
+	base := time.Now().Unix() + 5
+	mock := newMockSlack(token, 2)
+	mock.newestFirst = true
+	for i := 0; i < n; i++ {
+		mock.addEntry(auditEntry(fixtureID(i+1), base+int64(i), "user_login"))
+	}
+	return mock
+}
+
+func shipCounts(sink *captureSink) map[string]int {
+	counts := map[string]int{}
+	for _, m := range sink.snapshot() {
+		id, _ := m.JsonPayload["id"].(string)
+		counts[id]++
+	}
+	return counts
+}
+
+// TestFailedPageResumesFromItsCursor covers requests failing in the middle of
+// pagination (e.g. a rate limit hit while catching up on a backlog): the poll
+// resumes from the cursor of the failed page, so every entry ships once --
+// the pages before it are not shipped again, the ones after it not skipped.
+func TestFailedPageResumesFromItsCursor(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	const n = 9 // 5 pages
+	mock := newestFirstMock(token, n)
+	// Request 1 is the first page; 2 and 3 fail on the second page, 5 on
+	// the fourth.
+	fs := &failingServer{failAt: map[int]bool{2: true, 3: true, 5: true}, next: mock.handler(), fail: serverError}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _, err := newSlackAdapter(t.Context(), testConf(t, server.URL, token), sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return len(shipCounts(sink)) == n }, 5*time.Second, 10*time.Millisecond,
+		"every entry must ship despite the failed pages")
+	for id, c := range shipCounts(sink) {
+		assert.Equal(t, 1, c, "entry %s shipped %d times", id, c)
+	}
+}
+
+// TestPageFailingForeverIsGivenUp covers a page that never succeeds: after
+// maxPageAttempts the rest of the pagination is given up on with one error,
+// the entries already shipped are not shipped again, and polling continues.
+func TestPageFailingForeverIsGivenUp(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	mock := newestFirstMock(token, 5)
+	fs := &failingServer{next: mock.handler(), fail: serverError,
+		failIf: func(r *http.Request) bool { return r.URL.Query().Get("cursor") != "" }}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	var mu sync.Mutex
+	var errs []string
+	conf := testConf(t, server.URL, token)
+	conf.ClientOptions.OnError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		errs = append(errs, err.Error())
+	}
+	gaveUp := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, e := range errs {
+			if strings.HasPrefix(e, "giving up on the remaining pages") {
+				n++
+			}
+		}
+		return n
+	}
+
+	sink := &captureSink{}
+	adapter, chStopped, err := newSlackAdapter(t.Context(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return gaveUp() == 1 }, 10*time.Second, 10*time.Millisecond)
+	// The next poll starts fresh and polling goes on.
+	before := fs.count()
+	require.Eventually(t, func() bool { return fs.count() > before }, 10*time.Second, 10*time.Millisecond)
+	select {
+	case <-chStopped:
+		t.Fatal("the adapter must keep running")
+	default:
+	}
+
+	counts := shipCounts(sink)
+	for id, c := range counts {
+		assert.Equal(t, 1, c, "entry %s shipped %d times", id, c)
+	}
+	assert.Equal(t, map[string]int{fixtureID(5): 1, fixtureID(4): 1}, counts, "only the first page shipped")
 }

@@ -17,12 +17,19 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
+// receiveRestartDelay is how long to wait before restarting Receive after it
+// returned while the adapter is still running. The wait doubles per
+// consecutive failure up to receiveRestartMaxDelay; a Receive that ran for
+// receiveHealthyAfter resets it. Variables only so tests can shorten them.
+var (
+	receiveRestartDelay    = 2 * time.Second
+	receiveRestartMaxDelay = 5 * time.Minute
+	receiveHealthyAfter    = 1 * time.Minute
+)
+
 const (
 	defaultWriteTimeout = 60 * 10
 
-	// receiveRestartDelay is how long to wait before restarting Receive after
-	// it returned while the adapter is still running.
-	receiveRestartDelay = 2 * time.Second
 	// shipRetrySlice is how long one retry of a blocked Ship may wait. The
 	// retries are sliced so a message handler notices that the adapter is
 	// closing without relying on the client to wake it.
@@ -120,25 +127,16 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 	)
 	go func() {
 		defer close(chStopped)
-		for {
-			err := a.buildSub.Receive(pubsubCtx, a.processEvent)
-			// Close() (or a failed start) cancels the context: that is the
-			// only way out, transient errors restart Receive.
-			if pubsubCtx.Err() != nil {
-				return
+		receiveWithRestarts(pubsubCtx, func(ctx context.Context) error {
+			return a.buildSub.Receive(ctx, a.processEvent)
+		}, func(err error, retryIn time.Duration) {
+			if a.conf.ClientOptions.OnWarning != nil {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("buildSub.Receive: %v, restarting in %v", err, retryIn))
 			}
-			if err != nil {
-				a.conf.ClientOptions.DebugLog(fmt.Sprintf("buildSub.Receive: %v", err))
-				subErrMu.Lock()
-				subErr = err
-				subErrMu.Unlock()
-			}
-			select {
-			case <-pubsubCtx.Done():
-				return
-			case <-time.After(receiveRestartDelay):
-			}
-		}
+			subErrMu.Lock()
+			subErr = err
+			subErrMu.Unlock()
+		})
 	}()
 	// Give it a second to start the subscriber to check it's
 	// working without any errors.
@@ -154,6 +152,41 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 	}
 
 	return a, chStopped, nil
+}
+
+// receiveWithRestarts runs receive until ctx is cancelled, restarting it each
+// time it returns. Close() (or a failed start) cancels the context: that is
+// the only way out, transient errors restart receive after a wait that grows
+// while it keeps failing, so a persistent failure (e.g. TLS) is not retried
+// and reported every couple of seconds.
+func receiveWithRestarts(ctx context.Context, receive func(context.Context) error, onErr func(err error, retryIn time.Duration)) {
+	failures := 0
+	for {
+		started := time.Now()
+		err := receive(ctx)
+		if ctx.Err() != nil {
+			return
+		}
+		if time.Since(started) >= receiveHealthyAfter {
+			failures = 0
+		}
+		failures++
+		delay := receiveRestartDelay
+		for i := 1; i < failures && delay < receiveRestartMaxDelay; i++ {
+			delay *= 2
+		}
+		if delay > receiveRestartMaxDelay {
+			delay = receiveRestartMaxDelay
+		}
+		if err != nil {
+			onErr(err, delay)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
 }
 
 func (a *PubSubAdapter) Close() error {

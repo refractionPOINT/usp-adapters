@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -20,6 +21,14 @@ import (
 const (
 	defaultApiURL       = "https://api.slack.com/audit/v1/logs"
 	defaultPollInterval = 5 * time.Second
+	// maxErrorBackoff caps the wait between polls while requests keep
+	// failing; the wait starts at the poll interval and doubles per failure.
+	maxErrorBackoff = 5 * time.Minute
+	// maxErrorBodyLog bounds how much of an error response body is logged.
+	maxErrorBodyLog = 1024
+	// maxPageAttempts is how many times the same page is requested before
+	// the rest of the pagination is given up on.
+	maxPageAttempts = 5
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -152,32 +161,38 @@ func (a *SlackAdapter) fetchEvents() {
 	// Initianlize the search parameters
 	lastTime := time.Now().Unix()
 
-	for !a.doStop.WaitFor(a.pollInterval) {
-		isItemsProcessed := false
+	// A failed request (e.g. the API unreachable or a TLS error) is retried
+	// after a growing wait, rather than every poll. A failure in the middle
+	// of pagination resumes from the cursor of the failed page, so neither
+	// the pages before it are shipped again nor the ones after it skipped.
+	// A page that keeps failing is given up on after maxPageAttempts.
+	failures := 0
+	wait := a.pollInterval
+	retryLater := func() {
+		failures++
+		wait = errorBackoff(a.pollInterval, failures)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("request failed %d time(s) in a row, retrying in %v", failures, wait))
+	}
+	resumeCursor := ""
+	pageFailures := 0
+	isItemsProcessed := false
 
-		// Do a non-paged fetch based on time.
-		entries, nextPage, err := a.makeOneContentRequest(lastTime, "")
-		if err != nil {
-			return
-		}
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries", len(entries)))
+poll:
+	for !a.doStop.WaitFor(wait) {
+		wait = a.pollInterval
+		nextPage := resumeCursor
 
-		// If we got data, feed it.
-		if len(entries) != 0 {
-			isItemsProcessed = true
-			lastTime, err = a.shipEntries(entries)
+		if nextPage == "" {
+			isItemsProcessed = false
+
+			// Do a non-paged fetch based on time.
+			entries, page, err := a.makeOneContentRequest(lastTime, "")
 			if err != nil {
-				return
+				retryLater()
+				continue
 			}
-		}
-
-		// If a page was given back, exhaust the cursor.
-		for nextPage != "" {
-			entries, nextPage, err = a.makeOneContentRequest(lastTime, nextPage)
-			if err != nil {
-				return
-			}
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries from page", len(entries)))
+			nextPage = page
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries", len(entries)))
 
 			// If we got data, feed it.
 			if len(entries) != 0 {
@@ -189,10 +204,59 @@ func (a *SlackAdapter) fetchEvents() {
 			}
 		}
 
+		// If a page was given back, exhaust the cursor.
+		for nextPage != "" {
+			entries, page, err := a.makeOneContentRequest(lastTime, nextPage)
+			if err != nil {
+				pageFailures++
+				if pageFailures >= maxPageAttempts {
+					a.conf.ClientOptions.OnError(fmt.Errorf("giving up on the remaining pages of this poll after %d failed attempts, their entries are skipped: %v", pageFailures, err))
+					resumeCursor = ""
+					pageFailures = 0
+					// Close the poll as if complete, so the next one does
+					// not ship the newest entry again.
+					if isItemsProcessed {
+						lastTime++
+					}
+				} else {
+					resumeCursor = nextPage
+				}
+				retryLater()
+				continue poll
+			}
+			pageFailures = 0
+			nextPage = page
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries from page", len(entries)))
+
+			// If we got data, feed it.
+			if len(entries) != 0 {
+				isItemsProcessed = true
+				lastTime, err = a.shipEntries(entries)
+				if err != nil {
+					return
+				}
+			}
+		}
+		resumeCursor = ""
+		failures = 0
+
 		if isItemsProcessed {
 			lastTime++
 		}
 	}
+}
+
+// errorBackoff is the wait before the next poll after the given number of
+// consecutive failures: the poll interval, doubled per failure, capped.
+func errorBackoff(pollInterval time.Duration, failures int) time.Duration {
+	wait := pollInterval
+	for i := 1; i < failures && wait < maxErrorBackoff; i++ {
+		wait *= 2
+	}
+	if wait > maxErrorBackoff {
+		wait = maxErrorBackoff
+	}
+	return wait
 }
 
 func (a *SlackAdapter) shipEntries(entries []utils.Dict) (int64, error) {
@@ -254,8 +318,14 @@ func (a *SlackAdapter) makeOneContentRequest(lastTime int64, page string) ([]uti
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		a.conf.ClientOptions.OnError(fmt.Errorf("slack content api non-200: %s\nRESPONSE: %s", resp.Status, string(body)))
+		body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, maxErrorBodyLog+1))
+		truncated := ""
+		if len(body) > maxErrorBodyLog {
+			body = body[:maxErrorBodyLog]
+			truncated = "... (truncated)"
+		}
+		err := fmt.Errorf("slack content api non-200: %s\nRESPONSE: %s%s", resp.Status, string(body), truncated)
+		a.conf.ClientOptions.OnError(err)
 		return nil, "", err
 	}
 

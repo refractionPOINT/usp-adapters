@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -39,6 +38,23 @@ var (
 	// pollInterval is how long the feed loop waits between eventsFeed calls.
 	// It is a package variable (not a constant) only so tests can shorten it.
 	pollInterval = 1 * time.Minute
+	// retryBaseDelay and retryMaxDelay bound the wait between attempts of a
+	// request failing in transport (e.g. a TLS error): it doubles per attempt
+	// up to the max. Variables only so tests can shorten them.
+	retryBaseDelay = 2 * time.Second
+	retryMaxDelay  = 5 * time.Minute
+	// apiErrorRetryDelay is the wait before re-sending a query the API
+	// answered with errors.
+	apiErrorRetryDelay = 15 * time.Second
+)
+
+const (
+	// retryEscalateAfter is the attempt at which a request still failing is
+	// reported as an error rather than a warning. Retries continue after it.
+	retryEscalateAfter = 10
+	// queryAttempts is how many times one eventsFeed query is sent before the
+	// cycle is skipped.
+	queryAttempts = 3
 )
 
 type CatoConfig struct {
@@ -75,7 +91,6 @@ type uspSink interface {
 
 type CatoAdapter struct {
 	conf         CatoConfig
-	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
 	uspClient    uspSink
@@ -147,8 +162,8 @@ func (a *CatoAdapter) Close() error {
 	a.isRunning = 0
 	a.mRunning.Unlock()
 
-	a.wg.Done()
-	a.wg.Wait()
+	// Wait for the feed loop to notice and exit.
+	<-a.chStopped
 
 	_, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions)
 	if err != nil {
@@ -185,8 +200,7 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 	totalCount := 0
 
 	for {
-		// Exit if the adapter was asked to stop (test seam; in production
-		// nothing flips isRunning before the process exits).
+		// Exit if the adapter was asked to stop by Close().
 		a.mRunning.RLock()
 		running := a.isRunning
 		a.mRunning.RUnlock()
@@ -215,15 +229,27 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 		var resp map[string]interface{}
 
 		attempts := 0
-		for attempts < 3 {
+		for attempts < queryAttempts {
 			success, resp = a.send(query, account_id, api_key)
-			if success {
+			if success || resp == nil {
 				break
 			}
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("%s", resp))
-			time.Sleep(15 * time.Second)
-
 			attempts++
+			if attempts < queryAttempts && !a.waitRunning(apiErrorRetryDelay) {
+				return
+			}
+		}
+		if !success {
+			if resp == nil {
+				// send() gave up because the adapter is stopping.
+				return
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("cato eventsFeed failed after %d attempts, retrying next poll: %v", attempts, resp["errors"]))
+			if !a.waitRunning(pollInterval) {
+				return
+			}
+			continue
 		}
 
 		*marker = resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})["marker"].(string)
@@ -282,7 +308,9 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 		iteration++
 
 		// Add sleep to ensure the request is made every 1 minute
-		time.Sleep(pollInterval)
+		if !a.waitRunning(pollInterval) {
+			return
+		}
 	}
 
 }
@@ -296,6 +324,104 @@ func (a *CatoAdapter) graphqlURL() string {
 	return defaultGraphqlURL
 }
 
+// retry reports a failed attempt and waits before the next one, longer after
+// each consecutive failure. It returns false when the adapter is stopping.
+func (a *CatoAdapter) retry(retryCount *int, err error) bool {
+	*retryCount++
+	delay := retryDelay(*retryCount)
+	msg := fmt.Sprintf("cato request failed (attempt %d), retrying in %v: %v", *retryCount, delay, err)
+	if *retryCount == retryEscalateAfter {
+		a.conf.ClientOptions.OnError(errors.New(msg))
+	} else {
+		a.conf.ClientOptions.OnWarning(msg)
+	}
+	return a.waitRunning(delay)
+}
+
+// retryDelay is the wait after the given number of consecutive failures.
+func retryDelay(failures int) time.Duration {
+	delay := retryBaseDelay
+	for i := 1; i < failures && delay < retryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > retryMaxDelay {
+		delay = retryMaxDelay
+	}
+	return delay
+}
+
+// waitRunning sleeps for d, returning early with false if the adapter is
+// asked to stop.
+func (a *CatoAdapter) waitRunning(d time.Duration) bool {
+	const slice = 100 * time.Millisecond
+	for deadline := time.Now().Add(d); ; {
+		a.mRunning.RLock()
+		running := a.isRunning
+		a.mRunning.RUnlock()
+		if running == 0 {
+			return false
+		}
+		left := time.Until(deadline)
+		if left <= 0 {
+			return true
+		}
+		if left > slice {
+			left = slice
+		}
+		time.Sleep(left)
+	}
+}
+
+// post sends one GraphQL request and returns the decompressed response body.
+// Everything it opens is released before it returns, so a request retried
+// through a long outage holds nothing from earlier attempts.
+func (a *CatoAdapter) post(data map[string]string, headers map[string]string) ([]byte, error) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", a.graphqlURL(), bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := ctxhttp.Do(ctx, http.DefaultClient, req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	apiCallCount++
+
+	zippedData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	totalBytesCompressed += len(zippedData)
+
+	reader, err := gzip.NewReader(bytes.NewReader(zippedData))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	resultData, err := ioutil.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	totalBytesUncompressed += len(resultData)
+	return resultData, nil
+}
+
 func (a *CatoAdapter) send(query string, account_id string, api_key string) (bool, map[string]interface{}) {
 	retryCount := 0
 	data := map[string]string{"query": query}
@@ -306,83 +432,27 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 	}
 
 	for {
-		if retryCount > 10 {
-			log.Fatal("FATAL ERROR: retry count exceeded")
-		}
-
-		jsonData, err := json.Marshal(data)
+		resultData, err := a.post(data, headers)
 		if err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
-			time.Sleep(2 * time.Second)
-			retryCount++
+			if !a.retry(&retryCount, err) {
+				return false, nil
+			}
 			continue
 		}
-
-		req, err := http.NewRequest("POST", a.graphqlURL(), bytes.NewBuffer(jsonData))
-		if err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		for key, value := range headers {
-			req.Header.Set(key, value)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		resp, err := ctxhttp.Do(ctx, http.DefaultClient, req)
-		if err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v, sleeping 2 seconds then retrying", retryCount, err))
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-		defer resp.Body.Close()
-
-		apiCallCount++
-
-		zippedData, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		totalBytesCompressed += len(zippedData)
-
-		reader, err := gzip.NewReader(bytes.NewReader(zippedData))
-		if err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-		defer reader.Close()
-
-		resultData, err := ioutil.ReadAll(reader)
-		if err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
-			time.Sleep(2 * time.Second)
-			retryCount++
-			continue
-		}
-
-		totalBytesUncompressed += len(resultData)
 
 		if strings.HasPrefix(string(resultData), `{"errors":[{"message":"rate limit for operation:`) {
 			a.conf.ClientOptions.DebugLog("RATE LIMIT sleeping 5 seconds then retrying")
-			time.Sleep(5 * time.Second)
+			if !a.waitRunning(5 * time.Second) {
+				return false, nil
+			}
 			continue
 		}
 
 		var result map[string]interface{}
 		if err := json.Unmarshal(resultData, &result); err != nil {
-			a.conf.ClientOptions.DebugLog(fmt.Sprintf("ERROR %d: %v", retryCount, err))
-			time.Sleep(2 * time.Second)
-			retryCount++
+			if !a.retry(&retryCount, err) {
+				return false, nil
+			}
 			continue
 		}
 

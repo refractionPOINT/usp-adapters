@@ -177,12 +177,12 @@ func main() {
 			confUpdateClient, confData, err = confupdateclient.NewConfUpdateClient(config.Cloud.OID, config.Cloud.ConfGUID, &limacharlie.LCLoggerZerolog{})
 			if err != nil {
 				logError("error creating conf update client: %v", err)
-				os.Exit(1)
+				exitProcess(1)
 			}
 			// Use this new config to run the adapter.
 			if err := limacharlie.Dict(confData).UnMarshalToStruct(config); err != nil {
 				logError("error unmarshalling conf update: %v", err)
-				os.Exit(1)
+				exitProcess(1)
 			}
 			method = config.SensorType
 			showConfig = config.Cloud.ShowConfig
@@ -192,7 +192,7 @@ func main() {
 		client, chRunning, err := runAdapter(context.Background(), method, *config, showConfig)
 		if err != nil {
 			logError("error running adapter: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 		mCurrentlyRunning.Lock()
 		clients = append(clients, client)
@@ -259,7 +259,7 @@ func main() {
 	if healthCheckPortRequested != 0 {
 		if err := startHealthChecks(healthCheckPortRequested); err != nil {
 			logError("error starting healthchecks: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}
 
@@ -277,9 +277,11 @@ func main() {
 	for _, client := range clients {
 		if err := client.Close(); err != nil {
 			logError("error closing client: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}
+	// Report repeats still folded in the limiters before exiting.
+	flushLogLimiters(true)
 	log("exited")
 }
 
@@ -621,14 +623,17 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 		lastBackPressure: time.Now(),
 	}
 
+	// Adapter and USP client messages go through the limiter so that a
+	// failure retried in a loop (e.g. a TLS error) cannot flood the logs.
+	limiter := newAdapterLogLimiter()
 	o.DebugLog = func(msg string) {
-		log("DBG %s: %s", time.Now().Format(time.Stamp), msg)
+		limiter.Log("DBG", msg)
 	}
 	o.OnWarning = func(msg string) {
-		log("WRN %s: %s", time.Now().Format(time.Stamp), msg)
+		limiter.Log("WRN", msg)
 	}
 	o.OnError = func(err error) {
-		logError("ERR %s: %s", time.Now().Format(time.Stamp), err.Error())
+		limiter.Log("ERR", err.Error())
 	}
 	o.BufferOptions.OnBackPressure = func() {
 		stats.m.Lock()

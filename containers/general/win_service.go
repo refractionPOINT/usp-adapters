@@ -186,6 +186,9 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 	go func() {
 		defer wg.Done()
 		<-chRunnings
+		// Report repeats still folded in the limiters before reporting the
+		// service stopped, after which the process may end at any time.
+		flushLogLimiters(true)
 		changes <- svc.Status{State: svc.Stopped, Accepts: acceptedControls}
 	}()
 

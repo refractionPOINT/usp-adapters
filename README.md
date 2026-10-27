@@ -56,6 +56,34 @@ acknowledged or checkpointed cannot be replayed generically; operators should
 treat this as uncertain delivery. Hosts using `go-uspclient` directly can recover
 the unacknowledged messages returned by its `Close` method.
 
+### Logging
+
+The adapter writes its debug (`DBG`) and warning (`WRN`) lines to stdout and
+its errors (`ERR`) to stderr. So that a failure retried in a loop (an
+unreachable API, a TLS error) cannot flood the host's logs, the output is
+deduplicated:
+
+- The first occurrence of a message is always printed as is.
+- Repeats of it within one minute are counted, then reported in a single
+  `last message repeated N more time(s) between <first> and <last>: <message>`
+  line carrying the most recent text. A message still repeating gets one such
+  line per minute. A message that went quiet for one to two minutes is
+  printed in full the next time it happens.
+- Ephemeral ports (32768 and up) following an IP address are ignored when
+  comparing messages, so the same error from the same host on a new
+  connection counts as a repeat. A different address or service port is a
+  different message.
+- Each adapter has its own limits, and each level is rate limited: up to 3000
+  lines at once, refilled at 3000 per minute. Lines over the limit are counted
+  and reported within seconds in a `log rate limit ... reached: dropped N ...
+  line(s)` line that includes the last dropped message. A flood of debug lines
+  never delays warnings or errors, and one adapter never uses up another's
+  budget.
+- Pending counts are reported when the adapter exits.
+
+Set the environment variable `USP_LOG_NO_DEDUP=1` to print every line
+unchanged.
+
 ### Multi-Adapter
 If running using a configuration file, it is possible to run multiple instances of the same adapter type within a single instance of the adapter
 process. To do this, simply make the config file multiple "documents" (in JSON or YAML format) within the same file, like:
