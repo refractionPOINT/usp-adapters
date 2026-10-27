@@ -69,13 +69,16 @@ deduplicated:
   line carrying the most recent text. A message still repeating gets one such
   line per minute. A message that went quiet for a minute is printed in full
   the next time it happens.
-- Ports following an IP address are ignored when comparing messages, so the
-  same error from the same host on a new connection counts as a repeat. A
-  different address is a different message.
-- Each level is capped at 600 lines per minute. Lines over the cap are counted
-  and reported in a `log rate limit ... reached: dropped N ... line(s)` line
-  that includes the last dropped message. A flood of debug lines never delays
-  warnings or errors.
+- Ephemeral ports (32768 and up) following an IP address are ignored when
+  comparing messages, so the same error from the same host on a new
+  connection counts as a repeat. A different address or service port is a
+  different message.
+- Each adapter has its own limits, and each level is rate limited: up to 3000
+  lines at once, refilled at 3000 per minute. Lines over the limit are counted
+  and reported within seconds in a `log rate limit ... reached: dropped N ...
+  line(s)` line that includes the last dropped message. A flood of debug lines
+  never delays warnings or errors, and one adapter never uses up another's
+  budget.
 - Pending counts are reported when the adapter exits.
 
 Set the environment variable `USP_LOG_NO_DEDUP=1` to print every line

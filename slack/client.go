@@ -159,7 +159,10 @@ func (a *SlackAdapter) fetchEvents() {
 	lastTime := time.Now().Unix()
 
 	// A failed request (e.g. the API unreachable or a TLS error) is retried
-	// from the same point after a growing wait, rather than every poll.
+	// after a growing wait, rather than every poll. The whole cycle is
+	// retried from where it started: a failure on a later page must not move
+	// past the pages not fetched yet. Entries of the pages already shipped in
+	// that cycle are shipped again, which is preferred over losing the rest.
 	failures := 0
 	wait := a.pollInterval
 	retryLater := func() {
@@ -168,9 +171,11 @@ func (a *SlackAdapter) fetchEvents() {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("request failed %d time(s) in a row, retrying in %v", failures, wait))
 	}
 
+poll:
 	for !a.doStop.WaitFor(wait) {
 		wait = a.pollInterval
 		isItemsProcessed := false
+		cycleStart := lastTime
 
 		// Do a non-paged fetch based on time.
 		entries, nextPage, err := a.makeOneContentRequest(lastTime, "")
@@ -178,7 +183,6 @@ func (a *SlackAdapter) fetchEvents() {
 			retryLater()
 			continue
 		}
-		failures = 0
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries", len(entries)))
 
 		// If we got data, feed it.
@@ -194,8 +198,9 @@ func (a *SlackAdapter) fetchEvents() {
 		for nextPage != "" {
 			entries, nextPage, err = a.makeOneContentRequest(lastTime, nextPage)
 			if err != nil {
+				lastTime = cycleStart
 				retryLater()
-				break
+				continue poll
 			}
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries from page", len(entries)))
 
@@ -208,6 +213,7 @@ func (a *SlackAdapter) fetchEvents() {
 				}
 			}
 		}
+		failures = 0
 
 		if isItemsProcessed {
 			lastTime++

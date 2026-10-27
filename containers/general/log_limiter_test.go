@@ -260,15 +260,23 @@ func TestLogLimiterDifferentHostsNotFolded(t *testing.T) {
 
 func TestNormalizeLogKey(t *testing.T) {
 	for in, want := range map[string]string{
-		"dial tcp 10.0.0.1:443: connect: connection refused":  "dial tcp 10.0.0.1:<port>: connect: connection refused",
-		"read tcp 127.0.0.1:51234->10.0.0.1:443: i/o timeout": "read tcp 127.0.0.1:<port>->10.0.0.1:<port>: i/o timeout",
-		"from [::1]:51234":                                       "from [::1]:<port>",
-		"from [fe80::1%eth0]:51234":                              "from [fe80::1%eth0]:<port>",
-		"got 42 entries":                                         "got 42 entries",
-		"api.example.com:443 unreachable":                        "api.example.com:443 unreachable",
-		"Oct 27 10:00:01":                                        "Oct 27 10:00:01",
-		"id 11111111-1111-1111-1111-111111111111":                "id 11111111-1111-1111-1111-111111111111",
-		"version 1.2.3.4:5 is not an address but looks like one": "version 1.2.3.4:<port> is not an address but looks like one",
+		// Ephemeral ports are masked, the address is kept.
+		"handling new connection from 10.0.0.1:51234":         "handling new connection from 10.0.0.1:<port>",
+		"read tcp 127.0.0.1:51234->10.0.0.1:443: i/o timeout": "read tcp 127.0.0.1:<port>->10.0.0.1:443: i/o timeout",
+		"from [::1]:51234":          "from [::1]:<port>",
+		"from [fe80::1%eth0]:51234": "from [fe80::1%eth0]:<port>",
+		"from [2001:db8::1]:32768":  "from [2001:db8::1]:<port>",
+		"from 10.0.0.1:32767":       "from 10.0.0.1:32767",
+		// Service ports tell messages apart.
+		"dial tcp 10.0.0.1:443: connect: connection refused":  "dial tcp 10.0.0.1:443: connect: connection refused",
+		"dial tcp 10.0.0.1:8443: connect: connection refused": "dial tcp 10.0.0.1:8443: connect: connection refused",
+		// Not addresses.
+		"[worker]:50000 failed":                   "[worker]:50000 failed",
+		"version 1.2.3.4:5":                       "version 1.2.3.4:5",
+		"got 42 entries":                          "got 42 entries",
+		"api.example.com:50000 unreachable":       "api.example.com:50000 unreachable",
+		"Oct 27 10:00:01":                         "Oct 27 10:00:01",
+		"id 11111111-1111-1111-1111-111111111111": "id 11111111-1111-1111-1111-111111111111",
 	} {
 		assert.Equal(t, want, normalizeLogKey(in), in)
 	}
@@ -277,9 +285,10 @@ func TestNormalizeLogKey(t *testing.T) {
 func TestLogLimiterRateLimitAccountsForDroppedLines(t *testing.T) {
 	l, f := newTestLimiter()
 
-	// 1000 distinct debug lines at once: the burst is printed, the rest is
-	// counted and reported.
-	for i := 0; i < 1000; i++ {
+	// More distinct debug lines at once than the burst: the burst is
+	// printed, the rest is counted and reported.
+	const total = logRateBurst + 400
+	for i := 0; i < total; i++ {
 		l.Log("DBG", fmt.Sprintf("fetched page %d", i))
 	}
 	require.Len(t, f.lines, logRateBurst)
@@ -292,15 +301,15 @@ func TestLogLimiterRateLimitAccountsForDroppedLines(t *testing.T) {
 	require.NotNil(t, m, "unexpected drop summary: %q", last.msg)
 	assert.Equal(t, "400", m[1])
 	assert.Equal(t, "DBG", m[2])
-	assert.Equal(t, "fetched page 999", m[3], "the last dropped line is shown")
-	assert.Equal(t, 1000, accountedFor(t, f.lines))
+	assert.Equal(t, fmt.Sprintf("fetched page %d", total-1), m[3], "the last dropped line is shown")
+	assert.Equal(t, total, accountedFor(t, f.lines))
 }
 
 func TestLogLimiterRateLimitPerLevel(t *testing.T) {
 	l, f := newTestLimiter()
 
 	// A debug flood must not starve warnings and errors.
-	for i := 0; i < 5000; i++ {
+	for i := 0; i < 2*logRateBurst; i++ {
 		l.Log("DBG", fmt.Sprintf("noise %d", i))
 	}
 	l.Log("WRN", "stream falling behind")
@@ -389,19 +398,26 @@ func TestLogLimiterConcurrentAccounting(t *testing.T) {
 	assert.Equal(t, goroutines*perG, accountedFor(t, f.lines))
 }
 
+// captureLogOutput points every adapter limiter at f for the test, without
+// starting the background flusher.
+func captureLogOutput(t *testing.T, f *fakeLogOutput) {
+	t.Helper()
+	orig := logOutput
+	logOutput = f.out
+	t.Cleanup(func() { logOutput = orig })
+	logFlusherOne.Do(func() {})
+}
+
 func TestApplyLoggingRoutesThroughLimiter(t *testing.T) {
-	l, f := newTestLimiter()
-	orig := processLogLimiter
-	processLogLimiter = l
-	t.Cleanup(func() { processLogLimiter = orig })
-	startLogFlusherOnce.Do(func() {}) // no background flusher in the test
+	f := &fakeLogOutput{}
+	captureLogOutput(t, f)
 
 	o := applyLogging(uspclient.ClientOptions{})
 	o.DebugLog("debug message")
 	o.OnWarning("warning message")
 	o.OnError(errors.New("error message"))
 	o.OnError(errors.New("error message"))
-	l.flush(true)
+	flushLogLimiters(true)
 
 	msgs := f.msgs()
 	require.Len(t, msgs, 4)
@@ -409,4 +425,95 @@ func TestApplyLoggingRoutesThroughLimiter(t *testing.T) {
 	assert.Equal(t, "WRN warning message", msgs[1])
 	assert.Equal(t, "ERR error message", msgs[2])
 	assert.True(t, strings.HasPrefix(msgs[3], "ERR last message repeated 1 more time(s)"), msgs[3])
+}
+
+func TestApplyLoggingLimiterPerAdapter(t *testing.T) {
+	f := &fakeLogOutput{}
+	captureLogOutput(t, f)
+
+	// The same go-uspclient message from two adapters is two messages, and
+	// one adapter's flood does not use up the other's budget.
+	a := applyLogging(uspclient.ClientOptions{})
+	b := applyLogging(uspclient.ClientOptions{})
+	for i := 0; i < 2*logRateBurst; i++ {
+		a.DebugLog(fmt.Sprintf("noise %d", i))
+	}
+	a.OnError(errors.New("Dial(): x509: certificate signed by unknown authority"))
+	b.OnError(errors.New("Dial(): x509: certificate signed by unknown authority"))
+	b.DebugLog("adapter b debug")
+
+	msgs := f.msgs()
+	n := 0
+	for _, m := range msgs {
+		if m == "ERR Dial(): x509: certificate signed by unknown authority" {
+			n++
+		}
+	}
+	assert.Equal(t, 2, n, "each adapter reports its own failure")
+	assert.Contains(t, msgs, "DBG adapter b debug")
+	flushLogLimiters(true)
+}
+
+func TestLogLimiterAfterFinalFlushPrintsDirectly(t *testing.T) {
+	l, f := newTestLimiter()
+
+	l.Log("ERR", "boom")
+	l.flush(true)
+	// Goroutines still running after the exit flush: nothing may be folded
+	// into a summary that will never be printed.
+	l.Log("ERR", "boom")
+	l.Log("ERR", "boom")
+
+	assert.Equal(t, []string{"ERR boom", "ERR boom", "ERR boom"}, f.msgs())
+}
+
+func TestLogLimiterBlockedOutputDoesNotStallCountedCallers(t *testing.T) {
+	release := make(chan struct{})
+	var once sync.Once
+	l := newLogLimiter(func(level string, _ time.Time, msg string) {
+		if level == "DBG" {
+			once.Do(func() { <-release }) // stdout stuck on the first write
+		}
+	})
+	defer close(release)
+
+	go l.Log("DBG", "stuck line")
+	time.Sleep(50 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.Log("DBG", "stuck line") // a repeat: only counted
+		l.Log("ERR", "an error")   // stderr is not stuck
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a blocked output must not stall other callers")
+	}
+}
+
+func TestLogLimiterDropsReportedPromptly(t *testing.T) {
+	l, f := newTestLimiter()
+
+	for i := 0; i < logRateBurst+5; i++ {
+		l.Log("DBG", fmt.Sprintf("line %d", i))
+	}
+	f.advance(logFlushInterval)
+	l.flush(false)
+
+	last := f.lines[len(f.lines)-1]
+	m := reDropped.FindStringSubmatch(last.msg)
+	require.NotNil(t, m, "drops must be reported at the next flush, got %q", last.msg)
+	assert.Equal(t, "5", m[1])
+}
+
+func TestLogDedupDisabledEnv(t *testing.T) {
+	for v, want := range map[string]bool{
+		"": false, "1": true, "true": true, "TRUE": true,
+		"0": false, "false": false, "FALSE": false, "no": false, "garbage": false,
+	} {
+		t.Setenv(logDedupDisableEnv, v)
+		assert.Equal(t, want, logDedupDisabled(), "%s=%q", logDedupDisableEnv, v)
+	}
 }

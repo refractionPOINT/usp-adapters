@@ -612,6 +612,7 @@ func TestBadTokenShipsNothing(t *testing.T) {
 type failingServer struct {
 	mu       sync.Mutex
 	failN    int
+	failAt   map[int]bool // also fail these requests (1-based)
 	fail     func(w http.ResponseWriter)
 	next     http.HandlerFunc
 	requests []time.Time
@@ -621,7 +622,7 @@ func (f *failingServer) handler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.requests = append(f.requests, time.Now())
-		failing := len(f.requests) <= f.failN
+		failing := len(f.requests) <= f.failN || f.failAt[len(f.requests)]
 		f.mu.Unlock()
 		if failing {
 			f.fail(w)
@@ -765,4 +766,39 @@ func TestErrorBackoff(t *testing.T) {
 	assert.Equal(t, maxErrorBackoff, errorBackoff(5*time.Second, 10))
 	assert.Equal(t, maxErrorBackoff, errorBackoff(5*time.Second, 1000), "no overflow")
 	assert.Equal(t, maxErrorBackoff, errorBackoff(10*time.Minute, 1), "capped even on the first failure")
+}
+
+// TestFailedPageDoesNotLoseLaterPages covers a request failing in the middle
+// of pagination: the cycle is retried from where it started, so the entries
+// on the pages not fetched yet still ship (the ones already shipped may ship
+// again).
+func TestFailedPageDoesNotLoseLaterPages(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	base := time.Now().Unix() + 5
+
+	mock := newMockSlack(token, 2)
+	mock.newestFirst = true
+	for i := 0; i < 5; i++ {
+		mock.addEntry(auditEntry(fixtureID(i+1), base+int64(i), "user_login"))
+	}
+	// Request 2 is the first cursor page.
+	fs := &failingServer{failAt: map[int]bool{2: true}, next: mock.handler(), fail: func(w http.ResponseWriter) {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+	}}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _, err := newSlackAdapter(t.Context(), testConf(t, server.URL, token), sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool {
+		seen := map[string]bool{}
+		for _, m := range sink.snapshot() {
+			id, _ := m.JsonPayload["id"].(string)
+			seen[id] = true
+		}
+		return len(seen) == 5
+	}, 5*time.Second, 10*time.Millisecond, "every entry must ship despite the failed page")
 }

@@ -659,6 +659,7 @@ func TestCatoMarkerPersistenceResume(t *testing.T) {
 func bareAdapter(t *testing.T, server *httptest.Server, apiKey string) *CatoAdapter {
 	t.Helper()
 	return &CatoAdapter{
+		isRunning: 1,
 		conf: CatoConfig{
 			ClientOptions: testClientOptions(t),
 			ApiKey:        apiKey,
@@ -810,7 +811,6 @@ func flakyAdapter(t *testing.T, mock *mockCato, failN int) (*CatoAdapter, *flaky
 	server := httptest.NewServer(flaky)
 	t.Cleanup(server.Close)
 	a := bareAdapter(t, server, mock.apiKey)
-	a.isRunning = 1
 	rec := &logRecorder{}
 	rec.wire(t, &a.conf.ClientOptions)
 	return a, flaky, rec

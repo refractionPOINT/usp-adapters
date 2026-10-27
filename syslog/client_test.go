@@ -774,3 +774,28 @@ func TestTLSHandshakeDeadlineClearedAfterHandshake(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return sink.count() == 1 }, eventuallyTimeout, eventuallyTick)
 }
+
+// TestTLSHealthCheckNotReported covers load balancer and probe health checks,
+// which open a TCP connection to the TLS port and close it without sending
+// anything: that is not a handshake failure and must stay silent.
+func TestTLSHealthCheckNotReported(t *testing.T) {
+	t.Parallel()
+	sink := &captureSink{}
+	addr, rec := startTLSAdapterRecordingWarnings(t, sink)
+
+	for i := 0; i < 3; i++ {
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		conn.Close()
+	}
+
+	// A broken client after the probes is still reported: the handler ran.
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	_, _ = conn.Write([]byte(sampleRFC3164 + "\n"))
+	defer conn.Close()
+
+	require.Eventually(t, func() bool { return len(rec.snapshot()) == 1 }, eventuallyTimeout, eventuallyTick)
+	require.Never(t, func() bool { return len(rec.snapshot()) > 1 }, 200*time.Millisecond, eventuallyTick,
+		"health checks must not be reported: %v", rec.snapshot())
+}

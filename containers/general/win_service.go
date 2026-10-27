@@ -149,6 +149,8 @@ func (m *serviceInstance) Execute(args []string, r <-chan svc.ChangeRequest, cha
 		os.Exit(1)
 		return
 	}
+	// Report repeats still folded in the limiters when the service stops.
+	defer flushLogLimiters(true)
 	clients := []USPClient{}
 	chRunnings := make(chan struct{})
 	for _, config := range configsToRun {

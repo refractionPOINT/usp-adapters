@@ -223,7 +223,12 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
 		// rather than surfacing as a read error on the first Read.
 		tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
 		if err := tlsConn.Handshake(); err != nil {
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("tls handshake with %s failed: %v", conn.RemoteAddr(), err))
+			// A client closing without sending anything (a load balancer
+			// or probe health check) is not a failure, as it was not when
+			// the handshake ran inside the first Read.
+			if !errors.Is(err, io.EOF) {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("tls handshake with %s failed: %v", conn.RemoteAddr(), err))
+			}
 			return
 		}
 		tlsConn.SetDeadline(time.Time{})

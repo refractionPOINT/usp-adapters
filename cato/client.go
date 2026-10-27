@@ -372,6 +372,56 @@ func (a *CatoAdapter) waitRunning(d time.Duration) bool {
 	}
 }
 
+// post sends one GraphQL request and returns the decompressed response body.
+// Everything it opens is released before it returns, so a request retried
+// through a long outage holds nothing from earlier attempts.
+func (a *CatoAdapter) post(data map[string]string, headers map[string]string) ([]byte, error) {
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", a.graphqlURL(), bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := ctxhttp.Do(ctx, http.DefaultClient, req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	apiCallCount++
+
+	zippedData, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	totalBytesCompressed += len(zippedData)
+
+	reader, err := gzip.NewReader(bytes.NewReader(zippedData))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+
+	resultData, err := ioutil.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	totalBytesUncompressed += len(resultData)
+	return resultData, nil
+}
+
 func (a *CatoAdapter) send(query string, account_id string, api_key string) (bool, map[string]interface{}) {
 	retryCount := 0
 	data := map[string]string{"query": query}
@@ -382,71 +432,19 @@ func (a *CatoAdapter) send(query string, account_id string, api_key string) (boo
 	}
 
 	for {
-		jsonData, err := json.Marshal(data)
+		resultData, err := a.post(data, headers)
 		if err != nil {
 			if !a.retry(&retryCount, err) {
 				return false, nil
 			}
 			continue
 		}
-
-		req, err := http.NewRequest("POST", a.graphqlURL(), bytes.NewBuffer(jsonData))
-		if err != nil {
-			if !a.retry(&retryCount, err) {
-				return false, nil
-			}
-			continue
-		}
-
-		for key, value := range headers {
-			req.Header.Set(key, value)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		resp, err := ctxhttp.Do(ctx, http.DefaultClient, req)
-		if err != nil {
-			if !a.retry(&retryCount, err) {
-				return false, nil
-			}
-			continue
-		}
-		defer resp.Body.Close()
-
-		apiCallCount++
-
-		zippedData, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			if !a.retry(&retryCount, err) {
-				return false, nil
-			}
-			continue
-		}
-
-		totalBytesCompressed += len(zippedData)
-
-		reader, err := gzip.NewReader(bytes.NewReader(zippedData))
-		if err != nil {
-			if !a.retry(&retryCount, err) {
-				return false, nil
-			}
-			continue
-		}
-		defer reader.Close()
-
-		resultData, err := ioutil.ReadAll(reader)
-		if err != nil {
-			if !a.retry(&retryCount, err) {
-				return false, nil
-			}
-			continue
-		}
-
-		totalBytesUncompressed += len(resultData)
 
 		if strings.HasPrefix(string(resultData), `{"errors":[{"message":"rate limit for operation:`) {
 			a.conf.ClientOptions.DebugLog("RATE LIMIT sleeping 5 seconds then retrying")
-			time.Sleep(5 * time.Second)
+			if !a.waitRunning(5 * time.Second) {
+				return false, nil
+			}
 			continue
 		}
 

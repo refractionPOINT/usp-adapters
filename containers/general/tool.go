@@ -192,7 +192,7 @@ func main() {
 		client, chRunning, err := runAdapter(context.Background(), method, *config, showConfig)
 		if err != nil {
 			logError("error running adapter: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 		mCurrentlyRunning.Lock()
 		clients = append(clients, client)
@@ -259,7 +259,7 @@ func main() {
 	if healthCheckPortRequested != 0 {
 		if err := startHealthChecks(healthCheckPortRequested); err != nil {
 			logError("error starting healthchecks: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}
 
@@ -276,13 +276,12 @@ func main() {
 	}
 	for _, client := range clients {
 		if err := client.Close(); err != nil {
-			processLogLimiter.flush(true)
 			logError("error closing client: %v", err)
-			os.Exit(1)
+			exitProcess(1)
 		}
 	}
-	// Report repeats still folded in the limiter before exiting.
-	processLogLimiter.flush(true)
+	// Report repeats still folded in the limiters before exiting.
+	flushLogLimiters(true)
 	log("exited")
 }
 
@@ -626,15 +625,15 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 
 	// Adapter and USP client messages go through the limiter so that a
 	// failure retried in a loop (e.g. a TLS error) cannot flood the logs.
-	processLogLimiter.startFlusher()
+	limiter := newAdapterLogLimiter()
 	o.DebugLog = func(msg string) {
-		processLogLimiter.Log("DBG", msg)
+		limiter.Log("DBG", msg)
 	}
 	o.OnWarning = func(msg string) {
-		processLogLimiter.Log("WRN", msg)
+		limiter.Log("WRN", msg)
 	}
 	o.OnError = func(err error) {
-		processLogLimiter.Log("ERR", err.Error())
+		limiter.Log("ERR", err.Error())
 	}
 	o.BufferOptions.OnBackPressure = func() {
 		stats.m.Lock()

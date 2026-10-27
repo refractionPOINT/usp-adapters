@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -12,29 +13,41 @@ const (
 	// logDedupWindow is how long repeats of a message are folded into one
 	// summary line after the message is first printed.
 	logDedupWindow = 1 * time.Minute
-	// logRatePerMinute and logRateBurst bound how many lines of one level are
-	// printed per minute. They only matter when many *different* messages
-	// flood in; repeats of the same message are already folded by dedup.
-	logRatePerMinute = 600
-	logRateBurst     = 600
+	// logRateBurst lines of one level can be printed at once, refilled at
+	// logRatePerMinute. They only matter when many *different* messages flood
+	// in (repeats of the same message are already folded by dedup), and are
+	// sized so that the routine per-object debug lines of a busy adapter fit.
+	logRatePerMinute = 3000
+	logRateBurst     = 3000
 	// logMaxTrackedKeys bounds the dedup table. Messages past it are still
 	// printed (subject to the rate limit), just not deduplicated.
 	logMaxTrackedKeys = 1000
 	// logFlushInterval is how often pending summaries are checked.
 	logFlushInterval = 5 * time.Second
+	// logEphemeralPortMin is the start of the ephemeral port range (Linux
+	// uses 32768+, Windows and macOS 49152+). Only such ports are masked:
+	// a service port like 443 or 8443 tells messages apart.
+	logEphemeralPortMin = 32768
 
 	// logDedupDisableEnv turns the limiter off: every line is printed as is.
 	logDedupDisableEnv = "USP_LOG_NO_DEDUP"
 )
 
-// reIPPort matches an IPv4 or bracketed IPv6 address followed by a port. The
-// port is masked in dedup keys so that the same error from the same host does
-// not look unique only because each connection uses a new ephemeral port. The
-// address itself is kept: a failure from another host is another message.
-var reIPPort = regexp.MustCompile(`(\b\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F:.%a-zA-Z]+\]):\d{1,5}\b`)
+// reIPPort matches an IPv4 or bracketed IPv6 address followed by a port.
+// Ephemeral ports are masked in dedup keys so that the same error from the
+// same host does not look unique only because each connection uses a new
+// port. The address itself is kept: a failure from another host is another
+// message.
+var reIPPort = regexp.MustCompile(`(\b\d{1,3}(?:\.\d{1,3}){3}|\[[0-9a-fA-F.]*:[0-9a-fA-F:.]*(?:%[0-9A-Za-z_.-]+)?\]):(\d{1,5})\b`)
 
 func normalizeLogKey(msg string) string {
-	return reIPPort.ReplaceAllString(msg, "$1:<port>")
+	return reIPPort.ReplaceAllStringFunc(msg, func(m string) string {
+		sub := reIPPort.FindStringSubmatch(m)
+		if port, err := strconv.Atoi(sub[2]); err != nil || port < logEphemeralPortMin {
+			return m
+		}
+		return sub[1] + ":<port>"
+	})
 }
 
 type logEntry struct {
@@ -54,7 +67,13 @@ type logBucket struct {
 	lastDropped  string
 }
 
-// logLimiter sits between the adapters' DebugLog/OnWarning/OnError callbacks
+type logLine struct {
+	level string
+	ts    time.Time
+	msg   string
+}
+
+// logLimiter sits between one adapter's DebugLog/OnWarning/OnError callbacks
 // and the process output. It never discards a message without accounting for
 // it: the first occurrence of a message is printed as is, repeats within
 // logDedupWindow are counted and reported in a summary line carrying the most
@@ -62,6 +81,7 @@ type logBucket struct {
 type logLimiter struct {
 	mu       sync.Mutex
 	disabled bool
+	closed   bool // after the final flush: print everything directly
 	window   time.Duration
 	rate     float64 // lines per second, per level
 	burst    float64
@@ -95,20 +115,41 @@ func printLogLine(level string, ts time.Time, msg string) {
 	log("%s %s: %s", level, ts.Format(time.Stamp), msg)
 }
 
-var processLogLimiter = func() *logLimiter {
-	l := newLogLimiter(printLogLine)
-	if v := os.Getenv(logDedupDisableEnv); v != "" && v != "0" && v != "false" {
-		l.disabled = true
+// logOutput is where limiters print. A variable so tests can capture it.
+var logOutput = printLogLine
+
+// logDedupDisabled reports whether logDedupDisableEnv asks for raw logs.
+func logDedupDisabled() bool {
+	v := os.Getenv(logDedupDisableEnv)
+	if v == "" {
+		return false
 	}
-	return l
-}()
+	disabled, err := strconv.ParseBool(v)
+	if err != nil {
+		logError("ignoring %s=%q: not a boolean", logDedupDisableEnv, v)
+		return false
+	}
+	return disabled
+}
 
-var startLogFlusherOnce sync.Once
+var (
+	logLimitersMu sync.Mutex
+	logLimiters   []*logLimiter
+	logFlusherOne sync.Once
+)
 
-// startFlusher prints pending summaries in the background so a burst that
-// stops is still reported without waiting for the next log line.
-func (l *logLimiter) startFlusher() {
-	startLogFlusherOnce.Do(func() {
+// newAdapterLogLimiter returns the limiter for one adapter. Each adapter gets
+// its own, so a chatty adapter cannot use up the budget of another and the
+// same message from two adapters is not merged into one.
+func newAdapterLogLimiter() *logLimiter {
+	l := newLogLimiter(func(level string, ts time.Time, msg string) { logOutput(level, ts, msg) })
+	l.disabled = logDedupDisabled()
+
+	logLimitersMu.Lock()
+	logLimiters = append(logLimiters, l)
+	logLimitersMu.Unlock()
+
+	logFlusherOne.Do(func() {
 		if l.disabled {
 			log("log deduplication disabled by %s", logDedupDisableEnv)
 			return
@@ -117,22 +158,54 @@ func (l *logLimiter) startFlusher() {
 		go func() {
 			for {
 				time.Sleep(logFlushInterval)
-				l.flush(false)
+				flushLogLimiters(false)
 			}
 		}()
 	})
+	return l
+}
+
+// flushLogLimiters flushes every adapter's limiter. With final set, all
+// pending counts are reported and later lines are printed directly.
+func flushLogLimiters(final bool) {
+	logLimitersMu.Lock()
+	ls := append([]*logLimiter(nil), logLimiters...)
+	logLimitersMu.Unlock()
+	for _, l := range ls {
+		l.flush(final)
+	}
+}
+
+// exitProcess reports what the limiters still hold, then exits.
+func exitProcess(code int) {
+	flushLogLimiters(true)
+	os.Exit(code)
+}
+
+// print writes lines outside the limiter's lock, so a slow or blocked output
+// (e.g. a stdout nobody drains) does not stall callers that are only counted,
+// nor errors, which go to stderr.
+func (l *logLimiter) print(lines []logLine) {
+	for _, line := range lines {
+		l.out(line.level, line.ts, line.msg)
+	}
 }
 
 func (l *logLimiter) Log(level string, msg string) {
+	l.print(l.record(level, msg))
+}
+
+// record updates the limiter state for one call and returns what to print.
+func (l *logLimiter) record(level string, msg string) []logLine {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 
-	if l.disabled {
-		l.out(level, now, msg)
-		return
+	if l.disabled || l.closed {
+		return []logLine{{level, now, msg}}
 	}
 
+	var lines []logLine
 	key := level + "\x00" + normalizeLogKey(msg)
 	if e, ok := l.entries[key]; ok {
 		if now.Sub(e.windowStart) < l.window {
@@ -142,19 +215,19 @@ func (l *logLimiter) Log(level string, msg string) {
 			e.repeats++
 			e.lastRepeat = now
 			e.lastMsg = msg
-			return
+			return nil
 		}
 		if e.repeats > 0 {
 			// Still repeating: report the window that is over and fold
 			// this occurrence into the next one, so a steady flood costs
 			// one line per window.
-			l.emitSummary(e, now)
+			lines = l.summary(lines, e, now)
 			e.windowStart = now
 			e.repeats = 1
 			e.firstRepeat = now
 			e.lastRepeat = now
 			e.lastMsg = msg
-			return
+			return lines
 		}
 		// It went quiet for a whole window: print it in full again.
 		delete(l.entries, key)
@@ -167,13 +240,13 @@ func (l *logLimiter) Log(level string, msg string) {
 		}
 		b.dropped++
 		b.lastDropped = msg
-		return
+		return nil
 	}
 
-	l.out(level, now, msg)
 	if len(l.entries) < l.maxKeys {
 		l.entries[key] = &logEntry{level: level, windowStart: now}
 	}
+	return append(lines, logLine{level, now, msg})
 }
 
 // take consumes one token of the level's bucket, refilling it for the time
@@ -198,50 +271,57 @@ func (l *logLimiter) take(level string, now time.Time) bool {
 	return true
 }
 
-func (l *logLimiter) emitSummary(e *logEntry, now time.Time) {
+func (l *logLimiter) summary(lines []logLine, e *logEntry, now time.Time) []logLine {
 	if e.repeats == 0 {
-		return
+		return lines
 	}
-	l.out(e.level, now, fmt.Sprintf("last message repeated %d more time(s) between %s and %s: %s",
-		e.repeats, e.firstRepeat.Format(time.Stamp), e.lastRepeat.Format(time.Stamp), e.lastMsg))
+	return append(lines, logLine{e.level, now, fmt.Sprintf("last message repeated %d more time(s) between %s and %s: %s",
+		e.repeats, e.firstRepeat.Format(time.Stamp), e.lastRepeat.Format(time.Stamp), e.lastMsg)})
 }
 
-func (l *logLimiter) emitDropped(level string, b *logBucket, now time.Time) {
+func (l *logLimiter) droppedSummary(lines []logLine, level string, b *logBucket, now time.Time) []logLine {
 	if b.dropped == 0 {
-		return
+		return lines
 	}
-	l.out(level, now, fmt.Sprintf("log rate limit (%d/min) reached: dropped %d %s line(s) since %s, last dropped: %s",
-		logRatePerMinute, b.dropped, level, b.firstDropped.Format(time.Stamp), b.lastDropped))
+	lines = append(lines, logLine{level, now, fmt.Sprintf("log rate limit (%d/min) reached: dropped %d %s line(s) since %s, last dropped: %s",
+		logRatePerMinute, b.dropped, level, b.firstDropped.Format(time.Stamp), b.lastDropped)})
 	b.dropped = 0
 	b.lastDropped = ""
+	return lines
 }
 
 // flush reports the repeats of every message whose window is over, and the
 // lines dropped by the rate limit. A message still repeating keeps being
 // folded, one summary per window; one that went quiet is forgotten, so its
 // next occurrence prints in full. With final set (on exit), everything
-// pending is reported regardless of windows.
+// pending is reported regardless of windows, and the limiter stops folding.
 func (l *logLimiter) flush(final bool) {
+	l.print(l.collect(final))
+}
+
+func (l *logLimiter) collect(final bool) []logLine {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	now := l.now()
 
+	var lines []logLine
 	for key, e := range l.entries {
 		if !final && now.Sub(e.windowStart) < l.window {
 			continue
 		}
+		lines = l.summary(lines, e, now)
 		if e.repeats == 0 || final {
-			l.emitSummary(e, now)
 			delete(l.entries, key)
 			continue
 		}
-		l.emitSummary(e, now)
 		e.windowStart = now
 		e.repeats = 0
 	}
 	for level, b := range l.buckets {
-		if final || (b.dropped != 0 && now.Sub(b.firstDropped) >= l.window) {
-			l.emitDropped(level, b, now)
-		}
+		lines = l.droppedSummary(lines, level, b, now)
 	}
+	if final {
+		l.closed = true
+	}
+	return lines
 }
