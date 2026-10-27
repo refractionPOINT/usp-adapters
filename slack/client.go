@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -20,6 +21,11 @@ import (
 const (
 	defaultApiURL       = "https://api.slack.com/audit/v1/logs"
 	defaultPollInterval = 5 * time.Second
+	// maxErrorBackoff caps the wait between polls while requests keep
+	// failing; the wait starts at the poll interval and doubles per failure.
+	maxErrorBackoff = 5 * time.Minute
+	// maxErrorBodyLog bounds how much of an error response body is logged.
+	maxErrorBodyLog = 1024
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -152,14 +158,27 @@ func (a *SlackAdapter) fetchEvents() {
 	// Initianlize the search parameters
 	lastTime := time.Now().Unix()
 
-	for !a.doStop.WaitFor(a.pollInterval) {
+	// A failed request (e.g. the API unreachable or a TLS error) is retried
+	// from the same point after a growing wait, rather than every poll.
+	failures := 0
+	wait := a.pollInterval
+	retryLater := func() {
+		failures++
+		wait = errorBackoff(a.pollInterval, failures)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("request failed %d time(s) in a row, retrying in %v", failures, wait))
+	}
+
+	for !a.doStop.WaitFor(wait) {
+		wait = a.pollInterval
 		isItemsProcessed := false
 
 		// Do a non-paged fetch based on time.
 		entries, nextPage, err := a.makeOneContentRequest(lastTime, "")
 		if err != nil {
-			return
+			retryLater()
+			continue
 		}
+		failures = 0
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries", len(entries)))
 
 		// If we got data, feed it.
@@ -175,7 +194,8 @@ func (a *SlackAdapter) fetchEvents() {
 		for nextPage != "" {
 			entries, nextPage, err = a.makeOneContentRequest(lastTime, nextPage)
 			if err != nil {
-				return
+				retryLater()
+				break
 			}
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries from page", len(entries)))
 
@@ -193,6 +213,19 @@ func (a *SlackAdapter) fetchEvents() {
 			lastTime++
 		}
 	}
+}
+
+// errorBackoff is the wait before the next poll after the given number of
+// consecutive failures: the poll interval, doubled per failure, capped.
+func errorBackoff(pollInterval time.Duration, failures int) time.Duration {
+	wait := pollInterval
+	for i := 1; i < failures && wait < maxErrorBackoff; i++ {
+		wait *= 2
+	}
+	if wait > maxErrorBackoff {
+		wait = maxErrorBackoff
+	}
+	return wait
 }
 
 func (a *SlackAdapter) shipEntries(entries []utils.Dict) (int64, error) {
@@ -254,8 +287,14 @@ func (a *SlackAdapter) makeOneContentRequest(lastTime int64, page string) ([]uti
 
 	// Evaluate if success.
 	if resp.StatusCode != http.StatusOK {
-		body, _ := ioutil.ReadAll(resp.Body)
-		a.conf.ClientOptions.OnError(fmt.Errorf("slack content api non-200: %s\nRESPONSE: %s", resp.Status, string(body)))
+		body, _ := ioutil.ReadAll(io.LimitReader(resp.Body, maxErrorBodyLog+1))
+		truncated := ""
+		if len(body) > maxErrorBodyLog {
+			body = body[:maxErrorBodyLog]
+			truncated = "... (truncated)"
+		}
+		err := fmt.Errorf("slack content api non-200: %s\nRESPONSE: %s%s", resp.Status, string(body), truncated)
+		a.conf.ClientOptions.OnError(err)
 		return nil, "", err
 	}
 

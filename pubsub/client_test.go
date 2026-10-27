@@ -2,6 +2,7 @@ package usp_pubsub
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -294,4 +295,115 @@ func TestCloseFlushesSourceAcksBeforeClosingTransport(t *testing.T) {
 			waitClosed(t, stopped, time.Second, "receive stopped")
 		})
 	}
+}
+
+// setFastRestarts shortens the Receive restart waits for the test.
+func setFastRestarts(t *testing.T, base, max, healthy time.Duration) {
+	t.Helper()
+	ob, om, oh := receiveRestartDelay, receiveRestartMaxDelay, receiveHealthyAfter
+	receiveRestartDelay, receiveRestartMaxDelay, receiveHealthyAfter = base, max, healthy
+	t.Cleanup(func() { receiveRestartDelay, receiveRestartMaxDelay, receiveHealthyAfter = ob, om, oh })
+}
+
+type restartRecord struct {
+	err     error
+	retryIn time.Duration
+}
+
+// A Receive that keeps failing (e.g. TLS to Pub/Sub failing) is restarted
+// with a doubling, capped wait, and every failure is reported with its error
+// and the wait before the next attempt.
+func TestReceiveRestartsBackOff(t *testing.T) {
+	setFastRestarts(t, 10*time.Millisecond, 40*time.Millisecond, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	failure := errors.New("rpc error: code = Unavailable desc = connection error: tls: failed to verify certificate")
+	var mu sync.Mutex
+	var reports []restartRecord
+	calls := 0
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		receiveWithRestarts(ctx, func(context.Context) error {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+			if calls == 5 {
+				cancel()
+			}
+			return failure
+		}, func(err error, retryIn time.Duration) {
+			mu.Lock()
+			defer mu.Unlock()
+			reports = append(reports, restartRecord{err, retryIn})
+		})
+	}()
+	waitClosed(t, done, 5*time.Second, "receive loop")
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 5 {
+		t.Fatalf("receive called %d times, want 5", calls)
+	}
+	want := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 40 * time.Millisecond}
+	if len(reports) != len(want) {
+		t.Fatalf("got %d reports, want %d (the call cancelled by Close is not a failure)", len(reports), len(want))
+	}
+	for i, r := range reports {
+		if r.err != failure {
+			t.Errorf("report %d: err = %v, want the Receive error", i, r.err)
+		}
+		if r.retryIn != want[i] {
+			t.Errorf("report %d: retryIn = %v, want %v", i, r.retryIn, want[i])
+		}
+	}
+}
+
+// A Receive that ran long enough before failing resets the wait: an
+// occasional failure of a healthy subscription is retried quickly.
+func TestReceiveRestartResetsAfterHealthyRun(t *testing.T) {
+	setFastRestarts(t, 10*time.Millisecond, time.Second, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var retries []time.Duration
+	calls := 0
+	receiveWithRestarts(ctx, func(context.Context) error {
+		calls++
+		switch calls {
+		case 4:
+			time.Sleep(60 * time.Millisecond) // a healthy run
+		case 6:
+			cancel()
+		}
+		return errors.New("stream terminated")
+	}, func(_ error, retryIn time.Duration) {
+		retries = append(retries, retryIn)
+	})
+
+	want := []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 10 * time.Millisecond, 20 * time.Millisecond}
+	if len(retries) != len(want) {
+		t.Fatalf("retries = %v, want %v", retries, want)
+	}
+	for i := range want {
+		if retries[i] != want[i] {
+			t.Fatalf("retries = %v, want %v", retries, want)
+		}
+	}
+}
+
+// Cancelling while waiting to restart returns promptly.
+func TestReceiveRestartWaitInterruptedByClose(t *testing.T) {
+	setFastRestarts(t, time.Hour, time.Hour, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		receiveWithRestarts(ctx, func(context.Context) error { return errors.New("boom") }, func(error, time.Duration) {})
+	}()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	waitClosed(t, done, 2*time.Second, "receive loop")
 }

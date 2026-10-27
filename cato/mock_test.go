@@ -36,6 +36,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -384,6 +385,15 @@ func resetAdapterGlobals(t *testing.T) {
 	marker = ""
 	configFile = filepath.Join(t.TempDir(), "cato-marker.txt")
 	pollInterval = 25 * time.Millisecond
+	setFastRetries(t)
+}
+
+// setFastRetries shortens the retry waits for the test, restoring them after.
+func setFastRetries(t *testing.T) {
+	t.Helper()
+	origBase, origMax, origAPI := retryBaseDelay, retryMaxDelay, apiErrorRetryDelay
+	retryBaseDelay, retryMaxDelay, apiErrorRetryDelay = 10*time.Millisecond, 40*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { retryBaseDelay, retryMaxDelay, apiErrorRetryDelay = origBase, origMax, origAPI })
 }
 
 // newMockServer starts an httptest server for the mock, closed at test end
@@ -641,9 +651,8 @@ func TestCatoMarkerPersistenceResume(t *testing.T) {
 // Failure handling lives in the adapter's send(): a response carrying a
 // GraphQL "errors" key is reported as a failure to the caller; a rate-limit
 // error is retried in place. These are exercised directly (on an adapter
-// struct that has no polling goroutine) because the feed loop's own failure
-// path retries with multi-second sleeps and then crashes the process, which
-// cannot be hosted in a unit test.
+// struct that has no polling goroutine). Transport failures and the feed
+// loop's handling of a query that keeps failing are covered at the end.
 
 // bareAdapter builds a CatoAdapter without starting the polling goroutine, for
 // driving send() directly.
@@ -734,4 +743,190 @@ func TestCatoSendRateLimitRetried(t *testing.T) {
 	feed := resp["data"].(map[string]interface{})["eventsFeed"].(map[string]interface{})
 	assert.Equal(t, float64(1), feed["fetchedCount"])
 	assert.Equal(t, mockMarkerPrefix+"1", feed["marker"])
+}
+
+// flakyTransport fronts a handler and drops the connection of the first failN
+// requests, which the client sees as a transport error -- what a failed TLS
+// handshake looks like to it.
+type flakyTransport struct {
+	mu       sync.Mutex
+	failN    int
+	requests int
+	next     http.Handler
+}
+
+func (f *flakyTransport) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	f.requests++
+	failing := f.requests <= f.failN
+	f.mu.Unlock()
+	if failing {
+		if conn, _, err := w.(http.Hijacker).Hijack(); err == nil {
+			conn.Close()
+		}
+		return
+	}
+	f.next.ServeHTTP(w, r)
+}
+
+func (f *flakyTransport) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requests
+}
+
+// logRecorder collects warnings and errors reported by the adapter.
+type logRecorder struct {
+	mu       sync.Mutex
+	warnings []string
+	errors   []string
+}
+
+func (r *logRecorder) wire(t *testing.T, o *uspclient.ClientOptions) {
+	o.OnWarning = func(msg string) {
+		t.Logf("WRN: %s", msg)
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.warnings = append(r.warnings, msg)
+	}
+	o.OnError = func(err error) {
+		t.Logf("ERR: %v", err)
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		r.errors = append(r.errors, err.Error())
+	}
+}
+
+func (r *logRecorder) snapshot() (warnings, errors []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.warnings...), append([]string(nil), r.errors...)
+}
+
+func flakyAdapter(t *testing.T, mock *mockCato, failN int) (*CatoAdapter, *flakyTransport, *logRecorder) {
+	t.Helper()
+	setFastRetries(t)
+	flaky := &flakyTransport{failN: failN, next: mock.handler()}
+	server := httptest.NewServer(flaky)
+	t.Cleanup(server.Close)
+	a := bareAdapter(t, server, mock.apiKey)
+	a.isRunning = 1
+	rec := &logRecorder{}
+	rec.wire(t, &a.conf.ClientOptions)
+	return a, flaky, rec
+}
+
+// TestCatoSendTransportErrorBacksOff verifies a request failing in transport
+// is retried with a doubling, capped wait, each failure reported with the
+// error and the wait before the next attempt.
+func TestCatoSendTransportErrorBacksOff(t *testing.T) {
+	mock := newMockCato(t)
+	mock.addEvent(securityEvent(1, "2026-06-11T10:00:00Z"))
+	a, flaky, rec := flakyAdapter(t, mock, 4)
+
+	ok, _ := a.send(eventsFeedQuery(mock.accountID, ""), mock.accountID, mock.apiKey)
+
+	assert.True(t, ok, "the call must succeed once the transport recovers")
+	assert.Equal(t, 5, flaky.count())
+	warnings, errs := rec.snapshot()
+	assert.Empty(t, errs)
+	require.Len(t, warnings, 4)
+	for i, want := range []string{"retrying in 10ms", "retrying in 20ms", "retrying in 40ms", "retrying in 40ms"} {
+		assert.Contains(t, warnings[i], fmt.Sprintf("(attempt %d), %s: ", i+1, want))
+		assert.Contains(t, warnings[i], "EOF", "the underlying error must be in the message")
+	}
+}
+
+// TestCatoSendKeepsRetryingPastEscalation verifies a long outage is escalated
+// to an error once, but no longer kills the process: retries continue until
+// the API is reachable again.
+func TestCatoSendKeepsRetryingPastEscalation(t *testing.T) {
+	mock := newMockCato(t)
+	mock.addEvent(securityEvent(1, "2026-06-11T10:00:00Z"))
+	a, flaky, rec := flakyAdapter(t, mock, retryEscalateAfter+3)
+	retryBaseDelay, retryMaxDelay = time.Millisecond, 2*time.Millisecond
+
+	ok, _ := a.send(eventsFeedQuery(mock.accountID, ""), mock.accountID, mock.apiKey)
+
+	assert.True(t, ok)
+	assert.Equal(t, retryEscalateAfter+4, flaky.count())
+	warnings, errs := rec.snapshot()
+	require.Len(t, errs, 1, "escalated exactly once")
+	assert.Contains(t, errs[0], fmt.Sprintf("(attempt %d)", retryEscalateAfter))
+	assert.Len(t, warnings, retryEscalateAfter+2)
+}
+
+// TestCatoSendStopsRetryingOnStop verifies a send() stuck retrying returns
+// promptly when the adapter is stopped.
+func TestCatoSendStopsRetryingOnStop(t *testing.T) {
+	mock := newMockCato(t)
+	a, _, _ := flakyAdapter(t, mock, 1<<30)
+	retryBaseDelay, retryMaxDelay = time.Hour, time.Hour
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ok, resp := a.send(eventsFeedQuery(mock.accountID, ""), mock.accountID, mock.apiKey)
+		assert.False(t, ok)
+		assert.Nil(t, resp)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	a.mRunning.Lock()
+	a.isRunning = 0
+	a.mRunning.Unlock()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("send() must return when the adapter stops")
+	}
+}
+
+func TestCatoRetryDelay(t *testing.T) {
+	setFastRetries(t)
+	retryBaseDelay, retryMaxDelay = 2*time.Second, 5*time.Minute
+	assert.Equal(t, 2*time.Second, retryDelay(1))
+	assert.Equal(t, 4*time.Second, retryDelay(2))
+	assert.Equal(t, 256*time.Second, retryDelay(8))
+	assert.Equal(t, 5*time.Minute, retryDelay(9))
+	assert.Equal(t, 5*time.Minute, retryDelay(1000), "no overflow")
+}
+
+// TestCatoFeedLoopSurvivesFailingQuery verifies the feed loop reports a query
+// that keeps failing and tries again on the next poll, instead of crashing on
+// the missing data, and resumes shipping once the API answers again.
+func TestCatoFeedLoopSurvivesFailingQuery(t *testing.T) {
+	mock := newMockCato(t)
+	mock.forcedError = "internal error"
+	mock.addEvent(securityEvent(1, "2026-06-11T10:00:00Z"))
+	server := newMockServer(t, mock)
+	resetAdapterGlobals(t)
+
+	rec := &logRecorder{}
+	conf := CatoConfig{
+		ClientOptions: testClientOptions(t),
+		ApiKey:        mock.apiKey,
+		AccountId:     testAccountID,
+		Url:           server.URL + "/api/v1/graphql2",
+	}
+	rec.wire(t, &conf.ClientOptions)
+	sink := &captureSink{}
+	adapter, chStopped, err := newCatoAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	t.Cleanup(func() { stopAdapter(t, adapter, chStopped) })
+
+	require.Eventually(t, func() bool {
+		_, errs := rec.snapshot()
+		return len(errs) >= 1
+	}, 5*time.Second, 10*time.Millisecond)
+	_, errs := rec.snapshot()
+	assert.Contains(t, errs[0], fmt.Sprintf("failed after %d attempts", queryAttempts))
+	assert.Contains(t, errs[0], "internal error", "the API's error must be reported")
+
+	mock.mu.Lock()
+	mock.forcedError = ""
+	mock.mu.Unlock()
+
+	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, 10*time.Millisecond)
 }

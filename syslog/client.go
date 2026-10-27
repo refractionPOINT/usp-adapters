@@ -23,6 +23,11 @@ const (
 	udpBufferSize       = 64 * 1024
 )
 
+// tlsHandshakeTimeout bounds how long a TLS client may take to complete the
+// handshake, so a client that connects and never speaks does not hold a
+// goroutine forever. A variable only so tests can shorten it.
+var tlsHandshakeTimeout = 30 * time.Second
+
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
 // LimaCharlie client; *uspclient.Client satisfies it unchanged.
@@ -212,6 +217,17 @@ func (a *SyslogAdapter) handleConnection(conn net.Conn, isDatagram bool) {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("connection from %+v leaving", conn.RemoteAddr()))
 		conn.Close()
 	}()
+
+	if tlsConn, ok := conn.(*tls.Conn); ok {
+		// Handshake explicitly so its failure is reported as what it is,
+		// rather than surfacing as a read error on the first Read.
+		tlsConn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
+		if err := tlsConn.Handshake(); err != nil {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("tls handshake with %s failed: %v", conn.RemoteAddr(), err))
+			return
+		}
+		tlsConn.SetDeadline(time.Time{})
+	}
 
 	readBufferSize := 1024 * 16
 	st := utils.StreamTokenizer{

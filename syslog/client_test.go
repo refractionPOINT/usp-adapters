@@ -642,3 +642,135 @@ func TestUDPCloseStopsShipping(t *testing.T) {
 		"nothing sent after Close may ship")
 	require.Equal(t, []string{preLine}, sink.textPayloads())
 }
+
+// warningRecorder collects the adapter's OnWarning messages.
+type warningRecorder struct {
+	mu   sync.Mutex
+	msgs []string
+}
+
+func (r *warningRecorder) record(msg string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.msgs = append(r.msgs, msg)
+}
+
+func (r *warningRecorder) snapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.msgs...)
+}
+
+func startTLSAdapterRecordingWarnings(t *testing.T, sink uspSink) (string, *warningRecorder) {
+	t.Helper()
+	dir := t.TempDir()
+	server := newTestCert(t, "host1.example.com", false, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, nil)
+	rec := &warningRecorder{}
+	_, _, addr := startSyslogAdapter(t, sink, func(c *SyslogConfig) {
+		c.SslCertPath = writeTempFile(t, dir, "server.crt", server.certPEM)
+		c.SslKeyPath = writeTempFile(t, dir, "server.key", server.keyPEM)
+		c.ClientOptions.OnWarning = rec.record
+	})
+	return addr, rec
+}
+
+// TestTLSHandshakeFailureReportedOncePerConnection covers a sender with a
+// broken TLS setup (here: plain text sent to the TLS port). Each attempt is
+// reported as one handshake failure naming the sender, which is what an
+// operator needs to find the misconfigured host, and nothing ships.
+func TestTLSHandshakeFailureReportedOncePerConnection(t *testing.T) {
+	t.Parallel()
+	sink := &captureSink{}
+	addr, rec := startTLSAdapterRecordingWarnings(t, sink)
+
+	const attempts = 3
+	for i := 0; i < attempts; i++ {
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		_, _ = conn.Write([]byte(sampleRFC3164 + "\n"))
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = conn.Read(make([]byte, 64))
+		conn.Close()
+	}
+
+	require.Eventually(t, func() bool { return len(rec.snapshot()) == attempts }, eventuallyTimeout, eventuallyTick)
+	for _, w := range rec.snapshot() {
+		require.True(t, strings.HasPrefix(w, "tls handshake with 127.0.0.1:"), w)
+		require.Contains(t, w, "failed: ")
+	}
+	require.Never(t, func() bool { return len(rec.snapshot()) > attempts }, 200*time.Millisecond, eventuallyTick,
+		"one warning per failed connection")
+	require.Equal(t, 0, sink.count())
+}
+
+// TestTLSUntrustedClientCertificateReported covers the client side rejecting
+// the server certificate: the server sees the client's alert and reports it.
+func TestTLSUntrustedClientCertificateReported(t *testing.T) {
+	t.Parallel()
+	sink := &captureSink{}
+	addr, rec := startTLSAdapterRecordingWarnings(t, sink)
+
+	// The client does not trust the adapter's self-signed certificate.
+	_, err := tls.Dial("tcp", addr, &tls.Config{ServerName: "host1.example.com"})
+	require.Error(t, err)
+
+	require.Eventually(t, func() bool { return len(rec.snapshot()) == 1 }, eventuallyTimeout, eventuallyTick)
+	w := rec.snapshot()[0]
+	require.True(t, strings.HasPrefix(w, "tls handshake with 127.0.0.1:"), w)
+	require.Contains(t, w, "bad certificate", "the TLS alert tells the operator what went wrong")
+}
+
+// TestTLSSilentClientTimesOut covers a client that connects and never starts
+// the handshake: it is dropped after tlsHandshakeTimeout instead of holding a
+// goroutine forever. Not parallel: it shortens a package variable.
+func TestTLSSilentClientTimesOut(t *testing.T) {
+	orig := tlsHandshakeTimeout
+	tlsHandshakeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { tlsHandshakeTimeout = orig })
+
+	sink := &captureSink{}
+	addr, rec := startTLSAdapterRecordingWarnings(t, sink)
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.Eventually(t, func() bool { return len(rec.snapshot()) == 1 }, eventuallyTimeout, eventuallyTick)
+	require.Contains(t, rec.snapshot()[0], "timeout")
+
+	// The server closed its side.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err = conn.Read(make([]byte, 1))
+	require.Error(t, err)
+	var netErr net.Error
+	require.False(t, errors.As(err, &netErr) && netErr.Timeout(), "the server must close the connection, not leave it hanging")
+}
+
+// TestTLSHandshakeDeadlineClearedAfterHandshake ensures the handshake deadline
+// does not apply to the session: a sender idle for longer than it, after a
+// successful handshake, still delivers. Not parallel: it shortens a package
+// variable.
+func TestTLSHandshakeDeadlineClearedAfterHandshake(t *testing.T) {
+	orig := tlsHandshakeTimeout
+	tlsHandshakeTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { tlsHandshakeTimeout = orig })
+
+	dir := t.TempDir()
+	server := newTestCert(t, "host1.example.com", false, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, nil)
+	sink := &captureSink{}
+	_, _, addr := startSyslogAdapter(t, sink, func(c *SyslogConfig) {
+		c.SslCertPath = writeTempFile(t, dir, "server.crt", server.certPEM)
+		c.SslKeyPath = writeTempFile(t, dir, "server.key", server.keyPEM)
+	})
+
+	roots := x509.NewCertPool()
+	require.True(t, roots.AppendCertsFromPEM(server.certPEM))
+	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: roots, ServerName: "host1.example.com"})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	time.Sleep(3 * tlsHandshakeTimeout)
+	_, err = conn.Write([]byte(sampleRFC3164 + "\n"))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return sink.count() == 1 }, eventuallyTimeout, eventuallyTick)
+}

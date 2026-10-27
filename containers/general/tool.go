@@ -276,10 +276,13 @@ func main() {
 	}
 	for _, client := range clients {
 		if err := client.Close(); err != nil {
+			processLogLimiter.flush(true)
 			logError("error closing client: %v", err)
 			os.Exit(1)
 		}
 	}
+	// Report repeats still folded in the limiter before exiting.
+	processLogLimiter.flush(true)
 	log("exited")
 }
 
@@ -621,14 +624,17 @@ func applyLogging(o uspclient.ClientOptions) uspclient.ClientOptions {
 		lastBackPressure: time.Now(),
 	}
 
+	// Adapter and USP client messages go through the limiter so that a
+	// failure retried in a loop (e.g. a TLS error) cannot flood the logs.
+	processLogLimiter.startFlusher()
 	o.DebugLog = func(msg string) {
-		log("DBG %s: %s", time.Now().Format(time.Stamp), msg)
+		processLogLimiter.Log("DBG", msg)
 	}
 	o.OnWarning = func(msg string) {
-		log("WRN %s: %s", time.Now().Format(time.Stamp), msg)
+		processLogLimiter.Log("WRN", msg)
 	}
 	o.OnError = func(err error) {
-		logError("ERR %s: %s", time.Now().Format(time.Stamp), err.Error())
+		processLogLimiter.Log("ERR", err.Error())
 	}
 	o.BufferOptions.OnBackPressure = func() {
 		stats.m.Lock()

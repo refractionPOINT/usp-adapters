@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -570,8 +571,8 @@ func TestNewestFirstPaginationReships(t *testing.T) {
 
 // TestBadTokenShipsNothing pins the adapter's actual behavior on auth failure:
 // the Audit Logs API answers 401, the adapter reports the error and ships
-// nothing -- but it does NOT stop; it keeps polling (a non-200 is reported via
-// OnError and surfaced as a nil-error empty result to the poll loop).
+// nothing -- but it does NOT stop; it keeps polling, backing off between
+// failed requests.
 func TestBadTokenShipsNothing(t *testing.T) {
 	const token = "xoxp-1111111111-fake-test-token"
 	base := time.Now().Unix() + 5
@@ -606,26 +607,162 @@ func TestBadTokenShipsNothing(t *testing.T) {
 	}
 }
 
-// TestUnreachableAPIStopsAdapter pins the adapter's behavior on transport
-// errors: a failed HTTP request terminates the polling loop (chStopped closes)
-// and nothing ships.
-func TestUnreachableAPIStopsAdapter(t *testing.T) {
-	// Grab a URL that refuses connections.
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	deadURL := server.URL
-	server.Close()
+// failingServer answers the first failN requests with the given failure and
+// then delegates to next. It counts every request it sees, with its time.
+type failingServer struct {
+	mu       sync.Mutex
+	failN    int
+	fail     func(w http.ResponseWriter)
+	next     http.HandlerFunc
+	requests []time.Time
+}
+
+func (f *failingServer) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.requests = append(f.requests, time.Now())
+		failing := len(f.requests) <= f.failN
+		f.mu.Unlock()
+		if failing {
+			f.fail(w)
+			return
+		}
+		f.next(w, r)
+	}
+}
+
+func (f *failingServer) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests)
+}
+
+func (f *failingServer) gaps() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []time.Duration
+	for i := 1; i < len(f.requests); i++ {
+		out = append(out, f.requests[i].Sub(f.requests[i-1]))
+	}
+	return out
+}
+
+// dropConnection makes the HTTP client see a transport error, as it would on
+// a failed TLS handshake.
+func dropConnection(w http.ResponseWriter) {
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err == nil {
+		conn.Close()
+	}
+}
+
+// TestTransportErrorsRetriedWithBackoff covers the API being unreachable (e.g.
+// TLS failing): the adapter keeps running, reports each failure, and waits
+// longer after each consecutive failure instead of retrying every poll.
+func TestTransportErrorsRetriedWithBackoff(t *testing.T) {
+	fs := &failingServer{failN: 1 << 30, fail: dropConnection}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	var reported atomic.Int32
+	conf := testConf(t, server.URL, "xoxp-1111111111-fake-test-token")
+	conf.ClientOptions.OnError = func(err error) {
+		t.Logf("ERR: %v", err)
+		reported.Add(1)
+	}
 
 	sink := &captureSink{}
-	adapter, chStopped, err := newSlackAdapter(t.Context(),
-		testConf(t, deadURL, "xoxp-1111111111-fake-test-token"), sink)
+	adapter, chStopped, err := newSlackAdapter(t.Context(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	// With a 50ms poll interval, retrying every poll would make ~30 requests
+	// in 1.5s; backing off (50, 100, 200, 400, 800ms) makes about 4.
+	time.Sleep(1500 * time.Millisecond)
+	n := fs.count()
+	assert.GreaterOrEqual(t, n, 3, "the adapter must keep retrying")
+	assert.LessOrEqual(t, n, 6, "the adapter must back off between failures")
+	assert.Equal(t, int32(n), reported.Load(), "every failure is reported")
+
+	gaps := fs.gaps()
+	for i := 1; i < len(gaps); i++ {
+		assert.Greater(t, gaps[i], gaps[i-1], "waits grow: %v", gaps)
+	}
+
+	select {
+	case <-chStopped:
+		t.Fatal("a transport error must not stop the adapter")
+	default:
+	}
+	assert.Equal(t, 0, sink.count())
+}
+
+// TestRecoversAfterFailures covers the API coming back: entries ship once
+// requests succeed, and polling returns to the normal interval.
+func TestRecoversAfterFailures(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	mock := newMockSlack(token, 100)
+	mock.addEntry(auditEntry(fixtureID(1), time.Now().Unix()+5, "user_login"))
+
+	fs := &failingServer{failN: 3, fail: dropConnection, next: mock.handler()}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _, err := newSlackAdapter(t.Context(), testConf(t, server.URL, token), sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	// Back at the 50ms poll interval: many requests in the next 500ms.
+	before := fs.count()
+	time.Sleep(500 * time.Millisecond)
+	assert.GreaterOrEqual(t, fs.count()-before, 5, "polling must return to the normal interval after a success")
+}
+
+// TestNon200BodyTruncatedInError covers a TLS-inspecting proxy answering with
+// a large HTML error page: the status and the start of the body are reported,
+// the rest is cut.
+func TestNon200BodyTruncatedInError(t *testing.T) {
+	page := "<html>" + strings.Repeat("x", 10*1024) + "</html>"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(page))
+	}))
+	defer server.Close()
+
+	errs := make(chan error, 10)
+	conf := testConf(t, server.URL, "xoxp-1111111111-fake-test-token")
+	conf.ClientOptions.OnError = func(err error) {
+		select {
+		case errs <- err:
+		default:
+		}
+	}
+
+	sink := &captureSink{}
+	adapter, _, err := newSlackAdapter(t.Context(), conf, sink)
 	require.NoError(t, err)
 	defer adapter.Close()
 
 	select {
-	case <-chStopped:
-		// Expected: a transport error terminates the fetch loop.
+	case err := <-errs:
+		msg := err.Error()
+		assert.Contains(t, msg, "403 Forbidden")
+		assert.Contains(t, msg, "<html>xxx")
+		assert.True(t, strings.HasSuffix(msg, "... (truncated)"), "end of message: %q", msg[len(msg)-40:])
+		assert.Less(t, len(msg), 1200)
 	case <-time.After(5 * time.Second):
-		t.Fatal("adapter should stop when the API is unreachable")
+		t.Fatal("the non-200 must be reported")
 	}
-	assert.Equal(t, 0, sink.count())
+}
+
+func TestErrorBackoff(t *testing.T) {
+	assert.Equal(t, 5*time.Second, errorBackoff(5*time.Second, 1))
+	assert.Equal(t, 10*time.Second, errorBackoff(5*time.Second, 2))
+	assert.Equal(t, 40*time.Second, errorBackoff(5*time.Second, 4))
+	assert.Equal(t, maxErrorBackoff, errorBackoff(5*time.Second, 10))
+	assert.Equal(t, maxErrorBackoff, errorBackoff(5*time.Second, 1000), "no overflow")
+	assert.Equal(t, maxErrorBackoff, errorBackoff(10*time.Minute, 1), "capped even on the first failure")
 }
