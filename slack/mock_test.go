@@ -688,12 +688,13 @@ func TestTransportErrorsRetriedWithBackoff(t *testing.T) {
 	require.Eventually(t, func() bool { return reported.Load() >= 4 }, 10*time.Second, 10*time.Millisecond,
 		"every failure is reported")
 
-	// The waits double (100, 200, 400ms between the first requests with a
+	// The waits double (50, 100, 200ms between the first requests with a
 	// 50ms poll interval), where retrying every poll would leave ~50ms gaps.
+	// Lower bounds only: a slow runner can make a gap longer, never shorter
+	// than the wait before it.
 	gaps := fs.gaps()[:3]
-	for i := 1; i < len(gaps); i++ {
-		assert.Greater(t, gaps[i], gaps[i-1]*3/2, "waits must grow: %v", gaps)
-	}
+	assert.GreaterOrEqual(t, gaps[1], 80*time.Millisecond, "waits must grow: %v", gaps)
+	assert.GreaterOrEqual(t, gaps[2], 160*time.Millisecond, "waits must grow: %v", gaps)
 
 	select {
 	case <-chStopped:

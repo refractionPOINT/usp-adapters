@@ -403,6 +403,7 @@ func TestLogLimiterConcurrentAccounting(t *testing.T) {
 // reaches f through those limiters, which f's own lock protects.
 func captureLogOutput(t *testing.T, f *fakeLogOutput) {
 	t.Helper()
+	resetFinalFlush(t)
 	orig := logOutput
 	logOutput = f.out
 	t.Cleanup(func() { logOutput = orig })
@@ -538,6 +539,7 @@ func isRegistered(l *logLimiter) bool {
 // newTrackedTestLimiter is newTestLimiter for a limiter taking part in the
 // registry, like the ones applyLogging creates.
 func newTrackedTestLimiter(t *testing.T) (*logLimiter, *fakeLogOutput) {
+	resetFinalFlush(t)
 	l, f := newTestLimiter()
 	l.tracked = true
 	t.Cleanup(func() {
@@ -586,4 +588,31 @@ func TestLogLimiterReRegistersWhenActiveAgain(t *testing.T) {
 
 	flushLogLimiters(true)
 	assert.Equal(t, 1+2+logRateBurst+3, accountedFor(t, f.lines), "the exit flush must reach it")
+}
+
+// resetFinalFlush clears the process-wide final flush flag for the test, as
+// tests flush finally without the process exiting.
+func resetFinalFlush(t *testing.T) {
+	t.Helper()
+	logFinalFlushed.Store(false)
+	t.Cleanup(func() { logFinalFlushed.Store(false) })
+}
+
+// TestLogLimiterIdleLimiterPrintsDirectlyAfterFinalFlush covers a limiter
+// that was idle, so not listed, at the final flush: lines it gets afterwards
+// must be printed, not folded into a count nothing will report.
+func TestLogLimiterIdleLimiterPrintsDirectlyAfterFinalFlush(t *testing.T) {
+	l, f := newTrackedTestLimiter(t)
+
+	l.Log("ERR", "first")
+	f.advance(logDedupWindow)
+	flushLogLimiters(false)
+	require.False(t, isRegistered(l))
+
+	flushLogLimiters(true)
+	l.Log("ERR", "late")
+	l.Log("ERR", "late")
+
+	assert.Equal(t, []string{"ERR first", "ERR late", "ERR late"}, f.msgs())
+	assert.False(t, isRegistered(l))
 }

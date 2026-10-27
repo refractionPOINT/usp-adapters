@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -142,7 +143,11 @@ func logDedupDisabled() bool {
 var (
 	logLimitersMu sync.Mutex
 	logLimiters   []*logLimiter
-	logFlusherOne sync.Once
+	// logFinalFlushed is set by the final flush. From then on tracked
+	// limiters print every line directly, including those not listed at
+	// that moment because they were idle.
+	logFinalFlushed atomic.Bool
+	logFlusherOne   sync.Once
 )
 
 // newAdapterLogLimiter returns the limiter for one adapter. Each adapter gets
@@ -172,12 +177,27 @@ func newAdapterLogLimiter() *logLimiter {
 // flushLogLimiters flushes every adapter's limiter. With final set, all
 // pending counts are reported and later lines are printed directly.
 func flushLogLimiters(final bool) {
-	logLimitersMu.Lock()
-	ls := append([]*logLimiter(nil), logLimiters...)
-	logLimitersMu.Unlock()
-	for _, l := range ls {
-		l.flush(final)
-		l.unregisterIfIdle()
+	if final {
+		logFinalFlushed.Store(true)
+	}
+	flushed := map[*logLimiter]bool{}
+	// With final set, a second pass reaches limiters registered by a line
+	// logged while the first one ran.
+	for pass := 0; pass < 2; pass++ {
+		logLimitersMu.Lock()
+		ls := append([]*logLimiter(nil), logLimiters...)
+		logLimitersMu.Unlock()
+		for _, l := range ls {
+			if flushed[l] {
+				continue
+			}
+			flushed[l] = true
+			l.flush(final)
+			l.unregisterIfIdle()
+		}
+		if !final {
+			break
+		}
 	}
 }
 
@@ -250,7 +270,7 @@ func (l *logLimiter) record(level string, msg string) []logLine {
 	defer l.registerIfPendingLocked()
 	now := l.now()
 
-	if l.disabled || l.closed {
+	if l.disabled || l.closed || (l.tracked && logFinalFlushed.Load()) {
 		return []logLine{{level, now, msg}}
 	}
 
