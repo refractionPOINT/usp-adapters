@@ -469,16 +469,22 @@ func TestLogLimiterAfterFinalFlushPrintsDirectly(t *testing.T) {
 
 func TestLogLimiterBlockedOutputDoesNotStallCountedCallers(t *testing.T) {
 	release := make(chan struct{})
+	blocked := make(chan struct{})
 	var once sync.Once
 	l := newLogLimiter(func(level string, _ time.Time, msg string) {
 		if level == "DBG" {
-			once.Do(func() { <-release }) // stdout stuck on the first write
+			// stdout stuck on the first write
+			once.Do(func() { close(blocked); <-release })
 		}
 	})
 	defer close(release)
 
 	go l.Log("DBG", "stuck line")
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first line never reached the output")
+	}
 
 	done := make(chan struct{})
 	go func() {
@@ -516,4 +522,68 @@ func TestLogDedupDisabledEnv(t *testing.T) {
 		t.Setenv(logDedupDisableEnv, v)
 		assert.Equal(t, want, logDedupDisabled(), "%s=%q", logDedupDisableEnv, v)
 	}
+}
+
+func isRegistered(l *logLimiter) bool {
+	logLimitersMu.Lock()
+	defer logLimitersMu.Unlock()
+	for _, other := range logLimiters {
+		if other == l {
+			return true
+		}
+	}
+	return false
+}
+
+// newTrackedTestLimiter is newTestLimiter for a limiter taking part in the
+// registry, like the ones applyLogging creates.
+func newTrackedTestLimiter(t *testing.T) (*logLimiter, *fakeLogOutput) {
+	l, f := newTestLimiter()
+	l.tracked = true
+	t.Cleanup(func() {
+		l.flush(true)
+		l.unregisterIfIdle()
+	})
+	return l, f
+}
+
+// TestLogLimiterIdleLimiterLeavesRegistry covers adapters replaced by a
+// config update: their limiter drops out of the registry once it has nothing
+// left to report, instead of accumulating.
+func TestLogLimiterIdleLimiterLeavesRegistry(t *testing.T) {
+	l, f := newTrackedTestLimiter(t)
+
+	l.Log("ERR", "boom")
+	l.Log("ERR", "boom")
+	require.True(t, isRegistered(l), "a limiter holding a repeat must be flushed")
+
+	f.advance(logDedupWindow)
+	flushLogLimiters(false) // reports the repeat, starts a new window
+	require.True(t, isRegistered(l))
+	f.advance(logDedupWindow)
+	flushLogLimiters(false) // quiet window: entry forgotten
+	assert.False(t, isRegistered(l), "an idle limiter must leave the registry")
+	assert.Equal(t, 2, accountedFor(t, f.lines))
+}
+
+// TestLogLimiterReRegistersWhenActiveAgain ensures a limiter that left the
+// registry is listed again as soon as it holds something, so the exit flush
+// still reports it.
+func TestLogLimiterReRegistersWhenActiveAgain(t *testing.T) {
+	l, f := newTrackedTestLimiter(t)
+
+	l.Log("WRN", "first")
+	f.advance(logDedupWindow)
+	flushLogLimiters(false)
+	require.False(t, isRegistered(l))
+
+	l.Log("WRN", "again")
+	l.Log("WRN", "again")
+	require.True(t, isRegistered(l))
+	for i := 0; i < logRateBurst+3; i++ {
+		l.Log("DBG", fmt.Sprintf("distinct %d", i))
+	}
+
+	flushLogLimiters(true)
+	assert.Equal(t, 1+2+logRateBurst+3, accountedFor(t, f.lines), "the exit flush must reach it")
 }

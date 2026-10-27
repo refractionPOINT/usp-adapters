@@ -681,17 +681,18 @@ func TestTransportErrorsRetriedWithBackoff(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// With a 50ms poll interval, retrying every poll would make ~30 requests
-	// in 1.5s; backing off (50, 100, 200, 400, 800ms) makes about 4.
-	time.Sleep(1500 * time.Millisecond)
-	n := fs.count()
-	assert.GreaterOrEqual(t, n, 3, "the adapter must keep retrying")
-	assert.LessOrEqual(t, n, 6, "the adapter must back off between failures")
-	assert.Equal(t, int32(n), reported.Load(), "every failure is reported")
+	// Wait on what the server and the adapter observed, not on a fixed
+	// time: 4 failed requests, all reported.
+	require.Eventually(t, func() bool { return fs.count() >= 4 }, 10*time.Second, 10*time.Millisecond,
+		"the adapter must keep retrying")
+	require.Eventually(t, func() bool { return reported.Load() >= 4 }, 10*time.Second, 10*time.Millisecond,
+		"every failure is reported")
 
-	gaps := fs.gaps()
+	// The waits double (100, 200, 400ms between the first requests with a
+	// 50ms poll interval), where retrying every poll would leave ~50ms gaps.
+	gaps := fs.gaps()[:3]
 	for i := 1; i < len(gaps); i++ {
-		assert.Greater(t, gaps[i], gaps[i-1], "waits grow: %v", gaps)
+		assert.Greater(t, gaps[i], gaps[i-1]*3/2, "waits must grow: %v", gaps)
 	}
 
 	select {
@@ -709,7 +710,10 @@ func TestRecoversAfterFailures(t *testing.T) {
 	mock := newMockSlack(token, 100)
 	mock.addEntry(auditEntry(fixtureID(1), time.Now().Unix()+5, "user_login"))
 
-	fs := &failingServer{failN: 3, fail: dropConnection, next: mock.handler()}
+	// 6 failures back off to 1.6s; a poll after recovering that kept that
+	// wait would come at 3.2s, one back at the poll interval within 50ms.
+	const failN = 6
+	fs := &failingServer{failN: failN, fail: dropConnection, next: mock.handler()}
 	server := httptest.NewServer(fs.handler())
 	defer server.Close()
 
@@ -718,12 +722,13 @@ func TestRecoversAfterFailures(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return sink.count() == 1 }, 15*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return fs.count() >= failN+3 }, 15*time.Second, 10*time.Millisecond)
 
-	// Back at the 50ms poll interval: many requests in the next 500ms.
-	before := fs.count()
-	time.Sleep(500 * time.Millisecond)
-	assert.GreaterOrEqual(t, fs.count()-before, 5, "polling must return to the normal interval after a success")
+	gaps := fs.gaps()
+	for _, g := range gaps[failN : failN+2] {
+		assert.Less(t, g, time.Second, "polling must return to the normal interval after a success: %v", gaps)
+	}
 }
 
 // TestNon200BodyTruncatedInError covers a TLS-inspecting proxy answering with

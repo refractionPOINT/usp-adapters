@@ -82,14 +82,20 @@ type logLimiter struct {
 	mu       sync.Mutex
 	disabled bool
 	closed   bool // after the final flush: print everything directly
-	window   time.Duration
-	rate     float64 // lines per second, per level
-	burst    float64
-	maxKeys  int
-	now      func() time.Time
-	out      func(level string, ts time.Time, msg string)
-	entries  map[string]*logEntry
-	buckets  map[string]*logBucket
+	// tracked limiters are listed in logLimiters while they hold anything
+	// to report (registered), so the flusher and the exit flush reach them,
+	// and drop out of it once idle, so limiters of adapters replaced by a
+	// config update do not accumulate.
+	tracked    bool
+	registered bool
+	window     time.Duration
+	rate       float64 // lines per second, per level
+	burst      float64
+	maxKeys    int
+	now        func() time.Time
+	out        func(level string, ts time.Time, msg string)
+	entries    map[string]*logEntry
+	buckets    map[string]*logBucket
 }
 
 func newLogLimiter(out func(level string, ts time.Time, msg string)) *logLimiter {
@@ -145,10 +151,7 @@ var (
 func newAdapterLogLimiter() *logLimiter {
 	l := newLogLimiter(logOutput)
 	l.disabled = logDedupDisabled()
-
-	logLimitersMu.Lock()
-	logLimiters = append(logLimiters, l)
-	logLimitersMu.Unlock()
+	l.tracked = true
 
 	logFlusherOne.Do(func() {
 		if l.disabled {
@@ -174,7 +177,51 @@ func flushLogLimiters(final bool) {
 	logLimitersMu.Unlock()
 	for _, l := range ls {
 		l.flush(final)
+		l.unregisterIfIdle()
 	}
+}
+
+// hasPendingLocked reports whether the limiter holds anything a flush would
+// report, or will once a window is over. l.mu must be held.
+func (l *logLimiter) hasPendingLocked() bool {
+	if len(l.entries) != 0 {
+		return true
+	}
+	for _, b := range l.buckets {
+		if b.dropped != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// registerIfPendingLocked lists a tracked limiter that has something to
+// report. l.mu must be held; it is always taken before logLimitersMu.
+func (l *logLimiter) registerIfPendingLocked() {
+	if !l.tracked || l.registered || !l.hasPendingLocked() {
+		return
+	}
+	logLimitersMu.Lock()
+	logLimiters = append(logLimiters, l)
+	logLimitersMu.Unlock()
+	l.registered = true
+}
+
+func (l *logLimiter) unregisterIfIdle() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.registered || l.hasPendingLocked() {
+		return
+	}
+	logLimitersMu.Lock()
+	for i, other := range logLimiters {
+		if other == l {
+			logLimiters = append(logLimiters[:i], logLimiters[i+1:]...)
+			break
+		}
+	}
+	logLimitersMu.Unlock()
+	l.registered = false
 }
 
 // exitProcess reports what the limiters still hold, then exits.
@@ -200,6 +247,7 @@ func (l *logLimiter) Log(level string, msg string) {
 func (l *logLimiter) record(level string, msg string) []logLine {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	defer l.registerIfPendingLocked()
 	now := l.now()
 
 	if l.disabled || l.closed {
