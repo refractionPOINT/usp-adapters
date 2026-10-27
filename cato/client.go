@@ -91,7 +91,6 @@ type uspSink interface {
 
 type CatoAdapter struct {
 	conf         CatoConfig
-	wg           sync.WaitGroup
 	isRunning    uint32
 	mRunning     sync.RWMutex
 	uspClient    uspSink
@@ -163,8 +162,8 @@ func (a *CatoAdapter) Close() error {
 	a.isRunning = 0
 	a.mRunning.Unlock()
 
-	a.wg.Done()
-	a.wg.Wait()
+	// Wait for the feed loop to notice and exit.
+	<-a.chStopped
 
 	_, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions)
 	if err != nil {
@@ -201,8 +200,7 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 	totalCount := 0
 
 	for {
-		// Exit if the adapter was asked to stop (test seam; in production
-		// nothing flips isRunning before the process exits).
+		// Exit if the adapter was asked to stop by Close().
 		a.mRunning.RLock()
 		running := a.isRunning
 		a.mRunning.RUnlock()
@@ -310,7 +308,9 @@ func (a *CatoAdapter) handleEvent(marker *string, account_id string, api_key str
 		iteration++
 
 		// Add sleep to ensure the request is made every 1 minute
-		time.Sleep(pollInterval)
+		if !a.waitRunning(pollInterval) {
+			return
+		}
 	}
 
 }

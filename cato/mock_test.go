@@ -430,19 +430,22 @@ func startTestAdapter(t *testing.T, mock *mockCato, server *httptest.Server, pre
 	return sink
 }
 
-// stopAdapter asks the polling goroutine to exit and waits until it has. The
-// adapter's Close() is not usable as a stop mechanism (it calls Done() on a
-// WaitGroup that was never Add()ed, which panics), so tests flip the
-// isRunning flag the feed loop checks.
+// stopAdapter closes the adapter and checks that Close() returns promptly and
+// the polling goroutine has exited.
 func stopAdapter(t *testing.T, a *CatoAdapter, chStopped chan struct{}) {
 	t.Helper()
-	a.mRunning.Lock()
-	a.isRunning = 0
-	a.mRunning.Unlock()
+	closed := make(chan error, 1)
+	go func() { closed <- a.Close() }()
+	select {
+	case err := <-closed:
+		assert.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close() did not return")
+	}
 	select {
 	case <-chStopped:
-	case <-time.After(10 * time.Second):
-		t.Fatal("adapter goroutine did not stop")
+	default:
+		t.Fatal("adapter goroutine still running after Close()")
 	}
 }
 
@@ -929,4 +932,27 @@ func TestCatoFeedLoopSurvivesFailingQuery(t *testing.T) {
 	mock.mu.Unlock()
 
 	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, 10*time.Millisecond)
+}
+
+// TestCatoCloseInterruptsPollWait verifies Close() returns promptly while the
+// feed loop waits for its next poll, with the production poll interval.
+func TestCatoCloseInterruptsPollWait(t *testing.T) {
+	mock := newMockCato(t)
+	server := newMockServer(t, mock)
+	resetAdapterGlobals(t)
+	pollInterval = time.Hour
+
+	conf := CatoConfig{
+		ClientOptions: testClientOptions(t),
+		ApiKey:        mock.apiKey,
+		AccountId:     testAccountID,
+		Url:           server.URL + "/api/v1/graphql2",
+	}
+	adapter, chStopped, err := newCatoAdapter(context.Background(), conf, &captureSink{})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return mock.requestCount() == 1 }, 5*time.Second, 10*time.Millisecond)
+
+	start := time.Now()
+	stopAdapter(t, adapter, chStopped)
+	assert.Less(t, time.Since(start), 2*time.Second)
 }

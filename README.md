@@ -67,8 +67,8 @@ deduplicated:
 - Repeats of it within one minute are counted, then reported in a single
   `last message repeated N more time(s) between <first> and <last>: <message>`
   line carrying the most recent text. A message still repeating gets one such
-  line per minute. A message that went quiet for a minute is printed in full
-  the next time it happens.
+  line per minute. A message that went quiet for one to two minutes is
+  printed in full the next time it happens.
 - Ephemeral ports (32768 and up) following an IP address are ignored when
   comparing messages, so the same error from the same host on a new
   connection counts as a repeat. A different address or service port is a

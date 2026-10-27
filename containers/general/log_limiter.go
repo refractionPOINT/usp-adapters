@@ -115,7 +115,8 @@ func printLogLine(level string, ts time.Time, msg string) {
 	log("%s %s: %s", level, ts.Format(time.Stamp), msg)
 }
 
-// logOutput is where limiters print. A variable so tests can capture it.
+// logOutput is where limiters created from now on print. A variable so tests
+// can capture it; each limiter keeps the value it was created with.
 var logOutput = printLogLine
 
 // logDedupDisabled reports whether logDedupDisableEnv asks for raw logs.
@@ -142,7 +143,7 @@ var (
 // its own, so a chatty adapter cannot use up the budget of another and the
 // same message from two adapters is not merged into one.
 func newAdapterLogLimiter() *logLimiter {
-	l := newLogLimiter(func(level string, ts time.Time, msg string) { logOutput(level, ts, msg) })
+	l := newLogLimiter(logOutput)
 	l.disabled = logDedupDisabled()
 
 	logLimitersMu.Lock()

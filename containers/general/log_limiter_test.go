@@ -398,14 +398,14 @@ func TestLogLimiterConcurrentAccounting(t *testing.T) {
 	assert.Equal(t, goroutines*perG, accountedFor(t, f.lines))
 }
 
-// captureLogOutput points every adapter limiter at f for the test, without
-// starting the background flusher.
+// captureLogOutput points the adapter limiters created during the test at f.
+// The background flusher may be running (other tests start adapters); it only
+// reaches f through those limiters, which f's own lock protects.
 func captureLogOutput(t *testing.T, f *fakeLogOutput) {
 	t.Helper()
 	orig := logOutput
 	logOutput = f.out
 	t.Cleanup(func() { logOutput = orig })
-	logFlusherOne.Do(func() {})
 }
 
 func TestApplyLoggingRoutesThroughLimiter(t *testing.T) {

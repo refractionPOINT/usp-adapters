@@ -177,12 +177,12 @@ func main() {
 			confUpdateClient, confData, err = confupdateclient.NewConfUpdateClient(config.Cloud.OID, config.Cloud.ConfGUID, &limacharlie.LCLoggerZerolog{})
 			if err != nil {
 				logError("error creating conf update client: %v", err)
-				os.Exit(1)
+				exitProcess(1)
 			}
 			// Use this new config to run the adapter.
 			if err := limacharlie.Dict(confData).UnMarshalToStruct(config); err != nil {
 				logError("error unmarshalling conf update: %v", err)
-				os.Exit(1)
+				exitProcess(1)
 			}
 			method = config.SensorType
 			showConfig = config.Cloud.ShowConfig

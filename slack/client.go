@@ -26,6 +26,9 @@ const (
 	maxErrorBackoff = 5 * time.Minute
 	// maxErrorBodyLog bounds how much of an error response body is logged.
 	maxErrorBodyLog = 1024
+	// maxPageAttempts is how many times the same page is requested before
+	// the rest of the pagination is given up on.
+	maxPageAttempts = 5
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -159,10 +162,10 @@ func (a *SlackAdapter) fetchEvents() {
 	lastTime := time.Now().Unix()
 
 	// A failed request (e.g. the API unreachable or a TLS error) is retried
-	// after a growing wait, rather than every poll. The whole cycle is
-	// retried from where it started: a failure on a later page must not move
-	// past the pages not fetched yet. Entries of the pages already shipped in
-	// that cycle are shipped again, which is preferred over losing the rest.
+	// after a growing wait, rather than every poll. A failure in the middle
+	// of pagination resumes from the cursor of the failed page, so neither
+	// the pages before it are shipped again nor the ones after it skipped.
+	// A page that keeps failing is given up on after maxPageAttempts.
 	failures := 0
 	wait := a.pollInterval
 	retryLater := func() {
@@ -170,38 +173,59 @@ func (a *SlackAdapter) fetchEvents() {
 		wait = errorBackoff(a.pollInterval, failures)
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("request failed %d time(s) in a row, retrying in %v", failures, wait))
 	}
+	resumeCursor := ""
+	pageFailures := 0
+	isItemsProcessed := false
 
 poll:
 	for !a.doStop.WaitFor(wait) {
 		wait = a.pollInterval
-		isItemsProcessed := false
-		cycleStart := lastTime
+		nextPage := resumeCursor
 
-		// Do a non-paged fetch based on time.
-		entries, nextPage, err := a.makeOneContentRequest(lastTime, "")
-		if err != nil {
-			retryLater()
-			continue
-		}
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries", len(entries)))
+		if nextPage == "" {
+			isItemsProcessed = false
 
-		// If we got data, feed it.
-		if len(entries) != 0 {
-			isItemsProcessed = true
-			lastTime, err = a.shipEntries(entries)
+			// Do a non-paged fetch based on time.
+			entries, page, err := a.makeOneContentRequest(lastTime, "")
 			if err != nil {
-				return
+				retryLater()
+				continue
+			}
+			nextPage = page
+			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries", len(entries)))
+
+			// If we got data, feed it.
+			if len(entries) != 0 {
+				isItemsProcessed = true
+				lastTime, err = a.shipEntries(entries)
+				if err != nil {
+					return
+				}
 			}
 		}
 
 		// If a page was given back, exhaust the cursor.
 		for nextPage != "" {
-			entries, nextPage, err = a.makeOneContentRequest(lastTime, nextPage)
+			entries, page, err := a.makeOneContentRequest(lastTime, nextPage)
 			if err != nil {
-				lastTime = cycleStart
+				pageFailures++
+				if pageFailures >= maxPageAttempts {
+					a.conf.ClientOptions.OnError(fmt.Errorf("giving up on the remaining pages of this poll after %d failed attempts, their entries are skipped: %v", pageFailures, err))
+					resumeCursor = ""
+					pageFailures = 0
+					// Close the poll as if complete, so the next one does
+					// not ship the newest entry again.
+					if isItemsProcessed {
+						lastTime++
+					}
+				} else {
+					resumeCursor = nextPage
+				}
 				retryLater()
 				continue poll
 			}
+			pageFailures = 0
+			nextPage = page
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries from page", len(entries)))
 
 			// If we got data, feed it.
@@ -213,6 +237,7 @@ poll:
 				}
 			}
 		}
+		resumeCursor = ""
 		failures = 0
 
 		if isItemsProcessed {

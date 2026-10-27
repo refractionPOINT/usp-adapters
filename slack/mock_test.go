@@ -612,7 +612,8 @@ func TestBadTokenShipsNothing(t *testing.T) {
 type failingServer struct {
 	mu       sync.Mutex
 	failN    int
-	failAt   map[int]bool // also fail these requests (1-based)
+	failAt   map[int]bool             // also fail these requests (1-based)
+	failIf   func(*http.Request) bool // also fail requests matching this
 	fail     func(w http.ResponseWriter)
 	next     http.HandlerFunc
 	requests []time.Time
@@ -624,6 +625,9 @@ func (f *failingServer) handler() http.HandlerFunc {
 		f.requests = append(f.requests, time.Now())
 		failing := len(f.requests) <= f.failN || f.failAt[len(f.requests)]
 		f.mu.Unlock()
+		if f.failIf != nil && f.failIf(r) {
+			failing = true
+		}
 		if failing {
 			f.fail(w)
 			return
@@ -768,23 +772,41 @@ func TestErrorBackoff(t *testing.T) {
 	assert.Equal(t, maxErrorBackoff, errorBackoff(10*time.Minute, 1), "capped even on the first failure")
 }
 
-// TestFailedPageDoesNotLoseLaterPages covers a request failing in the middle
-// of pagination: the cycle is retried from where it started, so the entries
-// on the pages not fetched yet still ship (the ones already shipped may ship
-// again).
-func TestFailedPageDoesNotLoseLaterPages(t *testing.T) {
-	const token = "xoxp-1111111111-fake-test-token"
-	base := time.Now().Unix() + 5
+func serverError(w http.ResponseWriter) {
+	http.Error(w, "internal error", http.StatusInternalServerError)
+}
 
+// newestFirstMock returns a mock serving n entries newest-first, 2 per page.
+func newestFirstMock(token string, n int) *mockSlack {
+	base := time.Now().Unix() + 5
 	mock := newMockSlack(token, 2)
 	mock.newestFirst = true
-	for i := 0; i < 5; i++ {
+	for i := 0; i < n; i++ {
 		mock.addEntry(auditEntry(fixtureID(i+1), base+int64(i), "user_login"))
 	}
-	// Request 2 is the first cursor page.
-	fs := &failingServer{failAt: map[int]bool{2: true}, next: mock.handler(), fail: func(w http.ResponseWriter) {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-	}}
+	return mock
+}
+
+func shipCounts(sink *captureSink) map[string]int {
+	counts := map[string]int{}
+	for _, m := range sink.snapshot() {
+		id, _ := m.JsonPayload["id"].(string)
+		counts[id]++
+	}
+	return counts
+}
+
+// TestFailedPageResumesFromItsCursor covers requests failing in the middle of
+// pagination (e.g. a rate limit hit while catching up on a backlog): the poll
+// resumes from the cursor of the failed page, so every entry ships once --
+// the pages before it are not shipped again, the ones after it not skipped.
+func TestFailedPageResumesFromItsCursor(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	const n = 9 // 5 pages
+	mock := newestFirstMock(token, n)
+	// Request 1 is the first page; 2 and 3 fail on the second page, 5 on
+	// the fourth.
+	fs := &failingServer{failAt: map[int]bool{2: true, 3: true, 5: true}, next: mock.handler(), fail: serverError}
 	server := httptest.NewServer(fs.handler())
 	defer server.Close()
 
@@ -793,12 +815,62 @@ func TestFailedPageDoesNotLoseLaterPages(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	require.Eventually(t, func() bool {
-		seen := map[string]bool{}
-		for _, m := range sink.snapshot() {
-			id, _ := m.JsonPayload["id"].(string)
-			seen[id] = true
+	require.Eventually(t, func() bool { return len(shipCounts(sink)) == n }, 5*time.Second, 10*time.Millisecond,
+		"every entry must ship despite the failed pages")
+	for id, c := range shipCounts(sink) {
+		assert.Equal(t, 1, c, "entry %s shipped %d times", id, c)
+	}
+}
+
+// TestPageFailingForeverIsGivenUp covers a page that never succeeds: after
+// maxPageAttempts the rest of the pagination is given up on with one error,
+// the entries already shipped are not shipped again, and polling continues.
+func TestPageFailingForeverIsGivenUp(t *testing.T) {
+	const token = "xoxp-1111111111-fake-test-token"
+	mock := newestFirstMock(token, 5)
+	fs := &failingServer{next: mock.handler(), fail: serverError,
+		failIf: func(r *http.Request) bool { return r.URL.Query().Get("cursor") != "" }}
+	server := httptest.NewServer(fs.handler())
+	defer server.Close()
+
+	var mu sync.Mutex
+	var errs []string
+	conf := testConf(t, server.URL, token)
+	conf.ClientOptions.OnError = func(err error) {
+		mu.Lock()
+		defer mu.Unlock()
+		errs = append(errs, err.Error())
+	}
+	gaveUp := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		n := 0
+		for _, e := range errs {
+			if strings.HasPrefix(e, "giving up on the remaining pages") {
+				n++
+			}
 		}
-		return len(seen) == 5
-	}, 5*time.Second, 10*time.Millisecond, "every entry must ship despite the failed page")
+		return n
+	}
+
+	sink := &captureSink{}
+	adapter, chStopped, err := newSlackAdapter(t.Context(), conf, sink)
+	require.NoError(t, err)
+	defer adapter.Close()
+
+	require.Eventually(t, func() bool { return gaveUp() == 1 }, 10*time.Second, 10*time.Millisecond)
+	// The next poll starts fresh and polling goes on.
+	before := fs.count()
+	require.Eventually(t, func() bool { return fs.count() > before }, 10*time.Second, 10*time.Millisecond)
+	select {
+	case <-chStopped:
+		t.Fatal("the adapter must keep running")
+	default:
+	}
+
+	counts := shipCounts(sink)
+	for id, c := range counts {
+		assert.Equal(t, 1, c, "entry %s shipped %d times", id, c)
+	}
+	assert.Equal(t, map[string]int{fixtureID(5): 1, fixtureID(4): 1}, counts, "only the first page shipped")
 }
