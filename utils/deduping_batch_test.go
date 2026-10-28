@@ -79,8 +79,10 @@ func TestLocalDeduperBatchIgnoresTime(t *testing.T) {
 }
 
 func TestLocalDeduperBatchExpires(t *testing.T) {
-	window := 50 * time.Millisecond
-	ttl := 150 * time.Millisecond
+	// A ttl well above the time between AddMany and the first check, even on a
+	// loaded machine.
+	window := 100 * time.Millisecond
+	ttl := 2 * time.Second
 	d := newTestBatchDeduper(t, window, ttl)
 
 	d.AddMany(keys("a", "b"))

@@ -443,7 +443,10 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 }
 
 // processPage is processItems accumulating what deduplication did into stats.
-// With a BatchDeduper, whether the page's blobs are done is checked in one call.
+// With a BatchDeduper, whether the page's blobs are done is checked in one call
+// before the page is worked through, so a blob that another instance sharing the
+// deduper finishes meanwhile is downloaded again. Its events with an Id are
+// still skipped at event level; events without an Id ship twice.
 func (a *Office365Adapter) processPage(items []listItem, fs *failureState, stats *DedupeStats) (complete bool, abort bool) {
 	nFetched := 0
 	nShipped := 0
@@ -733,6 +736,10 @@ func (a *Office365Adapter) shipContentBatch(content []byte) (eventCounts, bool) 
 
 // shipChunk deduplicates, ships and records one chunk of a blob's events. seen
 // holds the Ids of the blob's earlier chunks and is extended with this one's.
+// Shipped events are recorded once per chunk, not one by one: if the process
+// dies mid-chunk, or an overlapping instance shares the deduper while a Ship
+// waits for a full buffer, the chunk's already shipped events can ship again.
+// That costs duplicates, never data.
 func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{}, counts *eventCounts) bool {
 	if a.doStop.IsSet() {
 		return false
