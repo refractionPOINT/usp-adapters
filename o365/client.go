@@ -67,6 +67,25 @@ type uspSink interface {
 	Close() ([]*protocol.DataMessage, error)
 }
 
+// DedupeStats counts what deduplication did during one polling cycle of one
+// content type.
+type DedupeStats struct {
+	// BlobsFetched is the number of content blobs downloaded and fully
+	// handled.
+	BlobsFetched int
+	// BlobsSkipped is the number of listed blobs skipped as already done.
+	BlobsSkipped int
+	// EventsShipped is the number of events shipped.
+	EventsShipped int
+	// EventsDuplicate is the number of events skipped because the deduper
+	// had already recorded their Id (typically shipped from another blob).
+	EventsDuplicate int
+	// EventsRepeated is the number of events skipped because the same Id
+	// appeared earlier in the same blob. Only reported with a
+	// utils.BatchDeduper; other dedupers count these as EventsDuplicate.
+	EventsRepeated int
+}
+
 type listItem struct {
 	ContentType       string `json:"contentType,omitempty"`
 	ContentID         string `json:"contentId,omitempty"`
@@ -126,6 +145,11 @@ type Office365Adapter struct {
 	// Content is then recorded as done only once it was shipped.
 	checker utils.CheckingDeduper
 
+	// batcher is conf.Deduper when it can also check and record many keys per
+	// call. It is then used in place of checker, one call per page of blobs and
+	// per chunk of events instead of one per key.
+	batcher utils.BatchDeduper
+
 	ctx context.Context
 }
 
@@ -147,6 +171,12 @@ type Office365Config struct {
 	TokenURL string `json:"token_url" yaml:"token_url"`
 
 	Deduper utils.Deduper `json:"-" yaml:"-"`
+
+	// OnDedupeStats, when set, is called once per polling cycle of a content
+	// type with what deduplication did during that cycle. It is called from
+	// the collection goroutines, so it must be safe for concurrent use and
+	// must not block.
+	OnDedupeStats func(DedupeStats) `json:"-" yaml:"-"`
 
 	// PollInterval is how long to wait between polling cycles. It is not
 	// settable through a config file; it exists as a seam for tests. Defaults
@@ -240,7 +270,10 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 		doStop: utils.NewEvent(),
 	}
 	a.stopCtx, a.cancelStop = context.WithCancel(context.Background())
-	if cd, ok := conf.Deduper.(utils.CheckingDeduper); ok {
+	if bd, ok := conf.Deduper.(utils.BatchDeduper); ok {
+		a.batcher = bd
+		a.checker = bd
+	} else if cd, ok := conf.Deduper.(utils.CheckingDeduper); ok {
 		a.checker = cd
 	} else {
 		a.conf.ClientOptions.DebugLog("deduper can't check without recording: content is recorded as done before it is downloaded")
@@ -367,6 +400,10 @@ func (a *Office365Adapter) fetchEvents(url string) {
 // those failures keep the continuous-outage clock running across polls.
 func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
 	a.expireLeftBlobs(fs, time.Now())
+	stats := &DedupeStats{}
+	if a.conf.OnDedupeStats != nil {
+		defer func() { a.conf.OnDedupeStats(*stats) }()
+	}
 	complete := true
 	for pageURL != "" {
 		body, header, err := a.getWithRetry(pageURL, "list api", fs, 0)
@@ -386,7 +423,7 @@ func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
 
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("listed %d events (with page: %v)", len(items), pageURL != ""))
 
-		pageComplete, abort := a.processItems(items, fs)
+		pageComplete, abort := a.processPage(items, fs, stats)
 		if abort {
 			return false
 		}
@@ -402,6 +439,15 @@ func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
 // false when transient retries were exhausted; abort is true when the poll
 // must stop. Other unprocessed blobs have a separate failure clock.
 func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (complete bool, abort bool) {
+	return a.processPage(items, fs, &DedupeStats{})
+}
+
+// processPage is processItems accumulating what deduplication did into stats.
+// With a BatchDeduper, whether the page's blobs are done is checked in one call
+// before the page is worked through, so a blob that another instance sharing the
+// deduper finishes meanwhile is downloaded again. Its events with an Id are
+// still skipped at event level; events without an Id ship twice.
+func (a *Office365Adapter) processPage(items []listItem, fs *failureState, stats *DedupeStats) (complete bool, abort bool) {
 	nFetched := 0
 	nShipped := 0
 	nSkipped := 0
@@ -411,13 +457,30 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetched %d, shipped %d: skipped: %d left unprocessed: %d", nFetched, nShipped, nSkipped, nLeft))
 	}()
 
-	for _, item := range items {
+	var blobDone []bool
+	if a.batcher != nil && len(items) != 0 {
+		keys := make([]utils.DedupeKey, len(items))
+		for i, item := range items {
+			keys[i] = blobKey(item)
+		}
+		blobDone = a.batcher.CheckMany(keys)
+	}
+
+	for i, item := range items {
 		if a.doStop.IsSet() {
 			return false, true
 		}
-		if a.isDone(item.ContentID) {
+		var done bool
+		if a.batcher != nil {
+			// A short answer means the backend failed open for the rest.
+			done = i < len(blobDone) && blobDone[i]
+		} else {
+			done = a.isDone(item.ContentID)
+		}
+		if done {
 			delete(fs.leftBlobs, item.ContentID)
 			nSkipped++
+			stats.BlobsSkipped++
 			continue
 		}
 
@@ -457,15 +520,33 @@ func (a *Office365Adapter) processItems(items []listItem, fs *failureState) (com
 		// Content is flowing again: the failure clock restarts.
 		fs.reset()
 
-		shipped, skipped, ok := a.shipContent(content)
+		var shipped, skipped int
+		var ok bool
+		if a.batcher != nil {
+			var c eventCounts
+			c, ok = a.shipContentBatch(content)
+			shipped, skipped = c.shipped, c.duplicate+c.repeated
+			stats.EventsShipped += c.shipped
+			stats.EventsDuplicate += c.duplicate
+			stats.EventsRepeated += c.repeated
+		} else {
+			shipped, skipped, ok = a.shipContent(content)
+			stats.EventsShipped += shipped
+			stats.EventsDuplicate += skipped
+		}
 		nShipped += shipped
 		nSkipped += skipped
 		if !ok {
 			return false, true
 		}
-		a.markDone(item.ContentID)
+		if a.batcher != nil {
+			a.batcher.AddMany([]utils.DedupeKey{blobKey(item)})
+		} else {
+			a.markDone(item.ContentID)
+		}
 		delete(fs.leftBlobs, item.ContentID)
 		nFetched++
+		stats.BlobsFetched++
 	}
 	return !transientLeft, false
 }
@@ -562,23 +643,9 @@ func (a *Office365Adapter) shipContent(content []byte) (int, int, bool) {
 			nSkipped++
 			return true
 		}
-		msg := &protocol.DataMessage{
-			TextPayload: event.Raw,
-			TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-		}
-		if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-			if err == uspclient.ErrorBufferFull {
-				a.conf.ClientOptions.OnWarning("stream falling behind")
-				err = a.uspClient.Ship(msg, 1*time.Hour)
-			}
-			if err != nil {
-				if err != uspclient.ErrorClosed {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				}
-				a.doStop.Set()
-				ok = false
-				return false
-			}
+		if !a.ship(event.Raw) {
+			ok = false
+			return false
 		}
 		if ID != "" {
 			a.markDone(ID)
@@ -587,6 +654,166 @@ func (a *Office365Adapter) shipContent(content []byte) (int, int, bool) {
 		return true
 	})
 	return nShipped, nSkipped, ok
+}
+
+// blobKey is the dedupe key of a listed content blob, timed by the blob's
+// contentCreated (zero if missing or unparseable).
+func blobKey(item listItem) utils.DedupeKey {
+	return utils.DedupeKey{Key: item.ContentID, Time: parseSourceTime(item.ContentCreated)}
+}
+
+// parseSourceTime parses a time reported by the Management API: RFC 3339 with
+// a zone (contentCreated, like 2026-10-28T12:34:56.000Z) or without one
+// (CreationTime, like 2026-10-28T12:34:56, which is UTC), with or without
+// fractional seconds. It returns the zero time if v is empty or unparseable.
+func parseSourceTime(v string) time.Time {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}
+	}
+	for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05"} {
+		if t, err := time.Parse(layout, v); err == nil {
+			return t.UTC()
+		}
+	}
+	return time.Time{}
+}
+
+// dedupeBatchSize bounds the number of keys sent to a BatchDeduper in one call.
+const dedupeBatchSize = 1000
+
+// eventCounts is what shipContentBatch did with the events of one blob.
+type eventCounts struct {
+	shipped   int
+	duplicate int // already recorded by the deduper
+	repeated  int // same Id earlier in the same blob
+}
+
+// batchEvent is one event of a blob while it is being deduplicated.
+type batchEvent struct {
+	raw string
+	key utils.DedupeKey // empty Key: no Id, always shipped, never recorded
+	// checkIdx is the index of the event's key in the chunk's CheckMany call,
+	// -1 if the event isn't checked (no Id, or repeated in the blob).
+	checkIdx int
+	repeated bool
+}
+
+// shipContentBatch is shipContent for a BatchDeduper: the events of a blob are
+// checked a chunk at a time with one call, and the shipped ones are recorded
+// with one call per chunk. Events shipped before a failure are still recorded,
+// so a retry of the blob doesn't ship them again. Repeats of an Id inside the
+// blob are skipped here, since the deduper can't see them before they are
+// recorded. It returns false if shipping failed or the adapter is stopping.
+func (a *Office365Adapter) shipContentBatch(content []byte) (eventCounts, bool) {
+	var counts eventCounts
+	seen := map[string]struct{}{}
+	chunk := make([]batchEvent, 0, dedupeBatchSize)
+
+	flush := func() bool {
+		ok := a.shipChunk(chunk, seen, &counts)
+		chunk = chunk[:0]
+		return ok
+	}
+
+	ok := true
+	gjson.ParseBytes(content).ForEach(func(_, event gjson.Result) bool {
+		chunk = append(chunk, batchEvent{raw: event.Raw, key: utils.DedupeKey{
+			Key:  event.Get("Id").String(),
+			Time: parseSourceTime(event.Get("CreationTime").String()),
+		}})
+		if len(chunk) < dedupeBatchSize {
+			return true
+		}
+		ok = flush()
+		return ok
+	})
+	if ok && len(chunk) != 0 {
+		ok = flush()
+	}
+	return counts, ok
+}
+
+// shipChunk deduplicates, ships and records one chunk of a blob's events. seen
+// holds the Ids of the blob's earlier chunks and is extended with this one's.
+// Shipped events are recorded once per chunk, not one by one: if the process
+// dies mid-chunk, or an overlapping instance shares the deduper while a Ship
+// waits for a full buffer, the chunk's already shipped events can ship again.
+// That costs duplicates, never data.
+func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{}, counts *eventCounts) bool {
+	if a.doStop.IsSet() {
+		return false
+	}
+
+	var toCheck []utils.DedupeKey
+	for i := range chunk {
+		e := &chunk[i]
+		e.checkIdx = -1
+		if e.key.Key == "" {
+			continue
+		}
+		if _, ok := seen[e.key.Key]; ok {
+			e.repeated = true
+			continue
+		}
+		seen[e.key.Key] = struct{}{}
+		e.checkIdx = len(toCheck)
+		toCheck = append(toCheck, e.key)
+	}
+	var known []bool
+	if len(toCheck) != 0 {
+		known = a.batcher.CheckMany(toCheck)
+	}
+
+	var shipped []utils.DedupeKey
+	// Record what was shipped even when shipping fails midway.
+	defer func() {
+		if len(shipped) != 0 {
+			a.batcher.AddMany(shipped)
+		}
+	}()
+
+	for _, e := range chunk {
+		if e.repeated {
+			counts.repeated++
+			continue
+		}
+		// A short answer means the backend failed open for the rest.
+		if e.checkIdx >= 0 && e.checkIdx < len(known) && known[e.checkIdx] {
+			counts.duplicate++
+			continue
+		}
+		if !a.ship(e.raw) {
+			return false
+		}
+		if e.key.Key != "" {
+			shipped = append(shipped, e.key)
+		}
+		counts.shipped++
+	}
+	return true
+}
+
+// ship sends one event to LimaCharlie. It returns false if shipping failed, in
+// which case the adapter is stopping.
+func (a *Office365Adapter) ship(raw string) bool {
+	msg := &protocol.DataMessage{
+		TextPayload: raw,
+		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+	}
+	err := a.uspClient.Ship(msg, 10*time.Second)
+	if err == uspclient.ErrorBufferFull {
+		a.conf.ClientOptions.OnWarning("stream falling behind")
+		err = a.uspClient.Ship(msg, 1*time.Hour)
+	}
+	if err != nil {
+		if err != uspclient.ErrorClosed {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
+		}
+		a.doStop.Set()
+		return false
+	}
+	return true
 }
 
 // isDone reports whether a content blob or event was already shipped. With a
