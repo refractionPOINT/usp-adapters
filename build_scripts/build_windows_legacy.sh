@@ -6,6 +6,12 @@
 # community fork that tracks upstream Go releases and restores Windows 7
 # support. It is not maintained by the Go team: the binary is best-effort.
 #
+# Trust: the release signs this binary with the project's code-signing key, so
+# shipping it means trusting the fork's compiler and standard library, not only
+# upstream Go. The checksum below guarantees the archive is the one that was
+# reviewed when the version was pinned; it says nothing about how the fork
+# built it. Review the fork's changes against upstream when bumping the version.
+#
 # Keep LEGACY_GO_VERSION at or above the go version in go.mod. GOTOOLCHAIN=local
 # makes the build fail if it falls behind, rather than having Go silently
 # download an upstream toolchain, which would produce a normal (Windows 10+)
@@ -29,7 +35,8 @@ archive="go-legacy-win7-${LEGACY_GO_VERSION}.linux_amd64.tar.gz"
 toolchain_dir="$(mktemp -d)"
 trap 'rm -rf "$toolchain_dir"' EXIT
 
-curl -fsSL -o "$toolchain_dir/$archive" \
+mkdir -p "$(dirname "$out")"
+curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 300 -o "$toolchain_dir/$archive" \
   "https://github.com/thongtech/go-legacy-win7/releases/download/v${LEGACY_GO_VERSION}/${archive}"
 echo "${LEGACY_GO_SHA256}  $toolchain_dir/$archive" | sha256sum -c -
 tar -C "$toolchain_dir" -xzf "$toolchain_dir/$archive"

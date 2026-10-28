@@ -92,7 +92,7 @@ steps:
     - 'GOARCH=amd64'
   waitFor: ['build-linux64', 'build-win64', 'build-macos64', 'build-docker-general']
 
-# Wave 3: 3 Arrow-heavy cross-compiles, after wave 2
+# Wave 3: 4 Arrow-heavy cross-compiles, after wave 2
 - name: 'golang:1.27-bookworm'
   id: 'build-freebsdamd64'
   args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64_$TAG_NAME', './containers/general']
@@ -114,11 +114,17 @@ steps:
     - 'GOOS=openbsd'
     - 'GOARCH=amd64'
   waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
-# Windows 7 / Server 2008 R2, built with the go-legacy-win7 toolchain.
+# Windows 7 / Server 2008 R2, built with the go-legacy-win7 toolchain. This
+# binary is best-effort: allowFailure keeps a failure here (a go.mod bump past
+# the pinned fork release, a failed download) from blocking the release of
+# every other adapter. It is built into legacy/, which the copy step's
+# ./lc_adapter_* glob does not match, and moved next to the other binaries
+# only once sign-win64-legacy has signed it, so it is never uploaded unsigned.
 - name: 'golang:1.27-bookworm'
   id: 'build-win64-legacy'
   entrypoint: 'bash'
-  args: ['./build_scripts/build_windows_legacy.sh', 'lc_adapter_windows_legacy_64_$TAG_NAME.exe', './containers/general']
+  args: ['./build_scripts/build_windows_legacy.sh', 'legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe', './containers/general']
+  allowFailure: true
   waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
 
 # Connectivity Tester
@@ -204,15 +210,24 @@ steps:
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
   id: sign-binaries
   entrypoint: 'python3'
-  args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$TAG_NAME.exe', 'lc_adapter_windows_legacy_64_$TAG_NAME.exe', 'lc_adapter_macos_64_$TAG_NAME', 'lc_adapter_macos_arm64_$TAG_NAME']
+  args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$TAG_NAME.exe', 'lc_adapter_macos_64_$TAG_NAME', 'lc_adapter_macos_arm64_$TAG_NAME']
   secretEnv: ['CODE_SIGNING_KEY']
-  waitFor: ['build-win64', 'build-win64-legacy', 'build-macos64', 'build-macosarm64']
+  waitFor: ['build-win64', 'build-macos64', 'build-macosarm64']
+# Sign the legacy Windows adapter on its own, so its absence cannot fail the
+# shared signing step above.
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+  id: sign-win64-legacy
+  entrypoint: 'bash'
+  args: ['-c', 'python3 ./build_scripts/code_signing/sign_release.py --timeout 300 legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe && mv legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe .']
+  secretEnv: ['CODE_SIGNING_KEY']
+  allowFailure: true
+  waitFor: ['build-win64-legacy']
 
 # Stage binaries
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-adapters
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64', 'sign-binaries', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64', 'build-win64-legacy']
+  waitFor: ['build-linux64', 'sign-binaries', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64', 'sign-win64-legacy']
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-connectivity
   args: ['cp', './lc_connectivity_*', 'gs://limacharlie-io/installers/']
