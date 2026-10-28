@@ -20,6 +20,27 @@ type CheckingDeduper interface {
 	Check(key string) (exists bool)
 }
 
+// DedupeKey identifies an item to deduplicate. Time is when the item was
+// created at the source (zero if unknown). Callers must pass the same Time
+// every time for the same Key; implementations may use it to group markers.
+type DedupeKey struct {
+	Key  string
+	Time time.Time
+}
+
+// BatchDeduper is a CheckingDeduper that checks and records many keys per call.
+type BatchDeduper interface {
+	CheckingDeduper
+	// CheckMany reports, for each key in order, whether it was already
+	// recorded. It never records. On a backend error it fails open: the
+	// affected keys report false.
+	CheckMany(keys []DedupeKey) []bool
+	// AddMany records the keys as done. Best effort.
+	AddMany(keys []DedupeKey)
+}
+
+var _ BatchDeduper = (*localDeduper)(nil)
+
 type localDeduper struct {
 	window   time.Duration
 	ttl      time.Duration
@@ -97,6 +118,33 @@ func (d *localDeduper) Check(key string) bool {
 		}
 	}
 	return false
+}
+
+// CheckMany implements BatchDeduper. The local deduper ignores key times.
+func (d *localDeduper) CheckMany(keys []DedupeKey) []bool {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	out := make([]bool, len(keys))
+	for i, k := range keys {
+		for _, w := range d.windows {
+			if _, ok := w[k.Key]; ok {
+				out[i] = true
+				break
+			}
+		}
+	}
+	return out
+}
+
+// AddMany implements BatchDeduper. The local deduper ignores key times.
+func (d *localDeduper) AddMany(keys []DedupeKey) {
+	d.m.Lock()
+	defer d.m.Unlock()
+
+	for _, k := range keys {
+		d.windows[d.nCurrent][k.Key] = struct{}{}
+	}
 }
 
 func (d *localDeduper) Close() {
