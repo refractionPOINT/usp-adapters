@@ -69,7 +69,7 @@ steps:
       - 'GOARCH=amd64'
     waitFor: ['build-linux64', 'build-win64', 'build-macos64']
 
-  # Wave 3: 3 Arrow-heavy cross-compiles, after wave 2
+  # Wave 3: 4 Arrow-heavy cross-compiles, after wave 2
   - name: 'golang:1.27-bookworm'
     id: build-freebsdamd64
     args: ['go', 'build', '-v', '-o', 'lc_adapter_freebsd_64', './containers/general']
@@ -90,6 +90,15 @@ steps:
     env:
       - 'GOOS=openbsd'
       - 'GOARCH=amd64'
+    waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
+  # Windows 7 / Server 2008 R2, built with the go-legacy-win7 toolchain.
+  # Best-effort, like in cloudbuild_release.yaml: a failure here (a go.mod bump
+  # past the pinned fork release, a failed download) does not fail the build.
+  - name: 'golang:1.27-bookworm'
+    id: build-win64-legacy
+    entrypoint: 'bash'
+    args: ['./build_scripts/build_windows_legacy.sh', 'lc_adapter_windows_legacy_64.exe', './containers/general']
+    allowFailure: true
     waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
 
 
