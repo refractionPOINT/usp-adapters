@@ -114,6 +114,12 @@ steps:
     - 'GOOS=openbsd'
     - 'GOARCH=amd64'
   waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
+# Windows 7 / Server 2008 R2, built with the go-legacy-win7 toolchain.
+- name: 'golang:1.27-bookworm'
+  id: 'build-win64-legacy'
+  entrypoint: 'bash'
+  args: ['./build_scripts/build_windows_legacy.sh', 'lc_adapter_windows_legacy_64_$TAG_NAME.exe', './containers/general']
+  waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
 
 # Connectivity Tester
 - name: 'golang:1.27-bookworm'
@@ -198,15 +204,15 @@ steps:
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
   id: sign-binaries
   entrypoint: 'python3'
-  args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$TAG_NAME.exe', 'lc_adapter_macos_64_$TAG_NAME', 'lc_adapter_macos_arm64_$TAG_NAME']
+  args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$TAG_NAME.exe', 'lc_adapter_windows_legacy_64_$TAG_NAME.exe', 'lc_adapter_macos_64_$TAG_NAME', 'lc_adapter_macos_arm64_$TAG_NAME']
   secretEnv: ['CODE_SIGNING_KEY']
-  waitFor: ['build-win64', 'build-macos64', 'build-macosarm64']
+  waitFor: ['build-win64', 'build-win64-legacy', 'build-macos64', 'build-macosarm64']
 
 # Stage binaries
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-adapters
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64', 'sign-binaries', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64']
+  waitFor: ['build-linux64', 'sign-binaries', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64', 'build-win64-legacy']
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-connectivity
   args: ['cp', './lc_connectivity_*', 'gs://limacharlie-io/installers/']

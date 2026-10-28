@@ -91,6 +91,12 @@ steps:
       - 'GOOS=openbsd'
       - 'GOARCH=amd64'
     waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
+  # Windows 7 / Server 2008 R2, built with the go-legacy-win7 toolchain.
+  - name: 'golang:1.27-bookworm'
+    id: build-win64-legacy
+    entrypoint: 'bash'
+    args: ['./build_scripts/build_windows_legacy.sh', 'lc_adapter_windows_legacy_64.exe', './containers/general']
+    waitFor: ['build-macosarm64', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64']
 
 
 # Connectivity Tester
