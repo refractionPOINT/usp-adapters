@@ -28,6 +28,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
+	"github.com/refractionPOINT/usp-adapters/proofpoint_isolation"
 	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -51,48 +52,49 @@ import (
 type GeneralConfigs struct {
 	Healthcheck int `json:"healthcheck" yaml:"healthcheck"`
 
-	Syslog            usp_syslog.SyslogConfig                         `json:"syslog" yaml:"syslog"`
-	PubSub            usp_pubsub.PubSubConfig                         `json:"pubsub" yaml:"pubsub"`
-	S3                usp_s3.S3Config                                 `json:"s3" yaml:"s3"`
-	Stdin             usp_stdin.StdinConfig                           `json:"stdin" yaml:"stdin"`
-	OnePassword       usp_1password.OnePasswordConfig                 `json:"1password" yaml:"1password"`
-	Bitwarden         usp_bitwarden.BitwardenConfig                   `json:"bitwarden" yaml:"bitwarden"`
-	ITGlue            usp_itglue.ITGlueConfig                         `json:"itglue" yaml:"itglue"`
-	Sophos            usp_sophos.SophosConfig                         `json:"sophos" yaml:"sophos"`
-	EntraID           usp_entraid.EntraIDConfig                       `json:"entraid" yaml:"entraid"`
-	Defender          usp_defender.DefenderConfig                     `json:"defender" yaml:"defender"`
-	Cato              usp_cato.CatoConfig                             `json:"cato" yaml:"cato"`
-	Cylance           usp_cylance.CylanceConfig                       `json:"cylance" yaml:"cylance"`
-	Okta              usp_okta.OktaConfig                             `json:"okta" yaml:"okta"`
-	Office365         usp_o365.Office365Config                        `json:"office365" yaml:"office365"`
-	Wel               usp_wel.WELConfig                               `json:"wel" yaml:"wel"`
-	MacUnifiedLogging usp_mac_unified_logging.MacUnifiedLoggingConfig `json:"mac_unified_logging" yaml:"mac_unified_logging"`
-	AzureEventHub     usp_azure_event_hub.EventHubConfig              `json:"azure_event_hub" yaml:"azure_event_hub"`
-	Duo               usp_duo.DuoConfig                               `json:"duo" yaml:"duo"`
-	Gcs               usp_gcs.GCSConfig                               `json:"gcs" yaml:"gcs"`
-	Slack             usp_slack.SlackConfig                           `json:"slack" yaml:"slack"`
-	Sqs               usp_sqs.SQSConfig                               `json:"sqs" yaml:"sqs"`
-	SqsFiles          usp_sqs_files.SQSFilesConfig                    `json:"sqs-files" yaml:"sqs-files"`
-	Simulator         usp_simulator.SimulatorConfig                   `json:"simulator" yaml:"simulator"`
-	File              usp_file.FileConfig                             `json:"file" yaml:"file"`
-	Evtx              usp_evtx.EVTXConfig                             `json:"evtx" yaml:"evtx"`
-	K8sPods           usp_k8s_pods.K8sPodsConfig                      `json:"k8s_pods" yaml:"k8s_pods"`
-	BigQuery          usp_bigquery.BigQueryConfig                     `json:"bigquery" yaml:"bigquery"`
-	Imap              usp_imap.ImapConfig                             `json:"imap" yaml:"imap"`
-	Gmail             usp_gmail.GmailConfig                           `json:"gmail" yaml:"gmail"`
-	HubSpot           usp_hubspot.HubSpotConfig                       `json:"hubspot" yaml:"hubspot"`
-	FalconCloud       usp_falconcloud.FalconCloudConfig               `json:"falconcloud" yaml:"falconcloud"`
-	Harmony           usp_harmony.HarmonyConfig                       `json:"harmony" yaml:"harmony"`
-	Mimecast          usp_mimecast.MimecastConfig                     `json:"mimecast" yaml:"mimecast"`
-	MsGraph           usp_ms_graph.MsGraphConfig                      `json:"ms_graph" yaml:"ms_graph"`
-	Zendesk           usp_zendesk.ZendeskConfig                       `json:"zendesk" yaml:"zendesk"`
-	PandaDoc          usp_pandadoc.PandaDocConfig                     `json:"pandadoc" yaml:"pandadoc"`
-	ProofpointTap     usp_proofpoint_tap.ProofpointTapConfig          `json:"proofpoint_tap" yaml:"proofpoint_tap"`
-	Box               usp_box.BoxConfig                               `json:"box" yaml:"box"`
-	Sublime           usp_sublime.SublimeConfig                       `json:"sublime" yaml:"sublime"`
-	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
-	ServiceNow        usp_servicenow.ServiceNowConfig                 `json:"servicenow" yaml:"servicenow"`
-	ThreatLocker      usp_threatlocker.ThreatLockerConfig             `json:"threatlocker" yaml:"threatlocker"`
-	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
-	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
+	Syslog              usp_syslog.SyslogConfig                            `json:"syslog" yaml:"syslog"`
+	PubSub              usp_pubsub.PubSubConfig                            `json:"pubsub" yaml:"pubsub"`
+	S3                  usp_s3.S3Config                                    `json:"s3" yaml:"s3"`
+	Stdin               usp_stdin.StdinConfig                              `json:"stdin" yaml:"stdin"`
+	OnePassword         usp_1password.OnePasswordConfig                    `json:"1password" yaml:"1password"`
+	Bitwarden           usp_bitwarden.BitwardenConfig                      `json:"bitwarden" yaml:"bitwarden"`
+	ITGlue              usp_itglue.ITGlueConfig                            `json:"itglue" yaml:"itglue"`
+	Sophos              usp_sophos.SophosConfig                            `json:"sophos" yaml:"sophos"`
+	EntraID             usp_entraid.EntraIDConfig                          `json:"entraid" yaml:"entraid"`
+	Defender            usp_defender.DefenderConfig                        `json:"defender" yaml:"defender"`
+	Cato                usp_cato.CatoConfig                                `json:"cato" yaml:"cato"`
+	Cylance             usp_cylance.CylanceConfig                          `json:"cylance" yaml:"cylance"`
+	Okta                usp_okta.OktaConfig                                `json:"okta" yaml:"okta"`
+	Office365           usp_o365.Office365Config                           `json:"office365" yaml:"office365"`
+	Wel                 usp_wel.WELConfig                                  `json:"wel" yaml:"wel"`
+	MacUnifiedLogging   usp_mac_unified_logging.MacUnifiedLoggingConfig    `json:"mac_unified_logging" yaml:"mac_unified_logging"`
+	AzureEventHub       usp_azure_event_hub.EventHubConfig                 `json:"azure_event_hub" yaml:"azure_event_hub"`
+	Duo                 usp_duo.DuoConfig                                  `json:"duo" yaml:"duo"`
+	Gcs                 usp_gcs.GCSConfig                                  `json:"gcs" yaml:"gcs"`
+	Slack               usp_slack.SlackConfig                              `json:"slack" yaml:"slack"`
+	Sqs                 usp_sqs.SQSConfig                                  `json:"sqs" yaml:"sqs"`
+	SqsFiles            usp_sqs_files.SQSFilesConfig                       `json:"sqs-files" yaml:"sqs-files"`
+	Simulator           usp_simulator.SimulatorConfig                      `json:"simulator" yaml:"simulator"`
+	File                usp_file.FileConfig                                `json:"file" yaml:"file"`
+	Evtx                usp_evtx.EVTXConfig                                `json:"evtx" yaml:"evtx"`
+	K8sPods             usp_k8s_pods.K8sPodsConfig                         `json:"k8s_pods" yaml:"k8s_pods"`
+	BigQuery            usp_bigquery.BigQueryConfig                        `json:"bigquery" yaml:"bigquery"`
+	Imap                usp_imap.ImapConfig                                `json:"imap" yaml:"imap"`
+	Gmail               usp_gmail.GmailConfig                              `json:"gmail" yaml:"gmail"`
+	HubSpot             usp_hubspot.HubSpotConfig                          `json:"hubspot" yaml:"hubspot"`
+	FalconCloud         usp_falconcloud.FalconCloudConfig                  `json:"falconcloud" yaml:"falconcloud"`
+	Harmony             usp_harmony.HarmonyConfig                          `json:"harmony" yaml:"harmony"`
+	Mimecast            usp_mimecast.MimecastConfig                        `json:"mimecast" yaml:"mimecast"`
+	MsGraph             usp_ms_graph.MsGraphConfig                         `json:"ms_graph" yaml:"ms_graph"`
+	Zendesk             usp_zendesk.ZendeskConfig                          `json:"zendesk" yaml:"zendesk"`
+	PandaDoc            usp_pandadoc.PandaDocConfig                        `json:"pandadoc" yaml:"pandadoc"`
+	ProofpointTap       usp_proofpoint_tap.ProofpointTapConfig             `json:"proofpoint_tap" yaml:"proofpoint_tap"`
+	ProofpointIsolation usp_proofpoint_isolation.ProofpointIsolationConfig `json:"proofpoint_isolation" yaml:"proofpoint_isolation"`
+	Box                 usp_box.BoxConfig                                  `json:"box" yaml:"box"`
+	Sublime             usp_sublime.SublimeConfig                          `json:"sublime" yaml:"sublime"`
+	SentinelOne         usp_sentinelone.SentinelOneConfig                  `json:"sentinel_one" yaml:"sentinel_one"`
+	ServiceNow          usp_servicenow.ServiceNowConfig                    `json:"servicenow" yaml:"servicenow"`
+	ThreatLocker        usp_threatlocker.ThreatLockerConfig                `json:"threatlocker" yaml:"threatlocker"`
+	TrendMicro          usp_trendmicro.TrendMicroConfig                    `json:"trendmicro" yaml:"trendmicro"`
+	Wiz                 usp_wiz.WizConfig                                  `json:"wiz" yaml:"wiz"`
 }
