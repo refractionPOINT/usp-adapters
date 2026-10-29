@@ -54,6 +54,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
+	"github.com/refractionPOINT/usp-adapters/symantec"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/threatlocker"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
@@ -512,6 +513,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ThreatLocker
 		client, chRunning, err = usp_threatlocker.NewThreatLockerAdapter(ctx, configs.ThreatLocker)
+	} else if method == "symantec" {
+		configs.Symantec.ClientOptions = applyLogging(configs.Symantec.ClientOptions)
+		configs.Symantec.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.Symantec
+		client, chRunning, err = usp_symantec.NewSymantecAdapter(ctx, configs.Symantec)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}

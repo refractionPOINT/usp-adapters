@@ -40,6 +40,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/sqs-files"
 	"github.com/refractionPOINT/usp-adapters/stdin"
 	"github.com/refractionPOINT/usp-adapters/sublime"
+	"github.com/refractionPOINT/usp-adapters/symantec"
 	"github.com/refractionPOINT/usp-adapters/syslog"
 	"github.com/refractionPOINT/usp-adapters/threatlocker"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
@@ -95,4 +96,5 @@ type GeneralConfigs struct {
 	ThreatLocker      usp_threatlocker.ThreatLockerConfig             `json:"threatlocker" yaml:"threatlocker"`
 	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
+	Symantec          usp_symantec.SymantecConfig                     `json:"symantec" yaml:"symantec"`
 }
