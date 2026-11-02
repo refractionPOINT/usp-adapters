@@ -206,12 +206,13 @@ steps:
 
 # Sign the Windows and macOS adapters in place, in one signing request
 # (build_scripts/code_signing/sign_release.py). The cloud-sdk image carries the
-# gcloud CLI that client.py drives, and python3.
+# gcloud CLI that client.py drives, and python3. No key: client.py signs with
+# the build's own service account (serviceAccount below), which has publish
+# rights on the signing topic and object rights on the unsigned bucket.
 - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
   id: sign-binaries
   entrypoint: 'python3'
   args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$TAG_NAME.exe', 'lc_adapter_macos_64_$TAG_NAME', 'lc_adapter_macos_arm64_$TAG_NAME']
-  secretEnv: ['CODE_SIGNING_KEY']
   waitFor: ['build-win64', 'build-macos64', 'build-macosarm64']
 # Sign the legacy Windows adapter on its own, so its absence cannot fail the
 # shared signing step above.
@@ -219,7 +220,6 @@ steps:
   id: sign-win64-legacy
   entrypoint: 'bash'
   args: ['-c', 'python3 ./build_scripts/code_signing/sign_release.py --timeout 300 legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe && mv legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe .']
-  secretEnv: ['CODE_SIGNING_KEY']
   allowFailure: true
   waitFor: ['build-win64-legacy']
 
@@ -266,8 +266,13 @@ availableSecrets:
     env: 'USERNAME'
   - versionName: projects/${PROJECT_ID}/secrets/GITHUB-DEPS-ACCESS/versions/latest
     env: 'SSH_KEY'
-  - versionName: projects/${PROJECT_ID}/secrets/CODE_SIGNING_KEY/versions/latest
-    env: 'CODE_SIGNING_KEY'
+# The release build runs as its own service account, not the project's shared
+# default build account, so that only this build can sign. A trigger's own
+# service account takes precedence over this field, so the release trigger is
+# set to the same account. With a user-specified service account, build logs
+# must go to a user-owned bucket or to Cloud Logging: they go to Cloud Logging.
+serviceAccount: 'projects/legion-212720/serviceAccounts/usp-adapters-release@legion-212720.iam.gserviceaccount.com'
 options:
   machineType: 'N1_HIGHCPU_32'
+  logging: CLOUD_LOGGING_ONLY
 timeout: 45m
