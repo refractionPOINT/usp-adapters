@@ -206,20 +206,21 @@ steps:
 
 # Sign the Windows and macOS adapters in place, in one signing request
 # (build_scripts/code_signing/sign_release.py). The cloud-sdk image carries the
-# gcloud CLI that client.py drives, and python3. No key: client.py signs with
+# gcloud CLI that client.py drives, and a bundled Python outside PATH. Pin the
+# image and invoke that interpreter directly. No key: client.py signs with
 # the build's own service account (serviceAccount below), which has publish
 # rights on the signing topic and object rights on the unsigned bucket.
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim@sha256:08c9cb2c82625689f26172f46f2cefdf30c3449959a71492569a824b537d369f'
   id: sign-binaries
-  entrypoint: 'python3'
+  entrypoint: '/usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3'
   args: ['./build_scripts/code_signing/sign_release.py', '--timeout', '300', 'lc_adapter_windows_64_$TAG_NAME.exe', 'lc_adapter_macos_64_$TAG_NAME', 'lc_adapter_macos_arm64_$TAG_NAME']
   waitFor: ['build-win64', 'build-macos64', 'build-macosarm64']
 # Sign the legacy Windows adapter on its own, so its absence cannot fail the
 # shared signing step above.
-- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim'
+- name: 'gcr.io/google.com/cloudsdktool/cloud-sdk:slim@sha256:08c9cb2c82625689f26172f46f2cefdf30c3449959a71492569a824b537d369f'
   id: sign-win64-legacy
   entrypoint: 'bash'
-  args: ['-c', 'python3 ./build_scripts/code_signing/sign_release.py --timeout 300 legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe && mv legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe .']
+  args: ['-c', '/usr/lib/google-cloud-sdk/platform/bundledpythonunix/bin/python3 ./build_scripts/code_signing/sign_release.py --timeout 300 legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe && mv legacy/lc_adapter_windows_legacy_64_$TAG_NAME.exe .']
   allowFailure: true
   waitFor: ['build-win64-legacy']
 
