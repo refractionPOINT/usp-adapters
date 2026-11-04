@@ -225,39 +225,52 @@ steps:
   allowFailure: true
   waitFor: ['build-win64-legacy']
 
-# Stage binaries
+# Publish gate. Every step that can fail the release (all builds and both
+# signing steps) must finish before anything is pushed, so a late failure
+# cannot leave a partial release: v1.32.53 had pushed its Docker images and
+# connectivity binaries when signing failed. The list is the terminal steps
+# only: the wave-3 builds cover waves 1-2 and build-docker-general, and
+# sign-binaries covers the Windows and macOS builds it waits on.
+# build_scripts/release_build_test.go checks the full closure.
+- name: 'gcr.io/cloud-builders/gcloud'
+  id: release-gate
+  entrypoint: 'bash'
+  args: ['-c', 'true']
+  waitFor: ['build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64', 'build-aixppc64', 'sign-binaries', 'sign-win64-legacy', 'build-docker-zeek', 'build-docker-zeek-extract', 'build-docker-k8s-pods', 'build-linux64-connectivity', 'build-win64-connectivity', 'build-macos64-connectivity', 'build-macosarm64-connectivity', 'build-linuxarm-connectivity', 'build-linuxarm64-connectivity', 'build-solarisamd64-connectivity', 'build-aixppc64-connectivity', 'build-freebsdamd64-connectivity', 'build-netbsdamd64-connectivity', 'build-openbsdamd64-connectivity']
+
+# Publish
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-adapters
   args: ['cp', './lc_adapter_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64', 'sign-binaries', 'build-linuxarm', 'build-linuxarm64', 'build-solarisamd64', 'build-aixppc64', 'build-freebsdamd64', 'build-netbsdamd64', 'build-openbsdamd64', 'sign-win64-legacy']
+  waitFor: ['release-gate']
 - name: 'gcr.io/cloud-builders/gsutil'
   id: copy-binary-connectivity
   args: ['cp', './lc_connectivity_*', 'gs://limacharlie-io/installers/']
-  waitFor: ['build-linux64-connectivity', 'build-win64-connectivity', 'build-macos64-connectivity', 'build-macosarm64-connectivity', 'build-linuxarm-connectivity', 'build-linuxarm64-connectivity', 'build-solarisamd64-connectivity', 'build-aixppc64-connectivity', 'build-freebsdamd64-connectivity', 'build-netbsdamd64-connectivity', 'build-openbsdamd64-connectivity']
+  waitFor: ['release-gate']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter-general
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter:$TAG_NAME && docker push refractionpoint/lc-adapter:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-general']
+  waitFor: ['release-gate']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter-zeek
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-zeek']
+  waitFor: ['release-gate']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter-zeek-extract
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-zeek-extract:$TAG_NAME && docker push refractionpoint/lc-adapter-zeek-extract:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-zeek-extract']
+  waitFor: ['release-gate']
 - name: 'gcr.io/cloud-builders/docker'
   id: copy-docker-adapter-k8s-pods
   entrypoint: 'bash'
   args: ['-c', 'docker login --username=$$USERNAME --password=$$PASSWORD && docker push refractionpoint/lc-adapter-k8s-pods:$TAG_NAME && docker push refractionpoint/lc-adapter-k8s-pods:latest']
   secretEnv: ['USERNAME', 'PASSWORD']
-  waitFor: ['build-docker-k8s-pods']
+  waitFor: ['release-gate']
 images:
   - gcr.io/$PROJECT_ID/github.com/refractionpoint/usp-adapters/lc-adapter:$TAG_NAME
 availableSecrets:
