@@ -44,6 +44,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/threatlocker"
 	"github.com/refractionPOINT/usp-adapters/trendmicro"
 	"github.com/refractionPOINT/usp-adapters/wel"
+	"github.com/refractionPOINT/usp-adapters/withsecure"
 	"github.com/refractionPOINT/usp-adapters/wiz"
 	"github.com/refractionPOINT/usp-adapters/zendesk"
 )
@@ -94,5 +95,6 @@ type GeneralConfigs struct {
 	ServiceNow        usp_servicenow.ServiceNowConfig                 `json:"servicenow" yaml:"servicenow"`
 	ThreatLocker      usp_threatlocker.ThreatLockerConfig             `json:"threatlocker" yaml:"threatlocker"`
 	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
+	WithSecure        usp_withsecure.WithSecureConfig                 `json:"withsecure" yaml:"withsecure"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
 }
