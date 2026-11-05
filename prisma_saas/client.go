@@ -25,20 +25,23 @@ import (
 )
 
 const (
-	defaultPlatform   = "prisma_saas"
-	defaultRegion     = "us"
-	defaultMaxPolls   = 4
-	maxAllowedPolls   = 30 // upper bound also used by the reference XSOAR collector
-	unknownEventType  = "unknown"
-	timestampField    = "timestamp"
-	eventTypeField    = "log_type"
-	shipTimeout       = 10 * time.Second
-	defaultEmptyWait  = 3 * time.Second
-	defaultRetryBase  = 1 * time.Second
-	defaultRetryMax   = 60 * time.Second
-	maxRetryAfter     = 5 * time.Minute
-	defaultShutGrace  = 25 * time.Second // > the 20s server-side long-poll timeout
-	minLongPollLength = 1 * time.Second  // a faster "no data" is not a real long-poll timeout
+	defaultPlatform  = "prisma_saas"
+	defaultRegion    = "us"
+	defaultMaxPolls  = 4
+	maxAllowedPolls  = 30 // upper bound also used by the reference XSOAR collector
+	unknownEventType = "unknown"
+	timestampField   = "timestamp"
+	eventTypeField   = "log_type"
+	shipTimeout      = 10 * time.Second
+	defaultEmptyWait = 3 * time.Second
+	defaultRetryBase = 1 * time.Second
+	defaultRetryMax  = 60 * time.Second
+	maxRetryAfter    = 5 * time.Minute
+	defaultShutGrace = 25 * time.Second // > the 20s server-side long-poll timeout
+	// defaultProducerGrace bounds how long Close waits for readers blocked in
+	// Ship once no read is in flight, before the USP client is sealed.
+	defaultProducerGrace = 10 * time.Second
+	minLongPollLength    = 1 * time.Second // a faster "no data" is not a real long-poll timeout
 )
 
 // regionHosts maps a SaaS Security region to its API host.
@@ -88,6 +91,7 @@ type PrismaSaaSConfig struct {
 	retryBaseDelay    time.Duration
 	retryMaxDelay     time.Duration
 	shutdownGrace     time.Duration
+	producerStopGrace time.Duration
 }
 
 // Validate checks the configuration and fills in defaults.
@@ -147,6 +151,9 @@ func (c *PrismaSaaSConfig) Validate() error {
 	if c.shutdownGrace <= 0 {
 		c.shutdownGrace = defaultShutGrace
 	}
+	if c.producerStopGrace <= 0 {
+		c.producerStopGrace = defaultProducerGrace
+	}
 	return nil
 }
 
@@ -176,6 +183,13 @@ type PrismaSaaSAdapter struct {
 	// useBulk is true until log_events_bulk answers 404, after which the
 	// documented single-event endpoint is used for good.
 	useBulk atomic.Bool
+
+	// Reads in flight. Close must not let the USP client stop accepting
+	// messages while a read that has already popped events is still pending.
+	readsMu    sync.Mutex
+	reads      int
+	readsDone  chan struct{} // closed once stopping and no read is in flight
+	readsClose sync.Once
 
 	chStopped chan struct{}
 	wgReaders sync.WaitGroup
@@ -223,6 +237,7 @@ func newPrismaSaaSAdapter(ctx context.Context, conf PrismaSaaSConfig, sink uspSi
 	a.ctx, a.cancel = context.WithCancel(ctx)
 	a.api = newAPIClient(conf.resolveBaseURL(), conf.ClientID, conf.ClientSecret, conf.MaxConcurrentPolls)
 	a.chStopped = make(chan struct{})
+	a.readsDone = make(chan struct{})
 
 	for i := 0; i < conf.MaxConcurrentPolls; i++ {
 		a.wgReaders.Add(1)
@@ -249,11 +264,20 @@ func newPrismaSaaSAdapter(ctx context.Context, conf PrismaSaaSConfig, sink uspSi
 
 // Close stops the adapter. Events already read are shipped first. It is
 // idempotent: repeated calls return the result of the first.
+//
+// Ordering matters: a read that returns after the USP client stopped accepting
+// messages would pop events from PAN's queue and then have nowhere to put them.
+// So Close first stops new reads and waits for the in-flight ones (cancelled
+// after shutdownGrace), and only then arms the timer that seals the USP client
+// against readers stuck in Ship.
 func (a *PrismaSaaSAdapter) Close() error {
-	defer utils.StopBlockedProducers(a.uspClient)()
 	a.closeOnce.Do(func() {
 		a.conf.ClientOptions.DebugLog("prisma_saas: closing")
 		a.doStop.Set()
+		a.markStopping()
+		<-a.readsDone
+		stopProducers := utils.StopBlockedProducersAfter(a.uspClient, a.conf.producerStopGrace)
+		defer stopProducers()
 		a.wgReaders.Wait()
 		err1 := a.uspClient.Drain(1 * time.Minute)
 		_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
@@ -265,6 +289,40 @@ func (a *PrismaSaaSAdapter) Close() error {
 		}
 	})
 	return a.closeErr
+}
+
+// beginRead registers an in-flight read. It returns false once the adapter is
+// stopping, in which case no read may start.
+func (a *PrismaSaaSAdapter) beginRead() bool {
+	a.readsMu.Lock()
+	defer a.readsMu.Unlock()
+	if a.doStop.IsSet() {
+		return false
+	}
+	a.reads++
+	return true
+}
+
+// endRead unregisters a read, after its events (if any) are in hand.
+func (a *PrismaSaaSAdapter) endRead() {
+	a.readsMu.Lock()
+	defer a.readsMu.Unlock()
+	a.reads--
+	a.signalReadsDoneLocked()
+}
+
+// markStopping records that no new read may start; readsDone closes once the
+// last in-flight read has returned.
+func (a *PrismaSaaSAdapter) markStopping() {
+	a.readsMu.Lock()
+	defer a.readsMu.Unlock()
+	a.signalReadsDoneLocked()
+}
+
+func (a *PrismaSaaSAdapter) signalReadsDoneLocked() {
+	if a.doStop.IsSet() && a.reads == 0 {
+		a.readsClose.Do(func() { close(a.readsDone) })
+	}
 }
 
 // runReader is one reader loop. Each reader reads a batch, ships all of it,
@@ -281,8 +339,12 @@ func (a *PrismaSaaSAdapter) runReader() {
 			path = bulkEventsPath
 		}
 
+		if !a.beginRead() {
+			return
+		}
 		started := time.Now()
 		batch, err := a.api.fetchEvents(a.ctx, path, bulk)
+		a.endRead()
 		if err != nil {
 			if a.doStop.IsSet() || a.ctx.Err() != nil {
 				return

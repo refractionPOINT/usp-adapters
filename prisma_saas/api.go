@@ -268,8 +268,10 @@ func (c *apiClient) requestToken(ctx context.Context) (string, time.Duration, er
 		// A rejected client id/secret answers 401 (per the docs) or 400
 		// invalid_client (OAuth2 convention); 403 means the client is not
 		// allowed to obtain the scope. None can heal by retrying.
-		if code == http.StatusBadRequest || code == http.StatusUnauthorized || code == http.StatusForbidden {
-			return "", 0, &AuthError{Err: fmt.Errorf("token request rejected (check client_id, client_secret and region): %w", herr)}
+		// Any other non-retryable answer (e.g. 404 from a wrong host) cannot
+		// heal either, and must not be mistaken for a missing events endpoint.
+		if code != http.StatusTooManyRequests && code < 500 {
+			return "", 0, &AuthError{Err: fmt.Errorf("token request rejected (check client_id, client_secret, region and base_url): %w", herr)}
 		}
 		return "", 0, herr
 	}

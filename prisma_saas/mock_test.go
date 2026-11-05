@@ -44,14 +44,19 @@ type captureSink struct {
 	blocked atomic.Bool  // while true, Ship returns ErrorBufferFull
 	failErr atomic.Value // when set (error), Ship returns it
 
-	drained atomic.Bool
-	closed  atomic.Bool
+	drained    atomic.Bool
+	closed     atomic.Bool
+	drainBegan atomic.Bool // set by BeginDrain/Drain: Ship then returns ErrorClosed
 }
 
 func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ships++
+	// Like *uspclient.Client: once draining begins, nothing more is accepted.
+	if s.drainBegan.Load() {
+		return uspclient.ErrorClosed
+	}
 	if v := s.failErr.Load(); v != nil {
 		return v.(error)
 	}
@@ -60,6 +65,9 @@ func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 		s.mu.Unlock()
 		time.Sleep(2 * time.Millisecond)
 		s.mu.Lock()
+		if s.drainBegan.Load() {
+			return uspclient.ErrorClosed
+		}
 		return uspclient.ErrorBufferFull
 	}
 	if s.fullFor > 0 {
@@ -70,7 +78,12 @@ func (s *captureSink) Ship(m *protocol.DataMessage, _ time.Duration) error {
 	return nil
 }
 
+// BeginDrain mirrors (*uspclient.Client).BeginDrain: it stops admission and
+// wakes blocked Ship calls.
+func (s *captureSink) BeginDrain() { s.drainBegan.Store(true) }
+
 func (s *captureSink) Drain(time.Duration) error {
+	s.drainBegan.Store(true)
 	s.drained.Store(true)
 	return nil
 }
@@ -118,6 +131,7 @@ type mockPAN struct {
 	tokenStatus   int           // token requests answer this status (e.g. 400 invalid_client)
 	faults        []fault       // consumed in order by events requests
 	garbageNext   int           // next N events 200s carry an unparseable body
+	gate          chan struct{} // when set, each events request waits for a token (or a closed gate)
 
 	// Token state.
 	nextToken int
@@ -144,13 +158,17 @@ func newMockPAN(t *testing.T) *mockPAN {
 }
 
 func (m *mockPAN) start() *httptest.Server {
+	srv := httptest.NewServer(m.handler())
+	m.t.Cleanup(srv.Close)
+	return srv
+}
+
+func (m *mockPAN) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oauth/token", m.handleToken)
 	mux.HandleFunc("/api/v1/log_events_bulk", func(w http.ResponseWriter, r *http.Request) { m.handleEvents(w, r, true) })
 	mux.HandleFunc("/api/v1/log_events", func(w http.ResponseWriter, r *http.Request) { m.handleEvents(w, r, false) })
-	srv := httptest.NewServer(mux)
-	m.t.Cleanup(srv.Close)
-	return srv
+	return mux
 }
 
 func (m *mockPAN) enqueue(events ...utils.Dict) {
@@ -176,6 +194,18 @@ func (m *mockPAN) stats() (tokens, bulk, single, unauth, popped int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.tokenRequests, m.bulkRequests, m.singleRequests, m.unauthorized, m.popped
+}
+
+func (m *mockPAN) singleCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.singleRequests
+}
+
+func (m *mockPAN) inflightNow() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.inflight
 }
 
 func (m *mockPAN) poppedCount() int {
@@ -303,10 +333,18 @@ func (m *mockPAN) handleEvents(w http.ResponseWriter, r *http.Request, bulk bool
 		return
 	}
 	hold := m.holdForever
+	gate := m.gate
 	m.mu.Unlock()
 	if hold {
 		<-r.Context().Done()
 		return
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			return
+		}
 	}
 
 	// Consume. An empty single-event queue is a long-poll: wait for data until

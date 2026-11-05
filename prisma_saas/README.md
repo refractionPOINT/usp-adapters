@@ -168,9 +168,11 @@ around never reading more than it can ship.
   rejected token request (400/401/403, e.g. `invalid_client`) or any other
   permanent 4xx **stops the adapter** with a clear error: the credentials,
   scope or region must be fixed.
-- **Shutdown.** `Close` stops new reads, lets requests already in flight finish
-  (up to 25 s, the long-poll timeout) and ships what they returned before
-  draining the LimaCharlie connection.
+- **Shutdown.** `Close` stops new reads and lets requests already in flight
+  finish (cancelled after 25 s, past the 20 s long-poll timeout). Only once no
+  read is in flight does it start the 10 s timer that releases readers stuck on
+  a full LimaCharlie buffer, so a late response is still shipped before the
+  connection is drained.
 
 ## Caveats
 

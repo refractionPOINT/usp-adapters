@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -513,7 +514,7 @@ func TestForbiddenStopsTheAdapter(t *testing.T) {
 }
 
 func TestTokenEndpointRejectionStopsTheAdapter(t *testing.T) {
-	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden} {
+	for _, status := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			mock := newMockPAN(t)
 			mock.tokenStatus = status
@@ -619,25 +620,37 @@ func TestTransientErrorsBackOffAndRecover(t *testing.T) {
 
 func TestNetworkErrorsAreRetried(t *testing.T) {
 	mock := newMockPAN(t)
-	mock.enqueue(fixtureActivity(1))
-	srv := mock.start()
-	conf := testConfig(t, srv, &logCollector{})
+	events := mixedEvents(5)
+	mock.enqueue(events...)
+
+	// A server the test owns that drops the connection without answering for
+	// its first requests (token and event requests alike), then serves.
+	const dropped = 4
+	var seen atomic.Int32
+	inner := mock.handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if seen.Add(1) <= dropped {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if assert.NoError(t, err) {
+				_ = conn.Close()
+			}
+			return
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	logs := &logCollector{}
+	conf := testConfig(t, srv, logs)
 	conf.MaxConcurrentPolls = 1
+	_, sink, chStopped := startAdapter(t, conf)
 
-	// Point at a dead address first, then bring the mock up on it.
-	dead := httptest.NewServer(http.NotFoundHandler())
-	addr := dead.Listener.Addr().String()
-	dead.Close()
-	conf.BaseURL = "http://" + addr
-
-	sink := &captureSink{}
-	a, chStopped, err := newPrismaSaaSAdapter(context.Background(), conf, sink)
-	require.NoError(t, err)
-	defer a.Close()
-
-	time.Sleep(150 * time.Millisecond)
-	assert.False(t, isStopped(chStopped), "connection refused is transient")
-	assert.Zero(t, sink.count())
+	require.Eventually(t, func() bool { return sink.count() == 5 }, 10*time.Second, 5*time.Millisecond)
+	assert.Equal(t, expectedNames(events), shippedNames(sink))
+	assert.GreaterOrEqual(t, int(seen.Load()), dropped+2, "the dropped requests were retried")
+	assert.False(t, isStopped(chStopped), "connection failures are transient")
+	assert.NotEmpty(t, logs.warns())
+	assert.Empty(t, logs.errors())
 }
 
 func TestUnexpectedClientErrorStopsTheAdapter(t *testing.T) {
@@ -720,6 +733,9 @@ func TestReadsPauseWhileTheBufferIsFull(t *testing.T) {
 func TestCloseShipsEverythingAlreadyRead(t *testing.T) {
 	mock := newMockPAN(t)
 	mock.enqueue(mixedEvents(3000)...)
+	// Each events request waits for a token, so the queue cannot drain before
+	// Close runs: four requests are released, the rest stay in flight.
+	mock.gate = make(chan struct{}, 4)
 	srv := mock.start()
 	conf := testConfig(t, srv, &logCollector{})
 	conf.MaxConcurrentPolls = 4
@@ -727,12 +743,28 @@ func TestCloseShipsEverythingAlreadyRead(t *testing.T) {
 	a, chStopped, err := newPrismaSaaSAdapter(context.Background(), conf, sink)
 	require.NoError(t, err)
 
-	require.Eventually(t, func() bool { return sink.count() >= 1 }, 5*time.Second, time.Millisecond)
-	require.NoError(t, a.Close())
+	for i := 0; i < 4; i++ {
+		mock.gate <- struct{}{}
+	}
+	require.Eventually(t, func() bool { return sink.count() == 400 }, 10*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return mock.inflightNow() == 4 }, 5*time.Second, time.Millisecond,
+		"all four readers are waiting on their next request")
+
+	closed := make(chan error, 1)
+	go func() { closed <- a.Close() }()
+	require.Eventually(t, a.doStop.IsSet, 5*time.Second, time.Millisecond)
+	close(mock.gate) // the in-flight requests now return their batches
+
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return")
+	}
 	require.NoError(t, a.Close(), "Close is idempotent")
 
+	assert.Equal(t, 800, mock.poppedCount(), "the four in-flight reads completed")
 	assert.Equal(t, mock.poppedCount(), sink.count(), "every event read from PAN was shipped before Close returned")
-	assert.Less(t, sink.count(), 3000, "the adapter stopped reading")
 	assert.True(t, sink.drained.Load())
 	assert.True(t, sink.closed.Load())
 	select {
@@ -746,32 +778,66 @@ func TestCloseShipsEverythingAlreadyRead(t *testing.T) {
 	}
 }
 
-func TestCloseWaitsForAnInflightLongPoll(t *testing.T) {
+// A read that completes after Close began, and after the point where the USP
+// client would have stopped accepting messages had the seal been armed at the
+// start of Close, must still be shipped.
+func TestCloseShipsAReadThatReturnsLate(t *testing.T) {
 	mock := newMockPAN(t)
 	mock.bulkMissing = true
-	mock.longPoll = 2 * time.Second
+	mock.longPoll = 5 * time.Second
 	srv := mock.start()
 	conf := testConfig(t, srv, &logCollector{})
 	conf.MaxConcurrentPolls = 1
+	conf.producerStopGrace = 100 * time.Millisecond
+	conf.shutdownGrace = 10 * time.Second
 	sink := &captureSink{}
 	a, _, err := newPrismaSaaSAdapter(context.Background(), conf, sink)
 	require.NoError(t, err)
 
-	require.Eventually(t, func() bool {
-		mock.mu.Lock()
-		defer mock.mu.Unlock()
-		return mock.inflight == 1
-	}, 5*time.Second, 2*time.Millisecond)
+	require.Eventually(t, func() bool { return mock.singleCount() >= 1 && mock.inflightNow() == 1 },
+		5*time.Second, time.Millisecond, "the long-poll itself is open")
 
-	// An event arrives while Close is waiting on the open long-poll: it has
-	// left PAN's queue, so it must still be shipped.
-	go func() {
-		time.Sleep(150 * time.Millisecond)
-		mock.enqueue(fixtureActivity(7))
-	}()
-	require.NoError(t, a.Close())
-	require.Equal(t, 1, sink.count(), "the in-flight event was shipped, not abandoned")
+	closed := make(chan error, 1)
+	go func() { closed <- a.Close() }()
+	require.Eventually(t, a.doStop.IsSet, 5*time.Second, time.Millisecond)
+
+	// The server holds the request well past producerStopGrace and answers
+	// late, as a real long-poll can. Waiting here models that slow server.
+	time.Sleep(4 * conf.producerStopGrace)
+	require.Zero(t, sink.count())
+	require.False(t, sink.drainBegan.Load(), "the USP client is not sealed while a read is in flight")
+	mock.enqueue(fixtureActivity(7))
+
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return")
+	}
+	require.Equal(t, 1, sink.count(), "the late event was shipped, not dropped")
 	assert.Equal(t, 1, mock.poppedCount())
+}
+
+// Readers stuck in Ship (a full buffer) are still released: once no read is in
+// flight the USP client is sealed after producerStopGrace.
+func TestCloseReleasesReadersStuckInShip(t *testing.T) {
+	mock := newMockPAN(t)
+	mock.enqueue(mixedEvents(300)...)
+	srv := mock.start()
+	conf := testConfig(t, srv, &logCollector{})
+	conf.MaxConcurrentPolls = 2
+	conf.producerStopGrace = 150 * time.Millisecond
+	sink := &captureSink{}
+	sink.blocked.Store(true)
+	a, chStopped, err := newPrismaSaaSAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+
+	require.Eventually(t, func() bool { return sink.shipCalls() > 0 }, 5*time.Second, time.Millisecond)
+	start := time.Now()
+	require.NoError(t, a.Close())
+	assert.Less(t, time.Since(start), 5*time.Second)
+	assert.True(t, isStopped(chStopped))
+	assert.Zero(t, sink.count())
 }
 
 func TestCloseDoesNotHangOnAStuckRequest(t *testing.T) {
@@ -785,11 +851,7 @@ func TestCloseDoesNotHangOnAStuckRequest(t *testing.T) {
 	a, chStopped, err := newPrismaSaaSAdapter(context.Background(), conf, sink)
 	require.NoError(t, err)
 
-	require.Eventually(t, func() bool {
-		mock.mu.Lock()
-		defer mock.mu.Unlock()
-		return mock.inflight == 2
-	}, 5*time.Second, 2*time.Millisecond)
+	require.Eventually(t, func() bool { return mock.inflightNow() == 2 }, 5*time.Second, 2*time.Millisecond)
 
 	start := time.Now()
 	require.NoError(t, a.Close())
