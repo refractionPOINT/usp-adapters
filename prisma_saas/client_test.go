@@ -402,6 +402,44 @@ func TestUnparseableSuccessBodyIsSurvived(t *testing.T) {
 	assert.Equal(t, "My File 2", sink.snapshot()[0].JsonPayload["item_name"])
 }
 
+func TestUnexpectedBulkShapeIsShippedAndWarnedOnce(t *testing.T) {
+	var served atomic.Int32
+	mock := newMockPAN(t)
+	inner := mock.handler()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == bulkEventsPath && served.Add(1) <= 3 {
+			// Valid token needed first: let the mock authenticate, then answer
+			// with an envelope the adapter does not know.
+			if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer tok-") {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprintf(w, `{"data":[{"n":%d}]}`, served.Load())
+				return
+			}
+		}
+		inner.ServeHTTP(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	logs := &logCollector{}
+	conf := testConfig(t, srv, logs)
+	conf.MaxConcurrentPolls = 1
+	_, sink, chStopped := startAdapter(t, conf)
+
+	require.Eventually(t, func() bool { return sink.count() == 3 }, 10*time.Second, 5*time.Millisecond)
+	for _, m := range sink.snapshot() {
+		assert.Equal(t, "unknown", m.EventType)
+		assert.Contains(t, m.JsonPayload, "data")
+	}
+	assert.False(t, isStopped(chStopped))
+	var shape int
+	for _, w := range logs.warns() {
+		if strings.Contains(w, "log_events_bulk answered") {
+			shape++
+		}
+	}
+	assert.Equal(t, 1, shape, "warned once for three unexpected responses")
+}
+
 // --- authentication ---------------------------------------------------------
 
 func TestTokenRequestIsCachedAndShared(t *testing.T) {
@@ -836,7 +874,7 @@ func TestCloseReleasesReadersStuckInShip(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, a.Close())
 	assert.Less(t, time.Since(start), 5*time.Second)
-	assert.True(t, isStopped(chStopped))
+	requireStopped(t, chStopped)
 	assert.Zero(t, sink.count())
 }
 
@@ -856,7 +894,7 @@ func TestCloseDoesNotHangOnAStuckRequest(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, a.Close())
 	assert.Less(t, time.Since(start), 5*time.Second)
-	assert.True(t, isStopped(chStopped))
+	requireStopped(t, chStopped)
 }
 
 func TestParentContextCancellationStopsTheAdapter(t *testing.T) {
@@ -906,22 +944,59 @@ func TestParseEvents(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, b.events, 2)
 		assert.Equal(t, "admin_audit", b.events[1]["log_type"])
+		assert.Empty(t, b.unexpectedShape)
 	})
 	t.Run("bulk bare array", func(t *testing.T) {
 		b, err := parseEvents([]byte(`[{"log_type":"incident"}]`), true)
 		require.NoError(t, err)
 		assert.Len(t, b.events, 1)
+		assert.Empty(t, b.unexpectedShape)
 	})
 	t.Run("bulk empty envelope", func(t *testing.T) {
 		b, err := parseEvents([]byte(`{"events":[]}`), true)
 		require.NoError(t, err)
 		assert.Empty(t, b.events)
+		assert.Empty(t, b.unexpectedShape)
+	})
+	t.Run("bulk null events", func(t *testing.T) {
+		b, err := parseEvents([]byte(`{"events":null}`), true)
+		require.NoError(t, err)
+		assert.Empty(t, b.events)
+		assert.Empty(t, b.unexpectedShape)
+	})
+	t.Run("bulk empty object", func(t *testing.T) {
+		b, err := parseEvents([]byte(`{}`), true)
+		require.NoError(t, err)
+		assert.Empty(t, b.events)
+		assert.Empty(t, b.unexpectedShape)
+	})
+	t.Run("bulk object without events is shipped whole", func(t *testing.T) {
+		b, err := parseEvents([]byte(`{"data":[{"a":1}]}`), true)
+		require.NoError(t, err)
+		require.Len(t, b.events, 1, "popped events are not discarded")
+		assert.Equal(t, []interface{}{map[string]interface{}{"a": uint64(1)}}, b.events[0]["data"])
+		assert.Contains(t, b.unexpectedShape, "without an")
+	})
+	t.Run("bulk bare event object", func(t *testing.T) {
+		b, err := parseEvents([]byte(`{"log_type":"incident","item_name":"x"}`), true)
+		require.NoError(t, err)
+		require.Len(t, b.events, 1)
+		assert.Equal(t, "incident", b.events[0]["log_type"])
+		assert.Contains(t, b.unexpectedShape, "event object")
+	})
+	t.Run("bulk events field not an array", func(t *testing.T) {
+		b, err := parseEvents([]byte(`{"events":"oops","k":1}`), true)
+		require.NoError(t, err)
+		require.Len(t, b.events, 1)
+		assert.Equal(t, "oops", b.events[0]["events"])
+		assert.Contains(t, b.unexpectedShape, "not an array")
 	})
 	t.Run("single event object", func(t *testing.T) {
 		b, err := parseEvents([]byte(`{"log_type":"activity_monitoring","target_name":null,"events":["kept as a field"]}`), false)
 		require.NoError(t, err)
 		require.Len(t, b.events, 1, "a single-event body is one event, never unwrapped")
 		assert.Contains(t, b.events[0], "events")
+		assert.Empty(t, b.unexpectedShape)
 	})
 	t.Run("blank body", func(t *testing.T) {
 		b, err := parseEvents([]byte("  \n"), false)
@@ -934,11 +1009,20 @@ func TestParseEvents(t *testing.T) {
 		assert.Len(t, b.events, 1)
 		assert.Equal(t, 4, b.skipped)
 	})
-	t.Run("garbage", func(t *testing.T) {
-		_, err := parseEvents([]byte(`<html>`), true)
-		assert.Error(t, err)
-		_, err = parseEvents([]byte(`{"events":`), true)
-		assert.Error(t, err)
+	t.Run("invalid JSON reports size, not content", func(t *testing.T) {
+		for _, body := range []string{`<html>secret-looking-content</html>`, `{"events":`, `[{"a":`} {
+			for _, bulk := range []bool{true, false} {
+				_, err := parseEvents([]byte(body), bulk)
+				require.Error(t, err, body)
+				assert.Contains(t, err.Error(), fmt.Sprintf("%d bytes", len(body)))
+				assert.NotContains(t, err.Error(), "secret-looking-content")
+			}
+		}
+	})
+	t.Run("valid JSON that is not an object or array", func(t *testing.T) {
+		_, err := parseEvents([]byte(`"just a string"`), true)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "just a string")
 	})
 }
 
@@ -980,4 +1064,15 @@ func TestIsTransientError(t *testing.T) {
 	assert.False(t, isTransientError(&AuthError{Err: &HTTPError{StatusCode: 500}}), "auth errors are never retried")
 	assert.False(t, isTransientError(context.Canceled))
 	assert.False(t, isTransientError(nil))
+}
+
+// requireStopped waits for the adapter's stopped channel, which is closed by a
+// goroutine that may lag slightly behind Close returning.
+func requireStopped(t *testing.T, ch chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stopped channel not closed")
+	}
 }

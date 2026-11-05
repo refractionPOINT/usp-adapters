@@ -162,6 +162,12 @@ around never reading more than it can ship.
   seconds between empty polls. The single-event endpoint holds the request, so a
   204 is followed by a new request straight away (unless it came back in under a
   second, which is not a real long-poll timeout).
+- **Unexpected bulk shape.** `log_events_bulk` is undocumented, so a 200 that
+  does not carry an `events` array is never discarded (the source has already
+  removed those events): a bare event object is shipped as one event, any other
+  JSON object is shipped whole with event type `unknown`, and a warning is logged
+  once. Only a body that is not valid JSON is dropped, with a warning that gives
+  its size but not its content.
 - **Errors.** 429, 5xx and network errors are retried with exponential backoff
   (1 s up to 60 s, with jitter), honouring `Retry-After` (capped at 5 minutes).
   A 401 refreshes the token once and retries. A persistent 401, any 403, a

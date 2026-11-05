@@ -345,40 +345,71 @@ type eventBatch struct {
 	// skipped counts elements that were not JSON objects and so could not be
 	// shipped.
 	skipped int
+	// unexpectedShape, when set, describes a 200 bulk response that did not
+	// carry an "events" array. Its content is still returned in events, since a
+	// 200 means the source already removed it from its queue.
+	unexpectedShape string
 }
 
 // parseEvents decodes an events response. log_events_bulk answers
 // {"events":[...]}; log_events answers a single event object. A bare array is
 // accepted for both.
+//
+// Anything the source answered with 200 has left its queue, so a body that
+// parses as JSON is never discarded: a bulk object without an "events" array is
+// shipped as one event (with unexpectedShape set so the caller can warn). Only
+// a body that is not valid JSON is an error, and its content is not echoed.
 func parseEvents(body []byte, bulk bool) (eventBatch, error) {
 	trimmed := strings.TrimSpace(string(body))
 	if trimmed == "" {
 		return eventBatch{}, nil
 	}
+	if !json.Valid([]byte(trimmed)) {
+		return eventBatch{}, fmt.Errorf("response body is not valid JSON (%d bytes)", len(body))
+	}
 
 	var raws []json.RawMessage
+	var unexpected string
 	switch trimmed[0] {
 	case '[':
 		if err := json.Unmarshal([]byte(trimmed), &raws); err != nil {
-			return eventBatch{}, fmt.Errorf("invalid JSON array: %v", err)
+			return eventBatch{}, fmt.Errorf("response is not a JSON array of events (%d bytes)", len(body))
 		}
 	case '{':
+		raws = []json.RawMessage{json.RawMessage(trimmed)}
 		if !bulk {
-			raws = []json.RawMessage{json.RawMessage(trimmed)}
 			break
 		}
-		var env struct {
-			Events []json.RawMessage `json:"events"`
-		}
+		var env map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(trimmed), &env); err != nil {
-			return eventBatch{}, fmt.Errorf("invalid JSON object: %v", err)
+			return eventBatch{}, fmt.Errorf("response is not a JSON object (%d bytes)", len(body))
 		}
-		raws = env.Events
+		evs, ok := env["events"]
+		switch {
+		case !ok:
+			// Not the documented envelope. A bare event is shipped as such;
+			// anything else is shipped whole rather than lost.
+			if _, isEvent := env[eventTypeField]; isEvent {
+				unexpected = "an event object instead of an \"events\" envelope"
+			} else if len(env) == 0 {
+				raws = nil
+			} else {
+				unexpected = "an object without an \"events\" array"
+			}
+		case strings.TrimSpace(string(evs)) == "null":
+			raws = nil
+		default:
+			raws = nil
+			if err := json.Unmarshal(evs, &raws); err != nil {
+				raws = []json.RawMessage{json.RawMessage(trimmed)}
+				unexpected = "an \"events\" field that is not an array"
+			}
+		}
 	default:
-		return eventBatch{}, errors.New("response is neither a JSON object nor a JSON array")
+		return eventBatch{}, fmt.Errorf("response is neither a JSON object nor a JSON array (%d bytes)", len(body))
 	}
 
-	batch := eventBatch{events: make([]utils.Dict, 0, len(raws))}
+	batch := eventBatch{events: make([]utils.Dict, 0, len(raws)), unexpectedShape: unexpected}
 	for _, r := range raws {
 		// UnmarshalCleanJSON keeps integer precision so payloads round-trip
 		// verbatim. A non-object element is skipped rather than failing the

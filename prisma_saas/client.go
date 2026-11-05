@@ -184,6 +184,9 @@ type PrismaSaaSAdapter struct {
 	// documented single-event endpoint is used for good.
 	useBulk atomic.Bool
 
+	// shapeWarned limits the unexpected-bulk-shape warning to once.
+	shapeWarned atomic.Bool
+
 	// Reads in flight. Close must not let the USP client stop accepting
 	// messages while a read that has already popped events is still pending.
 	readsMu    sync.Mutex
@@ -370,6 +373,11 @@ func (a *PrismaSaaSAdapter) runReader() {
 		}
 		failures = 0
 
+		if batch.unexpectedShape != "" && a.shapeWarned.CompareAndSwap(false, true) {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf(
+				"prisma_saas: log_events_bulk answered %s; shipping it as received (the response shape is undocumented, further occurrences are not logged)",
+				batch.unexpectedShape))
+		}
 		if batch.skipped > 0 {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("prisma_saas: skipped %d non-object element(s) in a response", batch.skipped))
 		}
