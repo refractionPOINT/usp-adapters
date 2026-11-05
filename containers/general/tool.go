@@ -42,6 +42,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
+	"github.com/refractionPOINT/usp-adapters/prisma_saas"
 	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -512,6 +513,11 @@ func runAdapter(ctx context.Context, method string, configs Configuration, showC
 		configs.ThreatLocker.ClientOptions.Architecture = "usp_adapter"
 		configToShow = configs.ThreatLocker
 		client, chRunning, err = usp_threatlocker.NewThreatLockerAdapter(ctx, configs.ThreatLocker)
+	} else if method == "prisma_saas" {
+		configs.PrismaSaaS.ClientOptions = applyLogging(configs.PrismaSaaS.ClientOptions)
+		configs.PrismaSaaS.ClientOptions.Architecture = "usp_adapter"
+		configToShow = configs.PrismaSaaS
+		client, chRunning, err = usp_prisma_saas.NewPrismaSaaSAdapter(ctx, configs.PrismaSaaS)
 	} else {
 		return nil, nil, errors.New(logError("unknown adapter_type: %s", method))
 	}

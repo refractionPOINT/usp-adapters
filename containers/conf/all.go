@@ -28,6 +28,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/o365"
 	"github.com/refractionPOINT/usp-adapters/okta"
 	"github.com/refractionPOINT/usp-adapters/pandadoc"
+	"github.com/refractionPOINT/usp-adapters/prisma_saas"
 	"github.com/refractionPOINT/usp-adapters/proofpoint_tap"
 	"github.com/refractionPOINT/usp-adapters/pubsub"
 	"github.com/refractionPOINT/usp-adapters/s3"
@@ -93,6 +94,7 @@ type GeneralConfigs struct {
 	SentinelOne       usp_sentinelone.SentinelOneConfig               `json:"sentinel_one" yaml:"sentinel_one"`
 	ServiceNow        usp_servicenow.ServiceNowConfig                 `json:"servicenow" yaml:"servicenow"`
 	ThreatLocker      usp_threatlocker.ThreatLockerConfig             `json:"threatlocker" yaml:"threatlocker"`
+	PrismaSaaS        usp_prisma_saas.PrismaSaaSConfig                `json:"prisma_saas" yaml:"prisma_saas"`
 	TrendMicro        usp_trendmicro.TrendMicroConfig                 `json:"trendmicro" yaml:"trendmicro"`
 	Wiz               usp_wiz.WizConfig                               `json:"wiz" yaml:"wiz"`
 }
