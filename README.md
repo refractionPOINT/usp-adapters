@@ -188,6 +188,17 @@ be added purely through configuration. See [threatlocker/README.md](./threatlock
 ./general threatlocker client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=json client_options.sensor_seed_key=threatlocker api_key=$THREATLOCKER_API_TOKEN instance=g
 ```
 
+### Palo Alto SaaS Security (Prisma SaaS)
+
+Pulls activity monitoring, incident, remediation, policy violation and admin
+audit events from the Palo Alto Networks SaaS Security (formerly Prisma SaaS)
+Log Events API, using an OAuth2 API client created in Strata Cloud Manager. See
+[prisma_saas/README.md](./prisma_saas/README.md).
+
+```
+./general prisma_saas client_options.identity.installation_key=e9a3bcdf-efa2-47ae-b6df-579a02f3a54d client_options.identity.oid=8cbe27f4-bfa1-4afb-ba19-138cd51389cd client_options.platform=prisma_saas client_options.sensor_seed_key=prisma_saas client_id=$PRISMA_SAAS_CLIENT_ID client_secret=$PRISMA_SAAS_CLIENT_SECRET region=us
+```
+
 ### Gmail
 
 Collects incoming email as telemetry from one or many Gmail mailboxes via the

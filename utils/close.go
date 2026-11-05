@@ -59,6 +59,12 @@ func StopBlockedProducers(c interface{}) func() {
 	return stopBlockedProducersAfter(c, 10*time.Second)
 }
 
+// StopBlockedProducersAfter is StopBlockedProducers with a caller-chosen grace
+// period, for adapters that must first wait for in-flight source reads.
+func StopBlockedProducersAfter(c interface{}, grace time.Duration) func() {
+	return stopBlockedProducersAfter(c, grace)
+}
+
 func stopBlockedProducersAfter(c interface{}, grace time.Duration) func() {
 	client, ok := c.(interface{ BeginDrain() })
 	if !ok {
