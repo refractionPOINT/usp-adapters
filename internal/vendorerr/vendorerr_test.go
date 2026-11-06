@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -683,4 +685,116 @@ func TestHTTPTextDropsIncompleteEscapeAtCut(t *testing.T) {
 		require.NotContains(t, out, "alpha", body)
 		require.True(t, strings.HasSuffix(out, " ... [truncated]"), body)
 	}
+}
+
+// The uppercase legacy aliases decode, so a secret echoed with one is hidden
+// whole: no tail survives.
+func TestRedactSecretWithUppercaseEntityAliases(t *testing.T) {
+	cases := map[string]string{
+		"QUOT":      `Qn7Zp3Lm9Kx1",xy`,
+		"AMP":       `Qn7Zp3Lm9Kx1&,xy`,
+		"LT":        `Qn7Zp3Lm9Kx1<,xy`,
+		"GT":        `Qn7Zp3Lm9Kx1>,xy`,
+		"QUOT long": `Qn7Zp3Lm9Kx1",xyAb5Cd8`,
+	}
+	names := map[string]string{"QUOT": "&QUOT;", "AMP": "&AMP;", "LT": "&LT;", "GT": "&GT;", "QUOT long": "&QUOT;"}
+	for name, secret := range cases {
+		for _, in := range []string{
+			`{"client_secret":"` + strings.Replace(secret, secret[12:13], names[name], 1) + `","after":1}`,
+			`{"detail":"bad ` + strings.Replace(secret, secret[12:13], names[name], 1) + ` end"}`,
+			`?token=` + strings.Replace(secret, secret[12:13], url.QueryEscape(names[name]), 1) + `&after=1`,
+			`{"detail":"bad ` + strings.Replace(secret, secret[12:13], names[name][:1]+fmt.Sprintf("%%%02x", names[name][1])+names[name][2:], 1) + ` end"}`,
+		} {
+			out := Redact(in, secret)
+			require.NotContains(t, out, "xy", "%s: %s", name, in)
+			require.NotContains(t, out, "Kx1", "%s: %s", name, in)
+			require.Contains(t, out, redacted, "%s: %s", name, in)
+		}
+	}
+	// A capitalization that is not an entity is not decoded.
+	require.Equal(t, "a &Quot; b", Redact("a &Quot; b"))
+	require.Equal(t, `a " b`, Redact("a &QUOT; b"))
+}
+
+// The zeros padding a numeric entity can be escaped like any other character.
+func TestRedactSecretWithEscapedEntityPadding(t *testing.T) {
+	secret := `Qn7Zp3Lm9Kx1",xy`
+	for name, in := range map[string]string{
+		"percent padding": `?token=Qn7Zp3Lm9Kx1&#%30%30%33%34;,xy&after=1`,
+		"json padding":    `{"detail":"Qn7Zp3Lm9Kx1&#\u0030\u003034;,xy"}`,
+		"hex padding":     `{"detail":"Qn7Zp3Lm9Kx1&#x%30%3022;,xy"}`,
+		"json hex pad":    `{"detail":"Qn7Zp3Lm9Kx1&#x\u0030\u003022;,xy"}`,
+	} {
+		out := Redact(in, secret)
+		require.NotContains(t, out, "xy", name)
+		require.NotContains(t, out, ",", name+" "+out)
+	}
+}
+
+func countingCache(max int) (*patternCache, *atomic.Int64) {
+	var compiles atomic.Int64
+	return newPatternCache(max, func(s string) *regexp.Regexp {
+		compiles.Add(1)
+		return secretPattern(s)
+	}), &compiles
+}
+
+// Simultaneous misses for one secret compile once and take one slot.
+func TestPatternCacheConcurrentMissesCompileOnce(t *testing.T) {
+	c, compiles := countingCache(4)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	res := make([]*regexp.Regexp, 128)
+	for i := range res {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			res[i] = c.get("Qn7Zp3Lm9Kx1-rotating")
+		}()
+	}
+	close(start)
+	wg.Wait()
+	require.EqualValues(t, 1, compiles.Load())
+	require.Equal(t, 1, c.order.Len())
+	require.Len(t, c.entries, 1)
+	for _, re := range res {
+		require.Same(t, res[0], re)
+	}
+}
+
+// A rotating bearer token (longer than a pattern allows) never reaches the
+// cache, so it cannot push the configured secrets out.
+func TestPatternCacheIgnoresLongSecrets(t *testing.T) {
+	c, compiles := countingCache(2)
+	require.NotNil(t, c.get("Qn7Zp3Lm9Kx1-static"))
+	for i := range 20 {
+		require.Nil(t, c.get(strings.Repeat("T", maxSecretPatternLen)+fmt.Sprint(i)))
+	}
+	require.EqualValues(t, 1, compiles.Load())
+	require.Equal(t, 1, c.order.Len())
+	c.get("Qn7Zp3Lm9Kx1-static")
+	require.EqualValues(t, 1, compiles.Load())
+}
+
+// A full cache evicts the least recently used secret, so new secrets are still
+// cached, and nothing but compiled patterns is stored.
+func TestPatternCacheEvictsLeastRecentlyUsedWhenFull(t *testing.T) {
+	c, compiles := countingCache(3)
+	for _, s := range []string{"secret-aaaa", "secret-bbbb", "secret-cccc"} {
+		c.get(s)
+	}
+	c.get("secret-aaaa") // refresh: bbbb is now the oldest
+	c.get("secret-dddd")
+	require.Equal(t, 3, c.order.Len())
+	require.EqualValues(t, 4, compiles.Load())
+	c.get("secret-dddd") // new secret was cached
+	c.get("secret-aaaa") // survivor was kept
+	require.EqualValues(t, 4, compiles.Load())
+	c.get("secret-bbbb") // evicted: compiled again
+	require.EqualValues(t, 5, compiles.Load())
+	for _, el := range c.entries {
+		require.NotNil(t, el.Value.(*patternEntry).re)
+	}
+	require.Len(t, c.entries, 3)
 }

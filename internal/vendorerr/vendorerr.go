@@ -6,6 +6,8 @@
 package vendorerr
 
 import (
+	"container/list"
+	"crypto/sha256"
 	"fmt"
 	"html"
 	"io"
@@ -100,8 +102,9 @@ const (
 	entityValueAlt = `(?:\\"` + afterQuote + `|\\[^"]|` + entityValue + `|&(?:quot|apos|lt|gt);` + afterQuote + `|[^&;#\s"'<>])+`
 )
 
-// quoteEntityRe matches the numeric spellings of ", ', < and >.
-var quoteEntityRe = regexp.MustCompile(`&#0*(?:34|39|60|62);|&#[xX]0*(?:22|27|3[cCeE]);`)
+// quoteEntityRe matches the numeric spellings of ", ', < and >, and the
+// uppercase aliases of ", < and >.
+var quoteEntityRe = regexp.MustCompile(`&#0*(?:34|39|60|62);|&#[xX]0*(?:22|27|3[cCeE]);|&(?:QUOT|LT|GT);`)
 
 var quoteEntityNames = map[rune]string{'"': "&quot;", '\'': "&apos;", '<': "&lt;", '>': "&gt;"}
 
@@ -110,6 +113,9 @@ var quoteEntityNames = map[rune]string{'"': "&quot;", '\'': "&apos;", '<': "&lt;
 // spelling by one rule.
 func normalizeQuoteEntities(s string) string {
 	return quoteEntityRe.ReplaceAllStringFunc(s, func(m string) string {
+		if m[1] != '#' {
+			return strings.ToLower(m)
+		}
 		digits, base := m[2:len(m)-1], 10
 		if digits[0] == 'x' || digits[0] == 'X' {
 			digits, base = digits[1:], 16
@@ -150,8 +156,10 @@ var (
 	jsonEscapeRe    = regexp.MustCompile(`\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))`)
 	surrogatePairRe = regexp.MustCompile(`\\u([dD][89abAB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})`)
 	// htmlEntityRe matches the entities a vendor's HTML or XML error body uses
-	// for markup and URL characters.
-	htmlEntityRe = regexp.MustCompile(`&(?:amp|lt|gt|quot|apos|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});`)
+	// for markup and URL characters, including the uppercase legacy aliases
+	// (&QUOT; &AMP; &LT; &GT;) that html.UnescapeString also decodes. Other
+	// capitalizations are not entities and stay as they are.
+	htmlEntityRe = regexp.MustCompile(`&(?:amp|lt|gt|quot|apos|AMP|LT|GT|QUOT|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});`)
 	// partialEscapeRe matches an escape sequence left incomplete at the end of
 	// text that was cut.
 	partialEscapeRe = regexp.MustCompile(`(?:%[0-9a-fA-F]?|\\u?[0-9a-fA-F]{0,3}|&#?[a-zA-Z0-9]{0,8})$`)
@@ -252,7 +260,9 @@ func canonicalOrRaw(s string) string {
 
 // maxSecretPatternLen bounds the secrets matched by pattern: the program grows
 // by about a hundred instructions per character. A longer secret (a bearer
-// token passed as a secret) is replaced by its literal forms and the sweep.
+// token passed as a secret) is replaced by its literal forms and the sweep. Known
+// limit: such a token echoed with a mixed-encoded entity suffix can leave a tail
+// of under residueLen characters, which no literal form or fragment matches.
 const maxSecretPatternLen = 256
 
 var jsonShortEscapeLetters = map[rune]string{'\b': "b", '\f': "f", '\n': "n", '\r': "r", '\t': "t"}
@@ -314,16 +324,24 @@ func spelled(text string, fold bool) string {
 	return b.String()
 }
 
+// upperEntities are the uppercase legacy aliases of named entities, the only
+// capitalizations other than lowercase that decode (html.UnescapeString).
+var upperEntities = map[rune]string{'"': "QUOT", '&': "AMP", '<': "LT", '>': "GT"}
+
 // charPattern matches any spelling of r in one layer: a plain spelling or an
-// HTML entity (decimal, hex or named).
+// HTML entity (decimal, hex or named). The zeros that may pad a numeric entity
+// are spelled in any plain spelling too, like every other character of it.
 func charPattern(r rune) string {
-	amp, hash, semi := spelled("&", false), spelled("#", false), spelled(";", false)
+	amp, hash, semi, zeros := spelled("&", false), spelled("#", false), spelled(";", false), "(?:"+plainSpelling('0')+")*"
 	alts := []string{
 		plainSpelling(r),
-		amp + hash + "0*" + spelled(strconv.Itoa(int(r)), false) + semi,
-		amp + hash + spelled("x", true) + "0*" + spelled(strconv.FormatInt(int64(r), 16), true) + semi,
+		amp + hash + zeros + spelled(strconv.Itoa(int(r)), false) + semi,
+		amp + hash + spelled("x", true) + zeros + spelled(strconv.FormatInt(int64(r), 16), true) + semi,
 	}
 	if n, ok := namedEntities[r]; ok {
+		alts = append(alts, amp+spelled(n, false)+semi)
+	}
+	if n, ok := upperEntities[r]; ok {
 		alts = append(alts, amp+spelled(n, false)+semi)
 	}
 	return "(?:" + strings.Join(alts, "|") + ")"
@@ -347,12 +365,75 @@ func secretPattern(s string) *regexp.Regexp {
 	return re
 }
 
-var secretPatterns sync.Map // secret -> *regexp.Regexp (nil: use literal forms)
+// patternCache is a bounded LRU of compiled secret patterns, keyed by the
+// SHA-256 of the secret so the secret itself is not a map key. The adapters pass
+// the same few secrets (client secret, SAS key, API token) on every error, and a
+// compile costs milliseconds. Only patterns that compiled are kept, secrets
+// longer than maxSecretPatternLen never reach the cache (rotating bearer tokens
+// would only churn it), and a full cache evicts its least recently used entry
+// so new secrets keep being cached.
+type patternCache struct {
+	mu      sync.Mutex
+	max     int
+	entries map[[sha256.Size]byte]*list.Element // of *patternEntry
+	order   *list.List                          // front = most recently used
+	compile func(string) *regexp.Regexp
+}
+
+type patternEntry struct {
+	key  [sha256.Size]byte
+	once sync.Once
+	re   *regexp.Regexp
+}
+
+func newPatternCache(max int, compile func(string) *regexp.Regexp) *patternCache {
+	return &patternCache{max: max, entries: map[[sha256.Size]byte]*list.Element{}, order: list.New(), compile: compile}
+}
+
+// get returns the pattern for s, nil when s is too long or does not compile.
+// Concurrent callers for one secret share a single entry and a single compile.
+func (c *patternCache) get(s string) *regexp.Regexp {
+	if len(s) > maxSecretPatternLen {
+		return nil
+	}
+	key := sha256.Sum256([]byte(s))
+	c.mu.Lock()
+	el, ok := c.entries[key]
+	if ok {
+		c.order.MoveToFront(el)
+	} else {
+		if c.order.Len() >= c.max {
+			oldest := c.order.Back()
+			c.order.Remove(oldest)
+			delete(c.entries, oldest.Value.(*patternEntry).key)
+		}
+		el = c.order.PushFront(&patternEntry{key: key})
+		c.entries[key] = el
+	}
+	c.mu.Unlock()
+
+	e := el.Value.(*patternEntry)
+	e.once.Do(func() { e.re = c.compile(s) })
+	if e.re == nil {
+		c.mu.Lock()
+		if cur, ok := c.entries[key]; ok && cur == el {
+			c.order.Remove(el)
+			delete(c.entries, key)
+		}
+		c.mu.Unlock()
+	}
+	return e.re
+}
+
+// maxCachedSecretPatterns bounds the cache: a handful of configured secrets per
+// adapter, many adapters per process.
+const maxCachedSecretPatterns = 64
+
+var secretPatterns = newPatternCache(maxCachedSecretPatterns, secretPattern)
 
 // secretMatchers returns what replaces the configured secrets in one layer of
 // text: a pattern per secret, longest first, and the literal forms of the
-// secrets that have none. The adapters pass the same secrets every time, so
-// patterns are cached by secret (a few at most; none are kept beyond the cap).
+// secrets that have none.
 func secretMatchers(secrets []string) (res []*regexp.Regexp, literals []string) {
 	secrets = slices.Clone(secrets)
 	for i, s := range secrets {
@@ -366,28 +447,15 @@ func secretMatchers(secrets []string) (res []*regexp.Regexp, literals []string) 
 		}
 		seen[s] = true
 		for _, v := range slices.Compact([]string{s, canonicalOrRaw(s)}) {
-			var re *regexp.Regexp
-			if cached, ok := secretPatterns.Load(v); ok {
-				re, _ = cached.(*regexp.Regexp)
-			} else {
-				re = secretPattern(v)
-				if secretPatternCount.Add(1) <= maxCachedSecretPatterns {
-					secretPatterns.Store(v, re)
-				}
-			}
-			if re == nil {
-				literals = append(literals, secretForms([]string{v})...)
-			} else {
+			if re := secretPatterns.get(v); re != nil {
 				res = append(res, re)
+			} else {
+				literals = append(literals, secretForms([]string{v})...)
 			}
 		}
 	}
 	return res, literals
 }
-
-const maxCachedSecretPatterns = 64
-
-var secretPatternCount atomic.Int64
 
 // Redact returns text in plain form (JSON, HTML and percent escapes decoded)
 // with the given configured secret values and well-known credential shapes
