@@ -14,6 +14,7 @@ import (
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -39,7 +40,8 @@ type EventHubAdapter struct {
 	closing   atomic.Bool
 	stalled   atomic.Bool
 	admission chan struct{}
-	final     *generation // worker-owned until chStopped closes
+	notifier  vendorerr.Notifier // delivers the recurring partition-runtime report to OnError
+	final     *generation        // worker-owned until chStopped closes
 	source    [32]byte
 	// Per-instance scheduling seams; no global mutable hooks or customer settings.
 	ackEvery, discoverEvery time.Duration
@@ -415,6 +417,9 @@ func (a *EventHubAdapter) Close() error {
 	a.closeOnce.Do(func() {
 		a.closing.Store(true)
 		a.cancel()
+		// No recurring OnError starts after this, and a running one is waited
+		// for (bounded). The terminal failure callback is separate (run).
+		a.notifier.Close()
 		a.uspClient.BeginDrain() // immediate wake; preserves the SDK's accepted buffer
 		stop := utils.StopBlockedProducers(a.uspClient)
 		defer stop()

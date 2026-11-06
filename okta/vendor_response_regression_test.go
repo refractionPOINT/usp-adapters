@@ -2,9 +2,11 @@ package usp_okta
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -152,7 +154,52 @@ func TestOktaCloseWaitsForRunningOnError(t *testing.T) {
 		finished.Store(true)
 	}
 	a.notify(fmt.Errorf("vendor said no"))
-	<-started
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnError was never called")
+	}
 	require.NoError(t, a.Close())
 	require.True(t, finished.Load(), "OnError was still running after Close returned")
+}
+
+// A persistent-outage report refused because OnError is blocked and the queue
+// is full is not marked as sent: once the callback is released and the failure
+// goes on, the report is delivered.
+func TestOktaPersistentFailureReportSurvivesFullNotifierQueue(t *testing.T) {
+	a := directAdapter(t, "http://127.0.0.1:1")
+	a.failureLimit = time.Minute
+	var mu sync.Mutex
+	var got []string
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	a.conf.ClientOptions.OnError = func(err error) {
+		once.Do(func() { close(started); <-release })
+		mu.Lock()
+		got = append(got, err.Error())
+		mu.Unlock()
+	}
+	require.True(t, a.notify(fmt.Errorf("blocker")))
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnError was never called")
+	}
+	for i := 0; a.notify(fmt.Errorf("other report %d", i)); i++ {
+		require.Less(t, i, 100, "the notifier queue is not bounded")
+	}
+
+	episode := &failureEpisode{since: time.Now().Add(-time.Hour)}
+	a.retryFailure(episode, errors.New("HTTP 503 Service Unavailable: Okta is down"))
+	require.False(t, episode.reported, "a refused report must not be marked as sent")
+
+	close(release)
+	a.flushNotifications()
+	a.retryFailure(episode, errors.New("HTTP 503 Service Unavailable: Okta is down"))
+	require.True(t, episode.reported)
+	a.flushNotifications()
+	mu.Lock()
+	defer mu.Unlock()
+	require.Contains(t, got[len(got)-1], "Okta is down")
+	a.notifier.Close()
 }

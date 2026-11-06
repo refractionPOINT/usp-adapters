@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -201,10 +202,9 @@ func TestWrapAndKindClipLongTextAfterRedaction(t *testing.T) {
 
 func TestClipRedactedNeverEndsInsideSecretPrefix(t *testing.T) {
 	// Defence in depth: even text that was not redacted must not end with the
-	// first part of a configured secret (raw or escaped) after the clip.
+	// first part of a configured secret after the clip.
 	for _, secret := range []string{"AAAA;BBBBBBBBBBBB", `AAAA"BBBBBBBBBBBB`} {
-		form := secretForms(secret)[len(secretForms(secret))-1] // the escaped form when there is one
-		text := strings.Repeat("a ", (MaxBodyText-8)/2) + form + " tail"
+		text := strings.Repeat("a ", (MaxBodyText-8)/2) + secret + " tail"
 		out := clipRedacted(text, []string{secret})
 		require.NotContains(t, out, "AAAA", secret)
 		require.True(t, strings.HasSuffix(out, " ... [truncated]"))
@@ -229,6 +229,13 @@ func TestRedactURLCredentials(t *testing.T) {
 		{"html ampersand", `<a href="https://example.test/p?after=1&amp;token=unknown-token-123456789">`, []string{"unknown-token-123456789"}, []string{"after=1"}},
 		{"fragment token", `redirect https://example.test/cb#access_token=unknown-token-123456789&state=ok`, []string{"unknown-token-123456789"}, []string{"state=ok"}},
 		{"json escaped userinfo", `{"url":"https:\/\/alice:unknown-password-123@example.test\/x"}`, []string{"alice", "unknown-password-123"}, []string{"@example.test"}},
+		{"json escaped ampersand in userinfo", `{"url":"https:\/\/alice:unknown\u0026password@example.test\/p"}`, []string{"alice", "unknown", "password@"}, []string{"@example.test/p"}},
+		{"userinfo with decoded slash", `bad https://alice:pa%2Fss%3Fword@example.test/p`, []string{"alice", "pa/ss", "word"}, []string{"@example.test/p"}},
+		{"encoded nested fragment", `redirect https://example.test/cb%23access_token%3Dunknown-token-123456789%26state%3Dok`, []string{"unknown-token-123456789"}, []string{"state=ok"}},
+		{"double encoded separators", `https://example.test/p?after=1%2526token%253Dunknown-token-123456789%2526limit%253D5`, []string{"unknown-token-123456789"}, []string{"after=1", "limit=5"}},
+		{"mixed case escapes", `https://example.test/p?after=1%26Token%3dunknown-token-123456789%2526limit%3d5`, []string{"unknown-token-123456789"}, []string{"after=1", "limit=5"}},
+		{"entity encoded fragment", `<a href="https://example.test/cb&#35;access_token&#61;unknown-token-123456789">`, []string{"unknown-token-123456789"}, []string{"https://example.test/cb"}},
+		{"surrogate pair and unicode escapes", `{"next":"https:\/\/example.test\/p?\ud83d\ude00=1\u0026\u0074oken=unknown-token-123456789"}`, []string{"unknown-token-123456789"}, []string{"=1"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -249,5 +256,61 @@ func TestRedactURLCredentials(t *testing.T) {
 		"see https://example.test/docs/page for the session policy",
 	} {
 		require.Equal(t, keep, Redact(keep))
+	}
+}
+
+func TestRedactConfiguredSecretInAnyEncoding(t *testing.T) {
+	secret := "unknown+token/123=456"
+	for name, echo := range map[string]string{
+		"raw":               "unknown+token/123=456",
+		"path escaped":      "unknown+token%2F123=456",
+		"lowercase escapes": "unknown%2btoken%2f123%3d456",
+		"query escaped":     "unknown%2Btoken%2F123%3D456",
+		"double escaped":    "unknown%252Btoken%252F123%253D456",
+		"json escaped":      `unknown+token\/123=456`,
+		"json unicode":      `unknown\u002btoken\u002f123\u003d456`,
+		"json in percent":   "unknown%5Cu002btoken%5Cu002f123=456",
+		"html entities":     "unknown+token/123&#61;456",
+	} {
+		t.Run(name, func(t *testing.T) {
+			out := Redact("denied: client_secret "+echo+" is invalid", secret)
+			require.Equal(t, "denied: client_secret [REDACTED] is invalid", out)
+		})
+	}
+	// A secret with spaces is also matched in its form-encoded spelling.
+	require.Equal(t, "bad [REDACTED] here", Redact("bad correct+horse+battery+staple here", "correct horse battery staple"))
+	// A secret that itself looks like an escape is matched as typed.
+	require.Equal(t, "bad [REDACTED] here", Redact("bad p%41ss-w0rd here", "p%41ss-w0rd"))
+	require.Equal(t, "bad [REDACTED] here", Redact("bad p%2541ss-w0rd here", "p%41ss-w0rd"))
+}
+
+func TestRedactFailsClosedOnDeeplyNestedEncoding(t *testing.T) {
+	nested := func(levels int) string {
+		s := "https://example.test/p?token=unknown-token-123456789"
+		for range levels {
+			s = url.QueryEscape(s)
+		}
+		return s
+	}
+	out := Redact("rejected " + nested(maxDecodePasses))
+	require.NotContains(t, out, "unknown-token-123456789")
+	require.Contains(t, out, "token=[REDACTED]")
+
+	out = Redact("rejected "+nested(maxDecodePasses+1), "unknown-token-123456789")
+	require.Equal(t, undecodable, out)
+	require.Equal(t, undecodable, Redact(nested(maxDecodePasses+3)))
+	err := Wrap("op", errors.New(nested(maxDecodePasses+1)))
+	require.Equal(t, "op: "+undecodable, err.Error())
+}
+
+func TestHTTPTextDropsIncompleteEscapeAtCut(t *testing.T) {
+	resp := &http.Response{StatusCode: 400}
+	// The secret contains a space and arrives percent-encoded twice, cut inside
+	// the second layer's escape.
+	secret := "alpha bravo/charlie"
+	for _, body := range []string{`{"hint":"x alpha bravo%2`, `{"hint":"x alpha bravo%25`, `{"hint":"x alpha bravo%252`, `{"hint":"x alpha bravo\u00`, `{"hint":"x alpha bravo&#x2`} {
+		out := HTTPText(resp, []byte(body), true, secret)
+		require.NotContains(t, out, "alpha", body)
+		require.True(t, strings.HasSuffix(out, " ... [truncated]"), body)
 	}
 }

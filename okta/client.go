@@ -156,10 +156,11 @@ func (a *OktaAdapter) vendorDetail(err error) {
 
 // notify queues err for OnError, which is delivered asynchronously from a
 // single goroutine (see vendorerr.Notifier): never on a goroutine Close joins,
-// so OnError may call Close; one callback at a time; reports are dropped when
-// the callback falls behind and once Close has started.
-func (a *OktaAdapter) notify(err error) {
-	a.notifier.Notify(err, a.conf.ClientOptions.OnError)
+// so OnError may call Close; one callback at a time. It reports whether the
+// report was accepted: it is refused when the callback has fallen behind or
+// Close has started, and one-shot reporters must then try again later.
+func (a *OktaAdapter) notify(err error) bool {
+	return a.notifier.Notify(err, a.conf.ClientOptions.OnError)
 }
 
 // retryFailure records a non-credential vendor failure that is being retried.
@@ -175,8 +176,7 @@ func (a *OktaAdapter) retryFailure(episode *failureEpisode, err error) {
 		limit = defaultFailureLimit
 	}
 	if !episode.reported && time.Since(episode.since) >= limit {
-		episode.reported = true
-		a.notify(fmt.Errorf("Okta API unavailable or invalid for a continuous retry interval: %w", err))
+		episode.reported = a.notify(fmt.Errorf("Okta API unavailable or invalid for a continuous retry interval: %w", err))
 	}
 }
 

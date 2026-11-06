@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -142,5 +143,78 @@ func TestEntraRejectedContinuationLinkRedactsJSONEscapedCredential(t *testing.T)
 	for _, text := range []string{err.Error(), reports[0]} {
 		require.NotContains(t, text, "unknown-token-123456789")
 		require.Contains(t, text, "[REDACTED]")
+	}
+}
+
+// entraFlow runs requestPage against server twice, the second time after the
+// failure episode is old enough to be reported, and returns the first error,
+// the OnError reports and the debug log.
+func entraFlow(t *testing.T, a *EntraIDAdapter) (error, []string, []string) {
+	t.Helper()
+	clock := fixtureBaseTime()
+	a.runtime.now = func() time.Time { return clock }
+	a.runtime.failureLimit = 10 * time.Minute
+	var reports, debug []string
+	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	a.conf.ClientOptions.DebugLog = func(s string) { debug = append(debug, s) }
+	state, failure, stream := &graphRequests{}, &requestFailure{}, a.streams[0]
+	raw := a.windowURL(stream, clock.UnixNano(), clock.Add(time.Minute).UnixNano())
+	request := func() error {
+		_, err := a.requestPage(context.Background(), stream, raw, false, state, failure)
+		a.flushNotifications()
+		return err
+	}
+	err := request()
+	clock = clock.Add(11 * time.Minute)
+	_ = request()
+	require.Len(t, reports, 1)
+	return err, reports, debug
+}
+
+// A continuation link whose userinfo contains a JSON-escaped "&" (the vendor
+// JSON writes it as &) must not leak the user or password through the
+// error, the debug log or the OnError report.
+func TestEntraJSONEscapedUserinfoInRejectedLinkIsRedacted(t *testing.T) {
+	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
+		sendPage(w, nil, "https://alice:unknown&password@example.test/p?$skiptoken=cursor")
+	})
+	a, _ := harness(t, server, &captureSink{})
+	err, reports, debug := entraFlow(t, a)
+	require.ErrorIs(t, err, errPage)
+	texts := append(append([]string{err.Error()}, reports...), debug...)
+	for _, text := range texts {
+		require.NotContains(t, text, "alice")
+		require.NotContains(t, text, "unknown")
+		require.NotContains(t, text, "password@")
+	}
+	for _, text := range append([]string{err.Error()}, reports...) {
+		require.Contains(t, text, "@example.test/p?$skiptoken=cursor", "the rest of the link stays readable")
+	}
+}
+
+// The configured client secret is removed from what the vendor echoes whatever
+// escaping it uses: here path-escaped with lowercase hex.
+func TestEntraPathEscapedClientSecretInVendorBodyIsRedactedInOnError(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			fmt.Fprint(w, `{"access_token":"fixture-bearer"}`)
+			return
+		}
+		w.WriteHeader(503)
+		fmt.Fprint(w, `{"error":{"code":"ServiceNotAvailable","message":"retry later; credential unknown%2btoken%2f123=456 was seen"}}`)
+	}))
+	defer server.Close()
+	a, _ := harness(t, server, &captureSink{})
+	a.conf.ClientSecret = "unknown+token/123=456"
+	err, reports, debug := entraFlow(t, a)
+	require.ErrorIs(t, err, errRetry)
+	for _, text := range append(append([]string{err.Error()}, reports...), debug...) {
+		require.NotContains(t, text, "unknown")
+		require.NotContains(t, text, "123=456")
+	}
+	for _, text := range append([]string{err.Error()}, reports...) {
+		require.Contains(t, text, "ServiceNotAvailable")
+		require.Contains(t, text, "credential [REDACTED] was seen")
 	}
 }

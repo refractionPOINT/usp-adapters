@@ -271,8 +271,7 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		state.failureStart = time.Now()
 	}
 	if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
-		a.notify(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err))
-		state.reported = true
+		state.reported = a.notify(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err))
 	}
 	if !errors.Is(err, errRetry) {
 		a.vendorDetail(err)

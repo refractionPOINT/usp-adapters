@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -433,4 +434,51 @@ func TestPartitionRuntimeFailureEpisodeIsPerPartition(t *testing.T) {
 		t.Fatal("a persistently failing partition was never reported because a healthy partition kept resetting the episode")
 	}
 	require.Len(t, g.runtimeFailure, 1, "episodes are tracked only for failing partitions")
+}
+
+// The recurring partition-runtime report goes through the one-at-a-time
+// notifier: a callback that blocks cannot accumulate one blocked goroutine per
+// failing partition, every report is still delivered once it is released, and
+// Close stops further delivery.
+func TestPartitionRuntimeReportsAreDeliveredOneAtATimeAndStopAtClose(t *testing.T) {
+	a, g, h, _ := resetHarness(t)
+	clock := time.Unix(1700000000, 0)
+	a.now = func() time.Time { return clock }
+	var running, maxRunning, delivered atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	a.conf.ClientOptions.OnError = func(error) {
+		cur := running.Add(1)
+		if cur > maxRunning.Load() {
+			maxRunning.Store(cur)
+		}
+		once.Do(func() { close(started) })
+		<-release
+		running.Add(-1)
+		delivered.Add(1)
+	}
+	h.runtime = func(_ context.Context, id string) (*eventhub.HubPartitionRuntimeInformation, error) {
+		return nil, fmt.Errorf("amqp: unauthorized-access: partition %s claim missing", id)
+	}
+	g.runtimeCursor = 0
+	for range 4 { // partitions 0, 1, 0, 1 across two hours
+		require.NoError(t, a.discover(g, false))
+		clock = clock.Add(31 * time.Minute)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runtime failure never reached OnError")
+	}
+	time.Sleep(50 * time.Millisecond) // a second, unbounded callback would have started by now
+	close(release)
+	a.notifier.Flush()
+	require.Equal(t, int32(2), delivered.Load(), "both partitions' reports are delivered")
+	require.Equal(t, int32(1), maxRunning.Load(), "callbacks never overlap")
+
+	a.stopGeneration(g)
+	a.final = g
+	close(a.chStopped)
+	require.NoError(t, a.Close())
+	require.False(t, a.notifier.Notify(errors.New("late"), a.conf.ClientOptions.OnError), "no runtime report is delivered after Close")
 }

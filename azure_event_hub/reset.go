@@ -90,12 +90,11 @@ func (a *EventHubAdapter) inspectPartitionReset(g *generation, id string) {
 			episode = &failureEpisode{}
 			g.runtimeFailure[id] = episode
 		}
-		if episode.failed(a.now()) && !episode.reported {
-			episode.reported = true
-			if onError := a.conf.ClientOptions.OnError; onError != nil {
-				// Not inline: OnError may call Close, which joins this worker.
-				go onError(a.vendorFailure("GetPartitionInformation() unavailable for a continuous retry interval", err))
-			}
+		if episode.failed(a.now()) && !episode.reported && a.conf.ClientOptions.OnError != nil {
+			// Not inline: OnError may call Close, which joins this worker. The
+			// notifier keeps one callback at a time; a refused report is retried
+			// on the next failing inspection.
+			episode.reported = a.notifier.Notify(a.vendorFailure("GetPartitionInformation() unavailable for a continuous retry interval", err), a.conf.ClientOptions.OnError)
 		}
 		return
 	}

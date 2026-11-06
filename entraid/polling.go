@@ -149,6 +149,8 @@ func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer s
 	}
 	for _, check := range validate {
 		if err := check(); err != nil {
+			// A 200 without an access_token is classed errPage like every other
+			// invalid 200 here (unchanged from before; Defender uses errCredential).
 			return delay, vendorerr.Kind(errPage, err.Error()+"; received "+received(), err, secrets...)
 		}
 	}
@@ -311,8 +313,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		episode.since = now
 	}
 	if !episode.reported && now.Sub(episode.since) >= a.runtime.failureLimit {
-		a.notify(fmt.Errorf("Entra collection unavailable or invalid for a continuous retry interval: %w", err))
-		episode.reported = true
+		episode.reported = a.notify(fmt.Errorf("Entra collection unavailable or invalid for a continuous retry interval: %w", err))
 	}
 	if failure.delay == 0 {
 		failure.delay = time.Second
