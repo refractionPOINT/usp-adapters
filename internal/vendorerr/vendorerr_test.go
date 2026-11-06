@@ -737,9 +737,9 @@ func TestRedactSecretWithEscapedUppercaseHexEntity(t *testing.T) {
 	secret := `Qn7Zp3Lm9Kx1",xy`
 	for name, in := range map[string]string{
 		"percent B":       `?token=Qn7Zp3Lm9%26%23x4%42%3Bx1&QUOT;,xy&after=1`,
-		"json B":          `{"detail":"Qn7Zp3Lm9&#x4B;x1&QUOT;,xy"}`,
+		"json B":          `{"detail":"Qn7Zp3Lm9&#x4\u0042;x1&QUOT;,xy"}`,
 		"percent X":       `?token=Qn7Zp3Lm9Kx1&#%5822;,xy&after=1`,
-		"json X":          `{"detail":"Qn7Zp3Lm9Kx1&#X22;,xy"}`,
+		"json X":          `{"detail":"Qn7Zp3Lm9Kx1&#\u005822;,xy"}`,
 		"percent lower b": `?token=Qn7Zp3Lm9%26%23x4%62%3Bx1&QUOT;,xy&after=1`,
 	} {
 		out := Redact(in, secret)
