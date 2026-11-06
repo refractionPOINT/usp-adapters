@@ -33,6 +33,7 @@ func TestDefenderPersistentInvalidAnswerReachesOnErrorOnce(t *testing.T) {
 	raw := a.windowURL(g.position.Boundary, g.position.WindowEnd)
 	request := func() error {
 		_, err := a.requestPage(context.Background(), raw, false, requests)
+		a.flushNotifications()
 		return err
 	}
 
@@ -79,6 +80,7 @@ func TestDefenderPersistentMalformedPageReachesOnErrorOnce(t *testing.T) {
 	raw := a.windowURL(g.position.Boundary, g.position.WindowEnd)
 	request := func() error {
 		_, err := a.requestPage(context.Background(), raw, false, requests)
+		a.flushNotifications()
 		return err
 	}
 

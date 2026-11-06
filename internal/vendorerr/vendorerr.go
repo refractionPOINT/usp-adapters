@@ -71,6 +71,11 @@ var redactions = []struct {
 	{regexp.MustCompile(`(?i)\b(bearer|ssws)\s+[A-Za-z0-9._~+/=-]{16,}`), "${1} " + redacted},
 	// Token and secret fields echoed in JSON, form or query text.
 	{regexp.MustCompile(`(?i)(["']?(?:access_token|refresh_token|id_token|client_secret|client_assertion|api_?key|password|secret)["']?\s*[:=]\s*["']?)[^"'&\s,;}]+`), "${1}" + redacted},
+	// URL userinfo (scheme://user:pass@host), whatever it holds.
+	{regexp.MustCompile(`(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s"'@?#<>\\]+@`), "${1}" + redacted + "@"},
+	// Credential-like query parameters in a URL. Only after ? or &, so prose
+	// that merely contains a word like "code" or "key" is left alone.
+	{regexp.MustCompile(`(?i)([?&](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)[^&\s"'#<>\\]+`), "${1}" + redacted},
 }
 
 // secretForms returns the raw secret plus the URL-escaped and JSON-escaped

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
@@ -79,6 +80,8 @@ type OktaAdapter struct {
 	// Only the worker writes generation. Close reads it after joining worker.
 	generation *oktaGeneration
 	closeOnce  sync.Once
+	closing    atomic.Bool    // set when Close starts; see notify
+	notifying  sync.WaitGroup // in-flight OnError deliveries; only tests wait on it, Close never does
 	closeErr   error
 }
 
@@ -122,6 +125,7 @@ func newOktaAdapter(ctx context.Context, conf OktaConfig, sink uspSink) (*OktaAd
 
 func (a *OktaAdapter) Close() error {
 	a.closeOnce.Do(func() {
+		a.closing.Store(true)
 		a.cancel()
 		// Seal admission and wake blocked Ship calls before joining producers.
 		// Accepted messages stay buffered for the subsequent ACK observation.
@@ -144,6 +148,17 @@ func (a *OktaAdapter) vendorDetail(err error) {
 	}
 }
 
+// notify delivers err to OnError from its own goroutine. The collector is
+// joined by Close, and OnError may itself call Close, so the callback must never
+// run on (or block) a goroutine Close waits for. Notifications are dropped once
+// Close has started.
+func (a *OktaAdapter) notify(err error) {
+	if onError := a.conf.ClientOptions.OnError; onError != nil && !a.closing.Load() {
+		a.notifying.Add(1)
+		go func() { defer a.notifying.Done(); onError(err) }()
+	}
+}
+
 // retryFailure records a non-credential vendor failure that is being retried.
 // Once the same failure episode has lasted a continuous failureLimit it reports
 // the vendor's (redacted) text once through OnError; a successful page re-arms
@@ -158,9 +173,7 @@ func (a *OktaAdapter) retryFailure(episode *failureEpisode, err error) {
 	}
 	if !episode.reported && time.Since(episode.since) >= limit {
 		episode.reported = true
-		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Okta API unavailable or invalid for a continuous retry interval: %w", err))
-		}
+		a.notify(fmt.Errorf("Okta API unavailable or invalid for a continuous retry interval: %w", err))
 	}
 }
 
@@ -232,9 +245,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				a.vendorDetail(err)
 				a.retryFailure(&episode, err)
 			} else if errors.Is(err, errVendorCredential) {
-				if a.conf.ClientOptions.OnError != nil {
-					a.conf.ClientOptions.OnError(err)
-				}
+				a.notify(err)
 			} else {
 				a.issue("request_retry")
 				a.vendorDetail(err)
@@ -291,8 +302,8 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 						a.issue("admission_tracking_failed")
 						return
 					}
-					if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
-						a.conf.ClientOptions.OnError(fmt.Errorf("okta event admission failed: %w", err))
+					if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
+						a.notify(fmt.Errorf("okta event admission failed: %w", err))
 					}
 					return
 				}

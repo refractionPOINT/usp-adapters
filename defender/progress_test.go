@@ -239,6 +239,7 @@ func TestDefenderRedirectContinuationAndVendorErrorText(t *testing.T) {
 			a.conf.ClientOptions.OnError = func(e error) { messages = append(messages, e.Error()) }
 			a.conf.ClientOptions.OnWarning = func(s string) { messages = append(messages, s) }
 			_, err := a.scanWindow(context.Background(), g, g.position.Boundary, g.position.WindowEnd, false, &graphRequests{})
+			a.flushNotifications()
 			require.Error(t, err)
 			for _, message := range messages {
 				require.NotContains(t, message, "http")
@@ -311,6 +312,7 @@ func TestDefenderRetryAfterAndCancellationWithoutOnError(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("retry wait ignored cancellation")
 	}
+	a.flushNotifications()
 	require.Zero(t, onError.Load())
 	require.Equal(t, 120*time.Second, retryAfter("120", time.Now()))
 	now := time.Now().UTC().Truncate(time.Second)
@@ -327,6 +329,7 @@ func TestDefenderTransientEscalatesOnlyContinuousFailure(t *testing.T) {
 	requests := &graphRequests{failureStart: time.Now().Add(-61 * time.Minute)}
 	_, err := a.scanWindow(ctx, g, g.position.Boundary, g.position.WindowEnd, false, requests)
 	require.Error(t, err)
+	a.flushNotifications()
 	require.Equal(t, int32(1), onError.Load())
 }
 

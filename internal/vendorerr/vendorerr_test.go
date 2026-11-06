@@ -210,3 +210,37 @@ func TestClipRedactedNeverEndsInsideSecretPrefix(t *testing.T) {
 		require.True(t, strings.HasSuffix(out, " ... [truncated]"))
 	}
 }
+
+func TestRedactURLCredentials(t *testing.T) {
+	cases := []struct {
+		name, in string
+		hidden   []string
+		shown    []string
+	}{
+		{"query token", `next link rejected: https://example.test/api/v1/logs?after=abc&token=unknown-token-123456789&limit=5`, []string{"unknown-token-123456789"}, []string{"after=abc", "limit=5"}},
+		{"userinfo", `rejected: http://alice:unknown-password-123@example.test/api/v1/logs?after=abc`, []string{"alice", "unknown-password-123"}, []string{"@example.test/api/v1/logs?after=abc"}},
+		{"user only userinfo", `Get "https://tok123456@example.test/x": dial tcp: refused`, []string{"tok123456"}, []string{"dial tcp: refused"}},
+		{"mixed case param", `<https://example.test/p?Access_Token=AbC987&Code=zzz-111>; rel="next"`, []string{"AbC987", "zzz-111"}, []string{`rel="next"`}},
+		{"api key and signature", `https://example.test/p?apikey=k-1&api_key=k-2&signature=s-3&session=s-4&key=k-5&client_secret=c-6&assertion=a-7`, []string{"k-1", "k-2", "s-3", "s-4", "k-5", "c-6", "a-7"}, []string{"https://example.test/p?"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out := Redact(c.in)
+			for _, h := range c.hidden {
+				require.NotContains(t, out, h)
+			}
+			for _, s := range c.shown {
+				require.Contains(t, out, s)
+			}
+			require.Contains(t, out, redacted)
+		})
+	}
+	// Words that are only prose, or parameters that are not credentials, stay.
+	for _, keep := range []string{
+		"the error code was E0000001 for this key rotation",
+		"https://example.test/p?after=abc&limit=10&filter=eventType",
+		"see https://example.test/docs/page for the session policy",
+	} {
+		require.Equal(t, keep, Redact(keep))
+	}
+}

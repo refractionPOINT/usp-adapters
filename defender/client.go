@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
@@ -96,6 +97,8 @@ type DefenderAdapter struct {
 	tracker       *acktrack.ACKTracker
 	generation    *defenderGeneration
 	closeOnce     sync.Once
+	closing       atomic.Bool    // set when Close starts; see notify
+	notifying     sync.WaitGroup // in-flight OnError deliveries; only tests wait on it, Close never does
 	closeErr      error
 	runtime       defenderRuntime
 	startedAt     int64
@@ -245,6 +248,7 @@ func newDefenderAdapterWithRuntime(ctx context.Context, conf DefenderConfig, sin
 
 func (a *DefenderAdapter) Close() error {
 	a.closeOnce.Do(func() {
+		a.closing.Store(true)
 		a.cancel()
 		// Seal admission before joining a producer blocked on SDK backpressure.
 		if client, ok := a.uspClient.(interface{ BeginDrain() }); ok {
@@ -257,6 +261,17 @@ func (a *DefenderAdapter) Close() error {
 		a.closeErr = errors.Join(err1, err2)
 	})
 	return a.closeErr
+}
+
+// notify delivers err to OnError from its own goroutine. The collector is
+// joined by Close, and OnError may itself call Close, so the callback must never
+// run on (or block) a goroutine Close waits for. Notifications are dropped once
+// Close has started.
+func (a *DefenderAdapter) notify(err error) {
+	if onError := a.conf.ClientOptions.OnError; onError != nil && !a.closing.Load() {
+		a.notifying.Add(1)
+		go func() { defer a.notifying.Done(); onError(err) }()
+	}
 }
 
 // vendorDetail logs the vendor's own (redacted) error text next to an issue code.

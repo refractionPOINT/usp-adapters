@@ -42,6 +42,7 @@ func TestEntraPersistentVendorFailuresReachOnErrorWithVendorText(t *testing.T) {
 			raw := a.windowURL(stream, clock.UnixNano(), clock.Add(time.Minute).UnixNano())
 			request := func() {
 				_, err := a.requestPage(context.Background(), stream, raw, false, state, failure)
+				a.flushNotifications()
 				require.Error(t, err)
 			}
 			request()

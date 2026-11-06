@@ -188,6 +188,7 @@ func TestEntraTransientRetryClockResetAndSanitization(t *testing.T) {
 	request := func(want error) {
 		t.Helper()
 		_, err := a.requestPage(context.Background(), stream, raw, false, state, failure)
+		a.flushNotifications()
 		if want == nil {
 			require.NoError(t, err)
 		} else {

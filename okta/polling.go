@@ -76,6 +76,28 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 			page.delay = d
 		}
 	}
+	if resp.StatusCode != http.StatusOK {
+		// Classify by status first: the body only supplies the vendor's words, so
+		// a body cut short by the vendor never hides the status or the credential
+		// classification.
+		body, cut := vendorerr.ReadBody(resp)
+		status := vendorerr.HTTPText(resp, body, cut, secrets...)
+		switch {
+		case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+			return page, vendorerr.Kind(errVendorCredential, status, nil, secrets...)
+		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+			return page, vendorerr.Kind(errRequestRetry, status, nil, secrets...)
+		}
+		if resp.StatusCode == http.StatusBadRequest && req.URL.Query().Get("after") != "" {
+			var envelope struct {
+				Code string `json:"errorCode"`
+			}
+			if json.Unmarshal(body, &envelope) == nil && envelope.Code == "E0000001" {
+				return page, vendorerr.Kind(errInvalidContinuation, status, nil, secrets...)
+			}
+		}
+		return page, vendorerr.Kind(errInvalidPage, status, nil, secrets...)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
 		return page, vendorerr.Kind(errRequestRetry, "reading response body: "+err.Error(), err, secrets...)
@@ -83,30 +105,13 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 	if len(body) > 16<<20 {
 		return page, vendorerr.Kind(errRequestRetry, "response body exceeds 16 MiB", nil)
 	}
-	// The body was read to its end, so it is only cut when HTTPText's own read limit cuts it.
-	status := func() string { return vendorerr.HTTPText(resp, body, false, secrets...) }
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return page, vendorerr.Kind(errVendorCredential, status(), nil, secrets...)
-	}
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return page, vendorerr.Kind(errRequestRetry, status(), nil, secrets...)
-	}
-	if resp.StatusCode == http.StatusBadRequest && req.URL.Query().Get("after") != "" {
-		var envelope struct {
-			Code string `json:"errorCode"`
-		}
-		if json.Unmarshal(body, &envelope) == nil && envelope.Code == "E0000001" {
-			return page, vendorerr.Kind(errInvalidContinuation, status(), nil, secrets...)
-		}
-	}
-	if resp.StatusCode != http.StatusOK {
-		return page, vendorerr.Kind(errInvalidPage, status(), nil, secrets...)
-	}
+	// An invalid 200 keeps the vendor's own words: status and (bounded, redacted) body.
+	received := func() string { return vendorerr.HTTPText(resp, body, false, secrets...) }
 	if err := json.Unmarshal(body, &page.items); err != nil {
-		return page, vendorerr.Kind(errInvalidPage, "decoding JSON response: "+err.Error(), err, secrets...)
+		return page, vendorerr.Kind(errInvalidPage, "decoding JSON response: "+err.Error()+"; received "+received(), err, secrets...)
 	}
 	if page.items == nil || len(page.items) > 1000 {
-		return page, vendorerr.Kind(errInvalidPage, "response is not a log page (null or more than 1000 events)", nil)
+		return page, vendorerr.Kind(errInvalidPage, "response is not a log page (null or more than 1000 events); received "+received(), nil, secrets...)
 	}
 	for _, item := range page.items {
 		if id, ok := item["uuid"].(string); !ok || id == "" {
@@ -115,10 +120,10 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 	}
 	page.next, err = nextLink(resp.Header.Values("Link"))
 	if err != nil {
-		return oktaPage{}, vendorerr.Kind(errInvalidPage, "response Link header has no single valid rel=\"next\" link: "+vendorerr.Clip(strings.Join(resp.Header.Values("Link"), ", ")), nil, secrets...)
+		return oktaPage{}, vendorerr.Kind(errInvalidPage, "response Link header has no single valid rel=\"next\" link: "+strings.Join(resp.Header.Values("Link"), ", "), nil, secrets...)
 	}
 	if a.validateContinuation(page.next) != nil {
-		return oktaPage{}, vendorerr.Kind(errInvalidPage, "response next link was rejected as a continuation: "+vendorerr.Clip(page.next), nil, secrets...)
+		return oktaPage{}, vendorerr.Kind(errInvalidPage, "response next link was rejected as a continuation: "+page.next, nil, secrets...)
 	}
 	return page, nil
 }

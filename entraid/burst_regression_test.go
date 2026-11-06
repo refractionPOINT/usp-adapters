@@ -68,6 +68,7 @@ func TestEntraMalformedLiveTipEscalatesDespiteSettleSuccess(t *testing.T) {
 		}
 		clock.Add(int64(5 * time.Second))
 	}
+	a.flushNotifications()
 	t.Logf("shipped=%d boundary=+%s settleOK=%d liveBad=%d onErrors=%d", sink.count(), time.Duration(g.position[stream.name].Boundary-base.UnixNano()), settleOK.Load(), liveBad.Load(), onErrors.Load())
 	require.True(t, g.position[stream.name].Boundary > bad.UnixNano() || onErrors.Load() > 0,
 		"a permanently invalid live page must not stall live collection for hours while staying invisible to OnError")
@@ -316,5 +317,6 @@ func TestEntraMalformedSettleEscalatesDespiteLiveSuccess(t *testing.T) {
 	require.Greater(t, valid.Load(), int64(100))
 	require.Greater(t, malformed.Load(), int64(100))
 	require.Greater(t, g.position[stream.name].Boundary, base.Add(time.Hour).UnixNano(), "healthy live collection remains available")
+	a.flushNotifications()
 	require.Equal(t, int64(1), callbacks.Load(), "a fixed invalid settle traversal must escalate even while live succeeds")
 }

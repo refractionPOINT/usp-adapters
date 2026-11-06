@@ -90,7 +90,11 @@ func retryAfter(value string, now time.Time) time.Duration {
 // status and response body, parse failure) with credential material redacted.
 // Each error still wraps one of the sentinel kinds that drive retry behaviour.
 // The copied client rejects redirects even when a test injects its transport.
-func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}) (time.Duration, error) {
+//
+// validate, when given, checks the decoded 200 response. A rejection keeps the
+// received status and (bounded, redacted) body next to the reason, so an error
+// envelope or denial page served with HTTP 200 stays readable.
+func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}, validate ...func() error) (time.Duration, error) {
 	secrets := []string{a.conf.ClientSecret, bearer}
 	req, err := http.NewRequestWithContext(ctx, method, raw, strings.NewReader(body))
 	if err != nil {
@@ -132,10 +136,36 @@ func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer 
 	if len(data) > 16<<20 {
 		return delay, vendorerr.Kind(errPage, "response body exceeds 16 MiB", nil)
 	}
+	received := func() string { return vendorerr.HTTPText(resp, data, false, secrets...) }
 	if err := json.Unmarshal(data, out); err != nil {
-		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error(), err, secrets...)
+		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error()+"; received "+received(), err, secrets...)
+	}
+	for _, check := range validate {
+		if err := check(); err != nil {
+			return delay, vendorerr.Kind(errPage, err.Error()+"; received "+received(), err, secrets...)
+		}
 	}
 	return delay, nil
+}
+
+// validateAlertPage rejects a page the collector could not process. The item
+// check lives here, before requestPage declares the page a success and re-arms
+// the failure episode, so a persistently malformed item is reported rather than
+// retried silently.
+func (a *DefenderAdapter) validateAlertPage(page *graphPage) error {
+	if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
+		return errors.New("response is not a valid alert page (missing value array, more than 1000 items, negative count or rejected nextLink)")
+	}
+	for i, item := range page.Items {
+		if id, ok := item["id"].(string); !ok || id == "" {
+			return fmt.Errorf("alert item %d has no valid id", i)
+		}
+		stamp, ok := item["createdDateTime"].(string)
+		if _, err := time.Parse(time.RFC3339Nano, stamp); !ok || err != nil {
+			return fmt.Errorf("alert %v has no valid createdDateTime (got %v)", item["id"], item["createdDateTime"])
+		}
+	}
+	return nil
 }
 
 type graphPage struct {
@@ -205,19 +235,13 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		return page, errYield
 	} // honor a token endpoint's cooldown before another request
 	if err == nil {
-		delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page)
+		delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page, func() error { return a.validateAlertPage(&page) })
 		if delay > 0 {
 			state.globalNext = later(state.globalNext, time.Now().Add(delay))
 		}
 	}
 	if ctx.Err() != nil {
 		return graphPage{}, ctx.Err()
-	}
-	if err == nil && (page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil)) {
-		// A structurally invalid page is a vendor failure like any other and
-		// joins the failure episode below.
-		err = vendorerr.Kind(errPage, "response is not a valid alert page (missing value array, more than 1000 items, negative count or rejected nextLink)", nil)
-		page = graphPage{}
 	}
 	if err == nil {
 		// Valid page collection, rather than an entire interval, breaks a continuous
@@ -229,9 +253,7 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		return page, nil
 	}
 	if errors.Is(err, errCredential) {
-		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(err)
-		}
+		a.notify(err)
 		*retry = time.Now().Add(jitterDelay(a.pollInterval))
 		return graphPage{}, err
 	}
@@ -242,9 +264,7 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		state.failureStart = time.Now()
 	}
 	if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
-		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err))
-		}
+		a.notify(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err))
 		state.reported = true
 	}
 	if !errors.Is(err, errRetry) {
@@ -334,8 +354,8 @@ func (a *DefenderAdapter) shipScanItem(ctx context.Context, g *defenderGeneratio
 				a.issue("admission_tracking_failed")
 				return err
 			}
-			if !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("Defender event admission failed: %w", err))
+			if !errors.Is(err, uspclient.ErrorClosed) {
+				a.notify(fmt.Errorf("Defender event admission failed: %w", err))
 			}
 			return err
 		}

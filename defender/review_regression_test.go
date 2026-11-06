@@ -199,6 +199,7 @@ func TestDefenderEverySuccessfulPageEndsContinuousFailureEpisode(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	_, _ = a.requestPage(ctx, page.Next, false, requests)
+	a.flushNotifications()
 	require.Zero(t, vendorErrors.Load(), "a new short outage cannot inherit the old episode's age")
 }
 

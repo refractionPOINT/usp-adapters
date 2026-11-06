@@ -95,7 +95,11 @@ func retryAfter(value string, now time.Time) time.Duration {
 // doJSON returns errors that keep the vendor's own words (transport error, HTTP
 // status and response body, parse failure) with credential material redacted.
 // Each error still wraps one of the sentinel kinds that drive retry behaviour.
-func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}) (time.Duration, error) {
+//
+// validate, when given, checks the decoded 200 response. A rejection keeps the
+// received status and (bounded, redacted) body next to the reason, so an error
+// envelope or denial page served with HTTP 200 stays readable.
+func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}, validate ...func() error) (time.Duration, error) {
 	secrets := []string{a.conf.ClientSecret, bearer}
 	ctx, cancel := context.WithTimeout(ctx, a.runtime.requestTimeout)
 	defer cancel()
@@ -139,10 +143,34 @@ func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer s
 	if len(data) > 16<<20 {
 		return delay, vendorerr.Kind(errPage, "response body exceeds 16 MiB", nil)
 	}
+	received := func() string { return vendorerr.HTTPText(resp, data, false, secrets...) }
 	if err := json.Unmarshal(data, out); err != nil {
-		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error(), err, secrets...)
+		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error()+"; received "+received(), err, secrets...)
+	}
+	for _, check := range validate {
+		if err := check(); err != nil {
+			return delay, vendorerr.Kind(errPage, err.Error()+"; received "+received(), err, secrets...)
+		}
 	}
 	return delay, nil
+}
+
+// validateGraphPage rejects a page the collector could not process, including
+// items without a usable id or timestamp, before the page counts as a success.
+func (a *EntraIDAdapter) validateGraphPage(page *graphPage, stream entraStream) error {
+	if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next, stream) != nil) {
+		return errors.New("response is not a valid page (missing value array, more than 1000 items, negative count or rejected nextLink)")
+	}
+	for i, item := range page.Items {
+		if id, ok := item["id"].(string); !ok || id == "" {
+			return fmt.Errorf("item %d has no valid id", i)
+		}
+		stamp, ok := item[stream.tsField].(string)
+		if _, err := time.Parse(time.RFC3339Nano, stamp); !ok || err != nil {
+			return fmt.Errorf("item %v has no valid %s (got %v)", item["id"], stream.tsField, item[stream.tsField])
+		}
+	}
+	return nil
 }
 
 type graphPage struct {
@@ -234,7 +262,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		return page, errYield
 	}
 	if err == nil {
-		delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page)
+		delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page, func() error { return a.validateGraphPage(&page, stream) })
 		if delay > 0 {
 			state.blockedUntil = a.runtime.now().Add(delay)
 		}
@@ -243,26 +271,10 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		return graphPage{}, ctx.Err()
 	}
 	if err == nil {
-		if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next, stream) != nil) {
-			err = vendorerr.Kind(errPage, "response is not a valid page (missing value array, more than 1000 items, negative count or rejected nextLink)", nil)
-		}
-		if err == nil {
-			for _, item := range page.Items {
-				id, ok := item["id"].(string)
-				stamp, okTime := item[stream.tsField].(string)
-				_, parseErr := time.Parse(time.RFC3339Nano, stamp)
-				if !ok || id == "" || !okTime || parseErr != nil {
-					err = vendorerr.Kind(errPage, "response item lacks a valid id or "+stream.tsField, nil)
-					break
-				}
-			}
-		}
-		if err == nil {
-			for _, check := range validate {
-				if check(page) != nil {
-					err = vendorerr.Kind(errPage, "response page failed collection validation", nil)
-					break
-				}
+		for _, check := range validate {
+			if check(page) != nil {
+				err = vendorerr.Kind(errPage, "response page failed collection validation", nil)
+				break
 			}
 		}
 	}
@@ -282,9 +294,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 			state.permanentNext = make(map[string]time.Time)
 		}
 		state.permanentNext[stream.name] = failure.retryAt
-		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(err)
-		}
+		a.notify(err)
 		return graphPage{}, err
 	}
 	if !errors.Is(err, errRetry) && !errors.Is(err, errPage) {
@@ -299,9 +309,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		episode.since = now
 	}
 	if !episode.reported && now.Sub(episode.since) >= a.runtime.failureLimit {
-		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Entra collection unavailable or invalid for a continuous retry interval: %w", err))
-		}
+		a.notify(fmt.Errorf("Entra collection unavailable or invalid for a continuous retry interval: %w", err))
 		episode.reported = true
 	}
 	if failure.delay == 0 {

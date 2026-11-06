@@ -170,6 +170,7 @@ func TestEntraStreamSuccessResetsBothLaneFailureEpisodes(t *testing.T) {
 	requests := &graphRequests{}
 	retry := func() error {
 		_, err := a.scanWindow(context.Background(), g, stream, base.UnixNano(), base.Add(time.Minute).UnixNano(), true, requests)
+		a.flushNotifications()
 		return err
 	}
 	require.ErrorIs(t, retry(), errRetry)

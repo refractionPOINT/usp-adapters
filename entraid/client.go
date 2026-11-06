@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
@@ -121,6 +122,8 @@ type EntraIDAdapter struct {
 	runtime    entraRuntime
 	startedAt  int64
 	closeOnce  sync.Once
+	closing    atomic.Bool    // set when Close starts; see notify
+	notifying  sync.WaitGroup // in-flight OnError deliveries; only tests wait on it, Close never does
 	closeErr   error
 }
 
@@ -319,6 +322,17 @@ func newEntraIDAdapterWithRuntime(ctx context.Context, conf EntraIDConfig, sink 
 	return a, a.chStopped, nil
 }
 
+// notify delivers err to OnError from its own goroutine. The collector is
+// joined by Close, and OnError may itself call Close, so the callback must never
+// run on (or block) a goroutine Close waits for. Notifications are dropped once
+// Close has started.
+func (a *EntraIDAdapter) notify(err error) {
+	if onError := a.conf.ClientOptions.OnError; onError != nil && !a.closing.Load() {
+		a.notifying.Add(1)
+		go func() { defer a.notifying.Done(); onError(err) }()
+	}
+}
+
 // vendorDetail logs the vendor's own (redacted) error text next to an issue code.
 func (a *EntraIDAdapter) vendorDetail(err error) {
 	if a.conf.ClientOptions.DebugLog != nil && err != nil {
@@ -334,6 +348,7 @@ func (a *EntraIDAdapter) issue(code string) {
 
 func (a *EntraIDAdapter) Close() error {
 	a.closeOnce.Do(func() {
+		a.closing.Store(true)
 		a.cancel()
 		if client, ok := a.uspClient.(interface{ BeginDrain() }); ok {
 			client.BeginDrain()
