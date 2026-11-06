@@ -164,3 +164,21 @@ func TestNotifierRefusedReportCanBeSentAgainAfterCallbackIsReleased(t *testing.T
 	require.Contains(t, got, outage.Error())
 	n.Close()
 }
+
+// The callback receives the very error value that was queued, so a sentinel in
+// its chain (embedders test errors.Is on it) survives asynchronous delivery.
+func TestNotifierDeliversTheOriginalErrorValue(t *testing.T) {
+	var n Notifier
+	defer n.Close()
+	sentinel := errors.New("sentinel")
+	sent := fmt.Errorf("vendor text: %w", sentinel)
+	got := make(chan error, 1)
+	require.True(t, n.Notify(sent, func(err error) { got <- err }))
+	select {
+	case err := <-got:
+		require.Same(t, sent, err)
+		require.ErrorIs(t, err, sentinel)
+	case <-time.After(5 * time.Second):
+		t.Fatal("report was not delivered")
+	}
+}

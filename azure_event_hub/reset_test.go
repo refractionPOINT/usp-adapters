@@ -10,6 +10,7 @@ import (
 	"time"
 
 	eventhub "github.com/Azure/azure-event-hubs-go/v3"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -394,6 +395,7 @@ func TestPartitionRuntimeFailureReachesOnErrorAfterContinuousHour(t *testing.T) 
 	select {
 	case err := <-reports:
 		require.Contains(t, err.Error(), "management claim missing")
+		require.ErrorIs(t, err, utils.ErrPersistentVendorFailure, "the adapter keeps running, so embedders must not restart it")
 	case <-time.After(5 * time.Second):
 		t.Fatal("persistent runtime failure never reached OnError")
 	}

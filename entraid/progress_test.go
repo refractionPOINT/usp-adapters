@@ -18,6 +18,7 @@ import (
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -180,7 +181,11 @@ func TestEntraTransientRetryClockResetAndSanitization(t *testing.T) {
 	clock := fixtureBaseTime()
 	a.runtime.now = func() time.Time { return clock }
 	var errs []string
-	a.conf.ClientOptions.OnError = func(err error) { errs = append(errs, err.Error()) }
+	var errValues []error
+	a.conf.ClientOptions.OnError = func(err error) {
+		errs = append(errs, err.Error())
+		errValues = append(errValues, err)
+	}
 	state := &graphRequests{}
 	failure := &requestFailure{}
 	stream := a.streams[0]
@@ -203,6 +208,7 @@ func TestEntraTransientRetryClockResetAndSanitization(t *testing.T) {
 	clock = clock.Add(time.Minute)
 	request(errRetry)
 	require.Len(t, errs, 1)
+	require.ErrorIs(t, errValues[0], utils.ErrPersistentVendorFailure, "the adapter keeps retrying, so embedders must not restart it")
 	clock = clock.Add(time.Minute)
 	status.Store(200)
 	request(nil)
@@ -218,6 +224,7 @@ func TestEntraTransientRetryClockResetAndSanitization(t *testing.T) {
 	clock = clock.Add(time.Minute)
 	request(errVendor)
 	require.Len(t, errs, 2)
+	require.NotErrorIs(t, errValues[1], utils.ErrPersistentVendorFailure, "a permanent vendor rejection is reported immediately and is not advisory")
 	for _, e := range errs {
 		require.NotContains(t, e, "must-not-escape")
 		require.NotContains(t, e, server.URL)

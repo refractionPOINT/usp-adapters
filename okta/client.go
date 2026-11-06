@@ -176,7 +176,7 @@ func (a *OktaAdapter) retryFailure(episode *failureEpisode, err error) {
 		limit = defaultFailureLimit
 	}
 	if !episode.reported && time.Since(episode.since) >= limit {
-		episode.reported = a.notify(fmt.Errorf("Okta API unavailable or invalid for a continuous retry interval: %w", err))
+		episode.reported = a.notify(utils.PersistentVendorFailure(fmt.Errorf("Okta API unavailable or invalid for a continuous retry interval: %w", err)))
 	}
 }
 
