@@ -156,12 +156,22 @@ func TestOktaAdvisoryMarkOnlyOnPersistentRetryReports(t *testing.T) {
 		}))
 		defer server.Close()
 		a, g := localHarness(t, server.URL, &ackSink{})
+		// Resume from an opaque cursor, so the 400 E0000001 is classified as a
+		// rejected continuation rather than an invalid first page.
+		g.position.Next += "&after=opaque-cursor-1"
 		a.failureLimit = 100 * time.Millisecond
 		var reports reportLog
 		a.conf.ClientOptions.OnError = reports.add
+		var stalled atomic.Bool
+		a.conf.ClientOptions.DebugLog = func(s string) {
+			if s == "okta collection: continuation_stalled" {
+				stalled.Store(true)
+			}
+		}
 		stop := runCollector(t, a, g)
 		defer stop()
 		require.Eventually(t, func() bool { return len(reports.errors()) >= 1 }, 10*time.Second, 10*time.Millisecond)
+		require.True(t, stalled.Load(), "the failure must go through the stalled-continuation branch")
 		err := reports.errors()[0]
 		require.Contains(t, err.Error(), "Invalid cursor")
 		require.ErrorIs(t, err, utils.ErrPersistentVendorFailure)

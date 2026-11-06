@@ -23,7 +23,9 @@ func (e *persistentFailure) Unwrap() []error { return []error{ErrPersistentVendo
 
 // PersistentVendorFailure marks err as an advisory persistent-failure report:
 // errors.Is(result, ErrPersistentVendorFailure) is true, Error() is unchanged
-// and the original chain stays reachable. A nil err returns nil.
+// and the original chain stays reachable through errors.Is and errors.As.
+// The result unwraps to several errors, so errors.Unwrap returns nil on it.
+// A nil err returns nil.
 func PersistentVendorFailure(err error) error {
 	if err == nil {
 		return nil
