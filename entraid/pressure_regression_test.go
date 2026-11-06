@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -199,6 +200,9 @@ func TestEntraMalformedVendorPagesEscalateAfterValidation(t *testing.T) {
 			var reported []string
 			a.conf.ClientOptions.OnError = func(err error) {
 				reportedMu.Lock()
+				if !errors.Is(err, utils.ErrPersistentVendorFailure) {
+					t.Errorf("persistent invalid-page report is not marked advisory: %v", err)
+				}
 				reported = append(reported, err.Error())
 				reportedMu.Unlock()
 				errorsSeen.Add(1)

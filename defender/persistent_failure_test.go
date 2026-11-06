@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -30,7 +31,11 @@ func TestDefenderPersistentInvalidAnswerReachesOnErrorOnce(t *testing.T) {
 	a, g := harness(t, server, &captureSink{})
 	a.runtime.failureLimit = 200 * time.Millisecond
 	var reports []string
-	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	var reportErrs []error
+	a.conf.ClientOptions.OnError = func(err error) {
+		reports = append(reports, err.Error())
+		reportErrs = append(reportErrs, err)
+	}
 	requests := &graphRequests{}
 	raw := a.windowURL(g.position.Boundary, g.position.WindowEnd)
 	request := func() error {
@@ -44,6 +49,7 @@ func TestDefenderPersistentInvalidAnswerReachesOnErrorOnce(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 	require.ErrorIs(t, request(), errPage)
 	require.Len(t, reports, 1)
+	require.ErrorIs(t, reportErrs[0], utils.ErrPersistentVendorFailure, "the adapter keeps retrying, so embedders must not restart it")
 	require.Contains(t, reports[0], "HTTP 404 Not Found")
 	require.Contains(t, reports[0], "Alerts collection moved")
 	require.NotContains(t, reports[0], "fixture-bearer")

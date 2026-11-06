@@ -8,6 +8,8 @@ import (
 
 	"github.com/Azure/azure-amqp-common-go/v4/conn"
 	eventhub "github.com/Azure/azure-event-hubs-go/v3"
+
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 // The timestamp describes this uncached request's observation, never the last
@@ -94,7 +96,7 @@ func (a *EventHubAdapter) inspectPartitionReset(g *generation, id string) {
 			// Not inline: OnError may call Close, which joins this worker. The
 			// notifier keeps one callback at a time; a refused report is retried
 			// on the next failing inspection.
-			episode.reported = a.notifier.Notify(a.vendorFailure("GetPartitionInformation() unavailable for a continuous retry interval", err), a.conf.ClientOptions.OnError)
+			episode.reported = a.notifier.Notify(utils.PersistentVendorFailure(a.vendorFailure("GetPartitionInformation() unavailable for a continuous retry interval", err)), a.conf.ClientOptions.OnError)
 		}
 		return
 	}

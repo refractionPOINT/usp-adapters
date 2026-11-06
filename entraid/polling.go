@@ -17,6 +17,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const graphTimeQuantum = 100 * time.Nanosecond
@@ -313,7 +314,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		episode.since = now
 	}
 	if !episode.reported && now.Sub(episode.since) >= a.runtime.failureLimit {
-		episode.reported = a.notify(fmt.Errorf("Entra collection unavailable or invalid for a continuous retry interval: %w", err))
+		episode.reported = a.notify(utils.PersistentVendorFailure(fmt.Errorf("Entra collection unavailable or invalid for a continuous retry interval: %w", err)))
 	}
 	if failure.delay == 0 {
 		failure.delay = time.Second

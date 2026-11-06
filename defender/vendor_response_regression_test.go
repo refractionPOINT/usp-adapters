@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -112,11 +113,16 @@ func TestDefenderTokenResponseWithoutTokenKeepsVendorText(t *testing.T) {
 	defer server.Close()
 	a, g := harness(t, server, &captureSink{})
 	var reports []string
-	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	var reportErrs []error
+	a.conf.ClientOptions.OnError = func(err error) {
+		reports = append(reports, err.Error())
+		reportErrs = append(reportErrs, err)
+	}
 	_, err := a.requestPage(context.Background(), a.windowURL(g.position.Boundary, g.position.WindowEnd), false, &graphRequests{})
 	a.flushNotifications()
 	require.ErrorIs(t, err, errCredential)
 	require.Len(t, reports, 1)
+	require.NotErrorIs(t, reportErrs[0], utils.ErrPersistentVendorFailure, "credential failures are reported immediately and are not advisory")
 	for _, text := range []string{err.Error(), reports[0]} {
 		for _, want := range []string{"no access_token", "HTTP 200 OK", "invalid_client", "Tenant disabled by gateway policy"} {
 			require.Contains(t, text, want)

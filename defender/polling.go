@@ -18,6 +18,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const graphTimeQuantum = 100 * time.Nanosecond
@@ -271,7 +272,7 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		state.failureStart = time.Now()
 	}
 	if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
-		state.reported = a.notify(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err))
+		state.reported = a.notify(utils.PersistentVendorFailure(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err)))
 	}
 	if !errors.Is(err, errRetry) {
 		a.vendorDetail(err)

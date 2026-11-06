@@ -14,6 +14,7 @@ import (
 	amqp "github.com/Azure/go-amqp"
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
 )
 
@@ -437,6 +438,7 @@ func TestInitialManagementFailureReportsAzureTextWithoutKey(t *testing.T) {
 		require.Contains(t, err.Error(), "GetRuntimeInformation(): unhandled error link rpc-link-1: status code 403 and description: Ip has been prevented to connect to the endpoint.")
 		require.NotContains(t, err.Error(), "not-a-real-key")
 		require.Contains(t, err.Error(), "[REDACTED]")
+		require.NotErrorIs(t, err, utils.ErrPersistentVendorFailure, "the adapter stops after this failure")
 	case <-time.After(5 * time.Second):
 		t.Fatal("management failure was not reported")
 	}
