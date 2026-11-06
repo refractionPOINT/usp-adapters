@@ -133,7 +133,7 @@ type generation struct {
 	monitors          sync.WaitGroup
 	retiring          atomic.Bool
 	managementFailure failureEpisode
-	runtimeFailure    failureEpisode
+	runtimeFailure    map[string]*failureEpisode // per partition ID, so one failing partition is not reset by the others' successes
 	receiverFailures  map[string]failureEpisode
 	retryPositions    map[string]partitionRetry
 }

@@ -80,8 +80,18 @@ func (a *EventHubAdapter) inspectPartitionReset(g *generation, id string) {
 		a.vendorDetail("GetPartitionInformation()", err)
 		// This read is auxiliary (data keeps flowing), so a persistent failure is
 		// reported once through OnError without stopping the adapter.
-		if g.runtimeFailure.failed(a.now()) && !g.runtimeFailure.reported {
-			g.runtimeFailure.reported = true
+		// The episode is per partition: the cursor rotates over partitions, so
+		// a healthy neighbour's success must not re-arm this one's report.
+		if g.runtimeFailure == nil {
+			g.runtimeFailure = make(map[string]*failureEpisode)
+		}
+		episode := g.runtimeFailure[id]
+		if episode == nil {
+			episode = &failureEpisode{}
+			g.runtimeFailure[id] = episode
+		}
+		if episode.failed(a.now()) && !episode.reported {
+			episode.reported = true
 			if onError := a.conf.ClientOptions.OnError; onError != nil {
 				// Not inline: OnError may call Close, which joins this worker.
 				go onError(a.vendorFailure("GetPartitionInformation() unavailable for a continuous retry interval", err))
@@ -89,7 +99,7 @@ func (a *EventHubAdapter) inspectPartitionReset(g *generation, id string) {
 		}
 		return
 	}
-	g.runtimeFailure = failureEpisode{}
+	delete(g.runtimeFailure, id)
 	if observed.Before(started) || observed.After(completed) {
 		a.issue("partition_runtime_stale")
 		return

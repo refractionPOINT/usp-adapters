@@ -129,7 +129,8 @@ func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer s
 		} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
 			kind = errVendor
 		}
-		return delay, vendorerr.Kind(kind, vendorerr.HTTPText(resp, vendorerr.ReadBody(resp), secrets...), nil, secrets...)
+		body, cut := vendorerr.ReadBody(resp)
+		return delay, vendorerr.Kind(kind, vendorerr.HTTPText(resp, body, cut, secrets...), nil, secrets...)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {

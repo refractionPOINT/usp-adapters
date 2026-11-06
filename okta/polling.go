@@ -83,7 +83,8 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 	if len(body) > 16<<20 {
 		return page, vendorerr.Kind(errRequestRetry, "response body exceeds 16 MiB", nil)
 	}
-	status := func() string { return vendorerr.HTTPText(resp, body, secrets...) }
+	// The body was read to its end, so it is only cut when HTTPText's own read limit cuts it.
+	status := func() string { return vendorerr.HTTPText(resp, body, false, secrets...) }
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		return page, vendorerr.Kind(errVendorCredential, status(), nil, secrets...)
 	}

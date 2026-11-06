@@ -401,5 +401,36 @@ func TestPartitionRuntimeFailureReachesOnErrorAfterContinuousHour(t *testing.T) 
 	quiet()
 	fail.Store(false)
 	inspect()
-	require.False(t, g.runtimeFailure.active, "a success ends the episode")
+	require.Empty(t, g.runtimeFailure, "a success ends the episode")
+}
+
+// Periodic inspection rotates over partitions. One partition that keeps
+// failing while its neighbour succeeds must still be reported: the neighbour's
+// success must not re-arm the failing partition's episode.
+func TestPartitionRuntimeFailureEpisodeIsPerPartition(t *testing.T) {
+	a, g, h, _ := resetHarness(t)
+	clock := time.Unix(1700000000, 0)
+	a.now = func() time.Time { return clock }
+	reports := make(chan error, 4)
+	a.conf.ClientOptions.OnError = func(err error) { reports <- err }
+	h.runtime = func(_ context.Context, id string) (*eventhub.HubPartitionRuntimeInformation, error) {
+		if id == "0" {
+			return nil, errors.New("amqp: unauthorized-access: partition 0 claim missing")
+		}
+		return runtimePosition(id, 600), nil
+	}
+	g.runtimeCursor = 0
+	// Rotation order is 0, 1, 0, 1: partition 0 fails at t=0 and t=62m with a
+	// success on partition 1 in between.
+	for i := 0; i < 4; i++ {
+		require.NoError(t, a.discover(g, false))
+		clock = clock.Add(31 * time.Minute)
+	}
+	select {
+	case err := <-reports:
+		require.Contains(t, err.Error(), "partition 0 claim missing")
+	case <-time.After(5 * time.Second):
+		t.Fatal("a persistently failing partition was never reported because a healthy partition kept resetting the episode")
+	}
+	require.Len(t, g.runtimeFailure, 1, "episodes are tracked only for failing partitions")
 }

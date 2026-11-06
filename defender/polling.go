@@ -122,7 +122,8 @@ func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer 
 		case resp.StatusCode == 401 || resp.StatusCode == 403 || (method == http.MethodPost && resp.StatusCode == 400):
 			kind = errCredential
 		}
-		return delay, vendorerr.Kind(kind, vendorerr.HTTPText(resp, vendorerr.ReadBody(resp), secrets...), nil, secrets...)
+		body, cut := vendorerr.ReadBody(resp)
+		return delay, vendorerr.Kind(kind, vendorerr.HTTPText(resp, body, cut, secrets...), nil, secrets...)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
@@ -212,10 +213,13 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 	if ctx.Err() != nil {
 		return graphPage{}, ctx.Err()
 	}
+	if err == nil && (page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil)) {
+		// A structurally invalid page is a vendor failure like any other and
+		// joins the failure episode below.
+		err = vendorerr.Kind(errPage, "response is not a valid alert page (missing value array, more than 1000 items, negative count or rejected nextLink)", nil)
+		page = graphPage{}
+	}
 	if err == nil {
-		if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
-			return graphPage{}, vendorerr.Kind(errPage, "response is not a valid alert page (missing value array, more than 1000 items, negative count or rejected nextLink)", nil)
-		}
 		// Valid page collection, rather than an entire interval, breaks a continuous
 		// vendor failure episode. Its opaque continuation may still be outstanding.
 		state.failureStart = time.Time{}

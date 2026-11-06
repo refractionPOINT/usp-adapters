@@ -57,3 +57,42 @@ func TestDefenderPersistentInvalidAnswerReachesOnErrorOnce(t *testing.T) {
 	require.ErrorIs(t, request(), errPage)
 	require.Len(t, reports, 2, "a new persistent failure reports again")
 }
+
+// A 200 answer that is not a valid alert page (here without a value array) is
+// still a persistent vendor failure: it must report once after the interval,
+// not retry silently forever.
+func TestDefenderPersistentMalformedPageReachesOnErrorOnce(t *testing.T) {
+	var malformed atomic.Bool
+	malformed.Store(true)
+	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if malformed.Load() {
+			fmt.Fprint(w, `{"value":null}`)
+			return
+		}
+		sendPage(w, nil, "")
+	})
+	a, g := harness(t, server, &captureSink{})
+	a.runtime.failureLimit = 200 * time.Millisecond
+	var reports []string
+	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	requests := &graphRequests{}
+	raw := a.windowURL(g.position.Boundary, g.position.WindowEnd)
+	request := func() error {
+		_, err := a.requestPage(context.Background(), raw, false, requests)
+		return err
+	}
+
+	require.ErrorIs(t, request(), errPage)
+	require.Empty(t, reports, "the first failure of an episode is a blip")
+	time.Sleep(250 * time.Millisecond)
+	require.ErrorIs(t, request(), errPage)
+	require.Len(t, reports, 1)
+	require.Contains(t, reports[0], "not a valid alert page")
+	require.ErrorIs(t, request(), errPage)
+	require.Len(t, reports, 1, "one report per episode")
+
+	malformed.Store(false)
+	_, err := a.requestPage(context.Background(), raw, false, requests)
+	require.NoError(t, err)
+	require.False(t, requests.reported, "a valid page re-arms the episode")
+}

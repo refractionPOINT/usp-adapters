@@ -50,13 +50,13 @@ func TestRedactRemovesSecretsAndKeepsVendorText(t *testing.T) {
 func TestHTTPTextReportsStatusAndBodyAndTruncatesAfterRedaction(t *testing.T) {
 	resp := &http.Response{StatusCode: 403}
 	require.Equal(t, `HTTP 403 Forbidden: {"error":{"code":"Forbidden", "message":"Insufficient privileges"}}`,
-		HTTPText(resp, []byte("{\"error\":{\"code\":\"Forbidden\",\n \"message\":\"Insufficient privileges\"}}")))
-	require.Equal(t, "HTTP 502 Bad Gateway", HTTPText(&http.Response{StatusCode: 502}, nil))
+		HTTPText(resp, []byte("{\"error\":{\"code\":\"Forbidden\",\n \"message\":\"Insufficient privileges\"}}"), false))
+	require.Equal(t, "HTTP 502 Bad Gateway", HTTPText(&http.Response{StatusCode: 502}, nil, false))
 
 	// A secret straddling the truncation point must not leak a prefix.
 	secret := strings.Repeat("S", 64)
 	body := strings.Repeat("a", MaxBodyText-10) + secret + " tail"
-	out := HTTPText(resp, []byte(body), secret)
+	out := HTTPText(resp, []byte(body), false, secret)
 	require.NotContains(t, out, "SSSS")
 	require.Contains(t, out, "[truncated]")
 	require.LessOrEqual(t, len(out), len("HTTP 403 Forbidden: ")+MaxBodyText+len(" ... [truncated]"))
@@ -98,21 +98,28 @@ func TestReadBodyReturnsBytesReadSoFarAtDeadline(t *testing.T) {
 	defer close(release)
 	resp := &http.Response{StatusCode: 400, Body: &stallingBody{data: []byte(`{"error":"partial vendor text`), release: release}}
 	start := time.Now()
-	got := readBody(resp, 50*time.Millisecond)
+	got, truncated := readBody(resp, 500*time.Millisecond)
 	elapsed := time.Since(start)
 	require.Equal(t, `{"error":"partial vendor text`, string(got))
-	require.GreaterOrEqual(t, elapsed, 50*time.Millisecond)
+	require.True(t, truncated)
+	require.GreaterOrEqual(t, elapsed, 500*time.Millisecond)
 	require.Less(t, elapsed, 5*time.Second)
 }
 
-func TestReadBodyReturnsImmediatelyAtEOFAndCapsAtReadLimit(t *testing.T) {
+func TestReadBodyReturnsAtEOFAndCapsAtReadLimit(t *testing.T) {
+	// A long deadline: returning well before it proves EOF ends the wait, with
+	// no dependence on how fast a loaded machine runs.
 	start := time.Now()
-	got := ReadBody(&http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader(`{"error":"busy"}`))})
+	got, truncated := readBody(&http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader(`{"error":"busy"}`))}, 30*time.Second)
 	require.Equal(t, `{"error":"busy"}`, string(got))
-	require.Less(t, time.Since(start), retryBodyTimeout)
+	require.False(t, truncated, "a body read to EOF is complete")
+	require.Less(t, time.Since(start), 10*time.Second)
 
-	big := ReadBody(&http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(strings.Repeat("x", 3*readLimit)))})
+	start = time.Now()
+	big, truncated := readBody(&http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(strings.Repeat("x", 3*readLimit)))}, 30*time.Second)
 	require.Len(t, big, readLimit)
+	require.True(t, truncated, "a body cut at readLimit is reported as cut")
+	require.Less(t, time.Since(start), 10*time.Second)
 }
 
 func TestHTTPTextDropsTokenSplitByReadLimit(t *testing.T) {
@@ -120,19 +127,38 @@ func TestHTTPTextDropsTokenSplitByReadLimit(t *testing.T) {
 	secret := strings.Repeat("S", 64)
 	// Whitespace compacts away, so the partial secret would be visible in the output.
 	body := strings.Repeat(" ", readLimit-30) + "ok " + secret
-	out := HTTPText(resp, []byte(body), secret)
+	out := HTTPText(resp, []byte(body), false, secret)
 	require.NotContains(t, out, "SSSS")
 	require.Equal(t, "HTTP 400 Bad Request: ok ... [truncated]", out)
 
 	// A secret that itself contains a delimiter character is cut mid-way.
 	odd := "AAAA;BBBBBBBBBBBB"
 	body = strings.Repeat(" ", readLimit-8) + "x " + odd
-	out = HTTPText(resp, []byte(body), odd)
+	out = HTTPText(resp, []byte(body), false, odd)
 	require.NotContains(t, out, "AAAA")
 	require.Contains(t, out, "[truncated]")
 
 	// Input beyond readLimit is never examined, whatever the caller passes.
 	body = "short " + strings.Repeat(" ", readLimit) + "tail-beyond-limit"
-	out = HTTPText(resp, []byte(body))
+	out = HTTPText(resp, []byte(body), false)
 	require.NotContains(t, out, "tail-beyond-limit")
+}
+
+func TestHTTPTextDropsTokenSplitByReadDeadline(t *testing.T) {
+	resp := &http.Response{StatusCode: 400}
+	release := make(chan struct{})
+	defer close(release)
+	// The vendor stalls after sending the first part of a credential, which is
+	// far shorter than readLimit.
+	secret := "abcdEFGHijklMNOPqrstUVWX0123456789"
+	data := `{"error":"denied","hint":"` + secret[:20]
+	got, truncated := readBody(&http.Response{StatusCode: 400, Body: &stallingBody{data: []byte(data), release: release}}, 500*time.Millisecond)
+	require.True(t, truncated, "a body cut by the deadline is reported as cut")
+	require.Equal(t, data, string(got))
+	out := HTTPText(resp, got, truncated, secret)
+	require.NotContains(t, out, secret[:8])
+	require.Equal(t, `HTTP 400 Bad Request: {"error":"denied","hint":" ... [truncated]`, out)
+
+	// A complete plain-text body without any delimiter is not emptied.
+	require.Equal(t, "HTTP 400 Bad Request: nodelimiter", HTTPText(resp, []byte("nodelimiter"), false))
 }
