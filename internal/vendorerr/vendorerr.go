@@ -311,14 +311,17 @@ func plainSpelling(r rune) string {
 
 // spelled matches text spelled character by character in plain spellings, so
 // the "&", "#" and ";" of an entity may themselves be percent or JSON escaped
-// (an entity inside JSON, or inside a URL). fold also accepts either letter case.
+// (an entity inside JSON, or inside a URL). fold also accepts either letter
+// case. It spells both cases explicitly: regexp case folding cannot reach a
+// letter that is itself escaped, like %42 or B for "B".
 func spelled(text string, fold bool) string {
 	var b strings.Builder
 	for _, r := range text {
-		if p := plainSpelling(r); fold {
-			b.WriteString("(?i:" + p + ")")
+		lower, upper := unicode.ToLower(r), unicode.ToUpper(r)
+		if fold && lower != upper {
+			b.WriteString("(?:" + plainSpelling(lower) + "|" + plainSpelling(upper) + ")")
 		} else {
-			b.WriteString(p)
+			b.WriteString(plainSpelling(r))
 		}
 	}
 	return b.String()

@@ -731,6 +731,24 @@ func TestRedactSecretWithEscapedEntityPadding(t *testing.T) {
 	}
 }
 
+// Hex entity digits and the "x" may be uppercase AND escaped. Regexp case
+// folding cannot see through an escape, so each case must be spelled out.
+func TestRedactSecretWithEscapedUppercaseHexEntity(t *testing.T) {
+	secret := `Qn7Zp3Lm9Kx1",xy`
+	for name, in := range map[string]string{
+		"percent B":       `?token=Qn7Zp3Lm9%26%23x4%42%3Bx1&QUOT;,xy&after=1`,
+		"json B":          `{"detail":"Qn7Zp3Lm9&#x4B;x1&QUOT;,xy"}`,
+		"percent X":       `?token=Qn7Zp3Lm9Kx1&#%5822;,xy&after=1`,
+		"json X":          `{"detail":"Qn7Zp3Lm9Kx1&#X22;,xy"}`,
+		"percent lower b": `?token=Qn7Zp3Lm9%26%23x4%62%3Bx1&QUOT;,xy&after=1`,
+	} {
+		out := Redact(in, secret)
+		require.NotContains(t, out, "xy", name+" "+out)
+		require.NotContains(t, out, "Kx1", name+" "+out)
+		require.Contains(t, out, redacted, name)
+	}
+}
+
 func countingCache(max int) (*patternCache, *atomic.Int64) {
 	var compiles atomic.Int64
 	return newPatternCache(max, func(s string) *regexp.Regexp {
