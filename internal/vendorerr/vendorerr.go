@@ -219,11 +219,12 @@ func canonicalize(s string, layer func(string) string) (canonical string, ok boo
 	return "", false
 }
 
-// secretForms returns the spellings of the configured secrets to look for in
-// canonical text: the canonical secret, the raw one when it differs (a secret
-// that itself looks like an escape), and the form-encoded spelling of a secret
-// containing spaces. Secrets too short to be real credentials are skipped;
-// replacing them would only mangle the text.
+// secretForms returns the literal spellings of the configured secrets: the
+// canonical secret, the raw one when it differs (a secret that itself looks like
+// an escape), and the form-encoded spelling of a secret containing spaces. They
+// feed the residue sweep and the cut trimming, and the replacement of a secret
+// too long for secretPattern. Secrets too short to be real credentials are
+// skipped; replacing them would only mangle the text.
 func secretForms(secrets []string) []string {
 	var forms []string
 	for _, s := range secrets {
@@ -249,6 +250,145 @@ func canonicalOrRaw(s string) string {
 	return s
 }
 
+// maxSecretPatternLen bounds the secrets matched by pattern: the program grows
+// by about a hundred instructions per character. A longer secret (a bearer
+// token passed as a secret) is replaced by its literal forms and the sweep.
+const maxSecretPatternLen = 256
+
+var jsonShortEscapeLetters = map[rune]string{'\b': "b", '\f': "f", '\n': "n", '\r': "r", '\t': "t"}
+
+var namedEntities = map[rune]string{'"': "quot", '\'': "apos", '<': "lt", '>': "gt", '&': "amp"}
+
+// hexClass spells hex digits matching either letter case.
+func hexClass(h string) string {
+	var b strings.Builder
+	for _, c := range strings.ToLower(h) {
+		if c >= 'a' && c <= 'f' {
+			b.WriteString("[" + string(c) + strings.ToUpper(string(c)) + "]")
+		} else {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
+// plainSpelling matches r spelled as itself, with percent escapes (and "+" for
+// a space) or with JSON escapes.
+func plainSpelling(r rune) string {
+	alts := []string{regexp.QuoteMeta(string(r))}
+	var percent strings.Builder
+	for _, c := range []byte(string(r)) {
+		percent.WriteString("%" + hexClass(fmt.Sprintf("%02x", c)))
+	}
+	alts = append(alts, percent.String())
+	if r == ' ' {
+		alts = append(alts, `\+`)
+	}
+	if r > 0xFFFF {
+		hi, lo := utf16.EncodeRune(r)
+		alts = append(alts, fmt.Sprintf(`\\u%s\\u%s`, hexClass(fmt.Sprintf("%04x", hi)), hexClass(fmt.Sprintf("%04x", lo))))
+	} else {
+		alts = append(alts, `\\u`+hexClass(fmt.Sprintf("%04x", r)))
+	}
+	if r == '"' || r == '\\' || r == '/' {
+		alts = append(alts, `\\`+regexp.QuoteMeta(string(r)))
+	}
+	if e, ok := jsonShortEscapeLetters[r]; ok {
+		alts = append(alts, `\\`+e)
+	}
+	return "(?:" + strings.Join(alts, "|") + ")"
+}
+
+// spelled matches text spelled character by character in plain spellings, so
+// the "&", "#" and ";" of an entity may themselves be percent or JSON escaped
+// (an entity inside JSON, or inside a URL). fold also accepts either letter case.
+func spelled(text string, fold bool) string {
+	var b strings.Builder
+	for _, r := range text {
+		if p := plainSpelling(r); fold {
+			b.WriteString("(?i:" + p + ")")
+		} else {
+			b.WriteString(p)
+		}
+	}
+	return b.String()
+}
+
+// charPattern matches any spelling of r in one layer: a plain spelling or an
+// HTML entity (decimal, hex or named).
+func charPattern(r rune) string {
+	amp, hash, semi := spelled("&", false), spelled("#", false), spelled(";", false)
+	alts := []string{
+		plainSpelling(r),
+		amp + hash + "0*" + spelled(strconv.Itoa(int(r)), false) + semi,
+		amp + hash + spelled("x", true) + "0*" + spelled(strconv.FormatInt(int64(r), 16), true) + semi,
+	}
+	if n, ok := namedEntities[r]; ok {
+		alts = append(alts, amp+spelled(n, false)+semi)
+	}
+	return "(?:" + strings.Join(alts, "|") + ")"
+}
+
+// secretPattern matches the secret s with every character in any single-layer
+// spelling, so "a&#34;,b", "a%22%2Cb" and a mix of them are one secret. nil when
+// s is too long for a pattern or does not compile.
+func secretPattern(s string) *regexp.Regexp {
+	if len(s) > maxSecretPatternLen {
+		return nil
+	}
+	var b strings.Builder
+	for _, r := range s {
+		b.WriteString(charPattern(r))
+	}
+	re, err := regexp.Compile(b.String())
+	if err != nil {
+		return nil
+	}
+	return re
+}
+
+var secretPatterns sync.Map // secret -> *regexp.Regexp (nil: use literal forms)
+
+// secretMatchers returns what replaces the configured secrets in one layer of
+// text: a pattern per secret, longest first, and the literal forms of the
+// secrets that have none. The adapters pass the same secrets every time, so
+// patterns are cached by secret (a few at most; none are kept beyond the cap).
+func secretMatchers(secrets []string) (res []*regexp.Regexp, literals []string) {
+	secrets = slices.Clone(secrets)
+	for i, s := range secrets {
+		secrets[i] = strings.TrimSpace(s)
+	}
+	slices.SortStableFunc(secrets, func(a, b string) int { return len(b) - len(a) })
+	seen := map[string]bool{}
+	for _, s := range secrets {
+		if len(s) < minSecretLen || seen[s] {
+			continue
+		}
+		seen[s] = true
+		for _, v := range slices.Compact([]string{s, canonicalOrRaw(s)}) {
+			var re *regexp.Regexp
+			if cached, ok := secretPatterns.Load(v); ok {
+				re, _ = cached.(*regexp.Regexp)
+			} else {
+				re = secretPattern(v)
+				if secretPatternCount.Add(1) <= maxCachedSecretPatterns {
+					secretPatterns.Store(v, re)
+				}
+			}
+			if re == nil {
+				literals = append(literals, secretForms([]string{v})...)
+			} else {
+				res = append(res, re)
+			}
+		}
+	}
+	return res, literals
+}
+
+const maxCachedSecretPatterns = 64
+
+var secretPatternCount atomic.Int64
+
 // Redact returns text in plain form (JSON, HTML and percent escapes decoded)
 // with the given configured secret values and well-known credential shapes
 // removed, at every layer of encoding (see above). Text that cannot be fully
@@ -267,9 +407,14 @@ var rawBreakRe = regexp.MustCompile(`[ \t\r\n\v\f]*[\t\r\n\v\f][ \t\r\n\v\f]*`)
 // the "\t" of a Windows path), so oneLine shows those as visible escapes.
 func redact(text string, flatten bool, secrets []string) string {
 	forms := secretForms(secrets)
+	patterns, literals := secretMatchers(secrets)
 	first := true
 	text, ok := canonicalize(text, func(layer string) string {
-		for _, f := range forms {
+		// Configured secrets go first, before any shape rule can cut them.
+		for _, re := range patterns {
+			layer = re.ReplaceAllLiteralString(layer, redacted)
+		}
+		for _, f := range literals {
 			layer = strings.ReplaceAll(layer, f, redacted)
 		}
 		layer = normalizeQuoteEntities(layer)

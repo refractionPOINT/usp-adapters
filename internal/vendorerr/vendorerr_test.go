@@ -317,6 +317,113 @@ func TestRedactConfiguredSecretNeverLeavesTail(t *testing.T) {
 	require.Equal(t, `denied: [REDACTED] and Tenant not found`, Redact(`denied: aaaabbbbccccdd and Tenant not found`, "xaaaabbbbccccddx"))
 }
 
+// A shape rule that ends a value at an entity quote used to cut a configured
+// secret containing a quote before decoding could match the whole of it, leaving
+// a tail shorter than the residue sweep. Configured secrets match in any
+// spelling of each character, mixed spellings included, as one secret.
+func TestRedactConfiguredSecretMatchesAnySpellingOfEachCharacter(t *testing.T) {
+	const secret = `Qn7Zp3Lm9Kx1",xy`
+	for name, echo := range map[string]string{
+		"raw":                "Qn7Zp3Lm9Kx1\",xy",
+		"entity quote":       "Qn7Zp3Lm9Kx1&#34;,xy",
+		"hex entity quote":   "Qn7Zp3Lm9Kx1&#x22;,xy",
+		"padded entity":      "Qn7Zp3Lm9Kx1&#0034;,xy",
+		"named entity quote": "Qn7Zp3Lm9Kx1&quot;,xy",
+		"percent":            "Qn7Zp3Lm9Kx1%22%2Cxy",
+		"percent lowercase":  "Qn7Zp3Lm9Kx1%22%2cxy",
+		"json escapes":       `Qn7Zp3Lm9Kx1\"\u002cxy`,
+		"json upper hex":     `Qn7Zp3Lm9Kx1\u0022\u002Cxy`,
+		"percent letters":    "Qn7Zp3Lm9Kx1%22,%78%79",
+		"entity letters":     "Qn7Zp3Lm9Kx1&#34;,&#x78;&#121;",
+		"mixed":              "Qn7Zp3Lm9Kx1&#34;%2Cx&#x79;",
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Equal(t, "?token=[REDACTED]&after=1", Redact("?token="+echo+"&after=1", secret))
+			inJSON := echo // already one layer of escapes; only a raw quote needs the JSON one
+			if name == "raw" {
+				inJSON = strings.ReplaceAll(echo, `"`, `\"`)
+			}
+			require.Equal(t, `{"error":"bad","client_secret":"[REDACTED]","after":1}`, Redact(`{"error":"bad","client_secret":"`+inJSON+`","after":1}`, secret))
+			require.Equal(t, "denied [REDACTED] end", Redact("denied "+echo+" end", secret))
+		})
+	}
+	// Non-ASCII characters, and a non-BMP one as a JSON surrogate pair.
+	const unicodeSecret = "pässwörd-\U0001F511-key"
+	for _, echo := range []string{unicodeSecret, "p%C3%A4sswörd-\U0001F511-key", `p\u00e4sswörd-\ud83d\udd11-key`, "p&#228;sswörd-&#128273;-key", "p&#xE4;sswörd-&#x1f511;-key"} {
+		require.Equal(t, "bad [REDACTED] here", Redact("bad "+echo+" here", unicodeSecret), echo)
+	}
+}
+
+// A secret too long for a pattern (a bearer token passed as a secret) is still
+// replaced, by its literal forms and the sweep, and does not slow redaction.
+func TestRedactLongConfiguredSecretFallsBackToLiteralForms(t *testing.T) {
+	var long strings.Builder
+	for long.Len() < 2048 {
+		long.WriteString("Zx9Qw4Er7Ty2Ui5Op8As1Df3Gh6Jk0Lm")
+	}
+	secret := long.String()
+	require.Nil(t, secretPattern(secret))
+	for name, echo := range map[string]string{"raw": secret, "percent": url.QueryEscape(secret), "json": jsonEscape(secret)} {
+		out := Redact("denied: "+echo+" end of text", secret)
+		require.Equal(t, "denied: [REDACTED] end of text", out, name)
+	}
+	start := time.Now()
+	Redact(strings.Repeat("vendor text ", 1300)+secret, secret)
+	require.Less(t, time.Since(start), 5*time.Second)
+	// A secret at the pattern limit compiles.
+	require.NotNil(t, secretPattern(secret[:maxSecretPatternLen]))
+	require.Equal(t, "x [REDACTED] y", Redact("x "+url.QueryEscape(secret[:maxSecretPatternLen])+" y", secret[:maxSecretPatternLen]))
+}
+
+// Whatever the encoding or the shape the secret is in, no three-character piece
+// of its tail from the first special character on survives (the sweep alone
+// only hides six).
+func TestRedactNeverLeavesSpecialCharacterTailOfConfiguredSecret(t *testing.T) {
+	secrets := []string{`Qn7Zp3Lm9Kx1",xy`, `Hv4Rt8Bc2Wd6'ab`, "Ju5Ne1Gs9Mf3<qz>", "Ka2Pv7Xo4Ly&jw=", "Td8Ci3Sb6Uh;vk+", "Rm1Ez5Wq9Nx w3p", "Yc6Bo2Fl8Ga/mt%", `Ok3Dj7Vu1Ph\sn,`}
+	encodings := map[string]func(string) string{
+		"raw":              func(s string) string { return s },
+		"percent":          url.QueryEscape,
+		"json":             jsonEscape,
+		"numeric entities": func(s string) string { return entityEncode(s, "&#%d;") },
+		"hex entities":     func(s string) string { return entityEncode(s, "&#x%X;") },
+		"named entities": func(s string) string {
+			return strings.NewReplacer(`"`, "&quot;", "'", "&apos;", "<", "&lt;", ">", "&gt;", "&", "&amp;").Replace(s)
+		},
+		"json of percent":     func(s string) string { return jsonEscape(url.QueryEscape(s)) },
+		"json of entities":    func(s string) string { return jsonEscape(entityEncode(s, "&#%d;")) },
+		"percent of entities": func(s string) string { return url.QueryEscape(entityEncode(s, "&#x%x;")) },
+	}
+	templates := map[string]string{
+		"param":    "bad link https://example.test/p?after=1&token=%s&limit=5 end",
+		"json":     `{"error":"invalid_client","client_secret":"%s","trace":"t-1"}`,
+		"userinfo": "bad link https://alice:%s@example.test/p?after=1 end",
+		"bearer":   "request failed. Authorization: Bearer %s trailing",
+		"sas":      "denied SharedAccessSignature sr=hub&sig=%s&se=1 end",
+		"prose":    "the credential %s was rejected",
+	}
+	special := func(secret string) string {
+		i := strings.IndexAny(secret, "\"'<>&,;+/=% \\")
+		return secret[i:]
+	}
+	for _, secret := range secrets {
+		tail := special(secret)
+		for encName, enc := range encodings {
+			for tmplName, tmpl := range templates {
+				in := strings.Replace(tmpl, "%s", enc(secret), 1)
+				out := Redact(in, secret)
+				for i := 0; i+3 <= len(tail); i++ {
+					piece := tail[i : i+3]
+					if strings.Contains(tmpl, piece) {
+						continue // vendor text of the template itself
+					}
+					require.NotContains(t, out, piece, "secret %q, %s, %s: %s", secret, encName, tmplName, out)
+				}
+				require.Contains(t, out, redacted)
+			}
+		}
+	}
+}
+
 func TestRedactDoesNotSwallowFieldsAfterEscapedURLQuote(t *testing.T) {
 	in := `{"error":"{\"url\":\"https://x.test/cb?code=abc\",\"message\":\"Tenant not found\"}"}`
 	out := Redact(in)
