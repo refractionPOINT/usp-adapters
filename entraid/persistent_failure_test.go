@@ -7,12 +7,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/stretchr/testify/require"
 )
 
 // Graph answers that are retried (503) or invalid (a 200 that is not a page)
 // must reach OnError once, with the vendor's text, after the failure interval.
 func TestEntraPersistentVendorFailuresReachOnErrorWithVendorText(t *testing.T) {
+	// A slow -race machine must not cut the body at the production deadline;
+	// the server closes it, so this does not slow the test down.
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	for _, c := range []struct {
 		name    string
 		handler http.HandlerFunc

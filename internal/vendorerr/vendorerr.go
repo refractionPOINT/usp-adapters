@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,11 +33,30 @@ const (
 // How long ReadBody waits for an error body. A vendor error body is a short
 // JSON or text document, so a body that is still arriving after this is
 // returned as read so far. Throttling and server errors are retried anyway, so
-// they get a shorter wait. Variables so tests can shorten them.
+// they get a shorter wait. Atomics so tests in other packages can raise them
+// (SetBodyTimeoutsForTest) while adapter goroutines read them.
 var (
-	errorBodyTimeout = 500 * time.Millisecond
-	retryBodyTimeout = 200 * time.Millisecond
+	errorBodyTimeout atomic.Int64
+	retryBodyTimeout atomic.Int64
 )
+
+func init() {
+	errorBodyTimeout.Store(int64(500 * time.Millisecond))
+	retryBodyTimeout.Store(int64(200 * time.Millisecond))
+}
+
+// SetBodyTimeoutsForTest overrides the ReadBody deadlines for the normal (4xx)
+// and retried (429 and 5xx) cases and returns a function restoring the previous
+// values. Tests asserting vendor body text raise them to several seconds so a
+// slow race-detector machine cannot cut the body: an end-of-body still returns
+// immediately, so the tests stay fast.
+func SetBodyTimeoutsForTest(normal, retry time.Duration) (restore func()) {
+	prevNormal, prevRetry := errorBodyTimeout.Swap(int64(normal)), retryBodyTimeout.Swap(int64(retry))
+	return func() {
+		errorBodyTimeout.Store(prevNormal)
+		retryBodyTimeout.Store(prevRetry)
+	}
+}
 
 var redactions = []struct {
 	re   *regexp.Regexp
@@ -53,6 +73,21 @@ var redactions = []struct {
 	{regexp.MustCompile(`(?i)(["']?(?:access_token|refresh_token|id_token|client_secret|client_assertion|api_?key|password|secret)["']?\s*[:=]\s*["']?)[^"'&\s,;}]+`), "${1}" + redacted},
 }
 
+// secretForms returns the raw secret plus the URL-escaped and JSON-escaped
+// forms a vendor may echo it in (query strings, JSON bodies).
+func secretForms(s string) []string {
+	forms := []string{s}
+	if q := url.QueryEscape(s); q != s {
+		forms = append(forms, q)
+	}
+	if j, err := json.Marshal(s); err == nil {
+		if e := string(j[1 : len(j)-1]); e != s {
+			forms = append(forms, e)
+		}
+	}
+	return forms
+}
+
 // Redact removes the given configured secret values and well-known credential
 // shapes from text. Empty secrets are ignored.
 func Redact(text string, secrets ...string) string {
@@ -61,15 +96,8 @@ func Redact(text string, secrets ...string) string {
 		if len(s) < minSecretLen {
 			continue // a real credential is never this short; replacing it would only mangle the text
 		}
-		text = strings.ReplaceAll(text, s, redacted)
-		// Vendors echo values URL-encoded in query strings or JSON-escaped in bodies.
-		if q := url.QueryEscape(s); q != s {
-			text = strings.ReplaceAll(text, q, redacted)
-		}
-		if j, err := json.Marshal(s); err == nil {
-			if e := string(j[1 : len(j)-1]); e != s {
-				text = strings.ReplaceAll(text, e, redacted)
-			}
+		for _, f := range secretForms(s) {
+			text = strings.ReplaceAll(text, f, redacted)
 		}
 	}
 	for _, r := range redactions {
@@ -100,13 +128,13 @@ func (e *Error) Unwrap() []error {
 	return out
 }
 
-// Wrap returns "op: <redacted cause text>" unwrapping to cause. A nil cause
-// returns nil.
+// Wrap returns "op: <redacted cause text>" unwrapping to cause, with the cause
+// text bounded to MaxBodyText. A nil cause returns nil.
 func Wrap(op string, cause error, secrets ...string) error {
 	if cause == nil {
 		return nil
 	}
-	text := Redact(cause.Error(), secrets...)
+	text := clipRedacted(Redact(cause.Error(), secrets...), secrets)
 	if op != "" {
 		text = op + ": " + text
 	}
@@ -115,10 +143,10 @@ func Wrap(op string, cause error, secrets ...string) error {
 
 // Kind returns "<kind text>: <redacted detail>" unwrapping to kind and, when
 // not nil, cause. The sentinel kind keeps control-flow checks working while the
-// detail carries what the vendor said.
+// detail carries what the vendor said, bounded to MaxBodyText.
 func Kind(kind error, detail string, cause error, secrets ...string) error {
 	text := kind.Error()
-	if d := Redact(detail, secrets...); d != "" {
+	if d := clipRedacted(Redact(detail, secrets...), secrets); d != "" {
 		text += ": " + d
 	}
 	return &Error{text: text, kind: kind, cause: cause}
@@ -136,9 +164,9 @@ func ReadBody(resp *http.Response) (body []byte, truncated bool) {
 	if resp == nil || resp.Body == nil {
 		return nil, false
 	}
-	timeout := errorBodyTimeout
+	timeout := time.Duration(errorBodyTimeout.Load())
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		timeout = retryBodyTimeout
+		timeout = time.Duration(retryBodyTimeout.Load())
 	}
 	return readBody(resp, timeout)
 }
@@ -197,7 +225,14 @@ func capBody(body []byte, truncated bool, secrets []string) (string, bool) {
 	if !truncated {
 		return string(body), false
 	}
-	text := string(body)
+	return trimCut(string(body), secrets), true
+}
+
+// trimCut drops the trailing partial token of text that was cut mid-stream:
+// everything after the last delimiter, and any trailing prefix of a configured
+// secret in its raw, URL-escaped or JSON-escaped form (for secrets that
+// themselves contain delimiter characters).
+func trimCut(text string, secrets []string) string {
 	if i := strings.LastIndexAny(text, partialTokenDelimiters); i >= 0 {
 		text = text[:i+1]
 	} else {
@@ -206,14 +241,29 @@ func capBody(body []byte, truncated bool, secrets []string) (string, bool) {
 	text = strings.ToValidUTF8(text, "")
 	for _, s := range secrets {
 		s = strings.TrimSpace(s)
-		for k := min(len(s)-1, len(text)); k >= minSecretLen; k-- {
-			if strings.HasSuffix(text, s[:k]) {
-				text = text[:len(text)-k]
-				break
+		if len(s) < minSecretLen {
+			continue // Redact ignores it too
+		}
+		for _, form := range secretForms(s) {
+			for k := min(len(form)-1, len(text)); k >= minSecretLen; k-- {
+				if strings.HasSuffix(text, form[:k]) {
+					text = text[:len(text)-k]
+					break
+				}
 			}
 		}
 	}
-	return text, true
+	return text
+}
+
+// clipRedacted bounds already-redacted text to MaxBodyText with a truncation
+// marker. The cut text gets the same trailing-partial-token treatment as a cut
+// body, so a clip never ends inside a secret.
+func clipRedacted(text string, secrets []string) string {
+	if len(text) <= MaxBodyText {
+		return text
+	}
+	return trimCut(text[:MaxBodyText], secrets) + " ... [truncated]"
 }
 
 // Clip bounds vendor-supplied text (a header, a link) to MaxBodyText bytes.

@@ -162,3 +162,51 @@ func TestHTTPTextDropsTokenSplitByReadDeadline(t *testing.T) {
 	// A complete plain-text body without any delimiter is not emptied.
 	require.Equal(t, "HTTP 400 Bad Request: nodelimiter", HTTPText(resp, []byte("nodelimiter"), false))
 }
+
+func TestHTTPTextDropsJSONEscapedSecretCutMidWay(t *testing.T) {
+	resp := &http.Response{StatusCode: 400}
+	// The vendor echoes the secret JSON-escaped (\"), so the cut leaves a prefix
+	// of the escaped form that is not a prefix of the raw secret.
+	secret := `abcd"efghijklmnop`
+	data := `{"detail":"x abcd\"efgh`
+	out := HTTPText(resp, []byte(data), true, secret)
+	require.NotContains(t, out, "abcd")
+	require.Equal(t, `HTTP 400 Bad Request: {"detail":"x ... [truncated]`, out)
+}
+
+func TestWrapAndKindClipLongTextAfterRedaction(t *testing.T) {
+	// 2500 bytes of words: the clip at MaxBodyText lands inside a word.
+	long := strings.Repeat("word ", 500)
+	clipped := strings.Repeat("word ", MaxBodyText/5) + " ... [truncated]"
+
+	cause := errors.New(long)
+	wrapped := Wrap("Receive()", cause)
+	require.ErrorIs(t, wrapped, cause, "clipping the text must not break unwrapping")
+	require.Equal(t, "Receive(): "+clipped, wrapped.Error())
+
+	kind := errors.New("temporarily unavailable")
+	err := Kind(kind, long, cause)
+	require.ErrorIs(t, err, kind)
+	require.Equal(t, "temporarily unavailable: "+clipped, err.Error())
+
+	// Redaction runs on the full text first: a secret that straddles the clip
+	// point is replaced whole, never half-shown.
+	secret := strings.Repeat("S", 64)
+	text := strings.Repeat("a ", MaxBodyText/2-10) + secret + " tail"
+	require.NotContains(t, Wrap("", errors.New(text), secret).Error(), "SSSS")
+
+	// Short text is untouched.
+	require.Equal(t, "op: short", Wrap("op", errors.New("short")).Error())
+}
+
+func TestClipRedactedNeverEndsInsideSecretPrefix(t *testing.T) {
+	// Defence in depth: even text that was not redacted must not end with the
+	// first part of a configured secret (raw or escaped) after the clip.
+	for _, secret := range []string{"AAAA;BBBBBBBBBBBB", `AAAA"BBBBBBBBBBBB`} {
+		form := secretForms(secret)[len(secretForms(secret))-1] // the escaped form when there is one
+		text := strings.Repeat("a ", (MaxBodyText-8)/2) + form + " tail"
+		out := clipRedacted(text, []string{secret})
+		require.NotContains(t, out, "AAAA", secret)
+		require.True(t, strings.HasSuffix(out, " ... [truncated]"))
+	}
+}
