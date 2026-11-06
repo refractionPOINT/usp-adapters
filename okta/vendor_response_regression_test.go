@@ -26,6 +26,13 @@ func TestOktaRejectedContinuationLinkRedactsCredentials(t *testing.T) {
 		{"query token", "http://%s" + logsURL + "?after=1&token=unknown-token-123456789", []string{"unknown-token-123456789"}},
 		{"percent-encoded name", "http://%s" + logsURL + "?after=1&to%%6ben=unknown-token-123456789", []string{"unknown-token-123456789"}},
 		{"userinfo", "http://alice:unknown-password-123@%s" + logsURL + "?after=1", []string{"alice", "unknown-password-123"}},
+		// Decoding must not move the boundary of a credential: each is redacted
+		// whole, as the vendor spelled it.
+		{"userinfo with encoded quote", "http://alice:strong%%22unknown-password-123@%s" + logsURL + "?after=1", []string{"strong", "unknown-password-123"}},
+		{"userinfo with encoded space", "http://alice:strong%%20unknown-password-123@%s" + logsURL + "?after=1", []string{"strong", "unknown-password-123"}},
+		{"userinfo with encoded apostrophe", "http://alice:strong%%27unknown-password-123@%s" + logsURL + "?after=1", []string{"strong", "unknown-password-123"}},
+		{"query token with encoded ampersand", "http://%s" + logsURL + "?after=1&token=strong%%26unknown-password-123", []string{"strong", "unknown-password-123"}},
+		{"query token with encoded semicolon", "http://%s" + logsURL + "?after=1&token=strong%%3Bunknown-password-123", []string{"strong", "unknown-password-123"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

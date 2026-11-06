@@ -60,11 +60,13 @@ func SetBodyTimeoutsForTest(normal, retry time.Duration) (restore func()) {
 	}
 }
 
-// Redaction works on canonical text: Redact first decodes every layer of
-// JSON, HTML and percent escaping a vendor may have wrapped around its message,
-// then runs the detectors once on that plain text and returns the redacted
-// plain text. No detector has to know about an encoding, so a new way of
-// hiding a credential in escapes cannot be a new way of leaking it.
+// Redaction runs at every layer of encoding. A vendor may wrap its message in
+// JSON, HTML and percent escaping; decoding moves the boundaries of a value
+// ("%26" becomes a "&" that ends a query parameter, "%22" a quote that ends a
+// URL), so a value is redacted with the boundaries of the encoding it actually
+// had: Redact runs every detector on the current layer, decodes one layer,
+// and repeats until the text stops changing, so the last run is on plain text.
+// A detector never has to guess how a decoded character used to be spelled.
 const (
 	maxDecodePasses = 4
 	undecodable     = "[REDACTED: undecodable content]"
@@ -75,10 +77,13 @@ var redactions = []struct {
 	with string
 }{
 	// Userinfo of a URL: everything between "scheme://" and the last "@" of the
-	// URL's token, so a password containing "/", "?" or "&" is hidden too.
-	{regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*://)[^\s"'<>]*@`), "${1}" + redacted + "@"},
+	// URL's token, so a password containing "/", "?" or "&" is hidden too. The
+	// URL's own punctuation may itself be escaped at this layer (":", "/", "@"
+	// as %XX or "\/"), and a JSON-escaped quote or backslash belongs to the
+	// password.
+	{regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*(?::|%3a)(?:\\?/|%2f){2})(?:\\.|[^\s"'<>])*(?:@|%40)`), "${1}" + redacted + "@"},
 	// Credential-like parameters of a query or fragment, in a URL or not.
-	{regexp.MustCompile(`(?i)([?&;#](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)[^&;#\s"'<>]+`), "${1}" + redacted},
+	{regexp.MustCompile(`(?i)([?&;#](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)(?:\\.|[^&;#\s"'<>])+`), "${1}" + redacted},
 	// SAS and signed URLs.
 	{regexp.MustCompile(`(?i)(\bsig=)[^&\s"';,]+`), "${1}" + redacted},
 	{regexp.MustCompile(`(?i)(SharedAccessKey\s*=)[^;\s"']+`), "${1}" + redacted},
@@ -92,8 +97,8 @@ var redactions = []struct {
 
 var (
 	// jsonEscapeRe matches a JSON string escape: \uXXXX (a surrogate pair is
-	// matched whole by surrogatePairRe first), \/, \" and \\.
-	jsonEscapeRe    = regexp.MustCompile(`\\(?:u([0-9a-fA-F]{4})|(["\\/]))`)
+	// matched whole by surrogatePairRe first), \/, \", \\, \b, \f, \n, \r and \t.
+	jsonEscapeRe    = regexp.MustCompile(`\\(?:u([0-9a-fA-F]{4})|(["\\/bfnrt]))`)
 	surrogatePairRe = regexp.MustCompile(`\\u([dD][89abAB][0-9a-fA-F]{2})\\u([dD][c-fC-F][0-9a-fA-F]{2})`)
 	// htmlEntityRe matches the entities a vendor's HTML or XML error body uses
 	// for markup and URL characters.
@@ -102,6 +107,8 @@ var (
 	// text that was cut.
 	partialEscapeRe = regexp.MustCompile(`(?:%[0-9a-fA-F]?|\\u?[0-9a-fA-F]{0,3}|&#?[a-zA-Z0-9]{0,8})$`)
 )
+
+var jsonShortEscapes = map[byte]string{'b': "\b", 'f': "\f", 'n': "\n", 'r': "\r", 't': "\t"}
 
 // decodeOnce undoes one layer of JSON, HTML and percent escaping. Malformed
 // escapes are left as they are. A "+" is not decoded: it is a space only in
@@ -114,6 +121,9 @@ func decodeOnce(s string) string {
 	})
 	s = jsonEscapeRe.ReplaceAllStringFunc(s, func(m string) string {
 		if m[1] != 'u' {
+			if c, ok := jsonShortEscapes[m[1]]; ok {
+				return c
+			}
 			return m[1:]
 		}
 		n, _ := strconv.ParseUint(m[2:], 16, 32)
@@ -141,12 +151,16 @@ func percentDecode(s string) string {
 	return b.String()
 }
 
-// canonicalize decodes s until it stops changing. ok is false when it still
-// changes after maxDecodePasses, which means deeper nesting than any real
-// vendor produces.
-func canonicalize(s string) (canonical string, ok bool) {
+// canonicalize decodes s until it stops changing, applying layer (when not nil)
+// to the text of every layer just before it is decoded, including the final
+// plain one. ok is false when it still changes after maxDecodePasses, which
+// means deeper nesting than any real vendor produces.
+func canonicalize(s string, layer func(string) string) (canonical string, ok bool) {
 	s = strings.ToValidUTF8(s, "?")
 	for range maxDecodePasses + 1 {
+		if layer != nil {
+			s = layer(s)
+		}
 		next := decodeOnce(s)
 		if next == s {
 			return s, true
@@ -180,7 +194,7 @@ func secretForms(secrets []string) []string {
 }
 
 func canonicalOrRaw(s string) string {
-	if c, ok := canonicalize(s); ok {
+	if c, ok := canonicalize(s, nil); ok {
 		return c
 	}
 	return s
@@ -188,18 +202,22 @@ func canonicalOrRaw(s string) string {
 
 // Redact returns text in plain form (JSON, HTML and percent escapes decoded)
 // with the given configured secret values and well-known credential shapes
-// removed. Text that cannot be fully decoded is replaced by a marker rather than
-// risk leaking what a deeper layer hides. Empty secrets are ignored.
+// removed, at every layer of encoding (see above). Text that cannot be fully
+// decoded is replaced by a marker rather than risk leaking what a deeper layer
+// hides. Empty secrets are ignored.
 func Redact(text string, secrets ...string) string {
-	text, ok := canonicalize(text)
+	forms := secretForms(secrets)
+	text, ok := canonicalize(text, func(layer string) string {
+		for _, f := range forms {
+			layer = strings.ReplaceAll(layer, f, redacted)
+		}
+		for _, r := range redactions {
+			layer = r.re.ReplaceAllString(layer, r.with)
+		}
+		return layer
+	})
 	if !ok {
 		return undecodable
-	}
-	for _, f := range secretForms(secrets) {
-		text = strings.ReplaceAll(text, f, redacted)
-	}
-	for _, r := range redactions {
-		text = r.re.ReplaceAllString(text, r.with)
 	}
 	return text
 }

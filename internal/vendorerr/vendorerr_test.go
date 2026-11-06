@@ -2,6 +2,7 @@ package vendorerr
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -211,6 +212,72 @@ func TestClipRedactedNeverEndsInsideSecretPrefix(t *testing.T) {
 	}
 }
 
+// A configured secret containing a tab or a newline is found when the vendor
+// JSON-escaped it, and so is every JSON short escape in other text.
+func TestRedactDecodesJSONShortEscapes(t *testing.T) {
+	for _, secret := range []string{"pass\tword-9876", "pass\nword-9876", "pass\r\nword\f-9876\b"} {
+		escaped := strings.NewReplacer("\t", `\t`, "\n", `\n`, "\r", `\r`, "\f", `\f`, "\b", `\b`).Replace(secret)
+		out := Redact(`{"detail":"bad key `+escaped+` given"}`, secret)
+		require.NotContains(t, out, "word")
+		require.NotContains(t, out, "9876")
+		require.Contains(t, out, "bad key [REDACTED] given")
+	}
+	require.Equal(t, "a\tb\nc", Redact(`a\tb\nc`))
+}
+
+// Whatever characters a credential holds and however its URL is encoded, no
+// recognisable part of it is shown. Credentials the adapter was configured with
+// are found in any spelling. Credentials it was not told about are found by
+// shape, as long as the vendor spelled the delimiting characters in an escaped
+// form: a raw "&", quote or space inside a value is indistinguishable from the
+// end of it.
+func TestRedactNeverShowsPartOfACredential(t *testing.T) {
+	secrets := []string{"ab&cdefghij", "ab;cdefghij", `ab"cdefghij`, "ab'cdefghij", "ab cdefghij", "ab%41cdefghij", "ab+cdefghij", "ab/cdefghij", "ab=cdefghij", "ab\tcdefghij"}
+	delimiting := strings.ContainsAny
+	encodings := map[string]func(string) string{
+		"raw":            func(s string) string { return s },
+		"percent":        url.QueryEscape,
+		"json":           func(s string) string { return jsonEscape(s) },
+		"double encoded": func(s string) string { return url.QueryEscape(url.QueryEscape(s)) },
+		"json of percent": func(s string) string {
+			return jsonEscape(url.QueryEscape(s))
+		},
+	}
+	embeddings := map[string]string{
+		"userinfo": "bad link https://alice:%s@example.test/p?after=1 end",
+		"param":    "bad link https://example.test/p?after=1&token=%s&limit=5 end",
+	}
+	for _, secret := range secrets {
+		for encName, enc := range encodings {
+			for embName, tmpl := range embeddings {
+				in := strings.Replace(tmpl, "%s", enc(secret), 1)
+				// A raw delimiter ends a value for any parser: only a configured
+				// secret can be found there.
+				ambiguous := delimiting(enc(secret), "&;' \t") || (encName == "raw" && delimiting(secret, `"`))
+				for _, configured := range []bool{true, false} {
+					if !configured && ambiguous {
+						continue
+					}
+					var cfg []string
+					if configured {
+						cfg = []string{secret}
+					}
+					out := Redact(in, cfg...)
+					for i := 0; i+6 <= len(secret); i++ {
+						require.NotContains(t, out, secret[i:i+6], "secret %q, %s, %s, configured=%v: %s", secret, encName, embName, configured, out)
+					}
+					require.Contains(t, out, redacted)
+				}
+			}
+		}
+	}
+}
+
+func jsonEscape(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b[1 : len(b)-1])
+}
+
 func TestRedactURLCredentials(t *testing.T) {
 	cases := []struct {
 		name, in string
@@ -233,8 +300,17 @@ func TestRedactURLCredentials(t *testing.T) {
 		{"userinfo with decoded slash", `bad https://alice:pa%2Fss%3Fword@example.test/p`, []string{"alice", "pa/ss", "word"}, []string{"@example.test/p"}},
 		{"encoded nested fragment", `redirect https://example.test/cb%23access_token%3Dunknown-token-123456789%26state%3Dok`, []string{"unknown-token-123456789"}, []string{"state=ok"}},
 		{"double encoded separators", `https://example.test/p?after=1%2526token%253Dunknown-token-123456789%2526limit%253D5`, []string{"unknown-token-123456789"}, []string{"after=1", "limit=5"}},
-		{"mixed case escapes", `https://example.test/p?after=1%26Token%3dunknown-token-123456789%2526limit%3d5`, []string{"unknown-token-123456789"}, []string{"after=1", "limit=5"}},
+		// At the layer where "Token" is spelled out, "%26limit" is still escaped, so
+		// it is part of the token's value and goes with it.
+		{"mixed case escapes", `https://example.test/p?after=1%26Token%3dunknown-token-123456789%2526limit%3d5`, []string{"unknown-token-123456789", "limit=5"}, []string{"after=1"}},
 		{"entity encoded fragment", `<a href="https://example.test/cb&#35;access_token&#61;unknown-token-123456789">`, []string{"unknown-token-123456789"}, []string{"https://example.test/cb"}},
+		{"userinfo with encoded quote", `https://alice:strong%22unknown-password-123@example.test/`, []string{"strong", "unknown-password-123"}, []string{"@example.test/"}},
+		{"userinfo with encoded space", `https://alice:strong%20unknown-password-123@example.test/`, []string{"strong", "unknown-password-123"}, []string{"@example.test/"}},
+		{"userinfo with encoded apostrophe", `https://alice:strong%27unknown-password-123@example.test/`, []string{"strong", "unknown-password-123"}, []string{"@example.test/"}},
+		{"userinfo with json escaped quote", `{"url":"https:\/\/alice:strong\"unknown-password-123@example.test\/"}`, []string{"strong", "unknown-password-123"}, []string{"@example.test"}},
+		{"param value with encoded ampersand", `https://example.test/p?after=1&token=strong%26unknown-password-123`, []string{"strong", "unknown-password-123"}, []string{"after=1"}},
+		{"param value with encoded semicolon", `https://example.test/p?after=1&token=strong%3Bunknown-password-123`, []string{"strong", "unknown-password-123"}, []string{"after=1"}},
+		{"param value with double encoded ampersand", `https://example.test/p?after=1&token=strong%2526unknown-password-123`, []string{"strong", "unknown-password-123"}, []string{"after=1"}},
 		{"surrogate pair and unicode escapes", `{"next":"https:\/\/example.test\/p?\ud83d\ude00=1\u0026\u0074oken=unknown-token-123456789"}`, []string{"unknown-token-123456789"}, []string{"=1"}},
 	}
 	for _, c := range cases {
