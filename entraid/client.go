@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -122,12 +122,16 @@ type EntraIDAdapter struct {
 	runtime    entraRuntime
 	startedAt  int64
 	closeOnce  sync.Once
-	closing    atomic.Bool    // set when Close starts; see notify
-	notifying  sync.WaitGroup // in-flight OnError deliveries; only tests wait on it, Close never does
+	notifier   vendorerr.Notifier // delivers OnError; see notify
 	closeErr   error
 }
 
 type EntraIDConfig struct {
+	// ClientOptions.OnError is delivered asynchronously from a single goroutine,
+	// after the failure was observed and possibly out of step with the adapter's
+	// other activity. It may call Close; reports are dropped if the callback
+	// falls behind; none starts after Close and a running one is waited for
+	// (bounded) before Close returns.
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
@@ -322,15 +326,12 @@ func newEntraIDAdapterWithRuntime(ctx context.Context, conf EntraIDConfig, sink 
 	return a, a.chStopped, nil
 }
 
-// notify delivers err to OnError from its own goroutine. The collector is
-// joined by Close, and OnError may itself call Close, so the callback must never
-// run on (or block) a goroutine Close waits for. Notifications are dropped once
-// Close has started.
+// notify queues err for OnError, which is delivered asynchronously from a
+// single goroutine (see vendorerr.Notifier): never on a goroutine Close joins,
+// so OnError may call Close; one callback at a time; reports are dropped when
+// the callback falls behind and once Close has started.
 func (a *EntraIDAdapter) notify(err error) {
-	if onError := a.conf.ClientOptions.OnError; onError != nil && !a.closing.Load() {
-		a.notifying.Add(1)
-		go func() { defer a.notifying.Done(); onError(err) }()
-	}
+	a.notifier.Notify(err, a.conf.ClientOptions.OnError)
 }
 
 // vendorDetail logs the vendor's own (redacted) error text next to an issue code.
@@ -348,8 +349,10 @@ func (a *EntraIDAdapter) issue(code string) {
 
 func (a *EntraIDAdapter) Close() error {
 	a.closeOnce.Do(func() {
-		a.closing.Store(true)
 		a.cancel()
+		// No OnError starts after this, and a running one is waited for (bounded),
+		// so embedders never see OnError after Close returns.
+		a.notifier.Close()
 		if client, ok := a.uspClient.(interface{ BeginDrain() }); ok {
 			client.BeginDrain()
 		}

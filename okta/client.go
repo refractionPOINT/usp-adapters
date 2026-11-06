@@ -8,12 +8,12 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -35,6 +35,11 @@ type uspSink interface {
 }
 
 type OktaConfig struct {
+	// ClientOptions.OnError is delivered asynchronously from a single goroutine,
+	// after the failure was observed and possibly out of step with the adapter's
+	// other activity. It may call Close; reports are dropped if the callback
+	// falls behind; none starts after Close and a running one is waited for
+	// (bounded) before Close returns.
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"apikey" yaml:"apikey"`
 	URL           string                  `json:"url" yaml:"url"`
@@ -80,8 +85,7 @@ type OktaAdapter struct {
 	// Only the worker writes generation. Close reads it after joining worker.
 	generation *oktaGeneration
 	closeOnce  sync.Once
-	closing    atomic.Bool    // set when Close starts; see notify
-	notifying  sync.WaitGroup // in-flight OnError deliveries; only tests wait on it, Close never does
+	notifier   vendorerr.Notifier // delivers OnError; see notify
 	closeErr   error
 }
 
@@ -125,8 +129,10 @@ func newOktaAdapter(ctx context.Context, conf OktaConfig, sink uspSink) (*OktaAd
 
 func (a *OktaAdapter) Close() error {
 	a.closeOnce.Do(func() {
-		a.closing.Store(true)
 		a.cancel()
+		// No OnError starts after this, and a running one is waited for (bounded),
+		// so embedders never see OnError after Close returns.
+		a.notifier.Close()
 		// Seal admission and wake blocked Ship calls before joining producers.
 		// Accepted messages stay buffered for the subsequent ACK observation.
 		if client, ok := a.uspClient.(interface{ BeginDrain() }); ok {
@@ -148,15 +154,12 @@ func (a *OktaAdapter) vendorDetail(err error) {
 	}
 }
 
-// notify delivers err to OnError from its own goroutine. The collector is
-// joined by Close, and OnError may itself call Close, so the callback must never
-// run on (or block) a goroutine Close waits for. Notifications are dropped once
-// Close has started.
+// notify queues err for OnError, which is delivered asynchronously from a
+// single goroutine (see vendorerr.Notifier): never on a goroutine Close joins,
+// so OnError may call Close; one callback at a time; reports are dropped when
+// the callback falls behind and once Close has started.
 func (a *OktaAdapter) notify(err error) {
-	if onError := a.conf.ClientOptions.OnError; onError != nil && !a.closing.Load() {
-		a.notifying.Add(1)
-		go func() { defer a.notifying.Done(); onError(err) }()
-	}
+	a.notifier.Notify(err, a.conf.ClientOptions.OnError)
 }
 
 // retryFailure records a non-credential vendor failure that is being retried.

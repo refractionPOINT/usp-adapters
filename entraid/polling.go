@@ -249,15 +249,17 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		AccessToken string `json:"access_token"`
 	}
 	form := url.Values{"client_id": {a.conf.ClientID}, "client_secret": {a.conf.ClientSecret}, "scope": {a.conf.scope()}, "grant_type": {"client_credentials"}}
-	delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token)
+	delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token, func() error {
+		if token.AccessToken == "" {
+			return errors.New("token endpoint response contained no access_token")
+		}
+		return nil
+	})
 	if delay > 0 {
 		state.blockedUntil = a.runtime.now().Add(delay)
 	}
 	// A delay on a successful token exchange must also postpone the collection.
 	// Keep no bearer token between attempts; retry the exchange after the delay.
-	if err == nil && token.AccessToken == "" {
-		err = vendorerr.Kind(errPage, "token endpoint response contained no access_token", nil)
-	}
 	if err == nil && delay > 0 {
 		return page, errYield
 	}

@@ -374,6 +374,7 @@ func TestEntraUnexpiredCapResumesPagedACKedProducer(t *testing.T) {
 	require.Greater(t, g.position[stream.name].Boundary, boundary+int64(30*time.Minute))
 	require.Greater(t, n, uint64(liveIDLimit))
 	require.Zero(t, duplicates)
+	a.flushNotifications()
 	require.Zero(t, onErrors.Load())
 	require.LessOrEqual(t, len(g.live), liveIDLimit)
 	require.Greater(t, g.position[stream.name].Coverage, s.Coverage)

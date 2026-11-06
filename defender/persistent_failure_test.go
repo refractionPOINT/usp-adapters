@@ -3,6 +3,7 @@ package usp_defender
 import (
 	"context"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -15,6 +16,7 @@ import (
 // reach OnError once, with the vendor's text, after the failure interval. A
 // short blip stays quiet and a valid page re-arms the report.
 func TestDefenderPersistentInvalidAnswerReachesOnErrorOnce(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	var fail atomic.Bool
 	fail.Store(true)
 	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {

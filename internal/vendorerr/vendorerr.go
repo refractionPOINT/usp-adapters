@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,10 +72,8 @@ var redactions = []struct {
 	{regexp.MustCompile(`(?i)\b(bearer|ssws)\s+[A-Za-z0-9._~+/=-]{16,}`), "${1} " + redacted},
 	// Token and secret fields echoed in JSON, form or query text.
 	{regexp.MustCompile(`(?i)(["']?(?:access_token|refresh_token|id_token|client_secret|client_assertion|api_?key|password|secret)["']?\s*[:=]\s*["']?)[^"'&\s,;}]+`), "${1}" + redacted},
-	// URL userinfo (scheme://user:pass@host), whatever it holds.
-	{regexp.MustCompile(`(?i)(\b[a-z][a-z0-9+.-]*://)[^/\s"'@?#<>\\]+@`), "${1}" + redacted + "@"},
-	// Credential-like query parameters in a URL. Only after ? or &, so prose
-	// that merely contains a word like "code" or "key" is left alone.
+	// Credential-like query parameters in a URL-less fragment such as a
+	// relative link. Whole URLs are handled by redactURLs, which decodes first.
 	{regexp.MustCompile(`(?i)([?&](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)[^&\s"'#<>\\]+`), "${1}" + redacted},
 }
 
@@ -105,10 +104,123 @@ func Redact(text string, secrets ...string) string {
 			text = strings.ReplaceAll(text, f, redacted)
 		}
 	}
+	text = urlRe.ReplaceAllStringFunc(text, redactURL)
 	for _, r := range redactions {
 		text = r.re.ReplaceAllString(text, r.with)
 	}
 	return text
+}
+
+var (
+	// urlRe finds URLs as they appear in plain text or inside a JSON string
+	// (where "/" may be written "\/").
+	urlRe = regexp.MustCompile(`(?i)\b[a-z][a-z0-9+.-]*:(?:\\?/){2}[^\s"'<>]+`)
+	// querySepRe matches the separators between query parameters, including
+	// the spellings a JSON or HTML body uses for "&".
+	querySepRe = regexp.MustCompile(`(?i)&amp;|\\u0026|[&;#]`)
+	jsonUniRe  = regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
+)
+
+// credentialParams are the (lowercase, decoded) query parameter names whose
+// value is a credential.
+var credentialParams = map[string]bool{
+	"token": true, "access_token": true, "refresh_token": true, "id_token": true,
+	"code": true, "key": true, "apikey": true, "api_key": true, "secret": true,
+	"client_secret": true, "client_assertion": true, "assertion": true,
+	"password": true, "passwd": true, "pwd": true, "sig": true, "signature": true,
+	"session": true, "sessionid": true, "session_id": true, "sid": true,
+	"auth": true, "authorization": true, "x-amz-signature": true,
+}
+
+// decodeLenient undoes JSON and percent escaping (repeatedly, so double
+// encoding does not help) and ignores malformed escapes instead of failing, so
+// the result is what a lenient parser on the vendor side would see.
+func decodeLenient(s string) string {
+	for range 3 {
+		d := jsonUniRe.ReplaceAllStringFunc(s, func(m string) string {
+			n, _ := strconv.ParseUint(m[2:], 16, 32)
+			return string(rune(n))
+		})
+		d = strings.ReplaceAll(d, `\/`, "/")
+		d = strings.ReplaceAll(d, "&amp;", "&")
+		d = percentDecode(d)
+		if d == s {
+			break
+		}
+		s = d
+	}
+	return s
+}
+
+func percentDecode(s string) string {
+	if !strings.Contains(s, "%") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '%' && i+2 < len(s) {
+			if n, err := strconv.ParseUint(s[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(n))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// redactURL hides the userinfo and the value of every credential-like query or
+// fragment parameter of one URL. Parameter names are judged after decoding, so
+// "to%6ben", "\u0026token" and "%26token%3D" do not hide a credential, while
+// parameters that are not credentials stay readable.
+func redactURL(u string) string {
+	i := strings.Index(u, ":")
+	j := i + 1
+	for j < len(u) && (u[j] == '/' || u[j] == '\\') {
+		j++
+	}
+	end := j
+	for end < len(u) && !strings.ContainsRune(`/\?#`, rune(u[end])) {
+		end++
+	}
+	if at := strings.LastIndex(u[j:end], "@"); at >= 0 {
+		u = u[:j] + redacted + u[j+at:]
+	}
+	q := strings.IndexAny(u[j:], "?#")
+	if q < 0 {
+		return u
+	}
+	q += j + 1
+	var b strings.Builder
+	b.WriteString(u[:q])
+	last := 0
+	query := u[q:]
+	for _, loc := range querySepRe.FindAllStringIndex(query, -1) {
+		b.WriteString(redactParam(query[last:loc[0]]))
+		b.WriteString(query[loc[0]:loc[1]])
+		last = loc[1]
+	}
+	b.WriteString(redactParam(query[last:]))
+	return b.String()
+}
+
+// redactParam redacts one raw "name=value" parameter when its decoded name, or
+// any parameter smuggled into it through an encoded separator, is a credential.
+func redactParam(seg string) string {
+	name, _, hasEq := strings.Cut(seg, "=")
+	if hasEq && credentialParams[strings.ToLower(strings.TrimSpace(decodeLenient(name)))] {
+		return name + "=" + redacted
+	}
+	for _, part := range strings.FieldsFunc(decodeLenient(seg), func(r rune) bool { return r == '&' || r == ';' || r == '?' }) {
+		if n, _, ok := strings.Cut(part, "="); ok && credentialParams[strings.ToLower(strings.TrimSpace(n))] {
+			if hasEq && !strings.ContainsAny(name, `%\`) {
+				return name + "=" + redacted
+			}
+			return redacted
+		}
+	}
+	return seg
 }
 
 // Error is an error whose text is redacted but which still unwraps to the

@@ -2,6 +2,7 @@ package usp_okta
 
 import (
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -37,6 +38,7 @@ func okPage(w http.ResponseWriter, r *http.Request) {
 // to retry forever with only a debug log line. It must reach OnError once, with
 // Okta's own text, after the failure interval.
 func TestOktaPersistentVendorFailureReachesOnErrorOnce(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	for _, status := range []int{404, 503} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			var requests atomic.Int32
@@ -88,6 +90,7 @@ func TestOktaShortVendorBlipStaysQuiet(t *testing.T) {
 
 // A successful page ends the episode: a later persistent failure reports again.
 func TestOktaVendorFailureReportRearmsAfterSuccess(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	var failing atomic.Bool
 	var okSeen atomic.Int32
 	failing.Store(true)

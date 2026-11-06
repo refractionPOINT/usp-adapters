@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -210,6 +211,7 @@ func TestDefenderPendingDedupEmptyWindowsAndContinuousTail(t *testing.T) {
 }
 
 func TestDefenderRedirectContinuationAndVendorErrorText(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	var leaked atomic.Int32
 	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { leaked.Add(1); fmt.Fprint(w, `{"value":[]}`) }))
 	defer evil.Close()
@@ -608,6 +610,7 @@ func TestDefenderGenerationCancellationBoundsEveryAdmissionAttempt(t *testing.T)
 			require.False(t, g.hasDependency)
 			require.NoError(t, a.confirm(g))
 			require.Equal(t, initial, g.confirmed.Load())
+			a.flushNotifications()
 			require.Zero(t, vendorErrors.Load(), "generation cancellation is not a vendor error")
 		})
 	}

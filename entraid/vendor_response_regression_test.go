@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -76,4 +77,70 @@ func TestEntraOnErrorCallingCloseDoesNotDeadlock(t *testing.T) {
 	a.notify(fmt.Errorf("after close"))
 	a.flushNotifications()
 	require.Empty(t, late, "notifications are dropped once Close has started")
+}
+
+// A token endpoint that answers HTTP 200 without an access_token (an error
+// envelope from a gateway or proxy) keeps its own words in the error and, once
+// persistent, in the OnError report.
+func TestEntraTokenResponseWithoutTokenKeepsVendorText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"error":"invalid_client","error_description":"Tenant disabled by gateway policy"}`)
+	}))
+	defer server.Close()
+	a, _ := harness(t, server, &captureSink{})
+	clock := fixtureBaseTime()
+	a.runtime.now = func() time.Time { return clock }
+	a.runtime.failureLimit = 10 * time.Minute
+	var reports []string
+	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	state, failure, stream := &graphRequests{}, &requestFailure{}, a.streams[0]
+	raw := a.windowURL(stream, clock.UnixNano(), clock.Add(time.Minute).UnixNano())
+	request := func() error {
+		_, err := a.requestPage(context.Background(), stream, raw, false, state, failure)
+		a.flushNotifications()
+		return err
+	}
+	err := request()
+	require.ErrorIs(t, err, errPage)
+	clock = clock.Add(11 * time.Minute)
+	require.ErrorIs(t, request(), errPage)
+	require.Len(t, reports, 1)
+	for _, text := range []string{err.Error(), reports[0]} {
+		for _, want := range []string{"no access_token", "HTTP 200 OK", "invalid_client", "Tenant disabled by gateway policy"} {
+			require.Contains(t, text, want)
+		}
+	}
+}
+
+// A continuation link that carries a credential is rejected and quoted in the
+// error; the credential must not survive in it even when the vendor's JSON
+// writes the "&" as &.
+func TestEntraRejectedContinuationLinkRedactsJSONEscapedCredential(t *testing.T) {
+	var a *EntraIDAdapter
+	clock := fixtureBaseTime()
+	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
+		stream := a.streams[0]
+		sendPage(w, nil, a.windowURL(stream, clock.UnixNano(), clock.Add(time.Minute).UnixNano())+"&token=unknown-token-123456789")
+	})
+	a, _ = harness(t, server, &captureSink{})
+	a.runtime.now = func() time.Time { return clock }
+	a.runtime.failureLimit = 10 * time.Minute
+	var reports []string
+	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	state, failure, stream := &graphRequests{}, &requestFailure{}, a.streams[0]
+	raw := a.windowURL(stream, clock.UnixNano(), clock.Add(time.Minute).UnixNano())
+	request := func() error {
+		_, err := a.requestPage(context.Background(), stream, raw, false, state, failure)
+		a.flushNotifications()
+		return err
+	}
+	err := request()
+	require.ErrorIs(t, err, errPage)
+	clock = clock.Add(11 * time.Minute)
+	require.ErrorIs(t, request(), errPage)
+	require.Len(t, reports, 1)
+	for _, text := range []string{err.Error(), reports[0]} {
+		require.NotContains(t, text, "unknown-token-123456789")
+		require.Contains(t, text, "[REDACTED]")
+	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -99,4 +100,57 @@ func TestDefenderOnErrorCallingCloseDoesNotDeadlock(t *testing.T) {
 	a.notify(fmt.Errorf("after close"))
 	a.flushNotifications()
 	require.Empty(t, late, "notifications are dropped once Close has started")
+}
+
+// A token endpoint that answers HTTP 200 without an access_token (an error
+// envelope from a gateway or proxy) keeps its own words in the error and in the
+// OnError report, and is still a credential failure.
+func TestDefenderTokenResponseWithoutTokenKeepsVendorText(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"error":"invalid_client","error_description":"Tenant disabled by gateway policy"}`)
+	}))
+	defer server.Close()
+	a, g := harness(t, server, &captureSink{})
+	var reports []string
+	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	_, err := a.requestPage(context.Background(), a.windowURL(g.position.Boundary, g.position.WindowEnd), false, &graphRequests{})
+	a.flushNotifications()
+	require.ErrorIs(t, err, errCredential)
+	require.Len(t, reports, 1)
+	for _, text := range []string{err.Error(), reports[0]} {
+		for _, want := range []string{"no access_token", "HTTP 200 OK", "invalid_client", "Tenant disabled by gateway policy"} {
+			require.Contains(t, text, want)
+		}
+	}
+}
+
+// An accepted-looking continuation link that carries a credential is rejected;
+// the link is quoted in the error, so the credential must not survive in it
+// even when the vendor's JSON writes the "&" as &.
+func TestDefenderRejectedContinuationLinkRedactsJSONEscapedCredential(t *testing.T) {
+	var server *httptest.Server
+	server = vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
+		sendPage(w, nil, server.URL+alertsPath+"?$skiptoken=cursor&token=unknown-token-123456789")
+	})
+	a, g := harness(t, server, &captureSink{})
+	a.runtime.failureLimit = 200 * time.Millisecond
+	var reports []string
+	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	requests := &graphRequests{}
+	raw := a.windowURL(g.position.Boundary, g.position.WindowEnd)
+	request := func() error {
+		_, err := a.requestPage(context.Background(), raw, false, requests)
+		a.flushNotifications()
+		return err
+	}
+	err := request()
+	require.ErrorIs(t, err, errPage)
+	time.Sleep(250 * time.Millisecond)
+	require.ErrorIs(t, request(), errPage)
+	require.Len(t, reports, 1)
+	for _, text := range []string{err.Error(), reports[0]} {
+		require.NotContains(t, text, "unknown-token-123456789")
+		require.Contains(t, text, "$skiptoken=cursor")
+		require.Contains(t, text, "[REDACTED]")
+	}
 }

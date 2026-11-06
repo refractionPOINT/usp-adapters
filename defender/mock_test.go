@@ -807,6 +807,7 @@ func TestMockNoAlertsShipsNothing(t *testing.T) {
 		5*time.Second, 10*time.Millisecond, "the adapter should keep polling")
 
 	assert.Equal(t, 0, sink.count(), "an empty result set ships nothing")
+	adapter.flushNotifications()
 	errMu.Lock()
 	defer errMu.Unlock()
 	assert.Empty(t, errs, "an empty result set is not an error")

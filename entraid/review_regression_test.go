@@ -107,6 +107,7 @@ func TestEntraExpiredReplayPressureResumesHTTPProducer(t *testing.T) {
 	saved := g.position
 	require.Equal(t, s.Coverage, saved[stream.name].Unverified)
 	require.Less(t, len(g.live), liveIDLimit)
+	a.flushNotifications()
 	require.Zero(t, onErrors.Load())
 }
 

@@ -222,6 +222,13 @@ func TestRedactURLCredentials(t *testing.T) {
 		{"user only userinfo", `Get "https://tok123456@example.test/x": dial tcp: refused`, []string{"tok123456"}, []string{"dial tcp: refused"}},
 		{"mixed case param", `<https://example.test/p?Access_Token=AbC987&Code=zzz-111>; rel="next"`, []string{"AbC987", "zzz-111"}, []string{`rel="next"`}},
 		{"api key and signature", `https://example.test/p?apikey=k-1&api_key=k-2&signature=s-3&session=s-4&key=k-5&client_secret=c-6&assertion=a-7`, []string{"k-1", "k-2", "s-3", "s-4", "k-5", "c-6", "a-7"}, []string{"https://example.test/p?"}},
+		{"json escaped ampersand", `{"next":"https:\/\/example.test\/p?$skiptoken=cursor\u0026token=unknown-token-123456789"}`, []string{"unknown-token-123456789"}, []string{"$skiptoken=cursor"}},
+		{"percent encoded name", `rejected https://example.test/api/v1/logs?after=1&to%6ben=unknown-token-123456789&limit=5`, []string{"unknown-token-123456789"}, []string{"after=1", "limit=5"}},
+		{"encoded separators", `bad link https://example.test/p?after=1%26token%3Dunknown-token-123456789&limit=5`, []string{"unknown-token-123456789"}, []string{"limit=5"}},
+		{"encoded separator inside value", `bad link https://example.test/p?next=x%26access_token=unknown-token-123456789`, []string{"unknown-token-123456789"}, []string{"next="}},
+		{"html ampersand", `<a href="https://example.test/p?after=1&amp;token=unknown-token-123456789">`, []string{"unknown-token-123456789"}, []string{"after=1"}},
+		{"fragment token", `redirect https://example.test/cb#access_token=unknown-token-123456789&state=ok`, []string{"unknown-token-123456789"}, []string{"state=ok"}},
+		{"json escaped userinfo", `{"url":"https:\/\/alice:unknown-password-123@example.test\/x"}`, []string{"alice", "unknown-password-123"}, []string{"@example.test"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

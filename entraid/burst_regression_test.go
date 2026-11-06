@@ -177,6 +177,7 @@ func TestEntraBurstHistoryPressureEventuallyResumes(t *testing.T) {
 	t.Logf("after +90m synthetic source time: shipped=%d boundary=+%s pressure=%d onErrors=%d dup=%d", sink.count(), time.Duration(b2-base.UnixNano()), pressure.Load(), onErrors.Load(), sink.dups())
 	require.Greater(t, b2, burstEnd.Add(10*time.Minute).UnixNano(), "actual completed local boundary must recover")
 	require.True(t, ok, "a completed burst must not wedge the settle tail until history expiry")
+	a.flushNotifications()
 	require.Zero(t, onErrors.Load())
 	require.Zero(t, sink.dups(), "reclaiming optional settle history must not re-emit delivered IDs")
 }

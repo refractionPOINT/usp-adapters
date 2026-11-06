@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ func TestOktaRejectedContinuationLinkRedactsCredentials(t *testing.T) {
 		hidden     []string
 	}{
 		{"query token", "http://%s" + logsURL + "?after=1&token=unknown-token-123456789", []string{"unknown-token-123456789"}},
+		{"percent-encoded name", "http://%s" + logsURL + "?after=1&to%%6ben=unknown-token-123456789", []string{"unknown-token-123456789"}},
 		{"userinfo", "http://alice:unknown-password-123@%s" + logsURL + "?after=1", []string{"alice", "unknown-password-123"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -133,4 +135,24 @@ func TestOktaOnErrorCallingCloseDoesNotDeadlock(t *testing.T) {
 	a.notify(fmt.Errorf("after close"))
 	a.flushNotifications()
 	require.Empty(t, late.all(), "notifications are dropped once Close has started")
+}
+
+// Close waits for an OnError callback that is already running, so an embedder
+// never sees OnError (or a test its t.Logf) after Close has returned.
+func TestOktaCloseWaitsForRunningOnError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer server.Close()
+	a, _ := localHarness(t, server.URL, &ackSink{})
+	a.ctx, a.cancel = context.WithCancel(context.Background())
+	started := make(chan struct{})
+	var finished atomic.Bool
+	a.conf.ClientOptions.OnError = func(error) {
+		close(started)
+		time.Sleep(200 * time.Millisecond)
+		finished.Store(true)
+	}
+	a.notify(fmt.Errorf("vendor said no"))
+	<-started
+	require.NoError(t, a.Close())
+	require.True(t, finished.Load(), "OnError was still running after Close returned")
 }

@@ -28,6 +28,7 @@ var (
 	errThrottle   = fmt.Errorf("Defender request throttled: %w", errRetry)
 	errCredential = errors.New("Defender credentials or permissions rejected")
 	errPage       = errors.New("Defender page invalid")
+	errNoToken    = errors.New("token endpoint response contained no access_token")
 	errIncomplete = errors.New("Defender interval completeness unproven")
 	errYield      = errors.New("Defender page budget yielded")
 	errPressure   = errors.New("Defender live history at capacity")
@@ -142,7 +143,11 @@ func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer 
 	}
 	for _, check := range validate {
 		if err := check(); err != nil {
-			return delay, vendorerr.Kind(errPage, err.Error()+"; received "+received(), err, secrets...)
+			kind := errPage
+			if errors.Is(err, errNoToken) {
+				kind = errCredential // a token response without a token is a credential failure
+			}
+			return delay, vendorerr.Kind(kind, err.Error()+"; received "+received(), err, secrets...)
 		}
 	}
 	return delay, nil
@@ -224,12 +229,14 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		AccessToken string `json:"access_token"`
 	}
 	form := url.Values{"client_id": {a.conf.ClientID}, "client_secret": {a.conf.ClientSecret}, "scope": {a.conf.scope()}, "grant_type": {"client_credentials"}}
-	delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token)
+	delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token, func() error {
+		if token.AccessToken == "" {
+			return errNoToken
+		}
+		return nil
+	})
 	if delay > 0 {
 		state.globalNext = later(state.globalNext, time.Now().Add(delay))
-	}
-	if err == nil && token.AccessToken == "" {
-		err = vendorerr.Kind(errCredential, "token endpoint response contained no access_token", nil)
 	}
 	if err == nil && delay > 0 {
 		return page, errYield

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -155,6 +156,7 @@ func TestRateBudgetAndRetryAfter(t *testing.T) {
 }
 
 func TestCredentialFailureDoesNotBecomeExpiredCursor(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	status := 400
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(status)

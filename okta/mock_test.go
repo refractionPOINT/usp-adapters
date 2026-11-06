@@ -516,9 +516,12 @@ func TestMockBadTokenShipsNothing(t *testing.T) {
 		5*time.Second, 10*time.Millisecond, "adapter should keep polling on auth failure")
 
 	assert.Equal(t, 0, sink.count(), "nothing may ship when authentication fails")
-	mu.Lock()
-	assert.GreaterOrEqual(t, apiErrors, 1, "the auth failure must be reported via OnError")
-	mu.Unlock()
+	// OnError is delivered asynchronously, so wait for the report.
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return apiErrors >= 1
+	}, 5*time.Second, 10*time.Millisecond, "the auth failure must be reported via OnError")
 
 	select {
 	case <-chStopped:
