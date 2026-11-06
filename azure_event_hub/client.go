@@ -63,13 +63,13 @@ func (c *EventHubConfig) Validate() error {
 func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
 	source, err := sourceFingerprint(conf.ConnectionString)
 	if err != nil {
-		return nil, nil, vendorFailure("event hub connection", err)
+		return nil, nil, vendorFailure("event hub connection", err, connectionSecrets(conf.ConnectionString)...)
 	}
 	// Leave HubWithOffsetPersistence unspecified: the default MemoryPersister
 	// must continue recording successful admission for ordinary SDK reconnects.
 	hub, err := eventhub.NewHubFromConnectionString(conf.ConnectionString)
 	if err != nil {
-		return nil, nil, vendorFailure("event hub connection", err)
+		return nil, nil, vendorFailure("event hub connection", err, connectionSecrets(conf.ConnectionString)...)
 	}
 	return newEventHubAdapter(ctx, conf, newAzureHub(conf.ConnectionString, hub), source)
 }
@@ -377,7 +377,7 @@ func (a *EventHubAdapter) captureListenerFailure(g *generation, listener hubList
 			a.stalled.Store(true)
 			return
 		}
-		a.recordFailure(vendorFailure("ListenerHandle.Err()", err).Error())
+		a.recordFailure(a.vendorFailure("ListenerHandle.Err()", err))
 	}
 }
 func (a *EventHubAdapter) stopGeneration(g *generation) {
@@ -427,13 +427,13 @@ func (a *EventHubAdapter) vendorError(ctx context.Context, text string, cause er
 			a.stalled.Store(true)
 			return
 		}
-		a.recordFailure(vendorFailure(text, cause).Error())
+		a.recordFailure(a.vendorFailure(text, cause))
 	}
 }
-func (a *EventHubAdapter) recordFailure(text string) {
+func (a *EventHubAdapter) recordFailure(err error) {
 	a.failureMu.Lock()
 	if a.failure == nil {
-		a.failure = errors.New(text)
+		a.failure = err
 	}
 	a.failureMu.Unlock()
 }
@@ -484,7 +484,7 @@ func (a *EventHubAdapter) processPartitionEvent(ctx context.Context, g *generati
 	}
 	position, err := eventPosition(event)
 	if err != nil {
-		a.recordFailure(vendorFailure("event hub event", errors.New("invalid event metadata")).Error())
+		a.recordFailure(a.vendorFailure("event hub event", errors.New("invalid event metadata")))
 		a.freeze(p, "event_invalid")
 		return err
 	}
@@ -520,8 +520,8 @@ func (a *EventHubAdapter) processPartitionEvent(ctx context.Context, g *generati
 		report := g.ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) && !errors.Is(err, context.Canceled) && !collectionInternalError(err)
 		var safeFailure error
 		if report {
-			safeFailure = vendorFailure("Ship()", err)
-			a.recordFailure(safeFailure.Error())
+			safeFailure = a.vendorFailure("Ship()", err)
+			a.recordFailure(safeFailure)
 		}
 		if collectionInternalError(err) {
 			a.stalled.Store(true)

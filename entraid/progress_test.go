@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -232,6 +233,11 @@ type unreadableBody struct{ reads *atomic.Int32 }
 
 func (b unreadableBody) Read([]byte) (int, error) { b.reads.Add(1); return 0, io.ErrUnexpectedEOF }
 func (b unreadableBody) Close() error             { return nil }
+
+type blockedReader struct{ release chan struct{} }
+
+func (b blockedReader) Read([]byte) (int, error) { <-b.release; return 0, io.EOF }
+
 func TestEntraRetryAfterBeforeBodyAndHTTPGuards(t *testing.T) {
 	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) { sendPage(w, nil, "") })
 	a, _ := harness(t, server, &captureSink{})
@@ -244,14 +250,28 @@ func TestEntraRetryAfterBeforeBodyAndHTTPGuards(t *testing.T) {
 		delay, err := a.doJSON(context.Background(), http.MethodGet, server.URL, "", "token", &graphPage{})
 		require.ErrorIs(t, err, errRetry)
 		require.Equal(t, 2*time.Hour, delay)
-		require.Zero(t, reads.Load())
+		// The unreadable body is attempted (for the vendor's error text) but
+		// never changes the outcome.
+		require.Contains(t, err.Error(), "HTTP "+strconv.Itoa(status))
 	}
+	// A body that never ends must not delay the status/Retry-After outcome
+	// beyond the bounded error-body read.
+	blocked := make(chan struct{})
+	defer close(blocked)
+	a.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": []string{"7200"}}, Body: io.NopCloser(blockedReader{blocked})}, nil
+	})}
+	started := time.Now()
+	delay, err := a.doJSON(context.Background(), http.MethodGet, server.URL, "", "token", &graphPage{})
+	require.ErrorIs(t, err, errRetry)
+	require.Equal(t, 2*time.Hour, delay)
+	require.Less(t, time.Since(started), 10*time.Second)
 	require.Equal(t, 2*time.Hour, retryAfter(now.Add(2*time.Hour).Format(http.TimeFormat), now))
 	// A truncated 200 body still preserves a vendor delay.
 	a.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		return &http.Response{StatusCode: 200, Header: http.Header{"Retry-After": []string{"120"}}, Body: unreadableBody{&atomic.Int32{}}}, nil
 	})}
-	delay, err := a.doJSON(context.Background(), http.MethodGet, server.URL, "", "token", &graphPage{})
+	delay, err = a.doJSON(context.Background(), http.MethodGet, server.URL, "", "token", &graphPage{})
 	require.ErrorIs(t, err, errRetry)
 	require.Equal(t, 2*time.Minute, delay)
 	// Request contexts impose deadlines even if an injected client has no Timeout.

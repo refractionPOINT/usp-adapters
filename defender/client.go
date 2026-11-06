@@ -259,6 +259,13 @@ func (a *DefenderAdapter) Close() error {
 	return a.closeErr
 }
 
+// vendorDetail logs the vendor's own (redacted) error text next to an issue code.
+func (a *DefenderAdapter) vendorDetail(err error) {
+	if a.conf.ClientOptions.DebugLog != nil && err != nil {
+		a.conf.ClientOptions.DebugLog("defender vendor error: " + err.Error())
+	}
+}
+
 func (a *DefenderAdapter) issue(code string) {
 	if a.conf.ClientOptions.DebugLog != nil {
 		a.conf.ClientOptions.DebugLog("defender collection: " + code)

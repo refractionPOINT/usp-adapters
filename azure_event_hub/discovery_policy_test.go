@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -13,7 +12,6 @@ import (
 
 	eventhub "github.com/Azure/azure-event-hubs-go/v3"
 	amqp "github.com/Azure/go-amqp"
-	"github.com/mitchellh/mapstructure"
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/stretchr/testify/require"
@@ -270,31 +268,43 @@ func TestMalformedVendorEventReportsOnceAfterFreeze(t *testing.T) {
 	default:
 	}
 }
-func TestSafeVendorCauseCategories(t *testing.T) {
+func TestVendorFailureKeepsVendorTextAndRedactsSecrets(t *testing.T) {
 	secret := "sensitive-fixture"
+	connection := "Endpoint=sb://example.servicebus.windows.net/;SharedAccessKeyName=root;SharedAccessKey=" + secret + ";EntityPath=hub"
 	cases := []struct {
-		name       string
-		err        error
-		diagnostic string
+		name    string
+		err     error
+		visible []string
 	}{
-		{"wrapped-amqp", fmt.Errorf("wrapped: %w", &amqp.LinkError{RemoteErr: &amqp.Error{Condition: amqp.ErrCondUnauthorizedAccess, Description: secret}}), "unauthorized-access"},
-		{"decode", &mapstructure.Error{Errors: []string{"bad annotation " + secret}}, "decode failure"},
-		{"url", &url.Error{Op: "POST", URL: "https://example.invalid?sig=" + secret, Err: &net.OpError{Op: "dial", Err: errors.New(secret)}}, "network connection failed"},
-		{"dns", &net.DNSError{Err: secret, Name: secret}, "name resolution failed"},
-		{"unknown-condition", &amqp.Error{Condition: amqp.ErrCond(secret), Description: secret}, "AMQP protocol error"},
-		{"unknown-raw", errors.New(secret + " ?sig=" + secret), "unclassified cause"},
-		{"auth", errors.New("CBS token authentication failed " + secret), "authentication failed"},
-		{"untrusted-parser-suffix", errors.New(`key "SharedAccessKey" must not be empty ` + secret), "unclassified cause"},
+		// The management failure text the Event Hubs SDK produces for a 403.
+		{"rpc-403", errors.New("unhandled error link rpc: status code 403 and description: ip has been prevented to connect to the endpoint"),
+			[]string{"status code 403", "ip has been prevented to connect to the endpoint"}},
+		{"wrapped-amqp", fmt.Errorf("wrapped: %w", &amqp.LinkError{RemoteErr: &amqp.Error{Condition: amqp.ErrCondUnauthorizedAccess, Description: "claim missing"}}),
+			[]string{"amqp:unauthorized-access", "claim missing"}},
+		{"dns", &net.DNSError{Err: "no such host", Name: "ns.servicebus.windows.net"}, []string{"no such host", "ns.servicebus.windows.net"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			safe := vendorFailure("ListenerHandle.Err()", c.err)
-			require.Contains(t, safe.Error(), c.diagnostic)
-			require.NotContains(t, safe.Error(), secret)
-			require.NotContains(t, safe.Error(), "https://")
-			require.Nil(t, errors.Unwrap(safe), "raw error must not survive as an unwrap cause")
+			failure := vendorFailure("GetRuntimeInformation()", c.err, connectionSecrets(connection)...)
+			require.True(t, strings.HasPrefix(failure.Error(), "GetRuntimeInformation(): "))
+			for _, text := range c.visible {
+				require.Contains(t, failure.Error(), text)
+			}
+			require.ErrorIs(t, failure, c.err, "wrapped cause must keep driving errors.Is/As")
 		})
 	}
+	t.Run("secrets", func(t *testing.T) {
+		raw := errors.New("cbs failed for " + connection + " token SharedAccessSignature sr=x&sig=" + secret + "&se=1 and key " + secret)
+		failure := vendorFailure("event hub connection", raw, connectionSecrets(connection)...)
+		require.NotContains(t, failure.Error(), secret)
+		require.Contains(t, failure.Error(), "cbs failed for")
+		require.Contains(t, failure.Error(), "[REDACTED]")
+	})
+	t.Run("typed-control-flow", func(t *testing.T) {
+		require.ErrorIs(t, vendorFailure("Ship()", uspclient.ErrorBufferFull), uspclient.ErrorBufferFull)
+		require.ErrorIs(t, vendorFailure("Ship()", fmt.Errorf("x: %w", context.Canceled)), context.Canceled)
+		require.True(t, collectionInternalError(vendorFailure("Ship()", acktrack.ErrLimit)))
+	})
 }
 
 func TestCleanupOnlySDKErrorAndInternalCauseStayQuiet(t *testing.T) {
@@ -348,17 +358,17 @@ func TestCanceledGenerationSnapshotsVerifiedCauseBeforeListenerCleanup(t *testin
 	require.ErrorIs(t, l.Err(), context.Canceled, "fixture must erase its cause during cleanup")
 }
 
-func TestFailedShipReturnsSanitizedVendorCause(t *testing.T) {
+func TestFailedShipReturnsVendorCauseWithoutSecrets(t *testing.T) {
 	c := newTestClient()
 	c.fail = &amqp.Error{Condition: amqp.ErrCondUnauthorizedAccess, Description: "https://example.invalid?sig=sensitive-fixture payload-fixture"}
 	a, g := harness(t, c)
 	err := process(t, a, g, "0", 100, 0)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "Ship(): amqp:unauthorized-access")
-	require.NotContains(t, err.Error(), "sensitive-fixture")
-	require.NotContains(t, err.Error(), "payload-fixture")
-	require.NotContains(t, err.Error(), "https://")
-	require.Nil(t, errors.Unwrap(err))
+	require.Contains(t, err.Error(), "Ship(): ")
+	require.Contains(t, err.Error(), "amqp:unauthorized-access")
+	require.Contains(t, err.Error(), "payload-fixture", "the vendor's own description must be reported")
+	require.NotContains(t, err.Error(), "sensitive-fixture", "SAS signature value must be redacted")
+	require.ErrorIs(t, err, c.fail)
 	a.failureMu.Lock()
 	failure := a.failure
 	a.failureMu.Unlock()
@@ -379,4 +389,24 @@ func TestSDKReceiveKeepsNilHandleAsNilInterface(t *testing.T) {
 	listener, err = sdkListenerResult(sdk, cause)
 	require.Same(t, sdk, listener)
 	require.Same(t, cause, err)
+}
+
+// A management failure (here the Event Hubs RPC text for a 403) must reach the
+// adapter's OnError with Azure's own description intact and no key material.
+func TestInitialManagementFailureReportsAzureTextWithoutKey(t *testing.T) {
+	h := &discoveryHub{testHub: testHub{ids: []string{"0"}}}
+	h.partitions = func(context.Context) ([]string, error) {
+		return nil, errors.New("unhandled error link rpc-link-1: status code 403 and description: Ip has been prevented to connect to the endpoint. TrackingId:abc " + testConnection)
+	}
+	callbacks := make(chan error, 1)
+	a := newReviewAdapter(t, h, newTestClient(), nil, func(err error) { callbacks <- err })
+	startWorker(t, a)
+	select {
+	case err := <-callbacks:
+		require.Contains(t, err.Error(), "GetRuntimeInformation(): unhandled error link rpc-link-1: status code 403 and description: Ip has been prevented to connect to the endpoint.")
+		require.NotContains(t, err.Error(), "not-a-real-key")
+		require.Contains(t, err.Error(), "[REDACTED]")
+	case <-time.After(5 * time.Second):
+		t.Fatal("management failure was not reported")
+	}
 }

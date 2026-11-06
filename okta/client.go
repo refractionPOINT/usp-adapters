@@ -132,6 +132,13 @@ func (a *OktaAdapter) Close() error {
 	return a.closeErr
 }
 
+// vendorDetail logs the vendor's own (redacted) error text next to an issue code.
+func (a *OktaAdapter) vendorDetail(err error) {
+	if a.conf.ClientOptions.DebugLog != nil && err != nil {
+		a.conf.ClientOptions.DebugLog("okta vendor error: " + err.Error())
+	}
+}
+
 func (a *OktaAdapter) issue(code string) {
 	if a.conf.ClientOptions.DebugLog != nil {
 		a.conf.ClientOptions.DebugLog("okta collection: " + code)
@@ -191,12 +198,14 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				// Keep retrying the exact opaque cursor. Rewinding could duplicate
 				// earlier pages; replacing it with now could skip source records.
 				a.issue("continuation_stalled")
+				a.vendorDetail(err)
 			} else if errors.Is(err, errVendorCredential) {
 				if a.conf.ClientOptions.OnError != nil {
-					a.conf.ClientOptions.OnError(errors.New("okta API credentials or permission rejected"))
+					a.conf.ClientOptions.OnError(err)
 				}
 			} else {
 				a.issue("request_retry")
+				a.vendorDetail(err)
 			}
 			delay := backoff
 			if page.delay > delay {
@@ -249,7 +258,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 						return
 					}
 					if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
-						a.conf.ClientOptions.OnError(errors.New("okta event admission failed"))
+						a.conf.ClientOptions.OnError(fmt.Errorf("okta event admission failed: %w", err))
 					}
 					return
 				}

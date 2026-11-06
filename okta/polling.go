@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -55,16 +56,17 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 	if err := a.validateContinuation(raw); err != nil {
 		return page, err
 	}
+	secrets := []string{a.conf.ApiKey}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return page, errInvalidPage
+		return page, vendorerr.Kind(errInvalidPage, "building request: "+err.Error(), err, secrets...)
 	}
 	req.Header.Set("Authorization", "SSWS "+a.conf.ApiKey)
 	req.Header.Set("Accept", "application/json")
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		return page, errRequestRetry
-	} // url.Error can contain a cursor.
+		return page, vendorerr.Kind(errRequestRetry, err.Error(), err, secrets...)
+	}
 	defer resp.Body.Close()
 	now := time.Now()
 	page.delay = rateDelay(resp.Header, now)
@@ -75,32 +77,39 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 		}
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
-	if err != nil || len(body) > 16<<20 {
-		return page, errRequestRetry
+	if err != nil {
+		return page, vendorerr.Kind(errRequestRetry, "reading response body: "+err.Error(), err, secrets...)
 	}
+	if len(body) > 16<<20 {
+		return page, vendorerr.Kind(errRequestRetry, "response body exceeds 16 MiB", nil)
+	}
+	status := func() string { return vendorerr.HTTPText(resp, body, secrets...) }
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return page, errVendorCredential
+		return page, vendorerr.Kind(errVendorCredential, status(), nil, secrets...)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return page, errRequestRetry
+		return page, vendorerr.Kind(errRequestRetry, status(), nil, secrets...)
 	}
 	if resp.StatusCode == http.StatusBadRequest && req.URL.Query().Get("after") != "" {
 		var envelope struct {
 			Code string `json:"errorCode"`
 		}
 		if json.Unmarshal(body, &envelope) == nil && envelope.Code == "E0000001" {
-			return page, errInvalidContinuation
+			return page, vendorerr.Kind(errInvalidContinuation, status(), nil, secrets...)
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return page, errInvalidPage
+		return page, vendorerr.Kind(errInvalidPage, status(), nil, secrets...)
 	}
-	if err := json.Unmarshal(body, &page.items); err != nil || page.items == nil || len(page.items) > 1000 {
-		return page, errInvalidPage
+	if err := json.Unmarshal(body, &page.items); err != nil {
+		return page, vendorerr.Kind(errInvalidPage, "decoding JSON response: "+err.Error(), err, secrets...)
+	}
+	if page.items == nil || len(page.items) > 1000 {
+		return page, vendorerr.Kind(errInvalidPage, "response is not a log page (null or more than 1000 events)", nil)
 	}
 	for _, item := range page.items {
 		if id, ok := item["uuid"].(string); !ok || id == "" {
-			return oktaPage{}, errInvalidPage
+			return oktaPage{}, vendorerr.Kind(errInvalidPage, "response event lacks a uuid", nil)
 		}
 	}
 	page.next, err = nextLink(resp.Header.Values("Link"))

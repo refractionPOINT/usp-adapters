@@ -17,6 +17,7 @@ import (
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 )
 
 const graphTimeQuantum = 100 * time.Nanosecond
@@ -85,12 +86,15 @@ func retryAfter(value string, now time.Time) time.Duration {
 	return 0
 }
 
-// doJSON sanitizes every transport/status/parse error, including token responses.
+// doJSON returns errors that keep the vendor's own words (transport error, HTTP
+// status and response body, parse failure) with credential material redacted.
+// Each error still wraps one of the sentinel kinds that drive retry behaviour.
 // The copied client rejects redirects even when a test injects its transport.
 func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}) (time.Duration, error) {
+	secrets := []string{a.conf.ClientSecret, bearer}
 	req, err := http.NewRequestWithContext(ctx, method, raw, strings.NewReader(body))
 	if err != nil {
-		return 0, errPage
+		return 0, vendorerr.Kind(errPage, "building request: "+err.Error(), err, secrets...)
 	}
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -104,28 +108,31 @@ func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer 
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, errRetry
+		return 0, vendorerr.Kind(errRetry, err.Error(), err, secrets...)
 	}
 	defer resp.Body.Close()
 	delay := retryAfter(resp.Header.Get("Retry-After"), time.Now())
-	if resp.StatusCode == 429 {
-		return delay, errThrottle
-	}
-	if resp.StatusCode >= 500 {
-		return delay, errRetry
-	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 || (method == http.MethodPost && resp.StatusCode == 400) {
-		return delay, errCredential
-	}
 	if resp.StatusCode != http.StatusOK {
-		return delay, errPage
+		kind := errPage
+		switch {
+		case resp.StatusCode == 429:
+			kind = errThrottle
+		case resp.StatusCode >= 500:
+			kind = errRetry
+		case resp.StatusCode == 401 || resp.StatusCode == 403 || (method == http.MethodPost && resp.StatusCode == 400):
+			kind = errCredential
+		}
+		return delay, vendorerr.Kind(kind, vendorerr.HTTPText(resp, vendorerr.ReadBody(resp), secrets...), nil, secrets...)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
-		return delay, errRetry
+		return delay, vendorerr.Kind(errRetry, "reading response body: "+err.Error(), err, secrets...)
 	}
-	if len(data) > 16<<20 || json.Unmarshal(data, out) != nil {
-		return delay, errPage
+	if len(data) > 16<<20 {
+		return delay, vendorerr.Kind(errPage, "response body exceeds 16 MiB", nil)
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error(), err, secrets...)
 	}
 	return delay, nil
 }
@@ -191,7 +198,7 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		state.globalNext = later(state.globalNext, time.Now().Add(delay))
 	}
 	if err == nil && token.AccessToken == "" {
-		err = errCredential
+		err = vendorerr.Kind(errCredential, "token endpoint response contained no access_token", nil)
 	}
 	if err == nil && delay > 0 {
 		return page, errYield
@@ -207,7 +214,7 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 	}
 	if err == nil {
 		if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
-			return graphPage{}, errPage
+			return graphPage{}, vendorerr.Kind(errPage, "response is not a valid alert page (missing value array, more than 1000 items, negative count or rejected nextLink)", nil)
 		}
 		// Valid page collection, rather than an entire interval, breaks a continuous
 		// vendor failure episode. Its opaque continuation may still be outstanding.
@@ -219,12 +226,13 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 	}
 	if errors.Is(err, errCredential) {
 		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(errCredential)
+			a.conf.ClientOptions.OnError(err)
 		}
 		*retry = time.Now().Add(jitterDelay(a.pollInterval))
-		return graphPage{}, errCredential
+		return graphPage{}, err
 	}
 	if !errors.Is(err, errRetry) {
+		a.vendorDetail(err)
 		return graphPage{}, err
 	}
 	if state.failureStart.IsZero() {
@@ -232,11 +240,12 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 	}
 	if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
 		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(errors.New("Defender API unavailable for a continuous retry interval"))
+			a.conf.ClientOptions.OnError(fmt.Errorf("Defender API unavailable for a continuous retry interval: %w", err))
 		}
 		state.reported = true
 	}
 	a.issue("vendor_retry")
+	a.vendorDetail(err)
 	if *backoff == 0 {
 		*backoff = time.Second
 	}
@@ -319,7 +328,7 @@ func (a *DefenderAdapter) shipScanItem(ctx context.Context, g *defenderGeneratio
 				return err
 			}
 			if !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
-				a.conf.ClientOptions.OnError(errors.New("Defender event admission failed"))
+				a.conf.ClientOptions.OnError(fmt.Errorf("Defender event admission failed: %w", err))
 			}
 			return err
 		}

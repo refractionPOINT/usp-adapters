@@ -247,7 +247,7 @@ func TestVerifiedDecodeFailureSurvivesHandlerCancellationRace(t *testing.T) {
 		})
 	}
 }
-func TestVendorCauseDiagnosticsExcludeSensitiveDescriptions(t *testing.T) {
+func TestVendorCauseKeepsDescriptionButRedactsCredentials(t *testing.T) {
 	h := &testHub{ids: []string{"0"}}
 	callbacks := make(chan error, 1)
 	a := newReviewAdapter(t, h, newTestClient(), nil, func(err error) { callbacks <- err })
@@ -258,7 +258,8 @@ func TestVendorCauseDiagnosticsExcludeSensitiveDescriptions(t *testing.T) {
 	select {
 	case err := <-callbacks:
 		require.Contains(t, err.Error(), "unauthorized-access")
-		for _, secret := range []string{"secret-fixture", "sas-fixture", "payload-fixture", "example.invalid", "https://"} {
+		require.Contains(t, err.Error(), "payload-fixture", "the vendor's own description must be reported")
+		for _, secret := range []string{"secret-fixture", "sas-fixture"} {
 			require.NotContains(t, err.Error(), secret)
 		}
 	case <-time.After(5 * time.Second):

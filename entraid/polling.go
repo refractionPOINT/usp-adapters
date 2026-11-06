@@ -16,6 +16,7 @@ import (
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 )
 
 const graphTimeQuantum = 100 * time.Nanosecond
@@ -90,12 +91,17 @@ func retryAfter(value string, now time.Time) time.Duration {
 	}
 	return 0
 }
+
+// doJSON returns errors that keep the vendor's own words (transport error, HTTP
+// status and response body, parse failure) with credential material redacted.
+// Each error still wraps one of the sentinel kinds that drive retry behaviour.
 func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}) (time.Duration, error) {
+	secrets := []string{a.conf.ClientSecret, bearer}
 	ctx, cancel := context.WithTimeout(ctx, a.runtime.requestTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, raw, strings.NewReader(body))
 	if err != nil {
-		return 0, errPage
+		return 0, vendorerr.Kind(errPage, "building request: "+err.Error(), err, secrets...)
 	}
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -109,27 +115,31 @@ func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer s
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, errRetry
+		return 0, vendorerr.Kind(errRetry, err.Error(), err, secrets...)
 	}
 	defer resp.Body.Close()
 	// Status and minimum vendor delay take precedence over any body read, even
-	// for truncated, oversized or indefinitely streaming throttling responses.
+	// for truncated, oversized or indefinitely streaming throttling responses:
+	// the error body is read with a short deadline and never gates the outcome.
 	delay := retryAfter(resp.Header.Get("Retry-After"), a.runtime.now())
-	if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-		return delay, errRetry
-	}
-	if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-		return delay, errVendor
-	}
 	if resp.StatusCode != http.StatusOK {
-		return delay, errPage
+		kind := errPage
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			kind = errRetry
+		} else if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			kind = errVendor
+		}
+		return delay, vendorerr.Kind(kind, vendorerr.HTTPText(resp, vendorerr.ReadBody(resp), secrets...), nil, secrets...)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
-		return delay, errRetry
+		return delay, vendorerr.Kind(errRetry, "reading response body: "+err.Error(), err, secrets...)
 	}
-	if len(data) > 16<<20 || json.Unmarshal(data, out) != nil {
-		return delay, errPage
+	if len(data) > 16<<20 {
+		return delay, vendorerr.Kind(errPage, "response body exceeds 16 MiB", nil)
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error(), err, secrets...)
 	}
 	return delay, nil
 }
@@ -217,7 +227,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 	// A delay on a successful token exchange must also postpone the collection.
 	// Keep no bearer token between attempts; retry the exchange after the delay.
 	if err == nil && token.AccessToken == "" {
-		err = errPage
+		err = vendorerr.Kind(errPage, "token endpoint response contained no access_token", nil)
 	}
 	if err == nil && delay > 0 {
 		return page, errYield
@@ -233,7 +243,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 	}
 	if err == nil {
 		if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next, stream) != nil) {
-			err = errPage
+			err = vendorerr.Kind(errPage, "response is not a valid page (missing value array, more than 1000 items, negative count or rejected nextLink)", nil)
 		}
 		if err == nil {
 			for _, item := range page.Items {
@@ -241,7 +251,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 				stamp, okTime := item[stream.tsField].(string)
 				_, parseErr := time.Parse(time.RFC3339Nano, stamp)
 				if !ok || id == "" || !okTime || parseErr != nil {
-					err = errPage
+					err = vendorerr.Kind(errPage, "response item lacks a valid id or "+stream.tsField, nil)
 					break
 				}
 			}
@@ -249,7 +259,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		if err == nil {
 			for _, check := range validate {
 				if check(page) != nil {
-					err = errPage
+					err = vendorerr.Kind(errPage, "response page failed collection validation", nil)
 					break
 				}
 			}
@@ -272,9 +282,9 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		}
 		state.permanentNext[stream.name] = failure.retryAt
 		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(errVendor)
+			a.conf.ClientOptions.OnError(err)
 		}
-		return graphPage{}, errVendor
+		return graphPage{}, err
 	}
 	if !errors.Is(err, errRetry) && !errors.Is(err, errPage) {
 		return graphPage{}, err
@@ -289,7 +299,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 	}
 	if !episode.reported && now.Sub(episode.since) >= a.runtime.failureLimit {
 		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(errors.New("Entra collection unavailable or invalid for a continuous retry interval"))
+			a.conf.ClientOptions.OnError(fmt.Errorf("Entra collection unavailable or invalid for a continuous retry interval: %w", err))
 		}
 		episode.reported = true
 	}
@@ -310,6 +320,7 @@ func (a *EntraIDAdapter) requestPage(ctx context.Context, stream entraStream, ra
 		}
 	}
 	a.issue("vendor_retry")
+	a.vendorDetail(err)
 	return graphPage{}, err
 }
 

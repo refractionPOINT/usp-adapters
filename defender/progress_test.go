@@ -209,7 +209,7 @@ func TestDefenderPendingDedupEmptyWindowsAndContinuousTail(t *testing.T) {
 	require.Equal(t, g.serial, g.confirmed.Load())
 }
 
-func TestDefenderRedirectContinuationAndErrorSanitization(t *testing.T) {
+func TestDefenderRedirectContinuationAndVendorErrorText(t *testing.T) {
 	var leaked atomic.Int32
 	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { leaked.Add(1); fmt.Fprint(w, `{"value":[]}`) }))
 	defer evil.Close()
@@ -243,7 +243,12 @@ func TestDefenderRedirectContinuationAndErrorSanitization(t *testing.T) {
 			for _, message := range messages {
 				require.NotContains(t, message, "http")
 				require.NotContains(t, message, "never-leak")
-				require.NotContains(t, message, "secret-response-payload")
+			}
+			if mode == "credential" {
+				// The vendor's own status and body must reach the reported error.
+				require.Len(t, messages, 1)
+				require.Contains(t, messages[0], "HTTP 403 Forbidden")
+				require.Contains(t, messages[0], `{"error":"secret-response-payload"}`)
 			}
 		})
 	}

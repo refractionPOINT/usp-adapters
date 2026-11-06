@@ -319,6 +319,13 @@ func newEntraIDAdapterWithRuntime(ctx context.Context, conf EntraIDConfig, sink 
 	return a, a.chStopped, nil
 }
 
+// vendorDetail logs the vendor's own (redacted) error text next to an issue code.
+func (a *EntraIDAdapter) vendorDetail(err error) {
+	if a.conf.ClientOptions.DebugLog != nil && err != nil {
+		a.conf.ClientOptions.DebugLog("entraid vendor error: " + err.Error())
+	}
+}
+
 func (a *EntraIDAdapter) issue(code string) {
 	if a.conf.ClientOptions.DebugLog != nil {
 		a.conf.ClientOptions.DebugLog("entraid collection: " + code)
