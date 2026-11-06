@@ -68,6 +68,7 @@ func TestEntraMalformedLiveTipEscalatesDespiteSettleSuccess(t *testing.T) {
 		}
 		clock.Add(int64(5 * time.Second))
 	}
+	a.flushNotifications()
 	t.Logf("shipped=%d boundary=+%s settleOK=%d liveBad=%d onErrors=%d", sink.count(), time.Duration(g.position[stream.name].Boundary-base.UnixNano()), settleOK.Load(), liveBad.Load(), onErrors.Load())
 	require.True(t, g.position[stream.name].Boundary > bad.UnixNano() || onErrors.Load() > 0,
 		"a permanently invalid live page must not stall live collection for hours while staying invisible to OnError")
@@ -176,6 +177,7 @@ func TestEntraBurstHistoryPressureEventuallyResumes(t *testing.T) {
 	t.Logf("after +90m synthetic source time: shipped=%d boundary=+%s pressure=%d onErrors=%d dup=%d", sink.count(), time.Duration(b2-base.UnixNano()), pressure.Load(), onErrors.Load(), sink.dups())
 	require.Greater(t, b2, burstEnd.Add(10*time.Minute).UnixNano(), "actual completed local boundary must recover")
 	require.True(t, ok, "a completed burst must not wedge the settle tail until history expiry")
+	a.flushNotifications()
 	require.Zero(t, onErrors.Load())
 	require.Zero(t, sink.dups(), "reclaiming optional settle history must not re-emit delivered IDs")
 }
@@ -316,5 +318,6 @@ func TestEntraMalformedSettleEscalatesDespiteLiveSuccess(t *testing.T) {
 	require.Greater(t, valid.Load(), int64(100))
 	require.Greater(t, malformed.Load(), int64(100))
 	require.Greater(t, g.position[stream.name].Boundary, base.Add(time.Hour).UnixNano(), "healthy live collection remains available")
+	a.flushNotifications()
 	require.Equal(t, int64(1), callbacks.Load(), "a fixed invalid settle traversal must escalate even while live succeeds")
 }

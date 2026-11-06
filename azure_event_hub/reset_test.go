@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -353,4 +354,131 @@ func TestRuntimePeriodicInspectionIsSequentialAndBounded(t *testing.T) {
 	a.final = g
 	close(a.chStopped)
 	require.NoError(t, a.Close())
+}
+
+// A partition runtime read that keeps failing never blocked data, but it must
+// not stay silent: after a continuous hour it reaches OnError once with the
+// vendor's text, and a success re-arms it.
+func TestPartitionRuntimeFailureReachesOnErrorAfterContinuousHour(t *testing.T) {
+	a, g, h, _ := resetHarness(t)
+	clock := time.Unix(1700000000, 0)
+	a.now = func() time.Time { return clock }
+	reports := make(chan error, 4)
+	a.conf.ClientOptions.OnError = func(err error) { reports <- err }
+	var debug []string
+	a.conf.ClientOptions.DebugLog = func(s string) { debug = append(debug, s) }
+	var fail atomic.Bool
+	fail.Store(true)
+	h.runtime = func(_ context.Context, id string) (*eventhub.HubPartitionRuntimeInformation, error) {
+		if fail.Load() {
+			return nil, errors.New("amqp: unauthorized-access: management claim missing")
+		}
+		return runtimePosition(id, 600), nil
+	}
+	inspect := func() { g.runtimePreferred = "0"; require.NoError(t, a.discover(g, false)) }
+	quiet := func() {
+		t.Helper()
+		select {
+		case err := <-reports:
+			t.Fatalf("reported too early: %v", err)
+		default:
+		}
+	}
+	inspect()
+	clock = clock.Add(59 * time.Minute)
+	inspect()
+	quiet()
+	require.Contains(t, debug, "event hub vendor error: GetPartitionInformation(): amqp: unauthorized-access: management claim missing")
+	clock = clock.Add(2 * time.Minute)
+	inspect()
+	select {
+	case err := <-reports:
+		require.Contains(t, err.Error(), "management claim missing")
+	case <-time.After(5 * time.Second):
+		t.Fatal("persistent runtime failure never reached OnError")
+	}
+	inspect()
+	time.Sleep(50 * time.Millisecond)
+	quiet()
+	fail.Store(false)
+	inspect()
+	require.Empty(t, g.runtimeFailure, "a success ends the episode")
+}
+
+// Periodic inspection rotates over partitions. One partition that keeps
+// failing while its neighbour succeeds must still be reported: the neighbour's
+// success must not re-arm the failing partition's episode.
+func TestPartitionRuntimeFailureEpisodeIsPerPartition(t *testing.T) {
+	a, g, h, _ := resetHarness(t)
+	clock := time.Unix(1700000000, 0)
+	a.now = func() time.Time { return clock }
+	reports := make(chan error, 4)
+	a.conf.ClientOptions.OnError = func(err error) { reports <- err }
+	h.runtime = func(_ context.Context, id string) (*eventhub.HubPartitionRuntimeInformation, error) {
+		if id == "0" {
+			return nil, errors.New("amqp: unauthorized-access: partition 0 claim missing")
+		}
+		return runtimePosition(id, 600), nil
+	}
+	g.runtimeCursor = 0
+	// Rotation order is 0, 1, 0, 1: partition 0 fails at t=0 and t=62m with a
+	// success on partition 1 in between.
+	for i := 0; i < 4; i++ {
+		require.NoError(t, a.discover(g, false))
+		clock = clock.Add(31 * time.Minute)
+	}
+	select {
+	case err := <-reports:
+		require.Contains(t, err.Error(), "partition 0 claim missing")
+	case <-time.After(5 * time.Second):
+		t.Fatal("a persistently failing partition was never reported because a healthy partition kept resetting the episode")
+	}
+	require.Len(t, g.runtimeFailure, 1, "episodes are tracked only for failing partitions")
+}
+
+// The recurring partition-runtime report goes through the one-at-a-time
+// notifier: a callback that blocks cannot accumulate one blocked goroutine per
+// failing partition, every report is still delivered once it is released, and
+// Close stops further delivery.
+func TestPartitionRuntimeReportsAreDeliveredOneAtATimeAndStopAtClose(t *testing.T) {
+	a, g, h, _ := resetHarness(t)
+	clock := time.Unix(1700000000, 0)
+	a.now = func() time.Time { return clock }
+	var running, maxRunning, delivered atomic.Int32
+	started, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	a.conf.ClientOptions.OnError = func(error) {
+		cur := running.Add(1)
+		if cur > maxRunning.Load() {
+			maxRunning.Store(cur)
+		}
+		once.Do(func() { close(started) })
+		<-release
+		running.Add(-1)
+		delivered.Add(1)
+	}
+	h.runtime = func(_ context.Context, id string) (*eventhub.HubPartitionRuntimeInformation, error) {
+		return nil, fmt.Errorf("amqp: unauthorized-access: partition %s claim missing", id)
+	}
+	g.runtimeCursor = 0
+	for range 4 { // partitions 0, 1, 0, 1 across two hours
+		require.NoError(t, a.discover(g, false))
+		clock = clock.Add(31 * time.Minute)
+	}
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runtime failure never reached OnError")
+	}
+	time.Sleep(50 * time.Millisecond) // a second, unbounded callback would have started by now
+	close(release)
+	a.notifier.Flush()
+	require.Equal(t, int32(2), delivered.Load(), "both partitions' reports are delivered")
+	require.Equal(t, int32(1), maxRunning.Load(), "callbacks never overlap")
+
+	a.stopGeneration(g)
+	a.final = g
+	close(a.chStopped)
+	require.NoError(t, a.Close())
+	require.False(t, a.notifier.Notify(errors.New("late"), a.conf.ClientOptions.OnError), "no runtime report is delivered after Close")
 }

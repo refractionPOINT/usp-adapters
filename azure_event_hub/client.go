@@ -14,6 +14,7 @@ import (
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -39,7 +40,8 @@ type EventHubAdapter struct {
 	closing   atomic.Bool
 	stalled   atomic.Bool
 	admission chan struct{}
-	final     *generation // worker-owned until chStopped closes
+	notifier  vendorerr.Notifier // delivers the recurring partition-runtime report to OnError
+	final     *generation        // worker-owned until chStopped closes
 	source    [32]byte
 	// Per-instance scheduling seams; no global mutable hooks or customer settings.
 	ackEvery, discoverEvery time.Duration
@@ -63,13 +65,13 @@ func (c *EventHubConfig) Validate() error {
 func NewEventHubAdapter(ctx context.Context, conf EventHubConfig) (*EventHubAdapter, chan struct{}, error) {
 	source, err := sourceFingerprint(conf.ConnectionString)
 	if err != nil {
-		return nil, nil, vendorFailure("event hub connection", err)
+		return nil, nil, vendorFailure("event hub connection", err, connectionSecrets(conf.ConnectionString)...)
 	}
 	// Leave HubWithOffsetPersistence unspecified: the default MemoryPersister
 	// must continue recording successful admission for ordinary SDK reconnects.
 	hub, err := eventhub.NewHubFromConnectionString(conf.ConnectionString)
 	if err != nil {
-		return nil, nil, vendorFailure("event hub connection", err)
+		return nil, nil, vendorFailure("event hub connection", err, connectionSecrets(conf.ConnectionString)...)
 	}
 	return newEventHubAdapter(ctx, conf, newAzureHub(conf.ConnectionString, hub), source)
 }
@@ -133,6 +135,7 @@ type generation struct {
 	monitors          sync.WaitGroup
 	retiring          atomic.Bool
 	managementFailure failureEpisode
+	runtimeFailure    map[string]*failureEpisode // per partition ID, so one failing partition is not reset by the others' successes
 	receiverFailures  map[string]failureEpisode
 	retryPositions    map[string]partitionRetry
 }
@@ -197,8 +200,9 @@ func (a *EventHubAdapter) collect(g *generation) error {
 // periodic discovery retries. Only a continuous hour of the same failing
 // operation escalates. Any successful management read resets its own episode.
 type failureEpisode struct {
-	since  time.Time
-	active bool
+	since    time.Time
+	active   bool
+	reported bool
 }
 
 func (e *failureEpisode) failed(now time.Time) bool {
@@ -217,6 +221,7 @@ func (a *EventHubAdapter) discover(g *generation, initial bool) error {
 		}
 		if !initial && !g.managementFailure.failed(a.now()) {
 			a.issue("discovery_retry")
+			a.vendorDetail("GetRuntimeInformation()", err)
 			return nil
 		}
 		a.vendorError(g.ctx, "GetRuntimeInformation()", err)
@@ -327,6 +332,7 @@ func (a *EventHubAdapter) discover(g *generation, initial bool) error {
 				return e
 			}
 			a.issue("receiver_start_retry")
+			a.vendorDetail("Receive()", e)
 			continue // failed partial setup is not published as a started partition
 		}
 		p.listener = listener
@@ -377,7 +383,7 @@ func (a *EventHubAdapter) captureListenerFailure(g *generation, listener hubList
 			a.stalled.Store(true)
 			return
 		}
-		a.recordFailure(vendorFailure("ListenerHandle.Err()", err).Error())
+		a.recordFailure(a.vendorFailure("ListenerHandle.Err()", err))
 	}
 }
 func (a *EventHubAdapter) stopGeneration(g *generation) {
@@ -411,6 +417,9 @@ func (a *EventHubAdapter) Close() error {
 	a.closeOnce.Do(func() {
 		a.closing.Store(true)
 		a.cancel()
+		// No recurring OnError starts after this, and a running one is waited
+		// for (bounded). The terminal failure callback is separate (run).
+		a.notifier.Close()
 		a.uspClient.BeginDrain() // immediate wake; preserves the SDK's accepted buffer
 		stop := utils.StopBlockedProducers(a.uspClient)
 		defer stop()
@@ -427,13 +436,13 @@ func (a *EventHubAdapter) vendorError(ctx context.Context, text string, cause er
 			a.stalled.Store(true)
 			return
 		}
-		a.recordFailure(vendorFailure(text, cause).Error())
+		a.recordFailure(a.vendorFailure(text, cause))
 	}
 }
-func (a *EventHubAdapter) recordFailure(text string) {
+func (a *EventHubAdapter) recordFailure(err error) {
 	a.failureMu.Lock()
 	if a.failure == nil {
-		a.failure = errors.New(text)
+		a.failure = err
 	}
 	a.failureMu.Unlock()
 }
@@ -484,7 +493,7 @@ func (a *EventHubAdapter) processPartitionEvent(ctx context.Context, g *generati
 	}
 	position, err := eventPosition(event)
 	if err != nil {
-		a.recordFailure(vendorFailure("event hub event", errors.New("invalid event metadata")).Error())
+		a.recordFailure(a.vendorFailure("event hub event", errors.New("invalid event metadata")))
 		a.freeze(p, "event_invalid")
 		return err
 	}
@@ -520,8 +529,8 @@ func (a *EventHubAdapter) processPartitionEvent(ctx context.Context, g *generati
 		report := g.ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) && !errors.Is(err, context.Canceled) && !collectionInternalError(err)
 		var safeFailure error
 		if report {
-			safeFailure = vendorFailure("Ship()", err)
-			a.recordFailure(safeFailure.Error())
+			safeFailure = a.vendorFailure("Ship()", err)
+			a.recordFailure(safeFailure)
 		}
 		if collectionInternalError(err) {
 			a.stalled.Store(true)

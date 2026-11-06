@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -209,7 +210,8 @@ func TestDefenderPendingDedupEmptyWindowsAndContinuousTail(t *testing.T) {
 	require.Equal(t, g.serial, g.confirmed.Load())
 }
 
-func TestDefenderRedirectContinuationAndErrorSanitization(t *testing.T) {
+func TestDefenderRedirectContinuationAndVendorErrorText(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	var leaked atomic.Int32
 	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { leaked.Add(1); fmt.Fprint(w, `{"value":[]}`) }))
 	defer evil.Close()
@@ -239,11 +241,17 @@ func TestDefenderRedirectContinuationAndErrorSanitization(t *testing.T) {
 			a.conf.ClientOptions.OnError = func(e error) { messages = append(messages, e.Error()) }
 			a.conf.ClientOptions.OnWarning = func(s string) { messages = append(messages, s) }
 			_, err := a.scanWindow(context.Background(), g, g.position.Boundary, g.position.WindowEnd, false, &graphRequests{})
+			a.flushNotifications()
 			require.Error(t, err)
 			for _, message := range messages {
 				require.NotContains(t, message, "http")
 				require.NotContains(t, message, "never-leak")
-				require.NotContains(t, message, "secret-response-payload")
+			}
+			if mode == "credential" {
+				// The vendor's own status and body must reach the reported error.
+				require.Len(t, messages, 1)
+				require.Contains(t, messages[0], "HTTP 403 Forbidden")
+				require.Contains(t, messages[0], `{"error":"secret-response-payload"}`)
 			}
 		})
 	}
@@ -306,6 +314,7 @@ func TestDefenderRetryAfterAndCancellationWithoutOnError(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("retry wait ignored cancellation")
 	}
+	a.flushNotifications()
 	require.Zero(t, onError.Load())
 	require.Equal(t, 120*time.Second, retryAfter("120", time.Now()))
 	now := time.Now().UTC().Truncate(time.Second)
@@ -322,6 +331,7 @@ func TestDefenderTransientEscalatesOnlyContinuousFailure(t *testing.T) {
 	requests := &graphRequests{failureStart: time.Now().Add(-61 * time.Minute)}
 	_, err := a.scanWindow(ctx, g, g.position.Boundary, g.position.WindowEnd, false, requests)
 	require.Error(t, err)
+	a.flushNotifications()
 	require.Equal(t, int32(1), onError.Load())
 }
 
@@ -600,6 +610,7 @@ func TestDefenderGenerationCancellationBoundsEveryAdmissionAttempt(t *testing.T)
 			require.False(t, g.hasDependency)
 			require.NoError(t, a.confirm(g))
 			require.Equal(t, initial, g.confirmed.Load())
+			a.flushNotifications()
 			require.Zero(t, vendorErrors.Load(), "generation cancellation is not a vendor error")
 		})
 	}

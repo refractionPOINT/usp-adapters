@@ -13,6 +13,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -96,6 +97,7 @@ type DefenderAdapter struct {
 	tracker       *acktrack.ACKTracker
 	generation    *defenderGeneration
 	closeOnce     sync.Once
+	notifier      vendorerr.Notifier // delivers OnError; see notify
 	closeErr      error
 	runtime       defenderRuntime
 	startedAt     int64
@@ -105,6 +107,11 @@ type DefenderAdapter struct {
 }
 
 type DefenderConfig struct {
+	// ClientOptions.OnError is delivered asynchronously from a single goroutine,
+	// after the failure was observed and possibly out of step with the adapter's
+	// other activity. It may call Close; reports are dropped if the callback
+	// falls behind; none starts after Close and a running one is waited for
+	// (bounded) before Close returns.
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	TenantID      string                  `json:"tenant_id" yaml:"tenant_id"`
 	ClientID      string                  `json:"client_id" yaml:"client_id"`
@@ -246,6 +253,9 @@ func newDefenderAdapterWithRuntime(ctx context.Context, conf DefenderConfig, sin
 func (a *DefenderAdapter) Close() error {
 	a.closeOnce.Do(func() {
 		a.cancel()
+		// No OnError starts after this, and a running one is waited for (bounded),
+		// so embedders never see OnError after Close returns.
+		a.notifier.Close()
 		// Seal admission before joining a producer blocked on SDK backpressure.
 		if client, ok := a.uspClient.(interface{ BeginDrain() }); ok {
 			client.BeginDrain()
@@ -257,6 +267,22 @@ func (a *DefenderAdapter) Close() error {
 		a.closeErr = errors.Join(err1, err2)
 	})
 	return a.closeErr
+}
+
+// notify queues err for OnError, which is delivered asynchronously from a
+// single goroutine (see vendorerr.Notifier): never on a goroutine Close joins,
+// so OnError may call Close; one callback at a time. It reports whether the
+// report was accepted: it is refused when the callback has fallen behind or
+// Close has started, and one-shot reporters must then try again later.
+func (a *DefenderAdapter) notify(err error) bool {
+	return a.notifier.Notify(err, a.conf.ClientOptions.OnError)
+}
+
+// vendorDetail logs the vendor's own (redacted) error text next to an issue code.
+func (a *DefenderAdapter) vendorDetail(err error) {
+	if a.conf.ClientOptions.DebugLog != nil && err != nil {
+		a.conf.ClientOptions.DebugLog("defender vendor error: " + err.Error())
+	}
 }
 
 func (a *DefenderAdapter) issue(code string) {

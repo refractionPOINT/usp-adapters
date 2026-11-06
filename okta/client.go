@@ -13,6 +13,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -20,6 +21,8 @@ const (
 	logsURL             = "/api/v1/logs"
 	overlapPeriod       = 30 * time.Minute
 	defaultPollInterval = 30 * time.Second
+	// A retried vendor failure stays quiet (debug log only) for this long.
+	defaultFailureLimit = time.Hour
 	// Bound one uncancellable SDK admission while preserving the original
 	// ten-second warning threshold and one-hour retry budget.
 	admissionSlice = 250 * time.Millisecond
@@ -32,6 +35,11 @@ type uspSink interface {
 }
 
 type OktaConfig struct {
+	// ClientOptions.OnError is delivered asynchronously from a single goroutine,
+	// after the failure was observed and possibly out of step with the adapter's
+	// other activity. It may call Close; reports are dropped if the callback
+	// falls behind; none starts after Close and a running one is waited for
+	// (bounded) before Close returns.
 	ClientOptions uspclient.ClientOptions `json:"client_options" yaml:"client_options"`
 	ApiKey        string                  `json:"apikey" yaml:"apikey"`
 	URL           string                  `json:"url" yaml:"url"`
@@ -71,9 +79,13 @@ type OktaAdapter struct {
 	wgSenders    sync.WaitGroup
 	tracker      *acktrack.ACKTracker
 	endpoint     *url.URL
+	// failureLimit is how long non-credential vendor failures may persist
+	// before one is reported through OnError; zero means defaultFailureLimit.
+	failureLimit time.Duration
 	// Only the worker writes generation. Close reads it after joining worker.
 	generation *oktaGeneration
 	closeOnce  sync.Once
+	notifier   vendorerr.Notifier // delivers OnError; see notify
 	closeErr   error
 }
 
@@ -118,6 +130,9 @@ func newOktaAdapter(ctx context.Context, conf OktaConfig, sink uspSink) (*OktaAd
 func (a *OktaAdapter) Close() error {
 	a.closeOnce.Do(func() {
 		a.cancel()
+		// No OnError starts after this, and a running one is waited for (bounded),
+		// so embedders never see OnError after Close returns.
+		a.notifier.Close()
 		// Seal admission and wake blocked Ship calls before joining producers.
 		// Accepted messages stay buffered for the subsequent ACK observation.
 		if client, ok := a.uspClient.(interface{ BeginDrain() }); ok {
@@ -130,6 +145,44 @@ func (a *OktaAdapter) Close() error {
 		a.closeErr = errors.Join(err1, err2)
 	})
 	return a.closeErr
+}
+
+// vendorDetail logs the vendor's own (redacted) error text next to an issue code.
+func (a *OktaAdapter) vendorDetail(err error) {
+	if a.conf.ClientOptions.DebugLog != nil && err != nil {
+		a.conf.ClientOptions.DebugLog("okta vendor error: " + err.Error())
+	}
+}
+
+// notify queues err for OnError, which is delivered asynchronously from a
+// single goroutine (see vendorerr.Notifier): never on a goroutine Close joins,
+// so OnError may call Close; one callback at a time. It reports whether the
+// report was accepted: it is refused when the callback has fallen behind or
+// Close has started, and one-shot reporters must then try again later.
+func (a *OktaAdapter) notify(err error) bool {
+	return a.notifier.Notify(err, a.conf.ClientOptions.OnError)
+}
+
+// retryFailure records a non-credential vendor failure that is being retried.
+// Once the same failure episode has lasted a continuous failureLimit it reports
+// the vendor's (redacted) text once through OnError; a successful page re-arms
+// it. Short blips therefore stay quiet, but a persistent failure never does.
+func (a *OktaAdapter) retryFailure(episode *failureEpisode, err error) {
+	if episode.since.IsZero() {
+		episode.since = time.Now()
+	}
+	limit := a.failureLimit
+	if limit <= 0 {
+		limit = defaultFailureLimit
+	}
+	if !episode.reported && time.Since(episode.since) >= limit {
+		episode.reported = a.notify(fmt.Errorf("Okta API unavailable or invalid for a continuous retry interval: %w", err))
+	}
+}
+
+type failureEpisode struct {
+	since    time.Time
+	reported bool
 }
 
 func (a *OktaAdapter) issue(code string) {
@@ -174,6 +227,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 	}
 	next := g.position.Next
 	backoff := time.Second
+	var episode failureEpisode
 	for ctx.Err() == nil {
 		if !g.makeRoom(time.Now()) {
 			a.issue("live_history_pressure")
@@ -191,12 +245,14 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				// Keep retrying the exact opaque cursor. Rewinding could duplicate
 				// earlier pages; replacing it with now could skip source records.
 				a.issue("continuation_stalled")
+				a.vendorDetail(err)
+				a.retryFailure(&episode, err)
 			} else if errors.Is(err, errVendorCredential) {
-				if a.conf.ClientOptions.OnError != nil {
-					a.conf.ClientOptions.OnError(errors.New("okta API credentials or permission rejected"))
-				}
+				a.notify(err)
 			} else {
 				a.issue("request_retry")
+				a.vendorDetail(err)
+				a.retryFailure(&episode, err)
 			}
 			delay := backoff
 			if page.delay > delay {
@@ -217,6 +273,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			continue
 		}
 		backoff = time.Second
+		episode = failureEpisode{}
 		g.page++
 		for _, item := range page.items {
 			if ctx.Err() != nil {
@@ -248,8 +305,8 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 						a.issue("admission_tracking_failed")
 						return
 					}
-					if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
-						a.conf.ClientOptions.OnError(errors.New("okta event admission failed"))
+					if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
+						a.notify(fmt.Errorf("okta event admission failed: %w", err))
 					}
 					return
 				}

@@ -99,6 +99,7 @@ func TestProgressCanceledAdmissionKeepsIncompletePageUncommitted(t *testing.T) {
 			require.Less(t, time.Since(started), time.Second)
 			require.Zero(t, sink.seals.Load(), "generation cancellation must keep the SDK usable")
 			require.LessOrEqual(t, time.Duration(sink.maxTimeout.Load()), 250*time.Millisecond)
+			a.flushNotifications()
 			require.Zero(t, vendorErrors.Load())
 			require.Equal(t, 1, sink.count(), "accepted data must stay in the SDK")
 			pending, err := sink.GetUnsent()

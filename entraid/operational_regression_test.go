@@ -57,6 +57,7 @@ func TestEntraOperationalStallsNeverBecomeVendorErrors(t *testing.T) {
 				}
 				require.True(t, a.collectionFailure(context.Background(), err))
 			}
+			a.flushNotifications()
 			require.Zero(t, callbacks.Load(), "bounded memory and valid but unproven completeness are operational failures")
 			require.Equal(t, base.UnixNano(), g.position[stream.name].Boundary)
 		})

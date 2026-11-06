@@ -17,6 +17,7 @@ import (
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 )
 
 const graphTimeQuantum = 100 * time.Nanosecond
@@ -27,6 +28,7 @@ var (
 	errThrottle   = fmt.Errorf("Defender request throttled: %w", errRetry)
 	errCredential = errors.New("Defender credentials or permissions rejected")
 	errPage       = errors.New("Defender page invalid")
+	errNoToken    = errors.New("token endpoint response contained no access_token")
 	errIncomplete = errors.New("Defender interval completeness unproven")
 	errYield      = errors.New("Defender page budget yielded")
 	errPressure   = errors.New("Defender live history at capacity")
@@ -85,12 +87,19 @@ func retryAfter(value string, now time.Time) time.Duration {
 	return 0
 }
 
-// doJSON sanitizes every transport/status/parse error, including token responses.
+// doJSON returns errors that keep the vendor's own words (transport error, HTTP
+// status and response body, parse failure) with credential material redacted.
+// Each error still wraps one of the sentinel kinds that drive retry behaviour.
 // The copied client rejects redirects even when a test injects its transport.
-func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}) (time.Duration, error) {
+//
+// validate, when given, checks the decoded 200 response. A rejection keeps the
+// received status and (bounded, redacted) body next to the reason, so an error
+// envelope or denial page served with HTTP 200 stays readable.
+func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer string, out interface{}, validate ...func() error) (time.Duration, error) {
+	secrets := []string{a.conf.ClientSecret, bearer}
 	req, err := http.NewRequestWithContext(ctx, method, raw, strings.NewReader(body))
 	if err != nil {
-		return 0, errPage
+		return 0, vendorerr.Kind(errPage, "building request: "+err.Error(), err, secrets...)
 	}
 	if method == http.MethodPost {
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -104,30 +113,64 @@ func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer 
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	if err != nil {
-		return 0, errRetry
+		return 0, vendorerr.Kind(errRetry, err.Error(), err, secrets...)
 	}
 	defer resp.Body.Close()
 	delay := retryAfter(resp.Header.Get("Retry-After"), time.Now())
-	if resp.StatusCode == 429 {
-		return delay, errThrottle
-	}
-	if resp.StatusCode >= 500 {
-		return delay, errRetry
-	}
-	if resp.StatusCode == 401 || resp.StatusCode == 403 || (method == http.MethodPost && resp.StatusCode == 400) {
-		return delay, errCredential
-	}
 	if resp.StatusCode != http.StatusOK {
-		return delay, errPage
+		kind := errPage
+		switch {
+		case resp.StatusCode == 429:
+			kind = errThrottle
+		case resp.StatusCode >= 500:
+			kind = errRetry
+		case resp.StatusCode == 401 || resp.StatusCode == 403 || (method == http.MethodPost && resp.StatusCode == 400):
+			kind = errCredential
+		}
+		body, cut := vendorerr.ReadBody(resp)
+		return delay, vendorerr.Kind(kind, vendorerr.HTTPText(resp, body, cut, secrets...), nil, secrets...)
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, (16<<20)+1))
 	if err != nil {
-		return delay, errRetry
+		return delay, vendorerr.Kind(errRetry, "reading response body: "+err.Error(), err, secrets...)
 	}
-	if len(data) > 16<<20 || json.Unmarshal(data, out) != nil {
-		return delay, errPage
+	if len(data) > 16<<20 {
+		return delay, vendorerr.Kind(errPage, "response body exceeds 16 MiB", nil)
+	}
+	received := func() string { return vendorerr.HTTPText(resp, data, false, secrets...) }
+	if err := json.Unmarshal(data, out); err != nil {
+		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error()+"; received "+received(), err, secrets...)
+	}
+	for _, check := range validate {
+		if err := check(); err != nil {
+			kind := errPage
+			if errors.Is(err, errNoToken) {
+				kind = errCredential // a token response without a token is a credential failure
+			}
+			return delay, vendorerr.Kind(kind, err.Error()+"; received "+received(), err, secrets...)
+		}
 	}
 	return delay, nil
+}
+
+// validateAlertPage rejects a page the collector could not process. The item
+// check lives here, before requestPage declares the page a success and re-arms
+// the failure episode, so a persistently malformed item is reported rather than
+// retried silently.
+func (a *DefenderAdapter) validateAlertPage(page *graphPage) error {
+	if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
+		return errors.New("response is not a valid alert page (missing value array, more than 1000 items, negative count or rejected nextLink)")
+	}
+	for i, item := range page.Items {
+		if id, ok := item["id"].(string); !ok || id == "" {
+			return fmt.Errorf("alert item %d has no valid id", i)
+		}
+		stamp, ok := item["createdDateTime"].(string)
+		if _, err := time.Parse(time.RFC3339Nano, stamp); !ok || err != nil {
+			return fmt.Errorf("alert %v has no valid createdDateTime (got %v)", item["id"], item["createdDateTime"])
+		}
+	}
+	return nil
 }
 
 type graphPage struct {
@@ -186,18 +229,20 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		AccessToken string `json:"access_token"`
 	}
 	form := url.Values{"client_id": {a.conf.ClientID}, "client_secret": {a.conf.ClientSecret}, "scope": {a.conf.scope()}, "grant_type": {"client_credentials"}}
-	delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token)
+	delay, err := a.doJSON(ctx, http.MethodPost, a.conf.tokenURL(), form.Encode(), "", &token, func() error {
+		if token.AccessToken == "" {
+			return errNoToken
+		}
+		return nil
+	})
 	if delay > 0 {
 		state.globalNext = later(state.globalNext, time.Now().Add(delay))
-	}
-	if err == nil && token.AccessToken == "" {
-		err = errCredential
 	}
 	if err == nil && delay > 0 {
 		return page, errYield
 	} // honor a token endpoint's cooldown before another request
 	if err == nil {
-		delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page)
+		delay, err = a.doJSON(ctx, http.MethodGet, raw, "", token.AccessToken, &page, func() error { return a.validateAlertPage(&page) })
 		if delay > 0 {
 			state.globalNext = later(state.globalNext, time.Now().Add(delay))
 		}
@@ -206,9 +251,6 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		return graphPage{}, ctx.Err()
 	}
 	if err == nil {
-		if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
-			return graphPage{}, errPage
-		}
 		// Valid page collection, rather than an entire interval, breaks a continuous
 		// vendor failure episode. Its opaque continuation may still be outstanding.
 		state.failureStart = time.Time{}
@@ -218,25 +260,25 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		return page, nil
 	}
 	if errors.Is(err, errCredential) {
-		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(errCredential)
-		}
+		a.notify(err)
 		*retry = time.Now().Add(jitterDelay(a.pollInterval))
-		return graphPage{}, errCredential
-	}
-	if !errors.Is(err, errRetry) {
 		return graphPage{}, err
 	}
+	// Retryable failures and invalid vendor answers (404, other 4xx, bad JSON)
+	// share one episode: report once, with the vendor's text, after the failure
+	// has lasted a continuous failureLimit. A valid page re-arms it.
 	if state.failureStart.IsZero() {
 		state.failureStart = time.Now()
 	}
 	if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
-		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(errors.New("Defender API unavailable for a continuous retry interval"))
-		}
-		state.reported = true
+		state.reported = a.notify(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err))
+	}
+	if !errors.Is(err, errRetry) {
+		a.vendorDetail(err)
+		return graphPage{}, err
 	}
 	a.issue("vendor_retry")
+	a.vendorDetail(err)
 	if *backoff == 0 {
 		*backoff = time.Second
 	}
@@ -318,8 +360,8 @@ func (a *DefenderAdapter) shipScanItem(ctx context.Context, g *defenderGeneratio
 				a.issue("admission_tracking_failed")
 				return err
 			}
-			if !errors.Is(err, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
-				a.conf.ClientOptions.OnError(errors.New("Defender event admission failed"))
+			if !errors.Is(err, uspclient.ErrorClosed) {
+				a.notify(fmt.Errorf("Defender event admission failed: %w", err))
 			}
 			return err
 		}

@@ -32,7 +32,7 @@ const graphTimestampLayout = "2006-01-02T15:04:05.0000000Z"
 const (
 	mockTenantID     = "11111111-1111-1111-1111-111111111111"
 	mockClientID     = "22222222-2222-2222-2222-222222222222"
-	mockClientSecret = "fake-client-secret-for-tests-only"
+	mockClientSecret = "Zq8~Kx3vLm9Rt2Bn5Yc7Wp4HsJ6Ga0Ue1Vo.dN"
 	mockAccessToken  = "fake-access-token-0000000000000001"
 
 	tokenPath  = "/" + mockTenantID + "/oauth2/v2.0/token"
@@ -807,6 +807,7 @@ func TestMockNoAlertsShipsNothing(t *testing.T) {
 		5*time.Second, 10*time.Millisecond, "the adapter should keep polling")
 
 	assert.Equal(t, 0, sink.count(), "an empty result set ships nothing")
+	adapter.flushNotifications()
 	errMu.Lock()
 	defer errMu.Unlock()
 	assert.Empty(t, errs, "an empty result set is not an error")

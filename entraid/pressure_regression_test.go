@@ -195,14 +195,18 @@ func TestEntraMalformedVendorPagesEscalateAfterValidation(t *testing.T) {
 			a, g := harness(t, server, sink)
 			stream := a.streams[0]
 			a.runtime.now = func() time.Time { return time.Unix(0, clock.Load()) }
+			var reportedMu sync.Mutex
+			var reported []string
 			a.conf.ClientOptions.OnError = func(err error) {
-				require.NotContains(t, err.Error(), "sensitive")
-				require.NotContains(t, err.Error(), "http")
+				reportedMu.Lock()
+				reported = append(reported, err.Error())
+				reportedMu.Unlock()
 				errorsSeen.Add(1)
 			}
 			requests := &graphRequests{}
 			retry := func() {
 				_, err := a.scanWindow(context.Background(), g, stream, base.UnixNano(), base.Add(time.Minute).UnixNano(), true, requests)
+				a.flushNotifications()
 				require.Error(t, err)
 			}
 			retry()
@@ -223,6 +227,16 @@ func TestEntraMalformedVendorPagesEscalateAfterValidation(t *testing.T) {
 			retry()
 			require.Equal(t, int32(1), errorsSeen.Load(), "persistent invalid vendor data must become visible after a continuous hour")
 			require.Equal(t, base.UnixNano(), g.position[stream.name].Boundary)
+			// The vendor's own words are reported, but a credential echoed in a
+			// continuation link stays redacted.
+			reportedMu.Lock()
+			defer reportedMu.Unlock()
+			for _, message := range reported {
+				if kind == "link" {
+					require.NotContains(t, message, "sensitive-value")
+					require.Contains(t, message, "[REDACTED]")
+				}
+			}
 		})
 	}
 }
@@ -241,6 +255,7 @@ func TestEntraPermanentVendorFailuresRespectOrdinaryPoll(t *testing.T) {
 	stream := a.streams[0]
 	request := func(replay bool) {
 		_, _ = a.requestPage(context.Background(), stream, a.windowURL(stream, base.UnixNano(), base.Add(time.Minute).UnixNano()), replay, requests, &requestFailure{})
+		a.flushNotifications()
 	}
 	request(false)
 	for i := 0; i < 20; i++ {
@@ -359,6 +374,7 @@ func TestEntraUnexpiredCapResumesPagedACKedProducer(t *testing.T) {
 	require.Greater(t, g.position[stream.name].Boundary, boundary+int64(30*time.Minute))
 	require.Greater(t, n, uint64(liveIDLimit))
 	require.Zero(t, duplicates)
+	a.flushNotifications()
 	require.Zero(t, onErrors.Load())
 	require.LessOrEqual(t, len(g.live), liveIDLimit)
 	require.Greater(t, g.position[stream.name].Coverage, s.Coverage)
