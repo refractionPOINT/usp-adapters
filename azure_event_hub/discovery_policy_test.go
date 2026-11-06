@@ -307,6 +307,37 @@ func TestVendorFailureKeepsVendorTextAndRedactsSecrets(t *testing.T) {
 	})
 }
 
+// A connection string may carry a ready-made SAS token. Only its signature is
+// secret: the namespace host, hub and key name are what make a failure
+// actionable.
+func TestVendorFailureKeepsHostWithSASTokenConnectionString(t *testing.T) {
+	sig := "Zk3Vq9Lm2Xw7Bn5Rt8Yc1Zp4Wj6Hs0Ga%2BUe%2FVo2Ni8E%3D"
+	decoded := "Zk3Vq9Lm2Xw7Bn5Rt8Yc1Zp4Wj6Hs0Ga+Ue/Vo2Ni8E="
+	connection := "Endpoint=sb://myns.servicebus.windows.net/;SharedAccessSignature=SharedAccessSignature sr=sb%3a%2f%2fmyns.servicebus.windows.net%2fhub&sig=" + sig + "&se=1700000000&skn=RootManageSharedAccessKey;EntityPath=hub"
+	secrets := connectionSecrets(connection)
+	require.ElementsMatch(t, []string{sig, decoded}, secrets)
+
+	failure := vendorFailure("event hub connection", errors.New("lookup myns.servicebus.windows.net: no such host"), secrets...)
+	require.Contains(t, failure.Error(), "lookup myns.servicebus.windows.net: no such host")
+
+	for name, form := range map[string]string{
+		"encoded": sig,
+		"decoded": decoded,
+		"entity":  strings.NewReplacer("%2B", "&#43;", "%2F", "&#47;", "%3D", "&#61;").Replace(sig),
+		"json":    strings.NewReplacer("%2F", `\/`).Replace(sig),
+		"token":   "SharedAccessSignature sr=hub&sig=" + sig + "&se=1&skn=RootManageSharedAccessKey",
+	} {
+		t.Run(name, func(t *testing.T) {
+			failure := vendorFailure("event hub connection", fmt.Errorf("cbs failed: %s for myns.servicebus.windows.net", form), secrets...)
+			for i := 0; i+6 <= len(decoded); i++ {
+				require.NotContains(t, failure.Error(), decoded[i:i+6])
+			}
+			require.NotContains(t, failure.Error(), sig[:12])
+			require.Contains(t, failure.Error(), "myns.servicebus.windows.net")
+		})
+	}
+}
+
 func TestCleanupOnlySDKErrorAndInternalCauseStayQuiet(t *testing.T) {
 	for _, mode := range []string{"generation_retiring", "adapter_closing", "closed_client", "internal_tracking"} {
 		t.Run(mode, func(t *testing.T) {

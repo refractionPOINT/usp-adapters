@@ -79,13 +79,45 @@ const (
 // Value units of the shape rules below. A value may spell a character as an
 // HTML entity, and the ";" inside it must not end the value, so a complete
 // entity is one unit. entity matches any entity; entityNotAmp matches all but
-// "&amp;", which in a query string or form body separates parameters and so
-// ends a value there.
+// "&amp;", which in a query string or form body separates parameters.
+// entityValue also leaves out the entities for quotes and angle brackets, which
+// end a value like their plain spelling does (see entityValueAlt). The rules
+// that use them are case-insensitive, so the entity part is wrapped in (?-i:):
+// entity names are case-sensitive, and folding would make "[b-z]" match "a" and
+// turn "&amp;" back into a value unit.
 const (
-	entity          = `&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);`
-	entityNotAmp    = `&(?:#[0-9]+|#[xX][0-9a-fA-F]+|(?:[b-zA-Z]|a[a-ln-zA-Z]|am[a-oq-zA-Z]|amp[a-zA-Z0-9])[a-zA-Z0-9]*);`
-	entityNotAmpAlt = `(?:\\"[^&;#\s"'<>,:}\]\\]|\\[^"]|` + entityNotAmp + `|[^&;#\s"'<>])+`
+	entity       = `&(?:#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);`
+	entityNotAmp = `&(?-i:#[0-9]+|#[xX][0-9a-fA-F]+|(?:[b-zA-Z]|a[a-ln-zA-Z]|am[a-oq-zA-Z]|amp[a-zA-Z0-9])[a-zA-Z0-9]*);`
+	// Names other than amp, quot, apos, lt and gt. The numeric spellings of the
+	// quote and bracket characters never reach the rules: normalizeQuoteEntities
+	// rewrites them to the named ones first.
+	entityValue = `&(?-i:#[0-9]+|#[xX][0-9a-fA-F]+|(?:[b-fh-km-pr-zA-Z]|a[0-9a-lnoq-zA-Z]|am[0-9a-oq-zA-Z]|amp[0-9a-zA-Z]|ap[0-9a-np-zA-Z]|apo[0-9a-rt-zA-Z]|apos[0-9a-zA-Z]|q[0-9a-tv-zA-Z]|qu[0-9a-np-zA-Z]|quo[0-9a-su-zA-Z]|quot[0-9a-zA-Z]|l[0-9a-su-zA-Z]|lt[0-9a-zA-Z]|g[0-9a-su-zA-Z]|gt[0-9a-zA-Z])[a-zA-Z0-9]*);`
+	// The characters a value continues with after an escaped or entity quote:
+	// anything but a JSON or URL delimiter.
+	afterQuote = `[^&;#\s"'<>,:}\]\\]`
+	// A quote, apostrophe or angle bracket, as a JSON escape or an entity, ends
+	// the value unless more value follows it.
+	entityValueAlt = `(?:\\"` + afterQuote + `|\\[^"]|` + entityValue + `|&(?:quot|apos|lt|gt);` + afterQuote + `|[^&;#\s"'<>])+`
 )
+
+// quoteEntityRe matches the numeric spellings of ", ', < and >.
+var quoteEntityRe = regexp.MustCompile(`&#0*(?:34|39|60|62);|&#[xX]0*(?:22|27|3[cCeE]);`)
+
+var quoteEntityNames = map[rune]string{'"': "&quot;", '\'': "&apos;", '<': "&lt;", '>': "&gt;"}
+
+// normalizeQuoteEntities spells the numeric entities of ", ', < and > by name,
+// which decodes to the same character, so the shape rules recognize every
+// spelling by one rule.
+func normalizeQuoteEntities(s string) string {
+	return quoteEntityRe.ReplaceAllStringFunc(s, func(m string) string {
+		digits, base := m[2:len(m)-1], 10
+		if digits[0] == 'x' || digits[0] == 'X' {
+			digits, base = digits[1:], 16
+		}
+		n, _ := strconv.ParseUint(digits, base, 32)
+		return quoteEntityNames[rune(n)]
+	})
+}
 
 var redactions = []struct {
 	re   *regexp.Regexp
@@ -100,7 +132,7 @@ var redactions = []struct {
 	// in, and the match must not run on into the next fields.
 	{regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*(?::|%3a)(?:\\?/|%2f){2})(?:\\"[^\s"'<>,:}\]@\\]|\\[^"]|[^\s"'<>])*(?:\\")?(?:@|%40)`), "${1}" + redacted + "@"},
 	// Credential-like parameters of a query or fragment, in a URL or not.
-	{regexp.MustCompile(`(?i)([?&;#](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)` + entityNotAmpAlt), "${1}" + redacted},
+	{regexp.MustCompile(`(?i)([?&;#](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)` + entityValueAlt), "${1}" + redacted},
 	// SAS and signed URLs.
 	{regexp.MustCompile(`(?i)(\bsig=)(?:` + entityNotAmp + `|[^&\s"';,])+`), "${1}" + redacted},
 	{regexp.MustCompile(`(?i)(SharedAccessKey\s*=)(?:` + entity + `|[^;\s"'])+`), "${1}" + redacted},
@@ -240,6 +272,7 @@ func redact(text string, flatten bool, secrets []string) string {
 		for _, f := range forms {
 			layer = strings.ReplaceAll(layer, f, redacted)
 		}
+		layer = normalizeQuoteEntities(layer)
 		for _, r := range redactions {
 			layer = r.re.ReplaceAllString(layer, r.with)
 		}

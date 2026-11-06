@@ -330,6 +330,53 @@ func TestRedactDoesNotSwallowFieldsAfterEscapedURLQuote(t *testing.T) {
 	require.Contains(t, out, "bob@example.test")
 }
 
+// The shape rules are case-insensitive, but entity names are not: "&amp;" must
+// end a query value however the letters of the exclusion are folded.
+func TestRedactAmpEntityEndsQueryValueNotFoldedByCase(t *testing.T) {
+	for _, c := range []struct {
+		in      string
+		hidden  string
+		visible []string
+	}{
+		{"?token=abc&amp;after=1", "abc", []string{"after=1"}},
+		{"?token=AbC987654321&amp;error=invalid_client&amp;trace=t-1", "AbC987654321", []string{"error=invalid_client", "trace=t-1"}},
+		{"denied https://hub.example.test/p?sr=hub&amp;sig=AbC987654321&amp;se=1 end", "AbC987654321", []string{"se=1", "end"}},
+		{"error=denied&amp;client_secret=AbC987654321&amp;trace=t-1", "AbC987654321", []string{"error=denied", "trace=t-1"}},
+		// Entities that merely start like "amp" or "a" are value characters.
+		{"?token=ab&ampere;cd&Alpha;ef&aacute;gh&amp;after=1", "cd", []string{"after=1"}},
+	} {
+		out := Redact(c.in)
+		require.NotContains(t, out, c.hidden, c.in)
+		for _, v := range c.visible {
+			require.Contains(t, out, v, c.in)
+		}
+	}
+}
+
+// A page that shows JSON with HTML-escaped quotes ends a value at the escaped
+// quote like the JSON-escaped version does, unless more value follows it.
+func TestRedactDoesNotSwallowFieldsAfterEntityQuote(t *testing.T) {
+	for _, q := range []string{"&quot;", "&#34;", "&#x22;", "&#x0022;", "&#0034;", "&apos;", "&#39;", "&#x27;", "&lt;", "&#60;", "&gt;", "&#x3e;", "&#X3C;"} {
+		in := "?code=abc" + q + ",&quot;message&quot;:&quot;Tenant not found&quot;"
+		out := Redact(in)
+		require.NotContains(t, out, "abc", in)
+		require.Contains(t, out, "Tenant not found", in)
+		require.Contains(t, out, redacted, in)
+	}
+	in := `<pre>{&quot;url&quot;:&quot;https://x.test/cb?code=abc&quot;,&quot;message&quot;:&quot;Tenant not found&quot;}</pre>`
+	out := Redact(in)
+	require.NotContains(t, out, "abc")
+	require.Contains(t, out, "Tenant not found")
+	// More value after the entity keeps it hidden: the quote is part of the value.
+	out = Redact("?code=ab&quot;cdefgh&amp;after=1")
+	require.NotContains(t, out, "cdefgh")
+	require.Contains(t, out, "after=1")
+	// A name that merely starts like a quote entity is a value character.
+	out = Redact("?code=ab&quotient;cdefgh&amp;after=1")
+	require.NotContains(t, out, "cdefgh")
+	require.Contains(t, out, "after=1")
+}
+
 func TestWrapKindAndHTTPTextKeepErrorTextOnOneLine(t *testing.T) {
 	// The vendor's own line breaks become spaces; escapes decoded from the text
 	// (the tab and newline of a Windows path, BEL, ESC) are shown as visible
