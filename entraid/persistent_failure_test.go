@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -57,5 +58,42 @@ func TestEntraPersistentVendorFailuresReachOnErrorWithVendorText(t *testing.T) {
 			request()
 			require.Len(t, reports, 1, "one report per episode")
 		})
+	}
+}
+
+// A token endpoint that echoes the configured client secret JSON-escaped in a
+// field must not leave the tail of the secret in Error() or OnError text.
+func TestEntraTokenFailureNeverEchoesPartOfClientSecret(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
+	const secret = `alpha"bravo-charlie`
+	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {})
+	rejecting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		fmt.Fprint(w, `{"error":"invalid_client","client_secret":"alpha\"bravo-charlie","error_description":"Tenant not found"}`)
+	}))
+	t.Cleanup(rejecting.Close)
+	a, _ := harness(t, server, &captureSink{})
+	a.conf.ClientSecret = secret
+	a.conf.LoginEndpoint = rejecting.URL
+	clock := fixtureBaseTime()
+	a.runtime.now = func() time.Time { return clock }
+	a.runtime.failureLimit = 10 * time.Minute
+	var reports []string
+	a.conf.ClientOptions.OnError = func(err error) { reports = append(reports, err.Error()) }
+	state, failure, stream := &graphRequests{}, &requestFailure{}, a.streams[0]
+	raw := a.windowURL(stream, clock.UnixNano(), clock.Add(time.Minute).UnixNano())
+	_, err := a.requestPage(context.Background(), stream, raw, false, state, failure)
+	a.flushNotifications()
+	require.Error(t, err)
+	clock = clock.Add(11 * time.Minute)
+	_, err = a.requestPage(context.Background(), stream, raw, false, state, failure)
+	a.flushNotifications()
+	require.Error(t, err)
+	texts := append([]string{err.Error()}, reports...)
+	require.NotEmpty(t, reports)
+	for _, text := range texts {
+		require.NotContains(t, text, "bravo-")
+		require.NotContains(t, text, "charlie")
+		require.Contains(t, text, "Tenant not found")
 	}
 }

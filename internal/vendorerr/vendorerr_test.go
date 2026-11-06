@@ -232,7 +232,7 @@ func TestRedactDecodesJSONShortEscapes(t *testing.T) {
 // form: a raw "&", quote or space inside a value is indistinguishable from the
 // end of it.
 func TestRedactNeverShowsPartOfACredential(t *testing.T) {
-	secrets := []string{"ab&cdefghij", "ab;cdefghij", `ab"cdefghij`, "ab'cdefghij", "ab cdefghij", "ab%41cdefghij", "ab+cdefghij", "ab/cdefghij", "ab=cdefghij", "ab\tcdefghij"}
+	secrets := []string{"ab&cdefghij", "ab;cdefghij", `ab"cdefghij`, "ab'cdefghij", "ab cdefghij", "ab%41cdefghij", "ab+cdefghij", "ab/cdefghij", "ab=cdefghij", "ab\tcdefghij", `alpha"bravo-charlie`, "alpha+bravo/charlie=delta"}
 	delimiting := strings.ContainsAny
 	encodings := map[string]func(string) string{
 		"raw":            func(s string) string { return s },
@@ -242,10 +242,27 @@ func TestRedactNeverShowsPartOfACredential(t *testing.T) {
 		"json of percent": func(s string) string {
 			return jsonEscape(url.QueryEscape(s))
 		},
+		"html entities": func(s string) string {
+			return strings.NewReplacer("+", "&#43;", "/", "&#47;", "=", "&#61;", `"`, "&quot;", "&", "&amp;", ";", "&#59;").Replace(s)
+		},
+		"json of html entities": func(s string) string {
+			return jsonEscape(strings.NewReplacer("+", "&#43;", "/", "&#47;", "=", "&#61;", `"`, "&quot;").Replace(s))
+		},
+	}
+	// Shapes whose value ends at a delimiter that a secret may contain; only a
+	// configured secret can be hidden whole there.
+	configuredOnly := map[string]string{
+		"json field":        `{"error":"invalid_client","client_secret":"%s","trace":"t-1"}`,
+		"bearer":            "request failed. Authorization: Bearer %s trailing",
+		"sas":               "denied SharedAccessSignature sr=hub&sig=%s&se=1 end",
+		"connection string": "Endpoint=sb://hub.example.test/;SharedAccessKeyName=root;SharedAccessKey=%s;EntityPath=h end",
 	}
 	embeddings := map[string]string{
 		"userinfo": "bad link https://alice:%s@example.test/p?after=1 end",
 		"param":    "bad link https://example.test/p?after=1&token=%s&limit=5 end",
+	}
+	for k, v := range configuredOnly {
+		embeddings[k] = v
 	}
 	for _, secret := range secrets {
 		for encName, enc := range encodings {
@@ -255,7 +272,7 @@ func TestRedactNeverShowsPartOfACredential(t *testing.T) {
 				// secret can be found there.
 				ambiguous := delimiting(enc(secret), "&;' \t") || (encName == "raw" && delimiting(secret, `"`))
 				for _, configured := range []bool{true, false} {
-					if !configured && ambiguous {
+					if !configured && (ambiguous || configuredOnly[embName] != "") {
 						continue
 					}
 					var cfg []string
@@ -271,6 +288,50 @@ func TestRedactNeverShowsPartOfACredential(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A shape rule at an encoded layer used to cut a configured secret before the
+// decoded layer could see all of it, leaving its tail in the output.
+func TestRedactConfiguredSecretNeverLeavesTail(t *testing.T) {
+	for _, c := range []struct {
+		name, secret, in string
+	}{
+		{"json field with escaped quote", `alpha"bravo-charlie`, `{"client_secret":"alpha\"bravo-charlie"}`},
+		{"entity encoded bearer", "alpha+bravo/charlie=delta", "Authorization: Bearer alpha&#43;bravo&#47;charlie&#61;delta"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			out := Redact(c.in, c.secret)
+			for i := 0; i+6 <= len(c.secret); i++ {
+				require.NotContains(t, out, c.secret[i:i+6], out)
+			}
+			require.Contains(t, out, redacted)
+		})
+	}
+	// Vendor text next to the residue stays readable and fragments merge.
+	require.Equal(t, `denied: [REDACTED] and Tenant not found`, Redact(`denied: aaaabbbbccccdd and Tenant not found`, "xaaaabbbbccccddx"))
+}
+
+func TestRedactDoesNotSwallowFieldsAfterEscapedURLQuote(t *testing.T) {
+	in := `{"error":"{\"url\":\"https://x.test/cb?code=abc\",\"message\":\"Tenant not found\"}"}`
+	out := Redact(in)
+	require.NotContains(t, out, "abc")
+	require.Contains(t, out, "Tenant not found")
+	// With an "@" later in the text the userinfo rule must not span the fields.
+	in = `{"error":"{\"url\":\"https://x.test/cb\",\"message\":\"Tenant not found\",\"user\":\"bob@example.test\"}"}`
+	out = Redact(in)
+	require.Contains(t, out, "Tenant not found")
+	require.Contains(t, out, "https://x.test/cb")
+	require.Contains(t, out, "bob@example.test")
+}
+
+func TestWrapKindAndHTTPTextKeepErrorTextOnOneLine(t *testing.T) {
+	const raw = `C:\\temp\\new path\u0007\u001b[31m` + "\n\n" + `done`
+	// The doubly escaped path decodes to a tab and a newline (the JSON escapes
+	// \t and \n), which become separators like the BEL and ESC bytes.
+	want := "C: emp ew path [31m done"
+	require.Equal(t, "op: "+want, Wrap("op", errors.New(raw)).Error())
+	require.Equal(t, "kind: "+want, Kind(errors.New("kind"), raw, nil).Error())
+	require.Equal(t, "HTTP 400 Bad Request: "+want, HTTPText(&http.Response{StatusCode: 400}, []byte(raw), false))
 }
 
 func jsonEscape(s string) string {

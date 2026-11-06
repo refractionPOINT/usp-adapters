@@ -19,9 +19,12 @@ func vendorFailure(operation string, cause error, secrets ...string) error {
 }
 
 // connectionSecrets lists the secret values of an Event Hubs connection
-// string: the whole string, its shared access key and its signature.
+// string: its shared access key and signature. The rest of the string (the
+// namespace host, key name, hub name) is not secret and is what makes a DNS or
+// authorization failure actionable; Redact also hides fragments of every secret
+// it is given, so the whole string must not be listed.
 func connectionSecrets(connection string) []string {
-	secrets := []string{connection}
+	var secrets []string
 	for _, part := range strings.Split(connection, ";") {
 		key, value, ok := strings.Cut(part, "=")
 		if !ok {

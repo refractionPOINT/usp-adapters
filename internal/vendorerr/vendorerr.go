@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 	"unicode/utf16"
 )
 
@@ -30,6 +31,9 @@ const (
 	readLimit    = 8 * MaxBodyText
 	redacted     = "[REDACTED]"
 	minSecretLen = 4
+	// residueLen is the length of the fragment of a configured secret that
+	// Redact hides wherever it still appears in its output (see sweepResidue).
+	residueLen = 8
 )
 
 // How long ReadBody waits for an error body. A vendor error body is a short
@@ -79,11 +83,13 @@ var redactions = []struct {
 	// Userinfo of a URL: everything between "scheme://" and the last "@" of the
 	// URL's token, so a password containing "/", "?" or "&" is hidden too. The
 	// URL's own punctuation may itself be escaped at this layer (":", "/", "@"
-	// as %XX or "\/"), and a JSON-escaped quote or backslash belongs to the
-	// password.
-	{regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*(?::|%3a)(?:\\?/|%2f){2})(?:\\.|[^\s"'<>])*(?:@|%40)`), "${1}" + redacted + "@"},
+	// as %XX or "\/"), and a JSON-escaped backslash belongs to the password.
+	// A JSON-escaped quote belongs to the password only when more
+	// password follows it: before a JSON delimiter it ends the string the URL is
+	// in, and the match must not run on into the next fields.
+	{regexp.MustCompile(`(?i)\b([a-z][a-z0-9+.-]*(?::|%3a)(?:\\?/|%2f){2})(?:\\"[^\s"'<>,:}\]@\\]|\\[^"]|[^\s"'<>])*(?:\\")?(?:@|%40)`), "${1}" + redacted + "@"},
 	// Credential-like parameters of a query or fragment, in a URL or not.
-	{regexp.MustCompile(`(?i)([?&;#](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)(?:\\.|[^&;#\s"'<>])+`), "${1}" + redacted},
+	{regexp.MustCompile(`(?i)([?&;#](?:token|access_token|refresh_token|id_token|code|key|api_?key|secret|client_secret|client_assertion|assertion|password|passwd|pwd|sig|signature|session|session_?id|sid|auth|authorization|x-amz-signature)=)(?:\\"[^&;#\s"'<>,:}\]\\]|\\[^"]|[^&;#\s"'<>])+`), "${1}" + redacted},
 	// SAS and signed URLs.
 	{regexp.MustCompile(`(?i)(\bsig=)[^&\s"';,]+`), "${1}" + redacted},
 	{regexp.MustCompile(`(?i)(SharedAccessKey\s*=)[^;\s"']+`), "${1}" + redacted},
@@ -219,7 +225,55 @@ func Redact(text string, secrets ...string) string {
 	if !ok {
 		return undecodable
 	}
-	return text
+	return sweepResidue(text, forms)
+}
+
+// sweepResidue is the safety net for configured secrets: a shape rule that
+// matched at an encoded layer (a field, header or URL whose delimiter was
+// escaped) may have consumed only the start of a secret, and no later layer
+// then sees the whole of it. Every occurrence in text of any residueLen-long
+// fragment of a secret (the whole secret when shorter) is replaced, with
+// overlapping and adjacent hits merged into one marker. Configured secrets are
+// long random values, so vendor prose does not collide with their fragments.
+func sweepResidue(text string, forms []string) string {
+	type span struct{ lo, hi int }
+	var spans []span
+	for _, f := range forms {
+		k := min(len(f), residueLen)
+		for i := 0; i+k <= len(f); i++ {
+			for from := 0; ; {
+				j := strings.Index(text[from:], f[i:i+k])
+				if j < 0 {
+					break
+				}
+				spans = append(spans, span{from + j, from + j + k})
+				from += j + 1
+			}
+		}
+	}
+	if len(spans) == 0 {
+		return text
+	}
+	slices.SortFunc(spans, func(a, b span) int { return a.lo - b.lo })
+	var b strings.Builder
+	last, cur := 0, spans[0]
+	for _, s := range append(spans[1:], span{len(text) + 1, len(text) + 1}) {
+		if s.lo <= cur.hi {
+			cur.hi = max(cur.hi, s.hi)
+			continue
+		}
+		b.WriteString(text[last:cur.lo] + redacted)
+		last, cur = cur.hi, s
+	}
+	b.WriteString(text[last:])
+	return strings.ToValidUTF8(b.String(), "?")
+}
+
+// oneLine collapses runs of whitespace and control characters to one space, so
+// vendor text (which JSON escapes can turn into tabs, newlines or terminal
+// control codes) stays on a single line.
+func oneLine(s string) string {
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }), " ")
 }
 
 // Error is an error whose text is redacted but which still unwraps to the
@@ -250,7 +304,7 @@ func Wrap(op string, cause error, secrets ...string) error {
 	if cause == nil {
 		return nil
 	}
-	text := clipRedacted(Redact(cause.Error(), secrets...), secrets)
+	text := clipRedacted(oneLine(Redact(cause.Error(), secrets...)), secrets)
 	if op != "" {
 		text = op + ": " + text
 	}
@@ -262,7 +316,7 @@ func Wrap(op string, cause error, secrets ...string) error {
 // detail carries what the vendor said, bounded to MaxBodyText.
 func Kind(kind error, detail string, cause error, secrets ...string) error {
 	text := kind.Error()
-	if d := clipRedacted(Redact(detail, secrets...), secrets); d != "" {
+	if d := clipRedacted(oneLine(Redact(detail, secrets...)), secrets); d != "" {
 		text += ": " + d
 	}
 	return &Error{text: text, kind: kind, cause: cause}
@@ -335,6 +389,8 @@ const partialTokenDelimiters = " \t\r\n\"'&,;{}[]"
 // secret that no pattern can recognise, so the end of cut text is never shown.
 func trimCut(text string, secrets []string) string {
 	text = partialEscapeRe.ReplaceAllString(text, "")
+	// A marker at the very end may stand for a secret the cut split.
+	text = strings.TrimSuffix(text, redacted)
 	if i := strings.LastIndexAny(text, partialTokenDelimiters); i >= 0 {
 		text = text[:i+1]
 	} else {
@@ -390,7 +446,7 @@ func HTTPText(resp *http.Response, body []byte, truncated bool, secrets ...strin
 		text = trimCut(text, secrets)
 		suffix = " ... [truncated]"
 	}
-	text = strings.Join(strings.Fields(text), " ")
+	text = oneLine(text)
 	if text == "" {
 		return status + suffix
 	}
