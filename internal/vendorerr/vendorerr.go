@@ -6,6 +6,7 @@
 package vendorerr
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,9 +21,10 @@ const (
 	MaxBodyText = 2048
 	// readLimit is read before redaction so a secret straddling the
 	// truncation point cannot leak as a partial value.
-	readLimit   = 8 * MaxBodyText
-	readTimeout = 2 * time.Second
-	redacted    = "[REDACTED]"
+	readLimit    = 8 * MaxBodyText
+	readTimeout  = 2 * time.Second
+	redacted     = "[REDACTED]"
+	minSecretLen = 4
 )
 
 var redactions = []struct {
@@ -45,12 +47,18 @@ var redactions = []struct {
 func Redact(text string, secrets ...string) string {
 	for _, s := range secrets {
 		s = strings.TrimSpace(s)
-		if s == "" {
-			continue
+		if len(s) < minSecretLen {
+			continue // a real credential is never this short; replacing it would only mangle the text
 		}
 		text = strings.ReplaceAll(text, s, redacted)
+		// Vendors echo values URL-encoded in query strings or JSON-escaped in bodies.
 		if q := url.QueryEscape(s); q != s {
 			text = strings.ReplaceAll(text, q, redacted)
+		}
+		if j, err := json.Marshal(s); err == nil {
+			if e := string(j[1 : len(j)-1]); e != s {
+				text = strings.ReplaceAll(text, e, redacted)
+			}
 		}
 	}
 	for _, r := range redactions {
