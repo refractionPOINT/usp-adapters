@@ -126,10 +126,9 @@ func TestOktaVendorFailureReportRearmsAfterSuccess(t *testing.T) {
 	require.Eventually(t, func() bool { return len(reports.all()) == 2 }, 10*time.Second, 10*time.Millisecond)
 }
 
-// Only the "still retrying" reports are advisory: a credential failure and the
-// stalled continuation (same cursor retried, nothing skipped) differ in kind.
-// The credential report must stay a fatal-class error for embedders, the
-// stalled continuation is advisory like any other persistent failure.
+// Only the "still retrying" report is advisory. A credential failure is
+// reported as before; a failing continuation request (same cursor retried) is
+// advisory like any other persistent failure.
 func TestOktaAdvisoryMarkOnlyOnPersistentRetryReports(t *testing.T) {
 	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
 	t.Run("credential", func(t *testing.T) {
