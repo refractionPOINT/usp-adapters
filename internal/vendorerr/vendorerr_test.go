@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -232,7 +234,7 @@ func TestRedactDecodesJSONShortEscapes(t *testing.T) {
 // form: a raw "&", quote or space inside a value is indistinguishable from the
 // end of it.
 func TestRedactNeverShowsPartOfACredential(t *testing.T) {
-	secrets := []string{"ab&cdefghij", "ab;cdefghij", `ab"cdefghij`, "ab'cdefghij", "ab cdefghij", "ab%41cdefghij", "ab+cdefghij", "ab/cdefghij", "ab=cdefghij", "ab\tcdefghij", `alpha"bravo-charlie`, "alpha+bravo/charlie=delta"}
+	secrets := []string{"ab&cdefghij", "ab;cdefghij", `ab"cdefghij`, "ab'cdefghij", "ab cdefghij", "ab%41cdefghij", "ab+cdefghij", "ab/cdefghij", "ab=cdefghij", "ab\tcdefghij", `alpha"bravo-charlie`, "alpha+bravo/charlie=delta", oktaToken, sasKey}
 	delimiting := strings.ContainsAny
 	encodings := map[string]func(string) string{
 		"raw":            func(s string) string { return s },
@@ -245,6 +247,9 @@ func TestRedactNeverShowsPartOfACredential(t *testing.T) {
 		"html entities": func(s string) string {
 			return strings.NewReplacer("+", "&#43;", "/", "&#47;", "=", "&#61;", `"`, "&quot;", "&", "&amp;", ";", "&#59;").Replace(s)
 		},
+		"numeric entities":         func(s string) string { return entityEncode(s, "&#%d;") },
+		"hex entities":             func(s string) string { return entityEncode(s, "&#x%X;") },
+		"json of numeric entities": func(s string) string { return jsonEscape(entityEncode(s, "&#%d;")) },
 		"json of html entities": func(s string) string {
 			return jsonEscape(strings.NewReplacer("+", "&#43;", "/", "&#47;", "=", "&#61;", `"`, "&quot;").Replace(s))
 		},
@@ -254,6 +259,7 @@ func TestRedactNeverShowsPartOfACredential(t *testing.T) {
 	configuredOnly := map[string]string{
 		"json field":        `{"error":"invalid_client","client_secret":"%s","trace":"t-1"}`,
 		"bearer":            "request failed. Authorization: Bearer %s trailing",
+		"ssws":              "request failed. Authorization: SSWS %s trailing",
 		"sas":               "denied SharedAccessSignature sr=hub&sig=%s&se=1 end",
 		"connection string": "Endpoint=sb://hub.example.test/;SharedAccessKeyName=root;SharedAccessKey=%s;EntityPath=h end",
 	}
@@ -325,13 +331,86 @@ func TestRedactDoesNotSwallowFieldsAfterEscapedURLQuote(t *testing.T) {
 }
 
 func TestWrapKindAndHTTPTextKeepErrorTextOnOneLine(t *testing.T) {
-	const raw = `C:\\temp\\new path\u0007\u001b[31m` + "\n\n" + `done`
-	// The doubly escaped path decodes to a tab and a newline (the JSON escapes
-	// \t and \n), which become separators like the BEL and ESC bytes.
-	want := "C: emp ew path [31m done"
-	require.Equal(t, "op: "+want, Wrap("op", errors.New(raw)).Error())
-	require.Equal(t, "kind: "+want, Kind(errors.New("kind"), raw, nil).Error())
-	require.Equal(t, "HTTP 400 Bad Request: "+want, HTTPText(&http.Response{StatusCode: 400}, []byte(raw), false))
+	// The vendor's own line breaks become spaces; escapes decoded from the text
+	// (the tab and newline of a Windows path, BEL, ESC) are shown as visible
+	// escapes, so the text stays on one line and the path reads as written.
+	for _, c := range []struct{ name, raw, want string }{
+		{"path as sent", `C:\temp\new path\u0007\u001b[31m` + "\n\n" + `done`, `C:\temp\new path\x07\x1b[31m done`},
+		{"path doubly escaped", `C:\\temp\\new`, `C:\temp\new`},
+		{"raw break in pretty JSON", "{\"a\":1,\r\n    \"b\":\"x\\ty\"}", `{"a":1, "b":"x\ty"}`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, "op: "+c.want, Wrap("op", errors.New(c.raw)).Error())
+			require.Equal(t, "kind: "+c.want, Kind(errors.New("kind"), c.raw, nil).Error())
+			require.Equal(t, "HTTP 400 Bad Request: "+c.want, HTTPText(&http.Response{StatusCode: 400}, []byte(c.raw), false))
+		})
+	}
+}
+
+// oktaToken and sasKey are realistic credentials: a 42-character Okta API token
+// and a 44-character base64 shared access key, both with characters a vendor
+// page may spell as entities.
+const (
+	oktaToken = "00aV7Hq9NmJ2kQp6xB4RsY8Lv0tC3nE5dF6_wX7z9A"
+	sasKey    = "Kd3Fv9Qm2Lx7Bn5Rt8Yc1Zp4Wj6Hs0Ga+Ue/Vo2Ni8E="
+)
+
+// valueEntityRe matches the entities that stand for one character of a value.
+var valueEntityRe = regexp.MustCompile(`&(?:#[0-9]+|#[xX][0-9a-fA-F]+|quot);`)
+
+// entityEncode spells every character that is not a letter or digit as an
+// entity, with the given format of its code point.
+func entityEncode(s, format string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x80 && (r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			b.WriteRune(r)
+		} else {
+			fmt.Fprintf(&b, format, r)
+		}
+	}
+	return b.String()
+}
+
+// Without being told the credential, the shape rules alone must hide a value
+// whose characters are spelled as entities, whole: the ";" of an entity ends no
+// value, and no tail of the value is left.
+func TestRedactEntityEncodedShapesHideWholeValue(t *testing.T) {
+	shapes := map[string]string{
+		"ssws header":       "403 Forbidden. Authorization: SSWS %s end",
+		"bearer header":     "403 Forbidden. Authorization: Bearer %s end",
+		"authorization key": `{"Authorization":"%s","trace":"t-1"}`,
+		"shared key":        "Endpoint=sb://hub.example.test/;SharedAccessKey=%s;EntityPath=h end",
+		"shared signature":  "denied SharedAccessSignature %s end",
+		"sig":               "denied https://hub.example.test/p?sr=hub&sig=%s&se=1 end",
+		"query token":       "bad link https://example.test/p?after=1&token=%s&limit=5 end",
+		"json field":        `{"error":"invalid_client","client_secret":"%s","trace":"t-1"}`,
+		"form field":        "error=denied&client_secret=%s&trace=t-1",
+	}
+	for _, secret := range []string{oktaToken, sasKey} {
+		for _, format := range []string{"&#%d;", "&#x%X;", "&#x%x;"} {
+			for name, tmpl := range shapes {
+				out := Redact(strings.Replace(tmpl, "%s", entityEncode(secret, format), 1))
+				for i := 0; i+6 <= len(secret); i++ {
+					require.NotContains(t, out, secret[i:i+6], "%s, %s: %s", name, format, out)
+				}
+				require.Contains(t, out, redacted, name)
+			}
+		}
+	}
+	// What follows the value is still the vendor's.
+	require.Equal(t, "sig=[REDACTED]&se=1 expired", Redact("sig=Kd3Fv9&#43;Qm2Lx7B&#47;n5Rt8&#61;&se=1 expired"))
+}
+
+// A shape rule or a partial match may leave only the end of a configured
+// secret; fragments of six characters or more are hidden.
+func TestRedactHidesSixAndSevenCharacterSecretTails(t *testing.T) {
+	secret := "Q7mK2xB9nR4vL8pT5wY3zA"
+	forms := secretForms([]string{secret})
+	require.Equal(t, "denied [REDACTED] end", sweepResidue("denied "+secret[len(secret)-6:]+" end", forms))
+	require.Equal(t, "denied [REDACTED] end", sweepResidue("denied "+secret[len(secret)-7:]+" end", forms))
+	require.Equal(t, "denied [REDACTED] end", sweepResidue("denied "+secret[:6]+" end", forms))
+	require.Equal(t, "denied Q7mK2 end", sweepResidue("denied Q7mK2 end", forms), "five characters are not hidden")
 }
 
 func jsonEscape(s string) string {

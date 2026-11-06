@@ -6,6 +6,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,5 +32,31 @@ func TestOktaVendorErrorBodyReachesErrorWithoutAPIKey(t *testing.T) {
 		require.Contains(t, err.Error(), `"errorSummary":"Invalid token provided"`)
 		require.NotContains(t, err.Error(), a.conf.ApiKey)
 		require.Contains(t, err.Error(), "[REDACTED]")
+	}
+}
+
+// A 403 body that echoes the configured token with an HTML-escaped character
+// ("&#95;" for "_") must not leave any part of the token in the OnError report:
+// the entity's ";" ends no value, and a short tail is not left behind.
+func TestOktaOnErrorHidesEntityEncodedTokenEcho(t *testing.T) {
+	defer vendorerr.SetBodyTimeoutsForTest(10*time.Second, 10*time.Second)()
+	const token = "00aV7Hq9NmJ2kQp6xB4RsY8Lv0tC3nE5dF6_wX7z9A"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprintf(w, "<html><body>Forbidden. Authorization: SSWS %s</body></html>", strings.ReplaceAll(token, "_", "&#95;"))
+	}))
+	defer server.Close()
+	a, g := localHarness(t, server.URL, &ackSink{})
+	a.conf.ApiKey = token
+	var reports reportLog
+	a.conf.ClientOptions.OnError = reports.add
+	stop := runCollector(t, a, g)
+	defer stop()
+	require.Eventually(t, func() bool { return len(reports.all()) >= 1 }, 10*time.Second, 10*time.Millisecond)
+	got := reports.all()[0]
+	require.Contains(t, got, "HTTP 403")
+	require.Contains(t, got, "Forbidden. Authorization: [REDACTED]")
+	for i := 0; i+6 <= len(token); i++ {
+		require.NotContains(t, got, token[i:i+6])
 	}
 }
