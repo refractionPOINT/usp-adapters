@@ -113,8 +113,11 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 		}
 	}
 	page.next, err = nextLink(resp.Header.Values("Link"))
-	if err != nil || a.validateContinuation(page.next) != nil {
-		return oktaPage{}, errInvalidPage
+	if err != nil {
+		return oktaPage{}, vendorerr.Kind(errInvalidPage, "response Link header has no single valid rel=\"next\" link: "+vendorerr.Clip(strings.Join(resp.Header.Values("Link"), ", ")), nil, secrets...)
+	}
+	if a.validateContinuation(page.next) != nil {
+		return oktaPage{}, vendorerr.Kind(errInvalidPage, "response next link was rejected as a continuation: "+vendorerr.Clip(page.next), nil, secrets...)
 	}
 	return page, nil
 }

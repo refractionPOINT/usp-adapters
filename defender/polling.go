@@ -231,18 +231,21 @@ func (a *DefenderAdapter) requestPage(ctx context.Context, raw string, replay bo
 		*retry = time.Now().Add(jitterDelay(a.pollInterval))
 		return graphPage{}, err
 	}
-	if !errors.Is(err, errRetry) {
-		a.vendorDetail(err)
-		return graphPage{}, err
-	}
+	// Retryable failures and invalid vendor answers (404, other 4xx, bad JSON)
+	// share one episode: report once, with the vendor's text, after the failure
+	// has lasted a continuous failureLimit. A valid page re-arms it.
 	if state.failureStart.IsZero() {
 		state.failureStart = time.Now()
 	}
 	if !state.reported && time.Since(state.failureStart) >= a.runtime.failureLimit {
 		if a.conf.ClientOptions.OnError != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("Defender API unavailable for a continuous retry interval: %w", err))
+			a.conf.ClientOptions.OnError(fmt.Errorf("Defender API unavailable or invalid for a continuous retry interval: %w", err))
 		}
 		state.reported = true
+	}
+	if !errors.Is(err, errRetry) {
+		a.vendorDetail(err)
+		return graphPage{}, err
 	}
 	a.issue("vendor_retry")
 	a.vendorDetail(err)

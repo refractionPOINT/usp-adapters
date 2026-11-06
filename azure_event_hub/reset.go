@@ -2,6 +2,7 @@ package usp_azure_event_hub
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"time"
 
@@ -73,8 +74,22 @@ func (a *EventHubAdapter) inspectPartitionReset(g *generation, id string) {
 	}
 	if err != nil || !validContext {
 		a.issue("partition_runtime_wait")
+		if err == nil {
+			err = errors.New("request timed out")
+		}
+		a.vendorDetail("GetPartitionInformation()", err)
+		// This read is auxiliary (data keeps flowing), so a persistent failure is
+		// reported once through OnError without stopping the adapter.
+		if g.runtimeFailure.failed(a.now()) && !g.runtimeFailure.reported {
+			g.runtimeFailure.reported = true
+			if onError := a.conf.ClientOptions.OnError; onError != nil {
+				// Not inline: OnError may call Close, which joins this worker.
+				go onError(a.vendorFailure("GetPartitionInformation() unavailable for a continuous retry interval", err))
+			}
+		}
 		return
 	}
+	g.runtimeFailure = failureEpisode{}
 	if observed.Before(started) || observed.After(completed) {
 		a.issue("partition_runtime_stale")
 		return

@@ -354,3 +354,52 @@ func TestRuntimePeriodicInspectionIsSequentialAndBounded(t *testing.T) {
 	close(a.chStopped)
 	require.NoError(t, a.Close())
 }
+
+// A partition runtime read that keeps failing never blocked data, but it must
+// not stay silent: after a continuous hour it reaches OnError once with the
+// vendor's text, and a success re-arms it.
+func TestPartitionRuntimeFailureReachesOnErrorAfterContinuousHour(t *testing.T) {
+	a, g, h, _ := resetHarness(t)
+	clock := time.Unix(1700000000, 0)
+	a.now = func() time.Time { return clock }
+	reports := make(chan error, 4)
+	a.conf.ClientOptions.OnError = func(err error) { reports <- err }
+	var debug []string
+	a.conf.ClientOptions.DebugLog = func(s string) { debug = append(debug, s) }
+	var fail atomic.Bool
+	fail.Store(true)
+	h.runtime = func(_ context.Context, id string) (*eventhub.HubPartitionRuntimeInformation, error) {
+		if fail.Load() {
+			return nil, errors.New("amqp: unauthorized-access: management claim missing")
+		}
+		return runtimePosition(id, 600), nil
+	}
+	inspect := func() { g.runtimePreferred = "0"; require.NoError(t, a.discover(g, false)) }
+	quiet := func() {
+		t.Helper()
+		select {
+		case err := <-reports:
+			t.Fatalf("reported too early: %v", err)
+		default:
+		}
+	}
+	inspect()
+	clock = clock.Add(59 * time.Minute)
+	inspect()
+	quiet()
+	require.Contains(t, debug, "event hub vendor error: GetPartitionInformation(): amqp: unauthorized-access: management claim missing")
+	clock = clock.Add(2 * time.Minute)
+	inspect()
+	select {
+	case err := <-reports:
+		require.Contains(t, err.Error(), "management claim missing")
+	case <-time.After(5 * time.Second):
+		t.Fatal("persistent runtime failure never reached OnError")
+	}
+	inspect()
+	time.Sleep(50 * time.Millisecond)
+	quiet()
+	fail.Store(false)
+	inspect()
+	require.False(t, g.runtimeFailure.active, "a success ends the episode")
+}

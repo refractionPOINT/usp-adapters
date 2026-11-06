@@ -75,15 +75,64 @@ func TestKindKeepsSentinelAndCauseForErrorsIs(t *testing.T) {
 	require.Nil(t, Wrap("x", nil))
 }
 
-type streamingBody struct{ release chan struct{} }
+// stallingBody delivers its data, then blocks until released, like a vendor
+// that sends part of an error body and never finishes it.
+type stallingBody struct {
+	data    []byte
+	release chan struct{}
+}
 
-func (b streamingBody) Read([]byte) (int, error) { <-b.release; return 0, io.EOF }
-func (b streamingBody) Close() error             { return nil }
+func (b *stallingBody) Read(p []byte) (int, error) {
+	if len(b.data) > 0 {
+		n := copy(p, b.data)
+		b.data = b.data[n:]
+		return n, nil
+	}
+	<-b.release
+	return 0, io.EOF
+}
+func (b *stallingBody) Close() error { return nil }
 
-func TestReadBodyDoesNotBlockOnEndlessBody(t *testing.T) {
+func TestReadBodyReturnsBytesReadSoFarAtDeadline(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
+	resp := &http.Response{StatusCode: 400, Body: &stallingBody{data: []byte(`{"error":"partial vendor text`), release: release}}
 	start := time.Now()
-	require.Nil(t, ReadBody(&http.Response{Body: streamingBody{release}}))
-	require.Less(t, time.Since(start), 2*readTimeout)
+	got := readBody(resp, 50*time.Millisecond)
+	elapsed := time.Since(start)
+	require.Equal(t, `{"error":"partial vendor text`, string(got))
+	require.GreaterOrEqual(t, elapsed, 50*time.Millisecond)
+	require.Less(t, elapsed, 5*time.Second)
+}
+
+func TestReadBodyReturnsImmediatelyAtEOFAndCapsAtReadLimit(t *testing.T) {
+	start := time.Now()
+	got := ReadBody(&http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader(`{"error":"busy"}`))})
+	require.Equal(t, `{"error":"busy"}`, string(got))
+	require.Less(t, time.Since(start), retryBodyTimeout)
+
+	big := ReadBody(&http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(strings.Repeat("x", 3*readLimit)))})
+	require.Len(t, big, readLimit)
+}
+
+func TestHTTPTextDropsTokenSplitByReadLimit(t *testing.T) {
+	resp := &http.Response{StatusCode: 400}
+	secret := strings.Repeat("S", 64)
+	// Whitespace compacts away, so the partial secret would be visible in the output.
+	body := strings.Repeat(" ", readLimit-30) + "ok " + secret
+	out := HTTPText(resp, []byte(body), secret)
+	require.NotContains(t, out, "SSSS")
+	require.Equal(t, "HTTP 400 Bad Request: ok ... [truncated]", out)
+
+	// A secret that itself contains a delimiter character is cut mid-way.
+	odd := "AAAA;BBBBBBBBBBBB"
+	body = strings.Repeat(" ", readLimit-8) + "x " + odd
+	out = HTTPText(resp, []byte(body), odd)
+	require.NotContains(t, out, "AAAA")
+	require.Contains(t, out, "[truncated]")
+
+	// Input beyond readLimit is never examined, whatever the caller passes.
+	body = "short " + strings.Repeat(" ", readLimit) + "tail-beyond-limit"
+	out = HTTPText(resp, []byte(body))
+	require.NotContains(t, out, "tail-beyond-limit")
 }

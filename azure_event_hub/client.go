@@ -133,6 +133,7 @@ type generation struct {
 	monitors          sync.WaitGroup
 	retiring          atomic.Bool
 	managementFailure failureEpisode
+	runtimeFailure    failureEpisode
 	receiverFailures  map[string]failureEpisode
 	retryPositions    map[string]partitionRetry
 }
@@ -197,8 +198,9 @@ func (a *EventHubAdapter) collect(g *generation) error {
 // periodic discovery retries. Only a continuous hour of the same failing
 // operation escalates. Any successful management read resets its own episode.
 type failureEpisode struct {
-	since  time.Time
-	active bool
+	since    time.Time
+	active   bool
+	reported bool
 }
 
 func (e *failureEpisode) failed(now time.Time) bool {
@@ -217,6 +219,7 @@ func (a *EventHubAdapter) discover(g *generation, initial bool) error {
 		}
 		if !initial && !g.managementFailure.failed(a.now()) {
 			a.issue("discovery_retry")
+			a.vendorDetail("GetRuntimeInformation()", err)
 			return nil
 		}
 		a.vendorError(g.ctx, "GetRuntimeInformation()", err)
@@ -327,6 +330,7 @@ func (a *EventHubAdapter) discover(g *generation, initial bool) error {
 				return e
 			}
 			a.issue("receiver_start_retry")
+			a.vendorDetail("Receive()", e)
 			continue // failed partial setup is not published as a started partition
 		}
 		p.listener = listener

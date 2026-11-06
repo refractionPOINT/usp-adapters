@@ -60,6 +60,14 @@ func validPosition(p partitionPosition) bool {
 	return err == nil
 }
 
+// vendorDetail logs the vendor's own (redacted) error text for a failure that
+// is being retried, so the debug log shows why next to the issue code.
+func (a *EventHubAdapter) vendorDetail(operation string, cause error) {
+	if a.conf.ClientOptions.DebugLog != nil && cause != nil {
+		a.conf.ClientOptions.DebugLog("event hub vendor error: " + a.vendorFailure(operation, cause).Error())
+	}
+}
+
 func (a *EventHubAdapter) issue(code string) {
 	if a.conf.ClientOptions.DebugLog != nil {
 		a.conf.ClientOptions.DebugLog("event hub collection: " + code)

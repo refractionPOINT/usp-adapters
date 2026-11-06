@@ -8,23 +8,33 @@ package vendorerr
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	// MaxBodyText bounds the vendor response body copied into an error.
 	MaxBodyText = 2048
-	// readLimit is read before redaction so a secret straddling the
-	// truncation point cannot leak as a partial value.
+	// readLimit is the most body text redaction ever looks at. A body at or
+	// over it is cut here and its trailing partial token is dropped before
+	// redaction (see HTTPText), so a secret split by the cut cannot escape the
+	// redaction patterns.
 	readLimit    = 8 * MaxBodyText
-	readTimeout  = 2 * time.Second
 	redacted     = "[REDACTED]"
 	minSecretLen = 4
+)
+
+// How long ReadBody waits for an error body. A vendor error body is a short
+// JSON or text document, so a body that is still arriving after this is
+// returned as read so far. Throttling and server errors are retried anyway, so
+// they get a shorter wait. Variables so tests can shorten them.
+var (
+	errorBodyTimeout = 500 * time.Millisecond
+	retryBodyTimeout = 200 * time.Millisecond
 )
 
 var redactions = []struct {
@@ -69,7 +79,8 @@ func Redact(text string, secrets ...string) string {
 
 // Error is an error whose text is redacted but which still unwraps to the
 // original cause and to an optional sentinel kind, so errors.Is/As keep driving
-// control flow.
+// control flow. Only Error() is redacted: Unwrap exposes the raw cause, so
+// callers must not format it into user-visible output themselves.
 type Error struct {
 	text  string
 	kind  error
@@ -112,40 +123,113 @@ func Kind(kind error, detail string, cause error, secrets ...string) error {
 	return &Error{text: text, kind: kind, cause: cause}
 }
 
-// ReadBody reads a bounded prefix of an HTTP error body. It never blocks past
-// a short deadline, so a vendor that streams a body forever cannot delay the
-// caller's own status handling; closing the body releases the reader.
+// ReadBody reads a bounded prefix of an HTTP error body. It waits at most a
+// few hundred milliseconds (less for 429 and 5xx, which are retried anyway)
+// and returns the bytes read so far, so a vendor that stalls or streams a body
+// forever delays the caller's status handling by at most that deadline and
+// still gets its partial text reported. Closing the body, which callers do,
+// releases the background reader.
 func ReadBody(resp *http.Response) []byte {
 	if resp == nil || resp.Body == nil {
 		return nil
 	}
-	done := make(chan []byte, 1)
-	go func() {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, readLimit))
-		done <- b
-	}()
-	select {
-	case b := <-done:
-		return b
-	case <-time.After(readTimeout):
-		return nil
+	timeout := errorBodyTimeout
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+		timeout = retryBodyTimeout
 	}
+	return readBody(resp, timeout)
+}
+
+func readBody(resp *http.Response, timeout time.Duration) []byte {
+	var (
+		mu  sync.Mutex
+		buf []byte
+	)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		chunk := make([]byte, 4096)
+		for {
+			mu.Lock()
+			room := readLimit - len(buf)
+			mu.Unlock()
+			if room <= 0 {
+				return
+			}
+			n, err := resp.Body.Read(chunk[:min(room, len(chunk))])
+			mu.Lock()
+			buf = append(buf, chunk[:n]...)
+			mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	return append([]byte(nil), buf...)
+}
+
+// partialTokenDelimiters end a token that cannot belong to a credential value.
+const partialTokenDelimiters = " \t\r\n\"'&,;{}[]"
+
+// capBody cuts body at readLimit and drops the token the cut may have split:
+// everything after the last delimiter, and any trailing prefix of a configured
+// secret (for secrets that themselves contain delimiter characters). The bool
+// reports whether the body was cut.
+func capBody(body []byte, secrets []string) (string, bool) {
+	if len(body) < readLimit {
+		return string(body), false
+	}
+	text := string(body[:readLimit])
+	if i := strings.LastIndexAny(text, partialTokenDelimiters); i >= 0 {
+		text = text[:i+1]
+	} else {
+		text = ""
+	}
+	text = strings.ToValidUTF8(text, "")
+	for _, s := range secrets {
+		s = strings.TrimSpace(s)
+		for k := min(len(s)-1, len(text)); k >= minSecretLen; k-- {
+			if strings.HasSuffix(text, s[:k]) {
+				text = text[:len(text)-k]
+				break
+			}
+		}
+	}
+	return text, true
+}
+
+// Clip bounds vendor-supplied text (a header, a link) to MaxBodyText bytes.
+func Clip(text string) string {
+	if len(text) <= MaxBodyText {
+		return text
+	}
+	return strings.ToValidUTF8(text[:MaxBodyText], "") + " ... [truncated]"
 }
 
 // HTTPText describes a failed HTTP exchange: status line and the (redacted,
-// whitespace-compacted, truncated) response body.
+// whitespace-compacted, truncated) response body. It only ever examines the
+// first readLimit bytes of body, whatever the caller passes.
 func HTTPText(resp *http.Response, body []byte, secrets ...string) string {
 	status := fmt.Sprintf("HTTP %d", resp.StatusCode)
 	if t := http.StatusText(resp.StatusCode); t != "" {
 		status += " " + t
 	}
-	text := strings.Join(strings.Fields(Redact(strings.ToValidUTF8(string(body), "?"), secrets...)), " ")
-	if text == "" {
-		return status
-	}
+	raw, capped := capBody(body, secrets)
+	text := strings.Join(strings.Fields(Redact(strings.ToValidUTF8(raw, "?"), secrets...)), " ")
 	suffix := ""
-	if len(body) >= readLimit {
+	if capped {
 		suffix = " ... [truncated]"
+	}
+	if text == "" {
+		return status + suffix
 	}
 	if len(text) > MaxBodyText {
 		text = strings.ToValidUTF8(text[:MaxBodyText], "") // may split a rune
