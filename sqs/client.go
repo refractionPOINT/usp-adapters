@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -21,15 +24,17 @@ const (
 )
 
 type SQSAdapter struct {
-	conf      SQSConfig
-	uspClient *uspclient.Client
+	conf           SQSConfig
+	uspClient      acktrack.SDKClient
+	tracker        *acktrack.ACKTracker
+	receiveStopped <-chan struct{}
 
 	awsConfig  *aws.Config
 	awsSession *session.Session
 	sqsClient  *sqs.SQS
 
 	ctx    context.Context
-	isStop bool
+	isStop atomic.Bool
 }
 
 type SQSConfig struct {
@@ -77,23 +82,31 @@ func NewSQSAdapter(ctx context.Context, conf SQSConfig) (*SQSAdapter, chan struc
 
 	a.sqsClient = sqs.New(a.awsSession)
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = acktrack.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	var subErr error
+	var subErrMu sync.Mutex
 	chStopped := make(chan struct{})
+	a.receiveStopped = chStopped
 	go func() {
 		defer close(chStopped)
-		subErr = a.receiveEvents()
+		err := a.receiveEvents()
+		subErrMu.Lock()
+		subErr = err
+		subErrMu.Unlock()
 	}()
 	// Give it a second to start the subscriber to check it's
 	// working without any errors.
 	time.Sleep(2 * time.Second)
-	if subErr != nil {
+	subErrMu.Lock()
+	startErr := subErr
+	subErrMu.Unlock()
+	if startErr != nil {
 		a.uspClient.Close()
-		return nil, nil, subErr
+		return nil, nil, startErr
 	}
 
 	return a, chStopped, nil
@@ -102,16 +115,29 @@ func NewSQSAdapter(ctx context.Context, conf SQSConfig) (*SQSAdapter, chan struc
 func (a *SQSAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
-	a.isStop = true
+	a.isStop.Store(true)
+	if a.receiveStopped != nil {
+		<-a.receiveStopped
+	}
 	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (a *SQSAdapter) receiveEvents() error {
-	for !a.isStop {
-		result, err := a.sqsClient.ReceiveMessage(&sqs.ReceiveMessageInput{
+func (a *SQSAdapter) receiveEvents() (receiveErr error) {
+	// All receiver failures, including worker and late cleanup errors, reach
+	// the existing error callback before the stopped channel is closed.
+	defer func() {
+		if receiveErr != nil && !errors.Is(receiveErr, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("SQS receive stopped: %w", receiveErr))
+		}
+	}()
+
+	for !a.isStop.Load() {
+		deadline := time.Now().Add(sourceLeaseBudget)
+		receiveCtx, receiveCancel := context.WithDeadline(a.ctx, deadline)
+		result, err := a.sqsClient.ReceiveMessageWithContext(receiveCtx, &sqs.ReceiveMessageInput{
 			AttributeNames:        []*string{},
 			MessageAttributeNames: []*string{},
 			QueueUrl:              &a.conf.QueueURL,
@@ -119,53 +145,67 @@ func (a *SQSAdapter) receiveEvents() error {
 			VisibilityTimeout:     aws.Int64(60), // 60 seconds
 			WaitTimeSeconds:       aws.Int64(5),
 		})
+		receiveCancel()
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.ReceiveMessage: %v", err))
 			return err
 		}
-		delRequest := &sqs.DeleteMessageBatchInput{
-			Entries:  make([]*sqs.DeleteMessageBatchRequestEntry, len(result.Messages)),
-			QueueUrl: &a.conf.QueueURL,
-		}
+
 		if len(result.Messages) == 0 {
 			continue
 		}
-		for i, msg := range result.Messages {
-			if err := a.processEvent(msg.Body); err != nil {
+		if a.tracker == nil {
+			a.tracker, _ = acktrack.NewACKTracker(a.uspClient, 1, 16)
+		}
+		delRequest := &sqs.DeleteMessageBatchInput{QueueUrl: &a.conf.QueueURL}
+		var dependency acktrack.ACKDependency
+		for _, msg := range result.Messages {
+			dep, err := a.processEvent(msg.Body)
+			if err != nil {
 				return err
 			}
-			delRequest.Entries[i] = &sqs.DeleteMessageBatchRequestEntry{
-				Id:            msg.MessageId,
-				ReceiptHandle: msg.ReceiptHandle,
+			dependency, err = dependency.Include(dep)
+			if err != nil {
+				return err
 			}
+			delRequest.Entries = append(delRequest.Entries, &sqs.DeleteMessageBatchRequestEntry{Id: msg.MessageId, ReceiptHandle: msg.ReceiptHandle})
 		}
-		delRes, err := a.sqsClient.DeleteMessageBatch(delRequest)
+		if err := a.tracker.Candidate("batch", []byte{1}, dependency); err != nil {
+			return err
+		}
+		if err := a.awaitDelivery(deadline); err != nil {
+			return err
+		}
+		deleteCtx, cancel := context.WithDeadline(a.ctx, deadline)
+		delRes, err := a.sqsClient.DeleteMessageBatchWithContext(deleteCtx, delRequest)
+		cancel()
 		if err != nil {
 			return err
 		}
 		if len(delRes.Failed) != 0 {
 			return errors.New("sqsClient.DeleteMessageBatch: failed to delete some messages")
 		}
+
 	}
 	return nil
 }
 
-func (a *SQSAdapter) processEvent(message *string) error {
+func (a *SQSAdapter) processEvent(message *string) (acktrack.ACKDependency, error) {
+	if message == nil {
+		return acktrack.ACKDependency{}, errors.New("missing message body")
+	}
 	msg := &protocol.DataMessage{
 		TextPayload: *message,
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
-	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
+	dep, err := a.tracker.Ship(msg, 2*time.Second)
+	if err != nil {
 		if err == uspclient.ErrorBufferFull {
 			a.conf.ClientOptions.DebugLog("stream falling behind")
-			err = a.uspClient.Ship(msg, 1*time.Hour)
+			dep, err = a.tracker.Ship(msg, 2*time.Second)
 		}
 		if err != nil {
-			if err != uspclient.ErrorClosed {
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-			}
-			return err
+			return dep, err
 		}
 	}
-	return nil
+	return dep, nil
 }

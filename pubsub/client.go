@@ -2,10 +2,13 @@ package usp_pubsub
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/pubsub"
@@ -43,8 +46,17 @@ const (
 )
 
 type PubSubAdapter struct {
-	conf      PubSubConfig
-	uspClient *uspclient.Client
+	conf            PubSubConfig
+	uspClient       acktrack.SDKClient
+	tracker         *acktrack.ACKTracker
+	trackerOnce     sync.Once
+	admissionMu     sync.Mutex
+	admitted        uint64
+	lastDependency  acktrack.ACKDependency
+	confirmed       atomic.Uint64
+	observationMu   sync.Mutex
+	nextObservation time.Time
+	observationErr  error
 
 	psClient *pubsub.Client
 
@@ -105,7 +117,7 @@ func NewPubSubAdapter(ctx context.Context, conf PubSubConfig) (*PubSubAdapter, c
 		}
 	}
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = acktrack.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		a.psClient.Close()
 		return nil, nil, err
@@ -192,6 +204,10 @@ func receiveWithRestarts(ctx context.Context, receive func(context.Context) erro
 func (a *PubSubAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
+	// Stop admissions while preserving the SDK connection for accepted records.
+	// Handlers may now finish delivery and flush source ACKs before Receive stops.
+	a.uspClient.BeginDrain()
+	drainErr := a.uspClient.Drain(time.Minute)
 	a.stopSub()
 	var flushErr error
 	if a.receiveStopped != nil {
@@ -209,18 +225,29 @@ func (a *PubSubAdapter) Close() error {
 	// Receive flushes source ACK/NACKs before returning. Keep its RPC transport
 	// alive until then; on the bounded fallback, Close aborts stuck source RPCs.
 	err1 := a.psClient.Close()
-	err2 := a.uspClient.Drain(1 * time.Minute)
+	err2 := drainErr
 	_, err3 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
 	return errors.Join(flushErr, err1, err2, err3)
 }
 
 func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Message) {
+	started := time.Now()
 	msg := &protocol.DataMessage{
 		TextPayload: string(message.Data),
 		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
-	if err := a.shipWhileRunning(ctx, msg); err != nil {
+	// Candidate order must match admission order, even with concurrent callbacks.
+	a.admissionMu.Lock()
+	err := a.shipWhileRunning(ctx, msg)
+	var marker uint64
+	if err == nil {
+		a.admitted++
+		marker = a.admitted
+		err = a.tracker.Candidate("messages", binary.BigEndian.AppendUint64(nil, marker), a.lastDependency)
+	}
+	a.admissionMu.Unlock()
+	if err != nil {
 		// A closed client or a stopped subscription is the adapter shutting
 		// down, not a failure: hand the message back quietly.
 		if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
@@ -228,6 +255,26 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 		}
 		message.Nack()
 		return
+	}
+	// Pub/Sub extends the lease while the handler runs, up to MaxExtension.
+	// Stop before that bound; cancellation and observation errors fail closed.
+	deadline := started.Add(60 * time.Minute)
+	for a.confirmed.Load() < marker {
+		if !time.Now().Before(deadline) {
+			message.Nack()
+			return
+		}
+		if err := a.observeDelivery(); err != nil {
+			message.Nack()
+			return
+		}
+		if a.confirmed.Load() >= marker {
+			break
+		}
+		if !acktrack.Wait(ctx, deliveryObservationInterval) {
+			message.Nack()
+			return
+		}
 	}
 	message.Ack()
 }
@@ -238,13 +285,17 @@ func (a *PubSubAdapter) processEvent(ctx context.Context, message *pubsub.Messag
 // to return before it returns, so a handler stuck here would keep the adapter
 // from stopping.
 func (a *PubSubAdapter) shipWhileRunning(ctx context.Context, msg *protocol.DataMessage) error {
+	a.trackerOnce.Do(func() { a.tracker, _ = acktrack.NewACKTracker(a.uspClient, 1, 16) })
 	blockedSince := time.Now()
 	loggedBehind := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := a.uspClient.Ship(msg, shipRetrySlice)
+		dep, err := a.tracker.Ship(msg, shipRetrySlice)
+		if err == nil {
+			a.lastDependency = dep
+		}
 		if err != uspclient.ErrorBufferFull {
 			return err
 		}
@@ -256,4 +307,28 @@ func (a *PubSubAdapter) shipWhileRunning(ctx context.Context, msg *protocol.Data
 			return err
 		}
 	}
+}
+
+// A shared cache bounds full GetUnsent snapshots to one per interval, regardless
+// of callback count. Cache errors as well as progress: an observation failure
+// must never appear to concurrent waiters as successful confirmation.
+const deliveryObservationInterval = 20 * time.Millisecond
+
+func (a *PubSubAdapter) observeDelivery() error {
+	a.observationMu.Lock()
+	defer a.observationMu.Unlock()
+	if time.Now().Before(a.nextObservation) {
+		return a.observationErr
+	}
+	positions, err := a.tracker.Confirm()
+	a.nextObservation = time.Now().Add(deliveryObservationInterval)
+	a.observationErr = err
+	if err != nil {
+		return err
+	}
+	if raw := positions["messages"]; len(raw) == 8 {
+		// Observations are serialized; the confirmed frontier only advances.
+		a.confirmed.Store(binary.BigEndian.Uint64(raw))
+	}
+	return nil
 }

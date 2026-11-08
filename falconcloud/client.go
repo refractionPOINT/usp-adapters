@@ -197,14 +197,24 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 	}
 	defer streamHandle.Close()
 
+	a.consumeStream(streamHandle, notBefore, a.uspClient.Ship)
+}
+
+func (a *FalconCloudAdapter) consumeStream(streamHandle *falcon.StreamingHandle, notBefore time.Time, ship func(*protocol.DataMessage, time.Duration) error) {
 	for {
 		select {
 		case <-a.ctx.Done():
 			return
-		case err := <-streamHandle.Errors:
+		case err, ok := <-streamHandle.Errors:
+			if !ok {
+				return
+			}
 			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
 			return
-		case event := <-streamHandle.Events:
+		case event, ok := <-streamHandle.Events:
+			if !ok || event == nil {
+				return
+			}
 			if !notBefore.IsZero() && notBefore.After(time.UnixMilli(int64(event.Metadata.EventCreationTime))) {
 				// This is a very ugly hack for what is a bad API design.
 				// It implies we HAVE to consume the entire 30 days of events
@@ -215,15 +225,19 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 				JsonPayload: a.convertStructToMap(event),
 				TimestampMs: uint64(time.Now().UnixMilli()),
 			}
-			err := a.uspClient.Ship(msg, a.writeTimeout)
+			err := ship(msg, a.writeTimeout)
 			if err == uspclient.ErrorBufferFull {
 				a.conf.ClientOptions.OnWarning("stream falling behind")
-				err = a.uspClient.Ship(msg, 0)
+				err = ship(msg, 0)
 			}
 			if err != nil {
 				if err != uspclient.ErrorClosed {
 					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 				}
+				// A failed admission cannot be skipped: stop this stream before
+				// consuming any more events. Buffer pressure already retries the
+				// same message above; a closed client cannot accept a retry.
+				return
 			}
 		}
 	}

@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -26,8 +28,10 @@ const (
 )
 
 type SQSFilesAdapter struct {
-	conf      SQSFilesConfig
-	uspClient *uspclient.Client
+	conf           SQSFilesConfig
+	uspClient      acktrack.SDKClient
+	tracker        *acktrack.ACKTracker
+	receiveStopped <-chan struct{}
 
 	chFiles chan fileInfo
 
@@ -44,7 +48,7 @@ type SQSFilesAdapter struct {
 	awsDownloader *s3manager.Downloader
 
 	ctx    context.Context
-	isStop bool
+	isStop atomic.Bool
 	wg     sync.WaitGroup
 }
 
@@ -66,9 +70,16 @@ type SQSFilesConfig struct {
 	Bucket string `json:"bucket,omitempty" yaml:"bucket,omitempty"`
 }
 
+type fileResult struct {
+	dep acktrack.ACKDependency
+	err error
+}
+
 type fileInfo struct {
 	bucket string
 	path   string
+	done   chan fileResult
+	ctx    context.Context
 }
 
 func (c *SQSFilesConfig) Validate() error {
@@ -126,7 +137,7 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 
 	a.chFiles = make(chan fileInfo)
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = acktrack.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -141,19 +152,27 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 	}
 
 	var subErr error
+	var subErrMu sync.Mutex
 	chStopped := make(chan struct{})
+	a.receiveStopped = chStopped
 	a.wg.Add(1)
 	go func() {
 		defer a.wg.Done()
 		defer close(chStopped)
-		subErr = a.receiveEvents()
+		err := a.receiveEvents()
+		subErrMu.Lock()
+		subErr = err
+		subErrMu.Unlock()
 	}()
 	// Give it a second to start the subscriber to check it's
 	// working without any errors.
 	time.Sleep(2 * time.Second)
-	if subErr != nil {
+	subErrMu.Lock()
+	startErr := subErr
+	subErrMu.Unlock()
+	if startErr != nil {
 		a.uspClient.Close()
-		return nil, nil, subErr
+		return nil, nil, startErr
 	}
 
 	return a, chStopped, nil
@@ -162,7 +181,7 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 func (a *SQSFilesAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
-	a.isStop = true
+	a.isStop.Store(true)
 	a.wg.Wait()
 	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {
 		return err
@@ -170,11 +189,11 @@ func (a *SQSFilesAdapter) Close() error {
 	return nil
 }
 
-func (a *SQSFilesAdapter) initS3SDKs(bucket string) error {
+func (a *SQSFilesAdapter) initS3SDKs(ctx context.Context, bucket string) error {
 	if a.isS3Inited {
 		return nil
 	}
-	region, err := a.getBucketRegion(bucket)
+	region, err := a.getBucketRegion(ctx, bucket)
 	if err != nil {
 		return fmt.Errorf("s3.Region: %v", err)
 	}
@@ -187,20 +206,31 @@ func (a *SQSFilesAdapter) initS3SDKs(bucket string) error {
 		return fmt.Errorf("s3.NewSession(): %v", err)
 	}
 
-	a.awsS3 = s3.New(a.awsSession)
+	a.awsS3 = s3.New(a.awsS3Session)
 	a.awsDownloader = s3manager.NewDownloader(a.awsS3Session)
+	a.isS3Inited = true
 	return nil
 }
 
-func (a *SQSFilesAdapter) getBucketRegion(bucket string) (string, error) {
-	return s3manager.GetBucketRegion(a.ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
+func (a *SQSFilesAdapter) getBucketRegion(ctx context.Context, bucket string) (string, error) {
+	return s3manager.GetBucketRegion(ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
 }
 
-func (a *SQSFilesAdapter) receiveEvents() error {
+func (a *SQSFilesAdapter) receiveEvents() (receiveErr error) {
+	// All receiver failures, including worker and late cleanup errors, reach
+	// the existing error callback before the stopped channel is closed.
+	defer func() {
+		if receiveErr != nil && !errors.Is(receiveErr, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("SQS receive stopped: %w", receiveErr))
+		}
+	}()
+
 	defer close(a.chFiles)
 
-	for !a.isStop {
-		result, err := a.sqsClient.ReceiveMessage(&sqs.ReceiveMessageInput{
+	for !a.isStop.Load() {
+		deadline := time.Now().Add(sourceLeaseBudget)
+		receiveCtx, receiveCancel := context.WithDeadline(a.ctx, deadline)
+		result, err := a.sqsClient.ReceiveMessageWithContext(receiveCtx, &sqs.ReceiveMessageInput{
 			AttributeNames:        []*string{},
 			MessageAttributeNames: []*string{},
 			QueueUrl:              &a.conf.QueueURL,
@@ -208,107 +238,126 @@ func (a *SQSFilesAdapter) receiveEvents() error {
 			VisibilityTimeout:     aws.Int64(60), // 60 seconds
 			WaitTimeSeconds:       aws.Int64(5),
 		})
+		receiveCancel()
 		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.ReceiveMessage: %v", err))
 			return err
 		}
-		delRequest := &sqs.DeleteMessageBatchInput{
-			Entries:  make([]*sqs.DeleteMessageBatchRequestEntry, 0, len(result.Messages)),
-			QueueUrl: &a.conf.QueueURL,
-		}
+
 		if len(result.Messages) == 0 {
 			continue
 		}
-		for _, msg := range result.Messages {
-			delRequest.Entries = append(delRequest.Entries, &sqs.DeleteMessageBatchRequestEntry{
-				Id:            msg.MessageId,
-				ReceiptHandle: msg.ReceiptHandle,
-			})
-
-			d := utils.Dict{}
-			if err := json.Unmarshal([]byte(*msg.Body), &d); err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("sqsClient.Message.Json: %v", err))
-				continue
-			}
-
-			bucket := a.conf.Bucket
-			if bucket == "" {
-				bucket = d.ExpandableFindOneString(a.conf.BucketPath)
-			}
-			filePaths := d.ExpandableFindString(a.conf.FilePath)
-
-			if bucket == "" {
-				a.conf.ClientOptions.OnError(errors.New("sqsClient.Message: missing bucket"))
-				continue
-			}
-			if len(filePaths) == 0 {
-				continue
-			}
-			if err := a.initS3SDKs(bucket); err != nil {
-				a.conf.ClientOptions.OnError(err)
-				return err
-			}
-
-			for _, p := range filePaths {
-				a.chFiles <- fileInfo{
-					bucket: bucket,
-					path:   p,
-				}
-			}
-
+		if a.tracker == nil {
+			a.tracker, _ = acktrack.NewACKTracker(a.uspClient, 1, 16)
 		}
-		delRes, err := a.sqsClient.DeleteMessageBatch(delRequest)
+		batchCtx, cancel := context.WithDeadline(a.ctx, deadline)
+		err = a.processBatch(batchCtx, result.Messages)
+		cancel()
 		if err != nil {
 			return err
 		}
-		if len(delRes.Failed) != 0 {
+		if err := a.awaitDelivery(deadline); err != nil {
+			return err
+		}
+		req := &sqs.DeleteMessageBatchInput{QueueUrl: &a.conf.QueueURL}
+		for _, msg := range result.Messages {
+			req.Entries = append(req.Entries, &sqs.DeleteMessageBatchRequestEntry{Id: msg.MessageId, ReceiptHandle: msg.ReceiptHandle})
+		}
+		deleteCtx, deleteCancel := context.WithDeadline(a.ctx, deadline)
+		res, err := a.sqsClient.DeleteMessageBatchWithContext(deleteCtx, req)
+		deleteCancel()
+		if err != nil {
+			return err
+		}
+		if len(res.Failed) != 0 {
 			return errors.New("sqsClient.DeleteMessageBatch: failed to delete some messages")
 		}
+
 	}
 	return nil
+}
+
+func (a *SQSFilesAdapter) processBatch(ctx context.Context, messages []*sqs.Message) error {
+	var dependency acktrack.ACKDependency
+	for _, message := range messages {
+		d := utils.Dict{}
+		if message.Body == nil {
+			return errors.New("missing notification body")
+		}
+		if err := json.Unmarshal([]byte(*message.Body), &d); err != nil {
+			return err
+		}
+		bucket := a.conf.Bucket
+		if bucket == "" {
+			bucket = d.ExpandableFindOneString(a.conf.BucketPath)
+		}
+		paths := d.ExpandableFindString(a.conf.FilePath)
+		if bucket == "" || len(paths) == 0 {
+			return errors.New("notification missing bucket or files")
+		}
+		if err := a.initS3SDKs(ctx, bucket); err != nil {
+			return err
+		}
+		// Buffer one result per file so workers never get stranded on errors.
+		results := make(chan fileResult, len(paths))
+		for _, path := range paths {
+			select {
+			case a.chFiles <- fileInfo{bucket: bucket, path: path, done: results, ctx: ctx}:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		for range paths {
+			select {
+			case r := <-results:
+				if r.err != nil {
+					return r.err
+				}
+				var err error
+				dependency, err = dependency.Include(r.dep)
+				if err != nil {
+					return err
+				}
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+	return a.tracker.Candidate("batch", []byte{1}, dependency)
 }
 
 func (a *SQSFilesAdapter) processFiles() error {
 	for f := range a.chFiles {
-		path := f.path
-		if a.conf.IsDecodeObjectKey {
-			// URL Decode the path
-			var err error
-			path, err = url.QueryUnescape(path)
-			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("url.QueryUnescape(): %v", err))
-				continue
-			}
-		}
-		startTime := time.Now().UTC()
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s", path))
-
-		writerAt := aws.NewWriteAtBuffer([]byte{})
-
-		if _, err := a.awsDownloader.Download(writerAt, &s3.GetObjectInput{
-			Bucket: aws.String(f.bucket),
-			Key:    aws.String(path),
-		}); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download(): %v", err))
-			return err
-		}
-		// PrepareBundleData routes through the parquet decoder when
-		// needed (including gzipped parquet) and otherwise returns the
-		// bytes untouched.
-		rawData, isCompressed, err := utils.PrepareBundleData(path, writerAt.Bytes())
-		if err != nil {
-			a.conf.ClientOptions.OnError(err)
-			continue
-		}
-
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v", path, time.Since(startTime)))
-
-		a.processEvent(rawData, isCompressed)
+		dep, err := a.processFile(f)
+		f.done <- fileResult{dep: dep, err: err}
 	}
 	return nil
 }
 
-func (a *SQSFilesAdapter) processEvent(data []byte, isCompressed bool) bool {
+func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error) {
+	var empty acktrack.ACKDependency
+	if err := f.ctx.Err(); err != nil {
+		return empty, err
+	}
+	path := f.path
+	if a.conf.IsDecodeObjectKey {
+		var err error
+		path, err = url.QueryUnescape(path)
+		if err != nil {
+			return empty, err
+		}
+	}
+	writerAt := aws.NewWriteAtBuffer([]byte{})
+	if _, err := a.awsDownloader.DownloadWithContext(f.ctx, writerAt, &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}); err != nil {
+		return empty, err
+	}
+	data, compressed, err := utils.PrepareBundleData(path, writerAt.Bytes())
+	if err != nil {
+		return empty, err
+	}
+	return a.shipEvent(data, compressed)
+}
+
+func (a *SQSFilesAdapter) shipEvent(data []byte, isCompressed bool) (acktrack.ACKDependency, error) {
 	// Since we're dealing with files, we use the
 	// bundle payloads to avoid having to go through
 	// the whole unmarshal+marshal roundtrip.
@@ -325,17 +374,9 @@ func (a *SQSFilesAdapter) processEvent(data []byte, isCompressed bool) bool {
 		}
 	}
 
-	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-		if err == uspclient.ErrorBufferFull {
-			a.conf.ClientOptions.OnWarning("stream falling behind")
-			err = a.uspClient.Ship(msg, 1*time.Hour)
-		}
-		if err != nil {
-			if err != uspclient.ErrorClosed {
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-			}
-			return false
-		}
+	dep, err := a.tracker.Ship(msg, 2*time.Second)
+	if err == uspclient.ErrorBufferFull {
+		dep, err = a.tracker.Ship(msg, 2*time.Second)
 	}
-	return true
+	return dep, err
 }
