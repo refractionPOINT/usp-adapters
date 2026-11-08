@@ -238,6 +238,16 @@ func NewOffice365Adapter(ctx context.Context, conf Office365Config) (*Office365A
 // sink is non-nil it is used in place of a real LimaCharlie client -- the seam
 // tests use to capture shipped events.
 func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink) (*Office365Adapter, chan struct{}, error) {
+	// Validate receipt and deduper compatibility before creating any clients,
+	// local dedupers, transports or collection goroutines.
+	if sink == nil && conf.ClientOptions.TestSinkMode {
+		return nil, nil, errors.New("office365: TestSinkMode is unsupported because delivery confirmation requires USP receipts")
+	}
+	if conf.Deduper != nil {
+		if _, ok := conf.Deduper.(utils.CheckingDeduper); !ok {
+			return nil, nil, errors.New("office365: Deduper must implement utils.CheckingDeduper (utils.BatchDeduper is also supported)")
+		}
+	}
 	var err error
 
 	if conf.PollInterval <= 0 {
@@ -278,8 +288,6 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 		a.checker = bd
 	} else if cd, ok := conf.Deduper.(utils.CheckingDeduper); ok {
 		a.checker = cd
-	} else {
-		a.conf.ClientOptions.DebugLog("deduper cannot check without recording: stored markers are ignored; only repeated IDs within a blob are suppressed")
 	}
 
 	if isURLEndpoint(conf.Endpoint) {
@@ -824,6 +832,7 @@ func (a *Office365Adapter) admitContext(ctx context.Context, raw string) (uspcli
 	}
 	var receipt uspclient.AdmissionReceipt
 	var err error
+	warned := false
 	for {
 		if ctx.Err() != nil {
 			return receipt, false
@@ -831,6 +840,10 @@ func (a *Office365Adapter) admitContext(ctx context.Context, raw string) (uspcli
 		receipt, err = a.uspClient.ShipWithReceipt(msg, 100*time.Millisecond)
 		if err != uspclient.ErrorBufferFull {
 			break
+		}
+		if !warned {
+			a.conf.ClientOptions.OnWarning("stream falling behind")
+			warned = true
 		}
 	}
 	if err != nil {
@@ -881,12 +894,12 @@ func (a *Office365Adapter) waitConfirmedContext(ctx context.Context, receipt usp
 }
 
 // isDone checks a blob's confirmed marker without writing anything. Older
-// admission markers are ignored. A check-and-add-only deduper fails open.
+// admission markers are ignored. The constructor requires a CheckingDeduper.
 func (a *Office365Adapter) isDone(key string) bool {
 	if a.checker != nil {
 		return a.checker.Check(confirmedKey(key))
 	}
-	// A legacy check-and-add cannot safely check before delivery. Fail open.
+	// Defensive fallback for an incompletely initialized adapter.
 	return false
 }
 

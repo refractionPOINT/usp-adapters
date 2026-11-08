@@ -324,7 +324,6 @@ func TestDeduperWiring(t *testing.T) {
 		"default local deduper": {nil, true, true},
 		"batch deduper":         {newFakeBatchDeduper(), true, true},
 		"checking deduper":      {newSharedDeduper(), false, true},
-		"plain deduper":         {newLegacyDeduper(), false, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := newMockO365(t)
@@ -751,34 +750,6 @@ func TestCheckingDeduperPathUnchanged(t *testing.T) {
 	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
 	assert.Equal(t, 2, sink.count())
 	assert.Equal(t, DedupeStats{BlobsSkipped: 2}, stats.all()[1])
-}
-
-// A check-and-add-only deduper cannot safely suppress replay.
-func TestPlainDeduperFailsOpen(t *testing.T) {
-	srv := newBlobServer(t)
-	dup := event("dup-event", "2026-10-28T12:00:00")
-	srv.add("blob-a", "2026-10-28T12:00:00.000Z", dup, event("other", "2026-10-28T12:00:01"))
-	srv.add("blob-b", "2026-10-28T12:01:00.000Z", dup)
-	dd := newLegacyDeduper()
-	sink := &captureSink{}
-	stats := &statsRecorder{}
-	conf := validConfig(t)
-	fastRetries(&conf)
-	conf.Deduper = dd
-	conf.OnDedupeStats = stats.hook
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	a := &Office365Adapter{conf: conf, httpClient: http.DefaultClient,
-		uspClient: sink, doStop: utils.NewEvent(), stopCtx: ctx, cancelStop: cancel}
-
-	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
-	assert.Equal(t, 3, sink.count())
-	assert.Equal(t, 2, sink.payloadCounts()[dup])
-	assert.Equal(t, []DedupeStats{{BlobsFetched: 2, EventsShipped: 3}}, stats.all())
-
-	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
-	assert.Equal(t, 6, sink.count())
-	assert.Equal(t, DedupeStats{BlobsFetched: 2, EventsShipped: 3}, stats.all()[1])
 }
 
 // With the default local deduper (a BatchDeduper) the adapter ships a

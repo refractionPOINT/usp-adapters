@@ -289,9 +289,6 @@ func TestCloseMidPageLosesNothing(t *testing.T) {
 	}{
 		// A deduper that can check without recording: nothing is lost.
 		{name: "checking deduper", deduper: func() interface{} { return newSharedDeduper() }},
-		// A check-and-add-only deduper fails open: duplicates are possible,
-		// but no blob is lost.
-		{name: "legacy deduper", deduper: func() interface{} { return newLegacyDeduper() }, maxLost: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const ct = "Audit.Exchange"
@@ -345,16 +342,7 @@ func TestCloseMidPageLosesNothing(t *testing.T) {
 			require.Eventually(t, func() bool {
 				return sink2.payloadCounts()[recs["blob-5"]] == 1
 			}, 5*time.Second, 10*time.Millisecond, "the next instance must ship the rest of the page")
-			var lost []string
-			if tc.name == "legacy deduper" {
-				for id, raw := range recs {
-					if sink1.payloadCounts()[raw]+sink2.payloadCounts()[raw] == 0 {
-						lost = append(lost, id)
-					}
-				}
-			} else {
-				lost = lostRecords(t, recs, sink1, sink2)
-			}
+			lost := lostRecords(t, recs, sink1, sink2)
 			assert.LessOrEqual(t, len(lost), tc.maxLost, "lost blobs: %v", lost)
 			for _, id := range lost {
 				assert.Equal(t, "blob-2", id, "only the in-flight blob may be lost")
@@ -376,14 +364,13 @@ func (s *blockingSink) Ship(m *protocol.DataMessage, d time.Duration) error {
 	return s.captureSink.Ship(m, d)
 }
 
-// A stop that lands between two blobs doesn't touch the next blob, even with
-// a deduper that records a key when it checks it.
+// A stop that lands between two blobs leaves the next blob eligible for replay.
 func TestStopBetweenBlobsMarksNothing(t *testing.T) {
 	const ct = "Audit.Exchange"
 	m := newFaultMock(t)
 	recs := addBlobs(t, m, ct, 3)
 
-	dd := newLegacyDeduper()
+	dd := newSharedDeduper()
 	sink1 := &blockingSink{shipped: make(chan struct{}, 1), release: make(chan struct{})}
 	conf1 := newTestConfig(t, m.mockO365, ct)
 	conf1.Deduper = dd
@@ -411,11 +398,9 @@ func TestStopBetweenBlobsMarksNothing(t *testing.T) {
 	fastRetries(&conf2)
 	startAdapter(t, conf2, sink2)
 
-	require.Eventually(t, func() bool { return sink2.count() == 3 },
-		5*time.Second, 10*time.Millisecond, "a legacy deduper must allow all blobs to replay")
-	for _, raw := range recs {
-		assert.Positive(t, sink2.payloadCounts()[raw])
-	}
+	require.Eventually(t, func() bool { return sink2.count() == 2 },
+		5*time.Second, 10*time.Millisecond, "the next instance must ship blob-2 and blob-3")
+	assert.Empty(t, lostRecords(t, recs, &sink1.captureSink, sink2))
 }
 
 // A Ship failure stops the instance without recording the unshipped events or

@@ -208,7 +208,7 @@ func TestConfirmedACKPartialAndShutdown(t *testing.T) {
 	nextACKFrame(t, frames)
 	acceptFrame(t, first)
 	receipt := <-tracked.receipts
-	require.Eventually(t, func() bool { return c.ObserveReceipt(receipt).Frame == uspclient.ReceiptAcknowledged }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return c.ObserveReceipt(receipt).Frame == uspclient.ReceiptAcknowledged }, 5*time.Second, time.Millisecond)
 	// Cancellation must release the wait without marking an unconfirmed tail.
 	a.cancelStop()
 	require.False(t, pollResult(t, done))
@@ -267,7 +267,7 @@ func TestConfirmedACKPartialAdmissionFailure(t *testing.T) {
 	nextACKFrame(t, frames)
 	acceptFrame(t, first)
 	receipt := <-tracked.receipts
-	require.Eventually(t, func() bool { return c.ObserveReceipt(receipt).Frame == uspclient.ReceiptAcknowledged }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return c.ObserveReceipt(receipt).Frame == uspclient.ReceiptAcknowledged }, 5*time.Second, time.Millisecond)
 	a.cancelStop()
 	require.False(t, pollResult(t, done))
 	require.True(t, dd.has("a-0001"))

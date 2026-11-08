@@ -341,19 +341,6 @@ func TestUnlistedLeftBlobExpiresAndReports(t *testing.T) {
 	}
 }
 
-// A check-and-add-only backend must not poison retry eligibility.
-func TestLegacyDeduperLeavesBlobRetryable(t *testing.T) {
-	var hits atomic.Int32
-	a, base := pollFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.Write([]byte(`[{`)) }))
-	a.conf.Deduper = newLegacyDeduper()
-	a.checker = nil
-	fs := &failureState{}
-	items := []listItem{{ContentID: "legacy-blob", ContentURI: base}}
-	a.processItems(items, fs)
-	a.processItems(items, fs)
-	assert.EqualValues(t, 2, hits.Load())
-}
-
 func TestBackoffJitterAndBounds(t *testing.T) {
 	a := &Office365Adapter{conf: Office365Config{
 		retryBaseDelay: defaultRetryBaseDelay,
