@@ -631,26 +631,8 @@ func (a *Office365Adapter) reportLeftBlobs(fs *failureState, now time.Time, mess
 // uniqueness, so we take a best stab by using the ID per event, recorded only
 // once the peer confirms it. It returns false if admission or confirmation fails.
 func (a *Office365Adapter) shipContent(content []byte) (int, int, bool) {
-	nShipped := 0
-	nSkipped := 0
-	ok := true
-	gjson.ParseBytes(content).ForEach(func(_, event gjson.Result) bool {
-		ID := event.Get("Id").String()
-		if ID != "" && a.isDone(ID) {
-			nSkipped++
-			return true
-		}
-		if !a.ship(event.Raw) {
-			ok = false
-			return false
-		}
-		if ID != "" {
-			a.markDone(ID)
-		}
-		nShipped++
-		return true
-	})
-	return nShipped, nSkipped, ok
+	counts, ok := a.shipContentBatch(content)
+	return counts.shipped, counts.duplicate + counts.repeated, ok
 }
 
 // blobKey is the dedupe key of a listed content blob, timed by the blob's
@@ -696,9 +678,10 @@ type batchEvent struct {
 	repeated bool
 }
 
-// shipContentBatch is shipContent for a BatchDeduper: the events of a blob are
-// checked a chunk at a time with one call, and the shipped ones are recorded
-// with one call per chunk. Events shipped before a failure are still recorded,
+// shipContentBatch checks and confirms the events of a blob in bounded chunks.
+// A BatchDeduper checks and records keys in one call per chunk; a CheckingDeduper
+// uses individual key operations around the same chunk confirmation barrier.
+// Events confirmed before a failure are still recorded,
 // so a retry of the blob doesn't ship them again. Repeats of an Id inside the
 // blob are skipped here, since the deduper can't see them before they are
 // recorded. It returns false if admission or confirmation fails.
@@ -759,7 +742,14 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 	}
 	var known []bool
 	if len(toCheck) != 0 {
-		known = a.batcher.CheckMany(toCheck)
+		if a.batcher != nil {
+			known = a.batcher.CheckMany(toCheck)
+		} else if a.checker != nil {
+			known = make([]bool, len(toCheck))
+			for i, key := range toCheck {
+				known[i] = a.checker.Check(key.Key)
+			}
+		}
 	}
 
 	type pendingEvent struct {
@@ -784,7 +774,13 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 			}
 		}
 		if len(confirmed) != 0 {
-			a.batcher.AddMany(confirmed)
+			if a.batcher != nil {
+				a.batcher.AddMany(confirmed)
+			} else if a.checker != nil {
+				for _, key := range confirmed {
+					a.checker.CheckAndAdd(key.Key)
+				}
+			}
 		}
 	}()
 
@@ -806,15 +802,6 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 		counts.shipped++
 	}
 	return true
-}
-
-// ship admits and confirms one event, bounded by the same cancellable deadline.
-func (a *Office365Adapter) ship(raw string) bool {
-	ctx, cancel := context.WithTimeout(a.stopCtx, a.confirmationTimeout())
-	defer cancel()
-	defer a.reportConfirmationTimeout(ctx)
-	receipt, ok := a.admitContext(ctx, raw)
-	return ok && a.waitConfirmedContext(ctx, receipt)
 }
 
 func (a *Office365Adapter) reportConfirmationTimeout(ctx context.Context) {

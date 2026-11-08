@@ -284,3 +284,34 @@ func TestConfirmedACKPartialAdmissionFailure(t *testing.T) {
 	require.True(t, pollResult(t, done))
 	require.True(t, dd.has("blob-1"))
 }
+
+// The per-key deduper uses the same chunk barrier as a batch deduper: every
+// event in the chunk can reach the wire before the peer ACKs any of them.
+func TestConfirmedACKCheckingChunkBarrier(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1), event("", ""), eventN("a", 2))
+	dd := newSharedDeduper()
+	c, frames := ackClient(t)
+	a, _ := newBatchAdapter(t, srv, newFakeBatchDeduper(), c)
+	a.batcher = nil
+	a.checker = dd
+	a.conf.Deduper = dd
+	done := pollAsync(a, srv)
+	nextACKFrame(t, frames)
+	nextACKFrame(t, frames)
+	last := nextACKFrame(t, frames)
+	require.False(t, dd.Check(confirmedKey("a-0001")))
+	require.False(t, dd.Check(confirmedKey("a-0002")))
+	require.False(t, dd.Check(confirmedKey("blob-1")))
+	acceptFrame(t, last)
+	require.True(t, pollResult(t, done))
+	require.True(t, dd.Check(confirmedKey("a-0001")))
+	require.True(t, dd.Check(confirmedKey("a-0002")))
+	require.True(t, dd.Check(confirmedKey("blob-1")))
+	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
+	select {
+	case <-frames:
+		t.Fatal("confirmed blob replayed")
+	default:
+	}
+}
