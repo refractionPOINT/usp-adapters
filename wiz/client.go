@@ -289,7 +289,12 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 			return alerts, newSince, newID, nil
 		}
 		if err := a.validateCursorQuery(); err != nil {
-			return nil, since, lastEventId, err
+			// Preserve single-page collection for existing query shapes.
+			// This is a warning, never the adapter's fatal/Org Error callback.
+			if a.conf.ClientOptions.OnWarning != nil {
+				a.conf.ClientOptions.OnWarning("Wiz pagination: collecting the first page only; wiz/README.md requires a query declaring $after: String, passing after: $after on the selected connection, and selecting pageInfo { hasNextPage endCursor }")
+			}
+			return alerts, newSince, newID, nil
 		}
 		if seen[next] {
 			return nil, since, lastEventId, fmt.Errorf("repeated GraphQL continuation cursor")

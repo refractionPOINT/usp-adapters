@@ -9,8 +9,9 @@ when an intermediate page contains no records.
 
 Optional-field GraphQL errors with explicit paths produce a warning while valid
 records continue. Errors without a path, or errors affecting the connection,
-records, paging information, IDs or times, fail the window. Malformed individual records are skipped with warnings, preserving the existing
-record-level behavior without blocking otherwise usable pages.
+records, paging information, IDs or times, fail the window. Malformed individual
+records are skipped with warnings, preserving the existing record-level behavior
+without blocking otherwise usable pages.
 
 A failed page, required-data GraphQL error, missing continuation cursor or repeated cursor
 leaves the time checkpoint unchanged. The next poll retries the window.
@@ -25,10 +26,12 @@ connections in one query is not supported by this traversal.
 Before following a cursor, the adapter parses the query's GraphQL syntax to
 verify that its single query operation declares `$after` and passes
 `after: $after` directly on the connection identified by `data_path`. A query
-that only selects `pageInfo` produces an explicit configuration error before
-another page is requested. The check does not infer a vendor schema or rewrite
+that exposes pagination without consuming the cursor keeps its existing
+first-page collection behavior. It emits one pagination warning per poll naming
+this required query shape; this case never calls the fatal error callback. The check does not infer a vendor schema or rewrite
 the query. Connection paths expressed through fragments, multiple operations,
-and nonstandard cursor argument names require a direct standard query instead.
+and nonstandard cursor argument names also use the first-page compatibility
+behavior; use a direct standard query for full pagination.
 Queries without a continuation keep their existing behavior.
 
 The adapter currently accumulates the complete query result in memory before

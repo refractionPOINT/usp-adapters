@@ -51,24 +51,49 @@ func TestReviewPartialGraphQL(t *testing.T) {
 	}
 }
 
-func TestReviewQueryMustConsumeAfter(t *testing.T) {
+func TestReviewUnsupportedCursorKeepsCollecting(t *testing.T) {
 	for _, query := range []string{
 		`{ issues { nodes { id createdAt } pageInfo { hasNextPage endCursor } } }`,
 		"query($after: String) { issues { nodes { id createdAt } pageInfo { hasNextPage endCursor } } } # after: $after",
 	} {
 		t.Run(query, func(t *testing.T) {
-			calls := 0
+			calls, errorsSeen := 0, 0
+			warnings := []string{}
+			stop := utils.NewEvent()
+			nextFloor := ""
+			const stamp = "2026-11-09T00:00:00Z"
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls++
-				fmt.Fprint(w, `{"data":{"issues":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same"}}}}`)
+				var body struct {
+					Variables map[string]interface{} `json:"variables"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					w.WriteHeader(400)
+					return
+				}
+				if calls == 2 {
+					nextFloor = body.Variables["filterBy"].(map[string]interface{})["createdAt"].(map[string]interface{})["after"].(string)
+					stop.Set()
+				}
+				fmt.Fprintf(w, `{"data":{"issues":{"nodes":[{"id":"event-%d","createdAt":%q}],"pageInfo":{"hasNextPage":true,"endCursor":"ignored"}}}}`, calls, stamp)
 			}))
 			defer srv.Close()
-			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: query, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt"}, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
-			_, since, id, err := a.makeOneGraphQLRequest("before", "previous")
-			require.ErrorContains(t, err, "configuration")
-			require.Equal(t, 1, calls)
-			require.Equal(t, "before", since)
-			require.Equal(t, "previous", id)
+			sink := &captureSink{}
+			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: query, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt", PollInterval: time.Millisecond, ClientOptions: uspclient.ClientOptions{DebugLog: func(string) {}, OnWarning: func(s string) { warnings = append(warnings, s) }, OnError: func(error) { errorsSeen++ }}}, doStop: stop, uspClient: sink, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
+			a.wgSenders.Add(1)
+			a.fetchEvents()
+			require.Equal(t, 2, calls, "one first-page request per poll")
+			require.Equal(t, 2, sink.count(), "keep collecting usable records on successive polls")
+			require.Zero(t, errorsSeen, "unsupported cursor query must not trigger the fatal or Org Error callback")
+			require.Len(t, warnings, 2, "exactly one pagination warning per poll")
+			for _, warning := range warnings {
+				require.Contains(t, warning, "wiz/README.md")
+				require.Contains(t, warning, "$after: String")
+				require.Contains(t, warning, "after: $after")
+				require.Contains(t, warning, "pageInfo { hasNextPage endCursor }")
+			}
+			require.Equal(t, stamp, nextFloor, "retain first-page checkpoint behavior")
 		})
 	}
 }
