@@ -28,14 +28,18 @@ type ackFrame struct {
 
 type trackingACKClient struct {
 	*uspclient.Client
-	receipts chan uspclient.AdmissionReceipt
-	calls    int
-	failOn   int
+	receipts      chan uspclient.AdmissionReceipt
+	calls         int
+	failOn        int
+	beforeFailure func()
 }
 
 func (c *trackingACKClient) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
 	c.calls++
 	if c.calls == c.failOn {
+		if c.beforeFailure != nil {
+			c.beforeFailure()
+		}
 		return uspclient.AdmissionReceipt{}, errors.New("synthetic admission failure")
 	}
 	r, e := c.Client.ShipWithReceipt(m, d)
@@ -138,10 +142,15 @@ func pollAsync(a *Office365Adapter, s *blobServer) <-chan bool {
 }
 func pollResult(t *testing.T, done <-chan bool) bool {
 	t.Helper()
+	return pollResultWithin(t, done, 5*time.Second)
+}
+
+func pollResultWithin(t *testing.T, done <-chan bool, timeout time.Duration) bool {
+	t.Helper()
 	select {
 	case ok := <-done:
 		return ok
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		t.Fatal("poll did not stop")
 		return false
 	}
@@ -265,7 +274,12 @@ func TestConfirmedACKPartialAdmissionFailure(t *testing.T) {
 	srv.add("blob-1", "", eventN("a", 1), eventN("a", 2), eventN("a", 3))
 	dd := newFakeBatchDeduper()
 	c, frames := ackClient(t)
-	tracked := &trackingACKClient{Client: c, receipts: make(chan uspclient.AdmissionReceipt, 3), failOn: 3}
+	releaseFailure := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(releaseFailure) }) }
+	t.Cleanup(release)
+	tracked := &trackingACKClient{Client: c, receipts: make(chan uspclient.AdmissionReceipt, 3), failOn: 3,
+		beforeFailure: func() { <-releaseFailure }}
 	a, _ := newBatchAdapter(t, srv, dd, tracked)
 	done := pollAsync(a, srv)
 	first := nextACKFrame(t, frames)
@@ -273,7 +287,9 @@ func TestConfirmedACKPartialAdmissionFailure(t *testing.T) {
 	acceptFrame(t, first)
 	receipt := <-tracked.receipts
 	require.Eventually(t, func() bool { return c.ObserveReceipt(receipt).Frame == uspclient.ReceiptAcknowledged }, 5*time.Second, time.Millisecond)
-	a.cancelStop()
+	// Only now permit the fatal admission error: this ACK was learned while
+	// the collector was still running, rather than during its failure exit.
+	release()
 	require.False(t, pollResult(t, done))
 	require.True(t, dd.has("a-0001"))
 	require.False(t, dd.has("a-0002"))
@@ -348,9 +364,9 @@ func TestConfirmedACKRequestsChunkTail(t *testing.T) {
 			dd.AddMany([]utils.DedupeKey{{Key: confirmedKey("known-0001")}})
 			c, frames := ackClient(t, true)
 			a, _ := newBatchAdapter(t, srv, dd, c)
-			a.conf.confirmationTimeout = 2 * time.Second
+			a.conf.confirmationTimeout = 20 * time.Second
 			done := pollAsync(a, srv)
-			require.True(t, pollResult(t, done), "peer ACKs only requested frames")
+			require.True(t, pollResultWithin(t, done, 30*time.Second), "peer ACKs only requested frames")
 			var received []protocol.DataMessage
 			for range tc.sent {
 				received = append(received, nextACKFrame(t, frames).msg)
@@ -370,4 +386,31 @@ func TestConfirmedACKRequestsChunkTail(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfirmedACKFatalAdmissionDoesNotWaitForTail(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1), eventN("a", 2), eventN("a", 3))
+	dd := newFakeBatchDeduper()
+	// No ACK timer and no manual ACKs. The requested chunk tail will fail
+	// admission, so neither of the first two records can be confirmed.
+	c, frames := ackClient(t, true)
+	tracked := &trackingACKClient{Client: c, receipts: make(chan uspclient.AdmissionReceipt, 3), failOn: 3}
+	a, _ := newBatchAdapter(t, srv, dd, tracked)
+	done := pollAsync(a, srv)
+	for range 2 {
+		require.False(t, nextACKFrame(t, frames).msg.AckRequested)
+	}
+	require.False(t, pollResult(t, done), "fatal admission must stop without cancelStop or the chunk deadline")
+	require.NoError(t, a.stopCtx.Err(), "test did not cancel the adapter")
+	for _, key := range []string{"a-0001", "a-0002", "a-0003", "blob-1"} {
+		require.False(t, dd.has(key))
+	}
+	replacement, replayed := ackClient(t, true)
+	b, _ := newBatchAdapter(t, srv, dd, replacement)
+	require.True(t, pollResult(t, pollAsync(b, srv)))
+	for i := 1; i <= 3; i++ {
+		require.Equal(t, eventN("a", i), nextACKFrame(t, replayed).msg.TextPayload)
+	}
+	require.True(t, dd.has("blob-1"))
 }

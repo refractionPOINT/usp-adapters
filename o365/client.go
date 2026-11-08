@@ -813,6 +813,9 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 		}
 		receipt, ok := a.admitContext(ctx, e.raw, i == lastToSend)
 		if !ok {
+			// Fatal admission must not wait for an ACK request that never shipped.
+			// The deferred observer can still commit an already confirmed prefix.
+			cancel()
 			return false
 		}
 		pending = append(pending, pendingEvent{key: e.key, receipt: receipt})
