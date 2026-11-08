@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -91,20 +92,13 @@ type graphRecord struct {
 // @odata.nextLink when pageSize truncates the result set
 // (https://learn.microsoft.com/en-us/graph/paging).
 //
-// The mock returns records in ascending createdDateTime order. That is a
-// deliberate modeling choice, not a Graph guarantee: the adapter sends no
-// $orderby (List alerts_v2 doesn't even offer one -- only $count, $filter,
-// $skip and $top are supported, and the official docs say "The most recent
-// alerts are displayed at the top of the list", i.e. newest first:
-// https://learn.microsoft.com/en-us/graph/api/security-list-alerts_v2).
-// Ascending order is the only ordering under which the adapter's
-// last-element watermark ships every record exactly once, which is the
-// behavior these tests pin.
+// The mock preserves insertion order, so tests can model ascending,
+// newest-first, and tied results without imposing a Graph ordering guarantee.
 type mockMsGraph struct {
 	mu      sync.Mutex
 	baseURL string // set once the httptest server is up; used for nextLink
 
-	records  []graphRecord // kept in ascending timestamp order
+	records  []graphRecord // returned in insertion order
 	pageSize int           // 0 = unlimited
 
 	// tsField is the datetime property the mock filters on; empty means
@@ -145,8 +139,7 @@ func (m *mockMsGraph) timestampField() string {
 	return m.tsField
 }
 
-// addRecord appends a record. Records must be added in ascending
-// timestamp order, matching how tests model a growing event stream.
+// addRecord appends a record in the desired response order.
 func (m *mockMsGraph) addRecord(payload map[string]interface{}) {
 	created, err := time.Parse(time.RFC3339Nano, payload[m.timestampField()].(string))
 	if err != nil {
@@ -314,6 +307,11 @@ func (m *mockMsGraph) serveGraph(w http.ResponseWriter, r *http.Request) {
 	baseURL := m.baseURL
 	m.mu.Unlock()
 
+	offset, _ := strconv.Atoi(r.URL.Query().Get("$skiptoken"))
+	if offset > len(matching) {
+		offset = len(matching)
+	}
+	matching = matching[offset:]
 	page := matching
 	truncated := false
 	if pageSize > 0 && len(matching) > pageSize {
@@ -333,7 +331,7 @@ func (m *mockMsGraph) serveGraph(w http.ResponseWriter, r *http.Request) {
 		// an opaque URL carrying a $skiptoken (or $skip) plus the original
 		// query parameters.
 		envelope["@odata.nextLink"] = baseURL + r.URL.Path +
-			"?$filter=" + url.QueryEscape(filter) + "&$skiptoken=fakeskiptoken1111"
+			"?$filter=" + url.QueryEscape(filter) + "&$skiptoken=" + strconv.Itoa(offset+pageSize)
 	}
 	writeJSON(w, http.StatusOK, envelope)
 }
@@ -388,10 +386,7 @@ func graphTimestamp(t time.Time) string {
 	return t.UTC().Format("2006-01-02T15:04:05.0000000Z")
 }
 
-// fixtureBase returns a time safely later than the adapter's startup `since`
-// filter. The adapter formats its initial `since` from the local clock with a
-// literal Z suffix, so on a machine east of UTC that boundary can sit up to 14
-// hours in the future; +24h clears it on any timezone.
+// fixtureBase returns a time safely later than the startup boundary.
 func fixtureBase() time.Time {
 	return time.Now().UTC().Add(24 * time.Hour)
 }
@@ -621,11 +616,8 @@ func TestMsGraphMidRunRecordShipsOnce(t *testing.T) {
 		"every alert must ship exactly once")
 }
 
-// TestMsGraphPagedSetFullyConsumed verifies behavior when Graph truncates a
-// result set and advertises @odata.nextLink: the adapter does not follow the
-// nextLink (pinning current behavior), but still consumes the full set across
-// successive polls because each shipped batch advances the createdDateTime
-// filter -- and every record ships exactly once.
+// TestMsGraphPagedSetFullyConsumed verifies every continuation is followed
+// and inclusive boundary records are not shipped again on subsequent polls.
 func TestMsGraphPagedSetFullyConsumed(t *testing.T) {
 	mock := newMockMsGraph()
 	mock.pageSize = 2
@@ -654,10 +646,9 @@ func TestMsGraphPagedSetFullyConsumed(t *testing.T) {
 		assert.Equalf(t, 1, n, "record %s shipped %d times", id, n)
 	}
 
-	// The adapter never follows @odata.nextLink; it relies on the advancing
-	// time filter instead.
+	// Every continuation must be consumed.
 	_, _, skipTokenReqs := mock.counts()
-	assert.Equal(t, 0, skipTokenReqs, "the adapter is not expected to follow @odata.nextLink")
+	assert.Greater(t, skipTokenReqs, 0, "the adapter must follow @odata.nextLink")
 }
 
 // TestMsGraphBadClientSecretShipsNothing pins the adapter's behavior on a
@@ -811,4 +802,17 @@ func TestMsGraphCustomTimestampField(t *testing.T) {
 		require.NotNil(t, byID[id], "record %s was not shipped", id)
 		assert.JSONEq(t, mustJSON(t, src), mustJSON(t, byID[id].JsonPayload))
 	}
+}
+
+func TestMsGraphNewestFirstPagination(t *testing.T) {
+	mock := newMockMsGraph()
+	mock.pageSize = 2
+	base := fixtureBase()
+	for i := 5; i >= 1; i-- {
+		mock.addRecord(graphSecurityAlert(fmt.Sprintf("alert-%d", i), graphTimestamp(base.Add(time.Duration(i)*time.Minute))))
+	}
+	server := mock.start(t)
+	sink, _, _ := startAdapter(t, testConfig(t, server))
+	require.Eventually(t, func() bool { return sink.count() == 5 }, time.Second, 10*time.Millisecond, "all five records must ship, including older pages")
+	require.Never(t, func() bool { return sink.count() != 5 }, 200*time.Millisecond, 10*time.Millisecond)
 }

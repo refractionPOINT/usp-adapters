@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -44,9 +45,9 @@ type MsGraphAdapter struct {
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
-	doStop    *utils.Event
 
-	ctx context.Context
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type MsGraphConfig struct {
@@ -105,10 +106,11 @@ func NewMsGraphAdapter(ctx context.Context, conf MsGraphConfig) (*MsGraphAdapter
 // tests use to capture shipped events.
 func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*MsGraphAdapter, chan struct{}, error) {
 	a := &MsGraphAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
+		conf: conf,
+		ctx:  context.Background(),
 	}
+
+	a.ctx, a.cancel = context.WithCancel(ctx)
 
 	a.loginEndpoint = strings.TrimSuffix(conf.LoginEndpoint, "/")
 	if a.loginEndpoint == "" {
@@ -124,6 +126,7 @@ func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*
 	} else {
 		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
 		if err != nil {
+			a.cancel()
 			return nil, nil, err
 		}
 		a.uspClient = uspClient
@@ -131,6 +134,9 @@ func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*
 
 	a.httpClient = &http.Client{
 		Timeout: 10 * time.Second,
+		// Refuse redirects before either bearer tokens or client credentials can
+		// be forwarded. Continuations are validated separately against the origin.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
 				Timeout: 10 * time.Second,
@@ -167,7 +173,7 @@ func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*
 func (a *MsGraphAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
-	a.doStop.Set()
+	a.cancel()
 	a.wgSenders.Wait()
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
@@ -182,18 +188,17 @@ func (a *MsGraphAdapter) Close() error {
 
 func (a *MsGraphAdapter) fetchToken() (string, error) {
 
-	url := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
-	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
+	tokenURL := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
+	payload := url.Values{"client_id": {a.conf.ClientID}, "scope": {scope}, "grant_type": {"client_credentials"}, "client_secret": {a.conf.ClientSecret}}.Encode()
 
-	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
+	req, err := http.NewRequestWithContext(a.ctx, "POST", tokenURL, bytes.NewBufferString(payload))
 	if err != nil {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := a.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
@@ -204,178 +209,216 @@ func (a *MsGraphAdapter) fetchToken() (string, error) {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("token endpoint returned HTTP %d", resp.StatusCode)
+	}
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("no bearer token returned: %s", err)
 	}
 
 	accessToken, ok := result["access_token"].(string)
-	if !ok {
-		return "", fmt.Errorf("no bearer token returned: %#v", result)
+	if !ok || accessToken == "" {
+		return "", errors.New("no bearer token returned")
 	}
 
 	return accessToken, nil
 
 }
 
-func (a *MsGraphAdapter) fetchEvents(url string) {
+// graphCursor is committed only after every page has been shipped. The inclusive
+// boundary retains all IDs at the maximum parsed instant, independent of order.
+type graphCursor struct {
+	since time.Time
+	ids   map[string]bool
+}
+
+type graphRecordKey struct {
+	id      string
+	instant time.Time
+}
+
+func (a *MsGraphAdapter) fetchEvents(eventsURL string) {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
-
-	lastEventId := ""
-	// since := time.Date(2022, time.June, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000000Z")
-	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
-
-	for !a.doStop.WaitFor(a.pollInterval) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
-		items, newSince, eventId, _ := a.makeOneListRequest(url, since, lastEventId)
-		since = newSince
-		lastEventId = eventId
-		if items == nil {
-			continue
+	cursor := graphCursor{since: time.Now().UTC(), ids: map[string]bool{}}
+	// Retain successful shipments while retrying an incomplete scan, including
+	// older records that would otherwise be skipped by a premature watermark.
+	delivered := map[graphRecordKey]bool{}
+	for {
+		timer := time.NewTimer(a.pollInterval)
+		select {
+		case <-a.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
 		}
 
-		for _, item := range items {
-			msg := &protocol.DataMessage{
-				JsonPayload: item,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
-				}
-				if err == nil {
-					continue
-				}
-				if err != uspclient.ErrorClosed {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				}
-				a.doStop.Set()
+		next, err := a.poll(eventsURL, cursor, delivered)
+		if err != nil {
+			if a.ctx.Err() != nil || errors.Is(err, uspclient.ErrorClosed) {
 				return
 			}
+			a.conf.ClientOptions.OnError(err)
+			continue
 		}
+		cursor = next
+		delivered = map[graphRecordKey]bool{}
 	}
 }
 
-func (a *MsGraphAdapter) makeOneListRequest(eventsUrl string, since string, lastEventId string) ([]map[string]interface{}, string, string, error) {
-	var alerts []map[string]interface{}
-	var lastDetectionTime, eventId string
-
-	// Retry up to 3 times
-	tsField := a.conf.TimestampField
-	if tsField == "" {
-		tsField = defaultTimestampField
+func (a *MsGraphAdapter) timestampField() string {
+	if a.conf.TimestampField != "" {
+		return a.conf.TimestampField
 	}
+	return defaultTimestampField
+}
 
+// poll streams pages, but keeps the committed watermark unchanged on any
+// request, decoding, validation or shipping failure. delivered is retry state.
+func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered map[graphRecordKey]bool) (graphCursor, error) {
+	origin, err := url.Parse(eventsURL)
+	if err != nil {
+		return cursor, err
+	}
+	if origin.Host == "" || origin.User != nil || (origin.Scheme != "https" && origin.Scheme != "http") {
+		return cursor, errors.New("invalid Graph endpoint")
+	}
+	query, err := url.ParseQuery(origin.RawQuery)
+	if err != nil {
+		return cursor, errors.New("invalid Graph query")
+	}
+	filter := a.timestampField() + " ge " + cursor.since.UTC().Format(time.RFC3339Nano)
+	if existing := query.Get("$filter"); existing != "" {
+		filter = "(" + existing + ") and (" + filter + ")"
+	}
+	query.Set("$filter", filter)
+	first := *origin
+	first.RawQuery = query.Encode()
+	current := &first
+	visited := map[string]bool{}
+	token := ""
+	candidate := graphCursor{since: cursor.since, ids: map[string]bool{}}
+	for id := range cursor.ids {
+		candidate.ids[id] = true
+	}
+	for {
+		if a.ctx.Err() != nil {
+			return cursor, a.ctx.Err()
+		}
+		if visited[current.String()] {
+			return cursor, errors.New("Graph continuation cycle")
+		}
+		visited[current.String()] = true
+		body, err := a.requestPage(current.String(), &token)
+		if err != nil {
+			return cursor, err
+		}
+		var page struct {
+			Value json.RawMessage `json:"value"`
+			Next  string          `json:"@odata.nextLink"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return cursor, errors.New("invalid Graph page JSON")
+		}
+		var records []map[string]interface{}
+		if len(page.Value) == 0 || string(page.Value) == "null" {
+			return cursor, errors.New("missing Graph value array")
+		}
+		if err := json.Unmarshal(page.Value, &records); err != nil {
+			return cursor, errors.New("invalid Graph value array")
+		}
+		for _, record := range records {
+			id, _ := record["id"].(string)
+			stamp, _ := record[a.timestampField()].(string)
+			instant, err := time.Parse(time.RFC3339Nano, stamp)
+			if err != nil || id == "" {
+				return cursor, errors.New("Graph record requires an ID and valid timestamp")
+			}
+			instant = instant.UTC()
+			if instant.Before(cursor.since) {
+				continue
+			}
+			key := graphRecordKey{id: id, instant: instant}
+			if !(instant.Equal(cursor.since) && cursor.ids[id]) && !delivered[key] {
+				if a.ctx.Err() != nil {
+					return cursor, a.ctx.Err()
+				}
+				msg := &protocol.DataMessage{JsonPayload: record, TimestampMs: uint64(time.Now().UnixMilli())}
+				err = a.uspClient.Ship(msg, 10*time.Second)
+				if err == uspclient.ErrorBufferFull {
+					a.conf.ClientOptions.OnWarning("stream falling behind")
+					err = a.uspClient.Ship(msg, time.Hour)
+				}
+				if err != nil {
+					return cursor, fmt.Errorf("Ship(): %w", err)
+				}
+				delivered[key] = true
+			}
+			if instant.After(candidate.since) {
+				candidate.since = instant
+				candidate.ids = map[string]bool{}
+			}
+			if instant.Equal(candidate.since) {
+				candidate.ids[id] = true
+			}
+		}
+		if page.Next == "" {
+			return candidate, nil
+		}
+		link, err := url.Parse(page.Next)
+		if err != nil {
+			return cursor, errors.New("invalid Graph continuation")
+		}
+		link = current.ResolveReference(link)
+		if !strings.EqualFold(link.Scheme, origin.Scheme) || !strings.EqualFold(link.Host, origin.Host) || link.User != nil || link.Fragment != "" {
+			return cursor, errors.New("Graph continuation must use the configured origin")
+		}
+		// nextLink is opaque: never reconstruct its query or add the filter again.
+		current = link
+	}
+}
+
+func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, error) {
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Create query parameters
-		filter := "%24"
-		query := "%20ge%20"
-		date_filter := fmt.Sprintf("?%sfilter=%s%s%s", filter, tsField, query, strings.Replace(since, ":", "%3A", -1))
-
-		// Create the full request URL with query parameters (don't modify eventsUrl to avoid corruption on retries)
-		requestUrl := eventsUrl + date_filter
-
-		authToken, err := a.fetchToken()
+		var err error
+		if *token == "" {
+			*token, err = a.fetchToken()
+		}
 		if err != nil {
-			// Retry if token fetch failed, but continue to the next iteration
-			if attempt < 3 {
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("error fetching token (attempt %d), retrying: %s", attempt, err))
-				time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
-				continue
+			if attempt == 3 {
+				return nil, fmt.Errorf("error fetching token after 3 attempts: %w", err)
 			}
-			// Return after 3 failed attempts
-			a.conf.ClientOptions.OnError(fmt.Errorf("error fetching token after 3 attempts: %s", err))
-			return nil, since, "", fmt.Errorf("error fetching token after 3 attempts: %s", err)
-		}
-
-		req, err := http.NewRequest("GET", requestUrl, nil)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error creating request: %s", err))
-			return nil, since, "", err
-		}
-
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
-		req.Header.Set("Content-Type", "application/json")
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error making request: %s", err))
-			return nil, since, "", err
-		}
-		defer resp.Body.Close()
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error reading response: %s", err))
-			return nil, since, "", err
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			// Check for retryable status codes (503, 504) - likely Microsoft infrastructure issues
-			isRetryable := resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout
-
-			if isRetryable {
-				// Retry for transient infrastructure errors
-				if attempt < 3 {
-					a.conf.ClientOptions.OnWarning(fmt.Sprintf("Microsoft API returned %d (attempt %d), retrying: %s", resp.StatusCode, attempt, body))
-					time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
-					continue
-				}
-				// Final attempt for retryable error
-				a.conf.ClientOptions.OnError(fmt.Errorf("Microsoft API returned %d after 3 attempts: %s", resp.StatusCode, body))
-				return nil, since, "", fmt.Errorf("Microsoft API returned %d after 3 attempts: %s", resp.StatusCode, body)
-			} else {
-				// Non-retryable error (auth, permission, etc) - fail immediately
-				a.conf.ClientOptions.OnError(fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s", body))
-				return nil, since, "", fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s", body)
+		} else {
+			req, err := http.NewRequestWithContext(a.ctx, "GET", pageURL, nil)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("Authorization", "Bearer "+*token)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := a.httpClient.Do(req)
+			if err != nil {
+				return nil, errors.New("Graph request failed")
+			}
+			body, readErr := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
+			if readErr != nil {
+				return nil, errors.New("error reading Graph response")
+			}
+			if resp.StatusCode == http.StatusOK {
+				return body, nil
+			}
+			if (resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusGatewayTimeout) || attempt == 3 {
+				return nil, fmt.Errorf("Microsoft API returned HTTP %d; verify permissions and Microsoft API status", resp.StatusCode)
 			}
 		}
-
-		// If the response is OK, parse the body and process detections
-		var data map[string]interface{}
-		err = json.Unmarshal(body, &data)
-		detections, _ := data["value"].([]interface{})
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error parsing JSON: %v", err))
-			return nil, since, "", err
+		// Cancellable backoff also bounds shutdown during authentication failures.
+		timer := time.NewTimer(time.Duration(attempt) * time.Second)
+		select {
+		case <-a.ctx.Done():
+			timer.Stop()
+			return nil, a.ctx.Err()
+		case <-timer.C:
 		}
-
-		items := detections
-
-		lastDetectionTime = since
-		for _, detection := range items {
-			detectMap, ok := detection.(map[string]interface{})
-			if !ok {
-				a.conf.ClientOptions.DebugLog("error parsing detectMap JSON")
-				continue
-			}
-
-			id, ok := detectMap["id"].(string)
-			if !ok {
-				a.conf.ClientOptions.DebugLog("error parsing ID from detectMap JSON")
-				continue
-			}
-			eventId = id
-
-			if id != lastEventId {
-				eventTime, ok := detectMap[tsField].(string)
-				if !ok {
-					a.conf.ClientOptions.DebugLog(fmt.Sprintf("error parsing %s from detectMap JSON", tsField))
-					continue
-				}
-
-				lastDetectionTime = eventTime
-				alerts = append(alerts, detectMap)
-			}
-		}
-
-		// Break out of the loop if successful
-		break
 	}
-
-	return alerts, lastDetectionTime, eventId, nil
+	return nil, errors.New("Graph retries exhausted")
 }
