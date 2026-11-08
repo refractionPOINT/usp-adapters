@@ -66,9 +66,9 @@ func (a *SQSFilesAdapter) handleBatchSlot(ctx context.Context, messages []*sqs.M
 	}
 	// Each source batch may prepare independently. The SDK tracker orders all
 	// admissions; the short registration lock orders immutable batch markers.
-	eligible, dependency, err := a.prepareBatch(l.ctx, messages)
+	eligible, dependency, hasDependency, err := a.prepareBatch(l.ctx, messages)
 	var marker uint64
-	if err == nil && len(eligible) > 0 {
+	if err == nil && len(eligible) > 0 && hasDependency {
 		d.mu.Lock()
 		d.next++
 		marker = d.next
@@ -84,8 +84,12 @@ func (a *SQSFilesAdapter) handleBatchSlot(ctx context.Context, messages []*sqs.M
 	if len(eligible) == 0 {
 		return nil
 	}
-	if err := a.awaitDeliveryContext(l.ctx, slot, marker); err != nil {
-		return err
+	// An all-absent batch has no successful admission/dependency to confirm.
+	// Its cleanup still requires known lease ownership and a joined renewer.
+	if hasDependency {
+		if err := a.awaitDeliveryContext(l.ctx, slot, marker); err != nil {
+			return err
+		}
 	}
 	deleteCtx, cancel, err := l.cleanupContext()
 	if err != nil {

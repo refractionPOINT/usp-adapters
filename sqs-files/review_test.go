@@ -259,9 +259,10 @@ func TestReviewPoisonNotificationsRetainedWithoutBlockingValidWork(t *testing.T)
 	if len(f.errors) != 0 {
 		t.Fatalf("permanent notifications raised fatal callback: %v", <-f.errors)
 	}
+	waitReview(t, "decode-only notification did not complete", func() bool { f.mu.Lock(); defer f.mu.Unlock(); return f.deleted["1"] })
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.deleted) != 1 {
+	if len(f.deleted) != 2 || !f.deleted["1"] || !f.deleted["2"] {
 		t.Fatalf("poison notifications deleted: %v", f.deleted)
 	}
 }
@@ -338,7 +339,7 @@ func TestReviewMixedBatchRetainsOnlyBadNotifications(t *testing.T) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if len(f.deleted) != 1 || !f.deleted["6"] {
+	if len(f.deleted) != 2 || !f.deleted["2"] || !f.deleted["6"] {
 		t.Fatalf("mixed notification disposal=%v", f.deleted)
 	}
 	if len(f.errors) != 0 || len(f.warnings) != 6 {

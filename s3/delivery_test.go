@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-func objectSink(t testing.TB) (*uspclient.Client, func(uint64), <-chan uint64, uspclient.ClientOptions) {
+func objectSink(t testing.TB, allowEmpty ...bool) (*uspclient.Client, func(uint64), <-chan uint64, uspclient.ClientOptions) {
 	t.Helper()
 	received := make(chan uint64, 128)
 	var mu sync.Mutex
@@ -52,7 +52,7 @@ func objectSink(t testing.TB) (*uspclient.Client, func(uint64), <-chan uint64, u
 			}
 			var m protocol.DataMessage
 			if msgpack.Unmarshal(raw, &m) == nil {
-				if string(m.BundlePayload) != "first\nother\n" {
+				if string(m.BundlePayload) != "first\nother\n" && !(len(allowEmpty) > 0 && allowEmpty[0] && len(m.BundlePayload) == 0) {
 					t.Error("object records must stay together in their acknowledged bundle")
 				}
 				received <- m.SeqNum
@@ -407,22 +407,13 @@ func TestBoundedBatchPartialACK(t *testing.T) {
 	}
 	removals := func(first, last int) {
 		t.Helper()
-		var observation uint64
-		for i := first; i <= last; i++ {
-			select {
-			case key := <-deleted:
-				require.Equal(t, fmt.Sprintf("test-%02d.log", i), key)
-				count := <-snapshotCounts
-				if i == first {
-					observation = count
-				} else {
-					require.Equal(t, observation, count, "one SDK snapshot must cover the entire confirmed prefix")
-				}
-			case <-time.After(objectTestTimeout):
-				t.Fatalf("confirmed object %d was not deleted", i)
-			}
+		expectDeletedPrefix(t, deleted, first, last)
+		observation := <-snapshotCounts
+		for i := first + 1; i <= last; i++ {
+			require.Equal(t, observation, <-snapshotCounts, "one SDK snapshot must cover the entire confirmed prefix")
 		}
 	}
+
 	receive(1, 32)
 	select {
 	case n := <-received:
@@ -522,14 +513,7 @@ func TestCloseFlushesBoundedBatch(t *testing.T) {
 	case <-time.After(objectTestTimeout):
 		t.Fatal("Close stuck")
 	}
-	for i := 1; i <= 32; i++ {
-		select {
-		case key := <-deleted:
-			require.Equal(t, fmt.Sprintf("test-%02d.log", i), key)
-		default:
-			t.Fatal("missing final prefix deletion")
-		}
-	}
+	expectDeletedPrefix(t, deleted, 1, 32)
 	select {
 	case n := <-received:
 		t.Fatalf("admitted after stop: %d", n)
@@ -552,14 +536,7 @@ func TestCloseRetainsUnconfirmedBatchSuffix(t *testing.T) {
 	ack(3)
 	require.Eventually(t, func() bool { pending, err := sink.GetUnsent(); return err == nil && len(pending) == 3 }, objectTestTimeout, time.Millisecond)
 	require.Error(t, a.Close())
-	for i := 1; i <= 3; i++ {
-		select {
-		case key := <-deleted:
-			require.Equal(t, fmt.Sprintf("test-%02d.log", i), key)
-		default:
-			t.Fatal("missing confirmed prefix deletion")
-		}
-	}
+	expectDeletedPrefix(t, deleted, 1, 3)
 	select {
 	case key := <-deleted:
 		t.Fatalf("unconfirmed suffix deleted: %s", key)
@@ -629,3 +606,19 @@ func TestObservationFailureRetainsBatch(t *testing.T) {
 }
 
 const objectTestTimeout = 10 * time.Second
+
+// Cleanup order is independent inside a confirmed prefix; its membership is not.
+func expectDeletedPrefix(t testing.TB, deleted <-chan string, first, last int) {
+	t.Helper()
+	want, got := []string{}, []string{}
+	for i := first; i <= last; i++ {
+		want = append(want, fmt.Sprintf("test-%02d.log", i))
+		select {
+		case key := <-deleted:
+			got = append(got, key)
+		case <-time.After(objectTestTimeout):
+			t.Fatal("missing confirmed prefix deletion")
+		}
+	}
+	require.ElementsMatch(t, want, got)
+}

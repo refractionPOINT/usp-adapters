@@ -77,7 +77,9 @@ func TestDeliveryConfirmedSourceDelete(t *testing.T) {
 	}))
 	defer source.Close()
 	sess := session.Must(session.NewSession(&aws.Config{S3ForcePathStyle: aws.Bool(true), DisableComputeChecksums: aws.Bool(true), Region: aws.String("us-east-1"), Endpoint: aws.String(source.URL), Credentials: credentials.NewStaticCredentials("test", "test", ""), MaxRetries: aws.Int(0)}))
-	a := &SQSFilesAdapter{uspClient: c, ctx: context.Background()}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := &SQSFilesAdapter{uspClient: c, ctx: ctx}
 	a.conf.ClientOptions = opts
 	a.conf.QueueURL = source.URL
 	a.sqsClient = awssqs.New(sess)
@@ -88,16 +90,41 @@ func TestDeliveryConfirmedSourceDelete(t *testing.T) {
 	go a.processFiles()
 	done := make(chan struct{})
 	go func() { defer close(done); t.Logf("receive: %v", a.receiveEvents()) }()
-	time.Sleep(2 * time.Second)
-	if receives.Load() == 0 {
-		t.Fatal("source was not read")
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("receiver cleanup did not join")
+		}
+	}()
+	// Positive proof first: the source was received, downloaded and admitted
+	// to the actual SDK. An idle receiver must not pass this negative-ACK test.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, err := c.GetUnsent()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if receives.Load() > 0 && len(pending) == 1 && string(pending[0].BundlePayload) == "test" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("source event was not received and admitted")
+		}
+		select {
+		case <-done:
+			t.Fatal("receiver stopped before source admission")
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
+	// Only the absence-of-deletion check uses a fixed observation window.
+	time.Sleep(150 * time.Millisecond)
 	if deleted.Load() {
 		t.Error("source deleted before delivery confirmation")
 	}
 	a.collectionContext()
 	a.stopCollection()
-	c.Close()
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):

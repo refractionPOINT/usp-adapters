@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
@@ -210,8 +211,18 @@ func (a *SQSFilesAdapter) downloaderForBucket(ctx context.Context, bucket string
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, leaseRPCBudget)
 	region, err := s3manager.GetBucketRegionWithClient(lookupCtx, s3.New(sess), bucket)
+	lookupErr := lookupCtx.Err()
 	cancel()
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
+		if lookupErr != nil {
+			return nil, fmt.Errorf("s3.Region: %w", lookupErr)
+		}
+		if sourceIsAbsent(err, "NoSuchBucket", "NotFound") {
+			return nil, &absentSourceError{err}
+		}
 		return nil, fmt.Errorf("s3.Region: %w", err)
 	}
 	if ctx.Err() != nil {
@@ -257,17 +268,27 @@ func (a *SQSFilesAdapter) receiveEvents() (receiveErr error) {
 // them; without it they can replay until the source retention window expires.
 type permanentNotificationError struct{ error }
 
+// Only a successful download followed by a decode failure gets this outcome.
+// It completes that file without touching the object; malformed notification
+// paths/configuration remain retained notification errors.
+type undecodableFileError struct {
+	error
+	bucket string
+	key    string
+}
+
 // S3 sends this control notice when notification delivery is configured. It has
 // no telemetry to admit. Retain it for redrive/DLQ without raising a fatal error.
 var errS3TestEvent = errors.New("S3 TestEvent control notice retained for queue redrive/DLQ")
 
 func permanent(err error) error { return &permanentNotificationError{err} }
 
-func (a *SQSFilesAdapter) prepareBatch(ctx context.Context, messages []*sqs.Message) ([]*sqs.Message, acktrack.ACKDependency, error) {
+func (a *SQSFilesAdapter) prepareBatch(ctx context.Context, messages []*sqs.Message) ([]*sqs.Message, acktrack.ACKDependency, bool, error) {
 	var eligible []*sqs.Message
 	var dependency acktrack.ACKDependency
+	var hasDependency bool
 	for _, m := range messages {
-		dep, err := a.processNotification(ctx, m)
+		dep, hasDep, err := a.processNotification(ctx, m)
 		if err != nil {
 			if errors.Is(err, errS3TestEvent) && ctx.Err() == nil {
 				if a.conf.ClientOptions.OnWarning != nil {
@@ -282,28 +303,32 @@ func (a *SQSFilesAdapter) prepareBatch(ctx context.Context, messages []*sqs.Mess
 				}
 				continue
 			}
-			return nil, dependency, err
+			return nil, dependency, hasDependency, err
 		}
-		dependency, err = dependency.Include(dep)
-		if err != nil {
-			return nil, dependency, err
+		if hasDep {
+			dependency, err = dependency.Include(dep)
+			if err != nil {
+				return nil, dependency, hasDependency, err
+			}
+			hasDependency = true
 		}
 		eligible = append(eligible, m)
 	}
-	return eligible, dependency, nil
+	return eligible, dependency, hasDependency, nil
 }
-func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.Message) (acktrack.ACKDependency, error) {
+func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.Message) (acktrack.ACKDependency, bool, error) {
 	var dependency acktrack.ACKDependency
+	var hasDependency bool
 	d := utils.Dict{}
 	if message.Body == nil {
-		return dependency, permanent(errors.New("missing notification body"))
+		return dependency, hasDependency, permanent(errors.New("missing notification body"))
 	}
 	if err := json.Unmarshal([]byte(*message.Body), &d); err != nil {
-		return dependency, permanent(err)
+		return dependency, hasDependency, permanent(err)
 	}
 	_, hasRecords := d["Records"]
 	if !hasRecords && d.ExpandableFindOneString("Event") == "s3:TestEvent" && d.ExpandableFindOneString("Service") == "Amazon S3" {
-		return dependency, errS3TestEvent
+		return dependency, hasDependency, errS3TestEvent
 	}
 	bucket := a.conf.Bucket
 	if bucket == "" {
@@ -311,11 +336,16 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	}
 	paths := d.ExpandableFindString(a.conf.FilePath)
 	if bucket == "" || len(paths) == 0 {
-		return dependency, permanent(errors.New("notification missing bucket or files"))
+		return dependency, hasDependency, permanent(errors.New("notification missing bucket or files"))
 	}
 	downloader, err := a.downloaderForBucket(ctx, bucket)
 	if err != nil {
-		return dependency, err
+		var absent *absentSourceError
+		if errors.As(err, &absent) && ctx.Err() == nil {
+			a.warnAbsent(absent)
+			return dependency, false, nil
+		}
+		return dependency, hasDependency, err
 	}
 	fileCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -324,7 +354,7 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 		select {
 		case a.chFiles <- fileInfo{bucket: bucket, path: path, done: results, ctx: fileCtx, downloader: downloader}:
 		case <-ctx.Done():
-			return dependency, context.Cause(ctx)
+			return dependency, hasDependency, context.Cause(ctx)
 		}
 	}
 	var permanentErr error
@@ -332,23 +362,36 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 		select {
 		case r := <-results:
 			if r.err != nil {
+				var absent *absentSourceError
+				if errors.As(r.err, &absent) && ctx.Err() == nil {
+					a.warnAbsent(absent)
+					continue
+				}
+				var skipped *undecodableFileError
+				if errors.As(r.err, &skipped) && ctx.Err() == nil {
+					if a.conf.ClientOptions.OnWarning != nil {
+						a.conf.ClientOptions.OnWarning(fmt.Sprintf("skipped_undecodable_files=1 bucket=%q object_key=%q: %v", skipped.bucket, skipped.key, skipped.error))
+					}
+					continue
+				}
 				var bad *permanentNotificationError
 				if errors.As(r.err, &bad) && ctx.Err() == nil {
 					permanentErr = bad
 					continue
 				}
-				return dependency, r.err
+				return dependency, hasDependency, r.err
 			}
 			var err error
 			dependency, err = dependency.Include(r.dep)
 			if err != nil {
-				return dependency, err
+				return dependency, hasDependency, err
 			}
+			hasDependency = true
 		case <-ctx.Done():
-			return dependency, context.Cause(ctx)
+			return dependency, hasDependency, context.Cause(ctx)
 		}
 	}
-	return dependency, permanentErr
+	return dependency, hasDependency, permanentErr
 }
 
 func (a *SQSFilesAdapter) processFiles() error {
@@ -374,6 +417,12 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 	}
 	writerAt := aws.NewWriteAtBuffer([]byte{})
 	if _, err := f.downloader.DownloadWithContext(f.ctx, writerAt, &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}); err != nil {
+		if f.ctx.Err() != nil {
+			return empty, context.Cause(f.ctx)
+		}
+		if sourceIsAbsent(err, "NoSuchKey", "NotFound") {
+			return empty, &absentSourceError{err}
+		}
 		return empty, err
 	}
 	if err := f.ctx.Err(); err != nil {
@@ -384,7 +433,7 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 		if f.ctx.Err() != nil {
 			return empty, context.Cause(f.ctx)
 		}
-		return empty, permanent(err)
+		return empty, &undecodableFileError{error: err, bucket: f.bucket, key: path}
 	}
 	if err := f.ctx.Err(); err != nil {
 		return empty, context.Cause(f.ctx)
@@ -410,4 +459,36 @@ func (a *SQSFilesAdapter) shipEventContext(ctx context.Context, data []byte, isC
 	}
 
 	return a.shipContext(ctx, msg)
+}
+
+// An absent source has no remaining bytes to admit; unlike malformed data, it
+// is complete rather than retained for DLQ. Authorization, server, transport,
+// and cancellation failures must never be mistaken for absence.
+type absentSourceError struct{ error }
+
+func sourceIsAbsent(err error, codes ...string) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var api awserr.Error
+	if errors.As(err, &api) && (api.Code() == "AccessDenied" || api.Code() == "Forbidden") {
+		return false
+	}
+	var failure awserr.RequestFailure
+	if errors.As(err, &failure) && failure.StatusCode() != 0 {
+		return failure.StatusCode() == 404
+	}
+	if errors.As(err, &api) {
+		for _, code := range codes {
+			if api.Code() == code {
+				return true
+			}
+		}
+	}
+	return false
+}
+func (a *SQSFilesAdapter) warnAbsent(err error) {
+	if a.conf.ClientOptions.OnWarning != nil {
+		a.conf.ClientOptions.OnWarning(fmt.Sprintf("S3 source absent; completing file without admission: %v", err))
+	}
 }

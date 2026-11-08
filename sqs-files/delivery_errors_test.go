@@ -19,7 +19,7 @@ import (
 )
 
 func TestReceiverFailuresReachOnError(t *testing.T) {
-	for _, kind := range []string{"ship", "observe", "renewal_uncertain", "delete_rpc", "delete_partial", "download"} {
+	for _, kind := range []string{"ship", "observe", "renewal_uncertain", "delete_rpc", "delete_partial", "download_forbidden", "download_server", "download_network"} {
 		t.Run(kind, func(t *testing.T) {
 			old := sourceLeaseBudget
 			sourceLeaseBudget = 10 * time.Second
@@ -49,8 +49,20 @@ func TestReceiverFailuresReachOnError(t *testing.T) {
 			var receives atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" {
-					if kind == "download" {
-						http.Error(w, "not found", http.StatusNotFound)
+					switch kind {
+					case "download_forbidden":
+						http.Error(w, "forbidden", 403)
+						return
+					case "download_server":
+						http.Error(w, "server failed", 503)
+						return
+					case "download_network":
+						conn, _, err := w.(http.Hijacker).Hijack()
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						conn.Close()
 						return
 					}
 					fmt.Fprint(w, "not a parquet file")

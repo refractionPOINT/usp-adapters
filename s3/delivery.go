@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 )
 
 const maxPendingObjectDeletes = 32
+const maxConcurrentObjectDeletes = 8
 
 // No payloads or localFile pointers belong in this bounded source identity queue.
 // Only the collector mutates it; Close joins that collector before final flush.
@@ -74,10 +76,20 @@ func (a *S3Adapter) confirmDelete() error {
 	if len(a.pendingDeletes) == 0 {
 		return nil
 	}
+	count, err := a.confirmedDeletePrefix()
+	if err != nil {
+		return err
+	}
+	return a.deleteConfirmedPrefix(count)
+}
+
+// Finish all ACK observations before starting network cleanup. Every delete in
+// this batch is covered by the same frozen observation, including partial ACKs.
+func (a *S3Adapter) confirmedDeletePrefix() (int, error) {
 	// Fail closed on snapshot errors, including during the final shutdown drain.
 	snapshot, err := a.uspClient.GetUnsent()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	// GetUnsent returns a copy. Keep sequence-only cells so ACKs arriving
 	// during source DELETEs do not leave large payloads pinned by this view.
@@ -89,30 +101,67 @@ func (a *S3Adapter) confirmDelete() error {
 	}
 	a.ackView.snapshot, a.ackView.observing = snapshot, true
 	defer func() { a.ackView.snapshot = nil; a.ackView.observing = false }()
-	for len(a.pendingDeletes) > 0 {
-		next := a.pendingDeletes[0]
+	count := 0
+	for _, next := range a.pendingDeletes {
 		if err := a.tracker.Candidate("objects", binary.BigEndian.AppendUint64(nil, next.marker), next.dependency); err != nil {
-			return err
+			return 0, err
 		}
 		confirmed, err := a.tracker.Confirm()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		raw := confirmed["objects"]
 		if len(raw) != 8 || binary.BigEndian.Uint64(raw) < next.marker {
-			return nil
+			return count, nil
 		}
-		// A changed or externally removed object is normal source churn.
-		// Retire only this delivered identity and let the next listing discover
-		// a replacement. Other delete failures still stop this client lifetime.
-		if err := next.remove(); err != nil && !objectDeleteRace(err) {
-			a.deleteErr = fmt.Errorf("s3.DeleteObject(): %w", err)
-			a.conf.ClientOptions.OnError(a.deleteErr)
-			return a.deleteErr
+		count++
+	}
+	return count, nil
+}
+
+// Workers touch only their own result slots. Join them before mutating pending
+// metadata or reporting errors, so neither collection nor Close leaves cleanup
+// running in the background. A fatal error stops future batches; already ACKed
+// identities in this batch may finish cleanup alongside the failing request.
+func (a *S3Adapter) deleteConfirmedPrefix(count int) error {
+	if count == 0 {
+		return nil
+	}
+	results := make([]error, count)
+	jobs := make(chan int, count)
+	for i := 0; i < count; i++ {
+		jobs <- i
+	}
+	close(jobs)
+	var wg sync.WaitGroup
+	for w := 0; w < min(count, maxConcurrentObjectDeletes); w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				results[i] = a.pendingDeletes[i].remove()
+			}
+		}()
+	}
+	wg.Wait()
+	retained := a.pendingDeletes[:0]
+	var failures []error
+	for i, entry := range a.pendingDeletes {
+		if i < count {
+			err := results[i]
+			if err == nil || objectDeleteRace(err) {
+				continue
+			}
+			failures = append(failures, fmt.Errorf("s3.DeleteObject(): %w", err))
 		}
-		// Clear references in the backing array before advancing the prefix.
-		a.pendingDeletes[0] = pendingObjectDelete{}
-		a.pendingDeletes = a.pendingDeletes[1:]
+		retained = append(retained, entry)
+	}
+	clear(a.pendingDeletes[len(retained):])
+	a.pendingDeletes = retained
+	if len(failures) > 0 {
+		a.deleteErr = errors.Join(failures...)
+		a.conf.ClientOptions.OnError(a.deleteErr)
+		return a.deleteErr
 	}
 	return nil
 }

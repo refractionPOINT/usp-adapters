@@ -120,8 +120,9 @@ type s3LocalFile struct {
 }
 
 type s3Record struct {
-	Key  string
-	Size int64
+	Key        string
+	Size       int64
+	ListedETag string
 }
 
 func NewS3Adapter(ctx context.Context, conf S3Config) (*S3Adapter, chan struct{}, error) {
@@ -350,7 +351,7 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 		}
 		e := resp.Contents[nextFileIndex]
 		nextFileIndex++
-		return &s3Record{Key: *e.Key, Size: *e.Size}, nil
+		return &s3Record{Key: *e.Key, Size: *e.Size, ListedETag: aws.StringValue(e.ETag)}, nil
 	}, a.conf.ParallelFetch, func(e utils.Element) utils.Element {
 		item := e.(*s3Record)
 
@@ -371,7 +372,15 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 		// response belongs to the same object before admitting the bundle.
 		var identity s3ObjectIdentity
 		var identityMu sync.Mutex
+		var identityRejected, emptyRange bool
 		observeIdentity := func(r *request.Request) {
+			r.Handlers.Complete.PushBack(func(r *request.Request) {
+				if r.HTTPResponse != nil && r.HTTPResponse.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+					identityMu.Lock()
+					emptyRange = true
+					identityMu.Unlock()
+				}
+			})
 			r.Handlers.Unmarshal.PushBack(func(r *request.Request) {
 				output, ok := r.Data.(*s3.GetObjectOutput)
 				if !ok || r.Error != nil {
@@ -381,6 +390,7 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 				identityMu.Lock()
 				defer identityMu.Unlock()
 				if current.ETag == "" || (identity.ETag != "" && identity != current) {
+					identityRejected = true
 					r.Error = errors.New("downloaded object identity missing or changed")
 					return
 				}
@@ -388,10 +398,25 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 			})
 		}
 
-		if _, err := a.awsDownloader.Download(writerAt, &s3.GetObjectInput{
-			Bucket: aws.String(a.conf.BucketName),
-			Key:    aws.String(item.Key),
-		}, s3manager.WithDownloaderRequestOptions(observeIdentity)); err != nil {
+		input := &s3.GetObjectInput{Bucket: aws.String(a.conf.BucketName), Key: aws.String(item.Key)}
+		if item.Size == 0 && item.ListedETag != "" {
+			input.IfMatch = aws.String(item.ListedETag)
+		}
+		n, err := a.awsDownloader.Download(writerAt, input, s3manager.WithDownloaderRequestOptions(observeIdentity))
+		if err == nil {
+			identityMu.Lock()
+			// The downloader turns ranged 416 into success for empty objects.
+			// Only a validated zero-byte read may borrow the listed identity;
+			// GET If-Match also protects replacement between listing and read.
+			if !identityRejected && identity.ETag == "" && emptyRange && item.Size == 0 && n == 0 && len(writerAt.Bytes()) == 0 && item.ListedETag != "" {
+				identity.ETag = item.ListedETag
+			}
+			if identityRejected || identity.ETag == "" {
+				err = errors.New("downloaded object identity missing or changed")
+			}
+			identityMu.Unlock()
+		}
+		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download() @ %s: %v", a.region, err))
 			return &s3LocalFile{
 				Obj:  item,
