@@ -17,7 +17,7 @@ func TestPagingFailureRetainsWindow(t *testing.T) {
 		t.Run(fmt.Sprint(firstWindow), func(t *testing.T) {
 			start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 			roots, pages := 0, 0
-			var rootStart string
+			var rootStart, rootEnd string
 			a := &BitwardenAdapter{uspClient: &captureSink{}, doStop: utils.NewEvent(), accessToken: "test", tokenExpiry: time.Now().Add(time.Hour), pollInterval: time.Millisecond}
 			a.conf.ClientOptions = uspclient.ClientOptions{DebugLog: func(string) {}, OnWarning: func(string) {}, OnError: func(error) {}}
 			if !firstWindow {
@@ -27,6 +27,7 @@ func TestPagingFailureRetainsWindow(t *testing.T) {
 				if r.URL.Query().Get("continuationToken") == "" {
 					roots++
 					rootStart = r.URL.Query().Get("start")
+					rootEnd = r.URL.Query().Get("end")
 					fmt.Fprint(w, `{"data":[{"id":"first"}],"continuationToken":"next"}`)
 				} else {
 					pages++
@@ -59,7 +60,9 @@ func TestPagingFailureRetainsWindow(t *testing.T) {
 			if !firstWindow {
 				require.Equal(t, start.Format(time.RFC3339), rootStart)
 			} else {
-				require.Equal(t, time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -30).Format(time.RFC3339), rootStart)
+				capturedEnd, err := time.Parse(time.RFC3339, rootEnd)
+				require.NoError(t, err)
+				require.Equal(t, capturedEnd.UTC().Truncate(24*time.Hour).AddDate(0, 0, -30).Format(time.RFC3339), rootStart)
 			}
 			require.Equal(t, 3, pages)
 			require.Equal(t, 3, a.uspClient.(*captureSink).count())

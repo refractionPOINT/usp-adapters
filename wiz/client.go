@@ -413,15 +413,21 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 				}
 			}
 
-			for i, item := range items {
+			for _, item := range items {
 				itemMap, ok := item.(map[string]interface{})
 				if !ok {
-					return nil, since, "", "", fmt.Errorf("invalid GraphQL record")
+					if a.conf.ClientOptions.OnWarning != nil {
+						a.conf.ClientOptions.OnWarning("skipping invalid GraphQL record")
+					}
+					continue
 				}
 
 				id, ok := itemMap[a.conf.IDField].(string)
 				if !ok || id == "" {
-					return nil, since, "", "", fmt.Errorf("missing GraphQL record ID")
+					if a.conf.ClientOptions.OnWarning != nil {
+						a.conf.ClientOptions.OnWarning("skipping GraphQL record without an ID")
+					}
+					continue
 				}
 
 				if id == lastEventId {
@@ -430,10 +436,13 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 
 				timeValue, ok := itemMap[a.conf.TimeField].(string)
 				if !ok || timeValue == "" {
-					return nil, since, "", "", fmt.Errorf("missing GraphQL record time")
+					if a.conf.ClientOptions.OnWarning != nil {
+						a.conf.ClientOptions.OnWarning("skipping GraphQL record without a time")
+					}
+					continue
 				}
 
-				if i == 0 {
+				if lastDetectionTime == "" {
 					lastDetectionTime = timeValue
 				}
 

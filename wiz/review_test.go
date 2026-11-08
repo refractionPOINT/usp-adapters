@@ -1,6 +1,7 @@
 package usp_wiz
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -84,4 +85,54 @@ func TestReviewShutdownIsQuiet(t *testing.T) {
 	a.wgSenders.Add(1)
 	a.fetchEvents()
 	require.Zero(t, errors)
+}
+
+func TestReviewMalformedRecordDoesNotBlockLaterPolls(t *testing.T) {
+	for _, paged := range []bool{false, true} {
+		t.Run(fmt.Sprint(paged), func(t *testing.T) {
+			stop := utils.NewEvent()
+			roots, warnings := 0, 0
+			nextFloor := ""
+			const stamp = "2026-11-09T00:00:00Z"
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var body struct {
+					Variables map[string]interface{} `json:"variables"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Error(err)
+					w.WriteHeader(400)
+					return
+				}
+				if body.Variables["after"] == "tail" {
+					fmt.Fprint(w, `{"data":{"issues":{"nodes":[{"id":"older","createdAt":"2026-11-08T23:00:00Z"}],"pageInfo":{"hasNextPage":false}}}}`)
+					return
+				}
+				roots++
+				if roots > 1 {
+					filters := body.Variables["filterBy"].(map[string]interface{})
+					nextFloor = filters["createdAt"].(map[string]interface{})["after"].(string)
+					stop.Set()
+					fmt.Fprint(w, `{"data":{"issues":{"nodes":[]}}}`)
+					return
+				}
+				page := ""
+				if paged {
+					page = `,"pageInfo":{"hasNextPage":true,"endCursor":"tail"}`
+				}
+				fmt.Fprintf(w, `{"data":{"issues":{"nodes":[null,{"id":null,"createdAt":%q},{"id":"missing-time"},{"id":"valid","createdAt":%q}]%s}}}`, stamp, stamp, page)
+			}))
+			defer srv.Close()
+			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: `query($after:String) { issues(after:$after) { nodes { id createdAt } pageInfo { hasNextPage endCursor } } }`, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt", PollInterval: time.Millisecond, ClientOptions: uspclient.ClientOptions{DebugLog: func(string) {}, OnError: func(error) { stop.Set() }, OnWarning: func(string) { warnings++ }}}, uspClient: &captureSink{}, doStop: stop, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
+			a.wgSenders.Add(1)
+			a.fetchEvents()
+			require.Equal(t, 2, roots, "malformed records must not block later polls")
+			require.Equal(t, stamp, nextFloor, "first valid record must provide the watermark")
+			require.Equal(t, 3, warnings)
+			want := 1
+			if paged {
+				want = 2
+			}
+			require.Equal(t, want, a.uspClient.(*captureSink).count())
+		})
+	}
 }

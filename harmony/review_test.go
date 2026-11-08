@@ -40,6 +40,8 @@ func TestReviewCanceledWindowBoundedThenCatchUp(t *testing.T) {
 		}
 	}))
 	defer srv.Close()
+	// Requests serialize times to whole seconds. A wait longer than one second
+	// makes this test fail on the old moving-end implementation deterministically.
 	a := &HarmonyAdapter{conf: HarmonyConfig{URL: srv.URL, ClientOptions: validClientOptions(), Events: EventsConfig{pollInterval: 1100 * time.Millisecond}}, httpClient: srv.Client(), doStop: stop}
 	// Seed auth so this test exercises only event queries.
 	a.cachedToken = "test"

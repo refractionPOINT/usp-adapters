@@ -68,7 +68,9 @@ func TestReviewStaleContinuationRestartsSameWindow(t *testing.T) {
 				require.Equal(t, ends[0], ends[1])
 				wantStart := start
 				if initial {
-					wantStart = time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -30)
+					capturedEnd, err := time.Parse(time.RFC3339, ends[0])
+					require.NoError(t, err)
+					wantStart = capturedEnd.UTC().Truncate(24*time.Hour).AddDate(0, 0, -30)
 				}
 				require.Equal(t, wantStart.Format(time.RFC3339), starts[0])
 				require.True(t, a.lastStartDate.After(start))

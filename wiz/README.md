@@ -9,8 +9,8 @@ when an intermediate page contains no records.
 
 Optional-field GraphQL errors with explicit paths produce a warning while valid
 records continue. Errors without a path, or errors affecting the connection,
-records, paging information, IDs or times, fail the window. Missing required
-record fields also fail rather than being skipped.
+records, paging information, IDs or times, fail the window. Malformed individual records are skipped with warnings, preserving the existing
+record-level behavior without blocking otherwise usable pages.
 
 A failed page, required-data GraphQL error, missing continuation cursor or repeated cursor
 leaves the time checkpoint unchanged. The next poll retries the window.
