@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sync"
 	"time"
 
@@ -19,9 +20,15 @@ const (
 	inTenYears = 10 * 365 * 24 * time.Hour
 )
 
+type uspSink interface {
+	Ship(*protocol.DataMessage, time.Duration) error
+	Drain(time.Duration) error
+	Close() ([]*protocol.DataMessage, error)
+}
+
 type DuoAdapter struct {
 	conf        DuoConfig
-	uspClient   *uspclient.Client
+	uspClient   uspSink
 	duoClient   *duoapi.DuoApi
 	adminClient *duoadmin.Client
 
@@ -30,6 +37,8 @@ type DuoAdapter struct {
 	doStop    *utils.Event
 
 	ctx context.Context
+	// pollInterval is an internal test seam; zero uses the normal one-minute poll.
+	pollInterval time.Duration
 }
 
 type DuoConfig struct {
@@ -107,16 +116,24 @@ func (a *DuoAdapter) Close() error {
 	return err2
 }
 
+func (a *DuoAdapter) pollDelay() time.Duration {
+	if a.pollInterval > 0 {
+		return a.pollInterval
+	}
+	return time.Minute
+}
+
 func (a *DuoAdapter) fetchAuthLogs() {
 	minTime := time.Now()
 	window := inTenYears
-	results, err := a.adminClient.GetAuthLogs(minTime, window)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("GetAuthLogs: %v", err))
-		return
-	}
-	next := results.Response.Metadata.GetNextOffset()
-	for !a.doStop.WaitFor(1 * time.Minute) {
+	var results *duoadmin.AuthLogResult
+	var err error
+	var next func(*url.Values)
+	pendingTime := minTime
+	wait := time.Duration(0)
+	for !a.doStop.WaitFor(wait) {
+		wait = a.pollDelay()
+
 		if next == nil {
 			results, err = a.adminClient.GetAuthLogs(minTime, window)
 		} else {
@@ -131,7 +148,6 @@ func (a *DuoAdapter) fetchAuthLogs() {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAuthLogs: %v", err))
 			continue
 		}
-		next = results.Response.Metadata.GetNextOffset()
 		for _, al := range results.Response.Logs {
 			msg := &protocol.DataMessage{
 				JsonPayload: al,
@@ -156,29 +172,37 @@ func (a *DuoAdapter) fetchAuthLogs() {
 			if its, ok := utils.Dict(al).GetString("isotimestamp"); ok {
 				nt, err := time.Parse(time.RFC3339, its)
 				if err == nil {
-					minTime = nt.Add(1 * time.Millisecond)
+					pendingTime = nt.Add(1 * time.Millisecond)
 				} else {
 					a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
 				}
 			} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
 				// Otherwise we use the timestamp in seconds.
-				minTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
+				pendingTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
 			} else {
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time: %#v", al))
 			}
+		}
+		next = results.Response.Metadata.GetNextOffset()
+		if next == nil {
+			minTime = pendingTime
+		} else {
+			// Drain the chain immediately, holding its original time bounds.
+			wait = 0
 		}
 	}
 }
 
 func (a *DuoAdapter) fetchAdminLogs() {
 	minTime := time.Now()
-	results, err := a.adminClient.GetAdminLogs(minTime)
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("GetAdminLogs: %v", err))
-		return
-	}
-	next := results.Logs.GetNextOffset(time.Now().Add(inTenYears))
-	for !a.doStop.WaitFor(1 * time.Minute) {
+	var results *duoadmin.AdminLogResult
+	var err error
+	var next func(*url.Values)
+	pendingTime := minTime
+	wait := time.Duration(0)
+	for !a.doStop.WaitFor(wait) {
+		wait = a.pollDelay()
+
 		if next == nil {
 			results, err = a.adminClient.GetAdminLogs(minTime)
 		} else {
@@ -193,7 +217,6 @@ func (a *DuoAdapter) fetchAdminLogs() {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAdminLogs: %v", err))
 			continue
 		}
-		next = results.Logs.GetNextOffset(time.Now().Add(inTenYears))
 		for _, al := range results.Logs {
 			msg := &protocol.DataMessage{
 				JsonPayload: al,
@@ -218,16 +241,23 @@ func (a *DuoAdapter) fetchAdminLogs() {
 			if its, ok := utils.Dict(al).GetString("isotimestamp"); ok {
 				nt, err := time.Parse(time.RFC3339, its)
 				if err == nil {
-					minTime = nt.Add(1 * time.Second)
+					pendingTime = nt.Add(1 * time.Second)
 				} else {
 					a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
 				}
 			} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
 				// Otherwise we use the timestamp in seconds.
-				minTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
+				pendingTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
 			} else {
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time: %#v", al))
 			}
+		}
+		next = results.Logs.GetNextOffset(time.Now().Add(inTenYears))
+		if next == nil {
+			minTime = pendingTime
+		} else {
+			// Drain the chain immediately, holding its original time bounds.
+			wait = 0
 		}
 	}
 }

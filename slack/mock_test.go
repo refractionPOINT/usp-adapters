@@ -74,9 +74,8 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 // Ordering: the real API returns entries newest-first ("the default ordering
 // being descending (most to least recent)" per the methods reference). The
 // mock defaults to serving oldest-first -- the ordering under which the
-// adapter's "oldest" watermark never re-ships across pages -- and offers
-// newestFirst to reproduce the documented ordering; see
-// TestNewestFirstPaginationReships for the behavior difference that causes.
+// mock serves entries in ascending order -- and offers newestFirst to
+// exercise the documented ordering in TestNewestFirstPaginationWatermark.
 type mockSlack struct {
 	mu       sync.Mutex
 	token    string
@@ -469,10 +468,8 @@ func TestMidRunEntryShipsExactlyOnce(t *testing.T) {
 // TestMultiPagePaginationFullyConsumed verifies the adapter exhausts the
 // next_cursor chain: a dataset spanning several pages is fully shipped, each
 // entry exactly once, and stays shipped-once across later polls. The mock
-// serves pages oldest-first here, the ordering under which the adapter's
-// last-page watermark is exact; see TestNewestFirstPaginationReships for the
-// documented (descending) ordering, where multi-page delivery degrades to
-// at-least-once.
+// serves pages oldest-first here; TestNewestFirstPaginationWatermark covers
+// the documented descending order.
 func TestMultiPagePaginationFullyConsumed(t *testing.T) {
 	const token = "xoxp-1111111111-fake-test-token"
 	base := time.Now().Unix() + 5
@@ -510,25 +507,9 @@ func TestMultiPagePaginationFullyConsumed(t *testing.T) {
 	assert.Equal(t, len(fixtures), sink.count())
 }
 
-// TestNewestFirstPaginationReships pins the adapter's behavior against the
-// documented Slack ordering: the real API returns entries newest-first
-// ("descending (most to least recent)" per
-// https://docs.slack.dev/reference/audit-logs-api/methods-actions-reference/).
-// Because the adapter's "oldest" watermark is the max date_create of the LAST
-// page it processed (+1 per cycle), a multi-page newest-first response leaves
-// the watermark anchored at the oldest chunk, so the newer pages re-ship on
-// subsequent polls until the watermark converges. With 5 entries (date_create
-// base..base+4) and a page size of 2 this is fully deterministic:
-//
-//	poll 1 (oldest<=base):  ships e5,e4 | e3,e2 | e1  -> watermark base+1
-//	poll 2 (oldest=base+1): ships e5,e4 | e3,e2       -> watermark base+3
-//	poll 3 (oldest=base+3): ships e5,e4               -> watermark base+5
-//	poll 4+ : nothing
-//
-// for a total of 11 ships: e1 once, e2/e3 twice, e4/e5 three times. Every
-// entry is eventually delivered (no loss), but multi-page responses are
-// at-least-once, not exactly-once.
-func TestNewestFirstPaginationReships(t *testing.T) {
+// TestNewestFirstPaginationWatermark verifies the watermark commits the newest
+// timestamp over the whole cursor chain, including newest-first responses.
+func TestNewestFirstPaginationWatermark(t *testing.T) {
 	const token = "xoxp-1111111111-fake-test-token"
 	base := time.Now().Unix() + 5
 
@@ -545,14 +526,14 @@ func TestNewestFirstPaginationReships(t *testing.T) {
 	require.NoError(t, err)
 	defer adapter.Close()
 
-	// The ship count converges to exactly 11 (see trace above)...
-	require.Eventually(t, func() bool { return sink.count() >= 11 },
-		5*time.Second, 10*time.Millisecond, "expected the watermark to converge after re-ships")
+	// Every entry ships, and following polls remain empty.
+	require.Eventually(t, func() bool { return sink.count() >= 5 },
+		5*time.Second, 10*time.Millisecond, "expected all pages to ship")
 	// ... and stays there once the watermark has passed the newest entry.
 	reqs := mock.requestCount()
 	require.Eventually(t, func() bool { return mock.requestCount() >= reqs+3 },
 		5*time.Second, 10*time.Millisecond)
-	assert.Equal(t, 11, sink.count(), "ships must stop once the watermark converges")
+	assert.Equal(t, 5, sink.count(), "ships must stop once the watermark converges")
 
 	shipsPerID := map[string]int{}
 	for _, m := range sink.snapshot() {
@@ -562,11 +543,11 @@ func TestNewestFirstPaginationReships(t *testing.T) {
 	}
 	assert.Equal(t, map[string]int{
 		fixtureID(1): 1,
-		fixtureID(2): 2,
-		fixtureID(3): 2,
-		fixtureID(4): 3,
-		fixtureID(5): 3,
-	}, shipsPerID, "newest-first pagination re-ships newer pages until the watermark converges")
+		fixtureID(2): 1,
+		fixtureID(3): 1,
+		fixtureID(4): 1,
+		fixtureID(5): 1,
+	}, shipsPerID, "the completed window must include every page once")
 }
 
 // TestBadTokenShipsNothing pins the adapter's actual behavior on auth failure:
@@ -828,55 +809,5 @@ func TestFailedPageResumesFromItsCursor(t *testing.T) {
 	}
 }
 
-// TestPageFailingForeverIsGivenUp covers a page that never succeeds: after
-// maxPageAttempts the rest of the pagination is given up on with one error,
-// the entries already shipped are not shipped again, and polling continues.
-func TestPageFailingForeverIsGivenUp(t *testing.T) {
-	const token = "xoxp-1111111111-fake-test-token"
-	mock := newestFirstMock(token, 5)
-	fs := &failingServer{next: mock.handler(), fail: serverError,
-		failIf: func(r *http.Request) bool { return r.URL.Query().Get("cursor") != "" }}
-	server := httptest.NewServer(fs.handler())
-	defer server.Close()
-
-	var mu sync.Mutex
-	var errs []string
-	conf := testConf(t, server.URL, token)
-	conf.ClientOptions.OnError = func(err error) {
-		mu.Lock()
-		defer mu.Unlock()
-		errs = append(errs, err.Error())
-	}
-	gaveUp := func() int {
-		mu.Lock()
-		defer mu.Unlock()
-		n := 0
-		for _, e := range errs {
-			if strings.HasPrefix(e, "giving up on the remaining pages") {
-				n++
-			}
-		}
-		return n
-	}
-
-	sink := &captureSink{}
-	adapter, chStopped, err := newSlackAdapter(t.Context(), conf, sink)
-	require.NoError(t, err)
-	defer adapter.Close()
-
-	require.Eventually(t, func() bool { return gaveUp() == 1 }, 10*time.Second, 10*time.Millisecond)
-	// The next poll starts fresh and polling goes on.
-	before := fs.count()
-	require.Eventually(t, func() bool { return fs.count() > before }, 10*time.Second, 10*time.Millisecond)
-	select {
-	case <-chStopped:
-		t.Fatal("the adapter must keep running")
-	default:
-	}
-
-	counts := shipCounts(sink)
-	for id, c := range counts {
-		assert.Equal(t, 1, c, "entry %s shipped %d times", id, c)
-	}
-	assert.Equal(t, map[string]int{fixtureID(5): 1, fixtureID(4): 1}, counts, "only the first page shipped")
-}
+// A continuation that fails past the former retry budget remains pending.
+// Recovery and fixed query bounds are covered by TestPagingRetainsCursorPastFiveFailures.
