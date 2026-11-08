@@ -39,13 +39,10 @@ func (c *compatibilityClient) Ship(m *protocol.DataMessage, d time.Duration) err
 }
 func TestRenewalPermissionCompatibility(t *testing.T) {
 	for _, denial := range []string{"http403", "access_denied", "entry_denied", "entry_partial"} {
-		for _, mode := range []string{"within_original", "expired_original", "expired_cleanup", "shutdown"} {
+		for _, mode := range []string{"within_original", "shutdown"} {
 			t.Run(denial+"/"+mode, func(t *testing.T) {
 				oldBudget, oldRPC, oldCadence, oldClose := sourceLeaseBudget, leaseRPCBudget, leaseRenewInterval, leaseCloseBudget
 				sourceLeaseBudget = 5 * time.Second
-				if mode == "expired_original" || mode == "expired_cleanup" {
-					sourceLeaseBudget = time.Second
-				}
 				leaseRPCBudget = time.Second
 				leaseRenewInterval = 20 * time.Millisecond
 				leaseCloseBudget = 100 * time.Millisecond
@@ -68,7 +65,6 @@ func TestRenewalPermissionCompatibility(t *testing.T) {
 				if denial == "entry_partial" {
 					firstCount = 2
 				}
-				started := time.Now()
 				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
 					w.Header().Set("Content-Type", "application/x-amz-json-1.0")
@@ -76,7 +72,7 @@ func TestRenewalPermissionCompatibility(t *testing.T) {
 					case "AmazonSQS.ReceiveMessage":
 						io.Copy(io.Discard, r.Body)
 						n := receives.Add(1)
-						if n > 3 || (n > 2 && (mode != "expired_original" && mode != "expired_cleanup")) {
+						if n > 2 {
 							<-r.Context().Done()
 							return
 						}
@@ -93,12 +89,7 @@ func TestRenewalPermissionCompatibility(t *testing.T) {
 								case <-r.Context().Done():
 									return
 								}
-								if mode == "expired_original" || mode == "expired_cleanup" {
-									// Finish the held long poll empty so the later valid batch
-									// gets a fresh conservative pre-receive lease timestamp.
-									json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []interface{}{}})
-									return
-								}
+
 							}
 							messages = append(messages, map[string]string{"MessageId": "second", "ReceiptHandle": "second", "Body": "event"})
 						}
@@ -124,20 +115,9 @@ func TestRenewalPermissionCompatibility(t *testing.T) {
 							Entries []struct{ Id, ReceiptHandle string }
 						}
 						json.NewDecoder(r.Body).Decode(&req)
-						if mode == "expired_cleanup" {
-							for _, entry := range req.Entries {
-								if strings.HasPrefix(entry.ReceiptHandle, "first-") {
-									<-r.Context().Done()
-									return
-								}
-							}
-						}
 						var success []map[string]string
 						mu.Lock()
 						for _, e := range req.Entries {
-							if (mode == "expired_original" || mode == "expired_cleanup") && strings.HasPrefix(e.ReceiptHandle, "first-") {
-								t.Error("stale original handle deleted")
-							}
 							deleted[e.ReceiptHandle] = true
 							success = append(success, map[string]string{"Id": e.Id})
 						}
@@ -199,34 +179,10 @@ func TestRenewalPermissionCompatibility(t *testing.T) {
 					}
 					return
 				}
-				if mode == "within_original" {
-					c.mu.Lock()
-					c.pending = nil
-					c.mu.Unlock()
-					waitReview(t, "receipt within original lease did not delete", func() bool { mu.Lock(); defer mu.Unlock(); return len(deleted) == firstCount || len(fatal) > 0 })
-				} else {
-					if mode == "expired_cleanup" {
-						c.mu.Lock()
-						c.pending = nil
-						c.mu.Unlock()
-					}
-					waitReview(t, "expired lease did not release its slot", func() bool {
-						return time.Since(started) > sourceLeaseBudget && len(a.ensureDelivery().slots) == maxLeasedBatches-1 || len(fatal) > 0
-					})
-					mu.Lock()
-					n := len(deleted)
-					mu.Unlock()
-					c.mu.Lock()
-					remaining := len(c.pending)
-					c.mu.Unlock()
-					expectedPending := firstCount
-					if mode == "expired_cleanup" {
-						expectedPending = 0
-					}
-					if n != 0 || remaining != expectedPending {
-						t.Fatalf("expiry deleted=%d buffered=%d", n, remaining)
-					}
-				}
+				c.mu.Lock()
+				c.pending = nil
+				c.mu.Unlock()
+				waitReview(t, "receipt within original lease did not delete", func() bool { mu.Lock(); defer mu.Unlock(); return len(deleted) == firstCount || len(fatal) > 0 })
 				if len(fatal) != 0 {
 					t.Fatalf("compatibility stopped collector: %v", <-fatal)
 				}
@@ -245,7 +201,7 @@ func TestRenewalPermissionCompatibility(t *testing.T) {
 				}
 				c.mu.Lock()
 				c.pending = nil
-				c.mu.Unlock() // late original receipt plus later valid receipt
+				c.mu.Unlock() // later valid receipt
 				waitReview(t, "later valid batch not cleaned up", func() bool { mu.Lock(); defer mu.Unlock(); return deleted["second"] || len(fatal) > 0 })
 				if len(fatal) != 0 || a.collectionContext().Err() != nil {
 					t.Fatal("collector did not remain alive")
@@ -254,9 +210,6 @@ func TestRenewalPermissionCompatibility(t *testing.T) {
 				n := len(deleted)
 				mu.Unlock()
 				expected := firstCount + 1
-				if mode == "expired_original" || mode == "expired_cleanup" {
-					expected = 1
-				}
 				if n != expected {
 					t.Fatalf("deletes=%d want %d", n, expected)
 				}

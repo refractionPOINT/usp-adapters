@@ -102,12 +102,11 @@ func (a *SQSAdapter) handleBatchSlot(ctx context.Context, messages []*sqs.Messag
 		if cause := context.Cause(l.ctx); cause != nil {
 			return cause
 		}
-		if l.compatibilityExpired() && deleteCtx.Err() != nil {
-			var canceled interface{ Code() string }
-			if errors.As(err, &canceled) && canceled.Code() == "RequestCanceled" {
-				return errOriginalLeaseRetained
-			}
-		}
+	}
+	if l.compatibility.retainStaleDelete(out, err, len(req.Entries)) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	if out == nil || len(out.Failed) != 0 {
@@ -202,7 +201,7 @@ func (a *SQSAdapter) receiveBatches() (receiveErr error) {
 		go func(slot int, messages []*sqs.Message, started time.Time) {
 			defer workers.Done()
 			defer func() { d.slots <- slot }()
-			if err := a.handleBatchSlot(ctx, messages, started, slot); err != nil && !a.expectedClose(err) && !errors.Is(err, errOriginalLeaseRetained) {
+			if err := a.handleBatchSlot(ctx, messages, started, slot); err != nil && !a.expectedClose(err) {
 				select {
 				case failures <- err:
 				default:

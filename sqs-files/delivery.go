@@ -86,7 +86,7 @@ func (a *SQSFilesAdapter) handleBatchSlot(ctx context.Context, messages []*sqs.M
 		return nil
 	}
 	// An all-absent batch has no successful admission/dependency to confirm.
-	// Its cleanup still requires known lease ownership and a joined renewer.
+	// Cleanup still joins renewal and follows the selected ownership policy.
 	if hasDependency {
 		if err := a.awaitDeliveryContext(l.ctx, slot, marker); err != nil {
 			return err
@@ -106,12 +106,11 @@ func (a *SQSFilesAdapter) handleBatchSlot(ctx context.Context, messages []*sqs.M
 		if cause := context.Cause(l.ctx); cause != nil {
 			return cause
 		}
-		if l.compatibilityExpired() && deleteCtx.Err() != nil {
-			var canceled interface{ Code() string }
-			if errors.As(err, &canceled) && canceled.Code() == "RequestCanceled" {
-				return errOriginalLeaseRetained
-			}
-		}
+	}
+	if l.compatibility.retainStaleDelete(out, err, len(req.Entries)) {
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	if out == nil || len(out.Failed) != 0 {
@@ -206,7 +205,7 @@ func (a *SQSFilesAdapter) receiveBatches() (receiveErr error) {
 		go func(slot int, messages []*sqs.Message, started time.Time) {
 			defer workers.Done()
 			defer func() { d.slots <- slot }()
-			if err := a.handleBatchSlot(ctx, messages, started, slot); err != nil && !a.expectedClose(err) && !errors.Is(err, errOriginalLeaseRetained) {
+			if err := a.handleBatchSlot(ctx, messages, started, slot); err != nil && !a.expectedClose(err) {
 				select {
 				case failures <- err:
 				default:

@@ -15,7 +15,8 @@ import (
 )
 
 // batchLease owns the known receipt handles until work and renewal have joined.
-// Any incomplete, late, failed, or ambiguous renewal abandons the whole batch.
+// Except for explicit permission fallback, incomplete, late, failed, or
+// ambiguous renewal abandons the whole batch.
 // The source may then replay it; no receipt is released early on an uncertain RPC.
 type batchLease struct {
 	ctx                    context.Context
@@ -68,7 +69,6 @@ func (l *batchLease) renew() {
 	defer close(l.done)
 	for {
 		if l.compatibility.isDisabled() {
-			l.waitOriginalLease()
 			return
 		}
 		deadline := l.knownDeadline()
@@ -86,7 +86,6 @@ func (l *batchLease) renew() {
 		select {
 		case <-l.compatibility.disabled:
 			timer.Stop()
-			l.waitOriginalLease()
 			return
 		case <-l.stopRequested:
 			timer.Stop()
@@ -101,7 +100,6 @@ func (l *batchLease) renew() {
 		// bounded request without canceling its ownership evidence.
 		select {
 		case <-l.compatibility.disabled:
-			l.waitOriginalLease()
 			return
 		case <-l.stopRequested:
 			return
@@ -116,15 +114,14 @@ func (l *batchLease) renew() {
 		}
 		rpcCtx, stop := context.WithDeadline(l.renewCtx, minTime(deadline, started.Add(leaseRPCBudget)))
 		out, err := l.client.ChangeMessageVisibilityBatchWithContext(rpcCtx, &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: &l.queue, Entries: l.entries})
-		rpcContextErr := rpcCtx.Err()
 		stop()
 		if renewalPermissionDenied(out, err, len(l.entries)) {
 			l.compatibility.disable()
-			l.waitOriginalLease()
 			return
 		}
-		if l.compatibilityExpired() && rpcContextErr != nil {
-			l.expire()
+		// Another batch may have disabled optional renewal during this bounded
+		// RPC. Native no-renew work no longer depends on its ownership result.
+		if l.compatibility.isDisabled() {
 			return
 		}
 		if err == nil {
@@ -176,7 +173,7 @@ func (l *batchLease) stopAndJoin() error {
 	if err := context.Cause(l.ctx); err != nil {
 		return err
 	}
-	if !time.Now().Before(l.knownDeadline()) {
+	if !l.compatibility.isDisabled() && !time.Now().Before(l.knownDeadline()) {
 		return l.expire()
 	}
 	return nil
@@ -185,8 +182,14 @@ func (l *batchLease) cleanupContext() (context.Context, context.CancelFunc, erro
 	if err := l.stopAndJoin(); err != nil {
 		return nil, nil, err
 	}
-	deadline := l.knownDeadline()
-	ctx, cancel := context.WithDeadline(l.ctx, minTime(deadline, time.Now().Add(leaseRPCBudget)))
+	// AWS associates a receipt handle with the same source message even after
+	// visibility expires. Native no-renew cleanup is receipt-gated and bounded
+	// by the RPC budget/caller shutdown, not by a claimed lease extension.
+	deadline := time.Now().Add(leaseRPCBudget)
+	if !l.compatibility.isDisabled() {
+		deadline = minTime(deadline, l.knownDeadline())
+	}
+	ctx, cancel := context.WithDeadline(l.ctx, deadline)
 	return ctx, cancel, nil
 }
 func (l *batchLease) abort() { l.cancel(context.Canceled); l.stopRenew(); <-l.done }
