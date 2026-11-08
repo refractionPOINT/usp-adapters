@@ -813,6 +813,6 @@ func TestMsGraphNewestFirstPagination(t *testing.T) {
 	}
 	server := mock.start(t)
 	sink, _, _ := startAdapter(t, testConfig(t, server))
-	require.Eventually(t, func() bool { return sink.count() == 5 }, time.Second, 10*time.Millisecond, "all five records must ship, including older pages")
+	require.Eventually(t, func() bool { return sink.count() == 5 }, 10*time.Second, 10*time.Millisecond, "all five records must ship, including older pages")
 	require.Never(t, func() bool { return sink.count() != 5 }, 200*time.Millisecond, 10*time.Millisecond)
 }

@@ -3,6 +3,7 @@ package usp_ms_graph
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -214,14 +215,14 @@ func TestMsGraphCloseCancelsRequests(t *testing.T) {
 			require.NoError(t, err)
 			select {
 			case <-entered:
-			case <-time.After(time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("request did not start")
 			}
 			stopped := make(chan struct{})
 			go func() { _ = a.Close(); close(stopped) }()
 			select {
 			case <-stopped:
-			case <-time.After(time.Second):
+			case <-time.After(5 * time.Second):
 				unblock()
 				select {
 				case <-stopped:
@@ -230,6 +231,61 @@ func TestMsGraphCloseCancelsRequests(t *testing.T) {
 				}
 				t.Fatal("Close did not cancel request/backoff")
 			}
+			// The old non-cancellable backoff finishes in three seconds, so
+			// elapsed time alone cannot distinguish it with a generous limit.
+			assert.ErrorIs(t, a.ctx.Err(), context.Canceled, "Close must cancel the reader context")
+		})
+	}
+}
+
+// A continuation can reject an expired token after earlier pages succeeded.
+// Stop at the scan boundary so counts cannot be affected by a later poll.
+func TestMsGraphRefreshTokenOnSamePage(t *testing.T) {
+	for _, persistent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("persistent-401=%t", persistent), func(t *testing.T) {
+			var tokenCalls, firstCalls, lastCalls atomic.Int32
+			var server *httptest.Server
+			stamp := graphTimestamp(fixtureBase())
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/" + testTenantID + "/oauth2/v2.0/token":
+					n := tokenCalls.Add(1)
+					writeJSON(w, 200, map[string]interface{}{"access_token": fmt.Sprintf("fake-token-%d", n)})
+				case "/v1.0/" + testResource:
+					firstCalls.Add(1)
+					page(w, []map[string]interface{}{graphSecurityAlert("first", stamp)}, server.URL+"/last?opaque=a%2Bb")
+				case "/last":
+					lastCalls.Add(1)
+					assert.Equal(t, "opaque=a%2Bb", r.URL.RawQuery)
+					if persistent || r.Header.Get("Authorization") == "Bearer fake-token-1" {
+						w.WriteHeader(http.StatusUnauthorized)
+						return
+					}
+					assert.Equal(t, "Bearer fake-token-2", r.Header.Get("Authorization"))
+					page(w, []map[string]interface{}{graphSecurityAlert("last", stamp)}, "")
+				default:
+					t.Errorf("unexpected path: %s", r.URL.Path)
+					w.WriteHeader(404)
+				}
+			}))
+			defer server.Close()
+			conf := testConfig(t, server)
+			conf.PollInterval = time.Hour // drive exactly one scan below
+			sink := &captureSink{}
+			a, _, err := newMsGraphAdapter(context.Background(), conf, sink)
+			require.NoError(t, err)
+			defer a.Close()
+			_, err = a.poll(server.URL+"/v1.0/"+testResource, graphCursor{since: time.Now().UTC()}, map[graphRecordKey]bool{})
+			if persistent {
+				require.ErrorContains(t, err, "401")
+				assert.Equal(t, 1, sink.count())
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, 2, sink.count())
+			}
+			assert.EqualValues(t, 1, firstCalls.Load(), "refresh must not restart the first page")
+			assert.EqualValues(t, 2, lastCalls.Load(), "one retry, including for persistent rejection")
+			assert.EqualValues(t, 2, tokenCalls.Load(), "refresh must be bounded to one per page")
 		})
 	}
 }

@@ -379,6 +379,7 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 }
 
 func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, error) {
+	refreshed := false
 	for attempt := 1; attempt <= 3; attempt++ {
 		var err error
 		if *token == "" {
@@ -406,6 +407,15 @@ func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, err
 			}
 			if resp.StatusCode == http.StatusOK {
 				return body, nil
+			}
+			// A long scan can outlive its token. Refresh at most once per
+			// page and retry the exact URL, without restarting pagination or
+			// spending the transient-error retry budget on the refresh.
+			if resp.StatusCode == http.StatusUnauthorized && !refreshed {
+				refreshed = true
+				*token = ""
+				attempt--
+				continue
 			}
 			if (resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusGatewayTimeout) || attempt == 3 {
 				return nil, fmt.Errorf("Microsoft API returned HTTP %d; verify permissions and Microsoft API status", resp.StatusCode)
