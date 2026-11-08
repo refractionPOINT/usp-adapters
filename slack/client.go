@@ -24,6 +24,8 @@ const (
 	// maxErrorBackoff caps the wait between polls while requests keep
 	// failing; the wait starts at the poll interval and doubles per failure.
 	maxErrorBackoff = 5 * time.Minute
+	// Restart an uncommitted scan if its continuation keeps failing.
+	maxContinuationFailures = 8
 	// maxErrorBodyLog bounds how much of an error response body is logged.
 	maxErrorBodyLog = 1024
 )
@@ -160,9 +162,8 @@ func (a *SlackAdapter) fetchEvents() {
 
 	// A failed request (e.g. the API unreachable or a TLS error) is retried
 	// after a growing wait, rather than every poll. A failure in the middle
-	// of pagination resumes from the cursor of the failed page, so neither
-	// the pages before it are shipped again nor the ones after it skipped.
-	// Keep the failed cursor until it succeeds or the adapter is closed.
+	// of pagination first resumes from the cursor of the failed page.
+	// After repeated continuation failures, replay the root from the same floor.
 	failures := 0
 	wait := a.pollInterval
 	retryLater := func() {
@@ -171,6 +172,7 @@ func (a *SlackAdapter) fetchEvents() {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("request failed %d time(s) in a row, retrying in %v", failures, wait))
 	}
 	resumeCursor := ""
+	continuationFailures := 0
 	pendingTime := lastTime
 	isItemsProcessed := false
 
@@ -211,9 +213,16 @@ poll:
 			entries, page, err := a.makeOneContentRequest(lastTime, nextPage)
 			if err != nil {
 				resumeCursor = nextPage
+				continuationFailures++
+				if continuationFailures >= maxContinuationFailures {
+					// Keep lastTime uncommitted; a new root can issue a fresh cursor.
+					resumeCursor = ""
+					continuationFailures = 0
+				}
 				retryLater()
 				continue poll
 			}
+			continuationFailures = 0
 			nextPage = page
 			a.conf.ClientOptions.DebugLog(fmt.Sprintf("got %d entries from page", len(entries)))
 

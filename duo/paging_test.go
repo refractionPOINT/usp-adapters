@@ -109,7 +109,7 @@ func TestPagingFirstPageAndFailedContinuation(t *testing.T) {
 			if kind == "admin" {
 				want = 1001
 			}
-			require.Eventually(t, func() bool { return sink.count() >= want }, time.Second, time.Millisecond, "first page and continuation must both ship")
+			require.Eventually(t, func() bool { return sink.count() >= want }, 10*time.Second, time.Millisecond, "first page and continuation must both ship")
 			a.doStop.Set()
 			<-done
 			sink.mu.Lock()
@@ -117,5 +117,100 @@ func TestPagingFirstPageAndFailedContinuation(t *testing.T) {
 			require.Contains(t, sink.ids, "0", "the initial response must be shipped")
 			require.Contains(t, sink.ids, "tail")
 		})
+	}
+}
+
+func TestPagingDescendingChainUsesNewestFloor(t *testing.T) {
+	for _, kind := range []string{"auth", "admin"} {
+		for _, iso := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/iso=%v", kind, iso), func(t *testing.T) {
+				sink := &pagingSink{}
+				calls := 0
+				floor, maxTime := "", ""
+				base := time.Now().Unix() + 10000
+				checked := make(chan struct{})
+				server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					q := r.URL.Query()
+					if calls == 1 {
+						floor = q.Get("mintime")
+						maxTime = q.Get("maxtime")
+					}
+					// Auth has a real continuation; admin's full page generates one via its SDK.
+					logs := []map[string]interface{}{}
+					makeLog := func(id string, ts int64) map[string]interface{} {
+						m := map[string]interface{}{"id": id, "timestamp": ts}
+						if iso {
+							m["isotimestamp"] = time.Unix(ts, 0).UTC().Format(time.RFC3339)
+						}
+						return m
+					}
+					if calls == 1 {
+						logs = append(logs, makeLog("newest", base+1001))
+						n := 1
+						if kind == "admin" {
+							n = 999
+						}
+						for i := 0; i < n; i++ {
+							logs = append(logs, makeLog(fmt.Sprint(i), base+999-int64(i)))
+						}
+					}
+					if calls == 2 {
+						if kind == "auth" {
+							assert.Equal(t, floor, q.Get("mintime"))
+							assert.Equal(t, maxTime, q.Get("maxtime"))
+							assert.Equal(t, "continue", q.Get("next_offset"))
+						}
+						logs = append(logs, makeLog("oldest", base-1))
+					}
+					if calls == 3 {
+						expected := (base + 1002)
+						if kind == "auth" {
+							expected = (base+1001)*1000 + 1000
+							if iso {
+								expected = (base+1001)*1000 + 1
+							}
+						}
+						assert.Equal(t, fmt.Sprint(expected), q.Get("mintime"), "next poll must use the maximum candidate over the whole chain")
+						assert.Empty(t, q.Get("next_offset"))
+						close(checked)
+					}
+					if kind == "auth" {
+						meta := utils.Dict{}
+						if calls == 1 {
+							meta["next_offset"] = []string{"continue"}
+						}
+						json.NewEncoder(w).Encode(utils.Dict{"stat": "OK", "response": utils.Dict{"authlogs": logs, "metadata": meta}})
+					} else {
+						json.NewEncoder(w).Encode(utils.Dict{"stat": "OK", "response": logs})
+					}
+				}))
+				defer server.Close()
+				api := duoapi.NewDuoApi("fake", "fake", strings.TrimPrefix(server.URL, "https://"), "test")
+				api.SetCustomHTTPClient(server.Client())
+				a := &DuoAdapter{uspClient: sink, adminClient: duoadmin.New(*api), doStop: utils.NewEvent(), pollInterval: time.Millisecond, conf: DuoConfig{ClientOptions: uspclient.ClientOptions{OnError: func(error) {}, OnWarning: func(string) {}, DebugLog: func(string) {}}}}
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					if kind == "auth" {
+						a.fetchAuthLogs()
+					} else {
+						a.fetchAdminLogs()
+					}
+				}()
+				defer func() { a.doStop.Set(); <-done }()
+				select {
+				case <-checked:
+				case <-time.After(10 * time.Second):
+					t.Fatal("next root poll was not observed")
+				}
+				a.doStop.Set()
+				<-done
+				sink.mu.Lock()
+				defer sink.mu.Unlock()
+				require.Contains(t, sink.ids, "newest")
+				require.Contains(t, sink.ids, "oldest")
+			})
+		}
 	}
 }

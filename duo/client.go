@@ -172,13 +172,17 @@ func (a *DuoAdapter) fetchAuthLogs() {
 			if its, ok := utils.Dict(al).GetString("isotimestamp"); ok {
 				nt, err := time.Parse(time.RFC3339, its)
 				if err == nil {
-					pendingTime = nt.Add(1 * time.Millisecond)
+					if candidate := nt.Add(time.Millisecond); candidate.After(pendingTime) {
+						pendingTime = candidate
+					}
 				} else {
 					a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
 				}
 			} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
 				// Otherwise we use the timestamp in seconds.
-				pendingTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
+				if candidate := time.Unix(int64(ts), 0).Add(time.Second); candidate.After(pendingTime) {
+					pendingTime = candidate
+				}
 			} else {
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time: %#v", al))
 			}
@@ -241,13 +245,17 @@ func (a *DuoAdapter) fetchAdminLogs() {
 			if its, ok := utils.Dict(al).GetString("isotimestamp"); ok {
 				nt, err := time.Parse(time.RFC3339, its)
 				if err == nil {
-					pendingTime = nt.Add(1 * time.Second)
+					if candidate := nt.Add(time.Second); candidate.After(pendingTime) {
+						pendingTime = candidate
+					}
 				} else {
 					a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time from iso: %#v", al))
 				}
 			} else if ts, ok := utils.Dict(al).GetInt("timestamp"); ok {
 				// Otherwise we use the timestamp in seconds.
-				pendingTime = time.Unix(int64(ts), 0).Add(1 * time.Second)
+				if candidate := time.Unix(int64(ts), 0).Add(time.Second); candidate.After(pendingTime) {
+					pendingTime = candidate
+				}
 			} else {
 				a.conf.ClientOptions.DebugLog(fmt.Sprintf("failed to get next time: %#v", al))
 			}

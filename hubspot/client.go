@@ -20,6 +20,8 @@ const (
 	logsURL             = "https://api.hubapi.com/account-info/v3/activity/audit-logs"
 	overlapPeriod       = 30 * time.Minute
 	defaultPollInterval = 30 * time.Second
+	// Restart an uncommitted scan if its continuation keeps failing.
+	maxContinuationFailures = 8
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -58,9 +60,10 @@ type HubSpotAdapter struct {
 // auditScan retains a fixed query window and its collected pages on request errors.
 // Records are not added to the overlap deduper until the complete result is returned.
 type auditScan struct {
-	start, until, after string
-	items               []utils.Dict
-	seen                map[string]bool
+	start, until, after  string
+	items                []utils.Dict
+	seen                 map[string]bool
+	continuationFailures int
 }
 
 type HubSpotConfig struct {
@@ -210,6 +213,18 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		a.scan = &auditScan{start: start, until: until, seen: make(map[string]bool)}
 	}
 	scan := a.scan
+	complete := false
+	defer func() {
+		if complete || scan.after == "" {
+			return
+		}
+		scan.continuationFailures++
+		if scan.continuationFailures >= maxContinuationFailures {
+			// Keep the window and collected records; refresh only its paging cursor.
+			scan.after = ""
+			scan.continuationFailures = 0
+		}
+	}()
 
 	for {
 		// Prepare the request.
@@ -269,6 +284,8 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		}
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", response))
 
+		scan.continuationFailures = 0
+
 		// Collect items.
 		items := response.Results
 		var newItems []utils.Dict
@@ -295,6 +312,7 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		epoch, _ := time.Parse(time.RFC3339, timestamp)
 		a.dedupe[eventid] = epoch.Unix()
 	}
+	complete = true
 	a.scan = nil
 
 	// Cull old dedupe entries.
