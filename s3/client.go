@@ -312,6 +312,9 @@ func (a *S3Adapter) lookForFiles() (bool, error) {
 		if next == "" || next == aws.StringValue(input.ContinuationToken) {
 			err := errors.New("s3.ListObjectsV2(): truncated listing has no advancing continuation token")
 			a.conf.ClientOptions.OnError(err)
+			if !a.conf.IsOneTimeLoad {
+				return found, nil
+			}
 			return found, err
 		}
 		input.ContinuationToken = aws.String(next)

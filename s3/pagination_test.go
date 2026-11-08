@@ -18,11 +18,16 @@ import (
 // or telemetry connections. Every listed key must reach the existing warning.
 func TestListingPagination(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		fail  bool
-		empty bool
+		name       string
+		fail       bool
+		empty      bool
+		continuous bool
+		repeated   bool
 	}{
 		{name: "multiple_pages"}, {name: "empty_intermediate_page", empty: true}, {name: "continuation_failure", fail: true},
+		{name: "continuous_continuation_failure", fail: true, continuous: true},
+		{name: "repeated_token", repeated: true},
+		{name: "continuous_repeated_token", repeated: true, continuous: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			requests := []string{}
@@ -48,6 +53,10 @@ func TestListingPagination(t *testing.T) {
 					truncated = true
 				case "next+/=":
 					key = "second"
+					if tc.repeated {
+						next = token
+						truncated = true
+					}
 					if tc.empty {
 						key = ""
 						next = "last"
@@ -66,7 +75,7 @@ func TestListingPagination(t *testing.T) {
 			}))
 			defer server.Close()
 			sess := session.Must(session.NewSession(&aws.Config{Region: aws.String("us-east-1"), Endpoint: aws.String(server.URL), S3ForcePathStyle: aws.Bool(true), Credentials: credentials.AnonymousCredentials, MaxRetries: aws.Int(0)}))
-			a := &S3Adapter{awsS3: s3.New(sess), conf: S3Config{BucketName: "test-bucket", Prefix: "logs/", IsOneTimeLoad: true, ParallelFetch: 1, ClientOptions: uspclient.ClientOptions{OnError: func(error) { errorsSeen++ }, OnWarning: func(s string) { warnings = append(warnings, s) }}}}
+			a := &S3Adapter{awsS3: s3.New(sess), conf: S3Config{BucketName: "test-bucket", Prefix: "logs/", IsOneTimeLoad: !tc.continuous, ParallelFetch: 1, ClientOptions: uspclient.ClientOptions{OnError: func(error) { errorsSeen++ }, OnWarning: func(s string) { warnings = append(warnings, s) }}}}
 			_, err := a.lookForFiles()
 			wantRequests := 2
 			if tc.empty {
@@ -76,8 +85,17 @@ func TestListingPagination(t *testing.T) {
 				t.Fatalf("listing requests = %q, want %d", requests, wantRequests)
 			}
 			if tc.fail {
-				if err == nil || errorsSeen != 1 {
+				if len(warnings) != 1 || !strings.Contains(warnings[0], "first") {
+					t.Fatalf("first page not processed before continuation failure: %v", warnings)
+				}
+				if (err != nil) != !tc.continuous || errorsSeen != 1 {
 					t.Fatalf("continuation failure hidden: err=%v callbacks=%d", err, errorsSeen)
+				}
+				return
+			}
+			if tc.repeated {
+				if (err != nil) != !tc.continuous || errorsSeen != 1 || len(warnings) != 2 {
+					t.Fatalf("repeated token handling: err=%v callbacks=%d warnings=%v", err, errorsSeen, warnings)
 				}
 				return
 			}
