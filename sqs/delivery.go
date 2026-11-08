@@ -26,6 +26,7 @@ var sourceLeaseBudget = 50 * time.Second
 type batchDelivery struct {
 	slots           chan int
 	sourceInit      chan struct{}
+	renewal         *renewalCompatibility
 	mu              sync.Mutex
 	next            uint64
 	confirmed       [maxLeasedBatches]uint64
@@ -35,7 +36,7 @@ type batchDelivery struct {
 
 func (a *SQSAdapter) ensureDelivery() *batchDelivery {
 	a.deliveryOnce.Do(func() {
-		d := &batchDelivery{slots: make(chan int, maxLeasedBatches), sourceInit: make(chan struct{}, 1)}
+		d := &batchDelivery{renewal: newRenewalCompatibility(a.conf.ClientOptions.OnWarning), slots: make(chan int, maxLeasedBatches), sourceInit: make(chan struct{}, 1)}
 		for i := 0; i < maxLeasedBatches; i++ {
 			d.slots <- i
 		}
@@ -59,7 +60,7 @@ func (a *SQSAdapter) handleBatch(ctx context.Context, messages []*sqs.Message, r
 }
 func (a *SQSAdapter) handleBatchSlot(ctx context.Context, messages []*sqs.Message, receivedBefore time.Time, slot int) error {
 	d := a.ensureDelivery()
-	l := newBatchLease(ctx, a.sqsClient, a.conf.QueueURL, messages, receivedBefore)
+	l := newBatchLease(ctx, a.sqsClient, a.conf.QueueURL, messages, receivedBefore, d.renewal)
 	defer l.abort()
 	if l.ctx.Err() != nil {
 		return context.Cause(l.ctx)
@@ -100,6 +101,12 @@ func (a *SQSAdapter) handleBatchSlot(ctx context.Context, messages []*sqs.Messag
 	if err != nil {
 		if cause := context.Cause(l.ctx); cause != nil {
 			return cause
+		}
+		if l.compatibilityExpired() && deleteCtx.Err() != nil {
+			var canceled interface{ Code() string }
+			if errors.As(err, &canceled) && canceled.Code() == "RequestCanceled" {
+				return errOriginalLeaseRetained
+			}
 		}
 		return err
 	}
@@ -195,7 +202,7 @@ func (a *SQSAdapter) receiveBatches() (receiveErr error) {
 		go func(slot int, messages []*sqs.Message, started time.Time) {
 			defer workers.Done()
 			defer func() { d.slots <- slot }()
-			if err := a.handleBatchSlot(ctx, messages, started, slot); err != nil && !a.expectedClose(err) {
+			if err := a.handleBatchSlot(ctx, messages, started, slot); err != nil && !a.expectedClose(err) && !errors.Is(err, errOriginalLeaseRetained) {
 				select {
 				case failures <- err:
 				default:

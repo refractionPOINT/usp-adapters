@@ -15,3 +15,13 @@ The S3 `s3:TestEvent` control notice contains no telemetry. It is recognized, wa
 A source redrive policy and dead-letter queue are required to quarantine retained invalid envelopes/configuration and control notices. The adapter does not create or change that policy. Without redrive, these notifications can be received repeatedly until the source queue's retention period expires.
 
 Transient download failures (network errors, throttling, or server failures) retain the entire notification for retry; already delivered readable files may replay on redelivery. Permission errors such as 403 remain fatal. Transport, source, admission, acknowledgement-observation, and visibility-ownership failures remain fatal: they use the error callback and stop collection conservatively. Graceful shutdown first stops intake and allows delivered notifications to be acknowledged and deleted within its shutdown budget; uncertain work remains available for source replay.
+
+## Optional visibility renewal
+
+Existing IAM policies do not need `sqs:ChangeMessageVisibility` for collection to work. Renewal remains preferred for long processing and acknowledgement waits when that permission is available.
+
+A denial of the visibility-renewal operation disables further renewal attempts for this adapter instance and emits one counted warning (`renewal_disabled_count=1`). It does not invoke the fatal error callback or create an OrgError. Without renewal, the adapter uses only the conservative original visibility deadline; it never assumes the denied request extended ownership.
+
+Receipts arriving within that original deadline allow normal cleanup. Work, receipt waits, or cleanup that exceed it retain the notification for natural source replay, release the leased-batch slot, and let the collector continue later work. Already-buffered SDK records remain buffered and may still deliver, so duplicates are possible. Very slow work may need renewal permission to make progress; queue retention and redrive settings still apply.
+
+Shutdown/abort and deadline cancellation remain active. Permission or other errors on Receive, Delete, or source-object access retain their existing fatal policy; this fallback applies only to visibility renewal. There are no additional IAM checks, source API operations, or new configuration settings.

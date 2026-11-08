@@ -60,16 +60,18 @@ func (r connResetRetryer) ShouldRetry(req *request.Request) bool {
 const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type S3Adapter struct {
-	conf           S3Config
-	uspClient      acktrack.SDKClient
-	tracker        *acktrack.ACKTracker
-	pendingDeletes []pendingObjectDelete
-	admitted       uint64
-	lastDependency acktrack.ACKDependency
-	ackView        *objectACKView
-	deleteErr      error
-	closeOnce      sync.Once
-	closeErr       error
+	conf                       S3Config
+	uspClient                  acktrack.SDKClient
+	tracker                    *acktrack.ACKTracker
+	pendingDeletes             []pendingObjectDelete
+	admitted                   uint64
+	lastDependency             acktrack.ACKDependency
+	ackView                    *objectACKView
+	deleteErr                  error
+	closeOnce                  sync.Once
+	closeErr                   error
+	conditionalDeleteFallbacks atomic.Uint64
+	warnedDeleteFallbacks      uint64 // collector-owned; cleanup workers only increment the atomic counter
 
 	ctx context.Context
 
@@ -553,6 +555,8 @@ func (a *S3Adapter) processEvent(data []byte, isCompressed bool) bool {
 
 // AWS SDK v1 predates conditional DeleteObject inputs. Its request option adds
 // If-Match before signing; never emulate this with a racy HEAD-then-DELETE.
+// Explicitly unsupported conditional DELETEs use the legacy key-delete path
+// only after this identity's delivery receipt, with a counted degraded-protection warning.
 // Always delete the key (creating a delete marker on versioned buckets), never
 // an individual version. Identical-ETag replacements cannot be distinguished.
 type s3ObjectIdentity struct {
@@ -566,5 +570,9 @@ func (a *S3Adapter) deleteDeliveredObject(key string, identity s3ObjectIdentity)
 		return errors.New("cannot delete object without downloaded identity")
 	}
 	_, err := a.awsS3.DeleteObjectWithContext(a.ctx, input, request.WithSetRequestHeaders(map[string]string{"If-Match": identity.ETag}))
+	if unsupportedConditionalDelete(err) {
+		a.conditionalDeleteFallbacks.Add(1)
+		_, err = a.awsS3.DeleteObjectWithContext(a.ctx, input)
+	}
 	return err
 }

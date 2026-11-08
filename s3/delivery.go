@@ -144,6 +144,7 @@ func (a *S3Adapter) deleteConfirmedPrefix(count int) error {
 		}()
 	}
 	wg.Wait()
+	a.warnDeleteCompatibilityFallbacks()
 	retained := a.pendingDeletes[:0]
 	var failures []error
 	for i, entry := range a.pendingDeletes {

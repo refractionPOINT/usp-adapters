@@ -30,6 +30,8 @@ type batchLease struct {
 	entries                []*sqs.ChangeMessageVisibilityBatchRequestEntry
 	mu                     sync.Mutex
 	deadline, hardDeadline time.Time
+	originalDeadline       time.Time
+	compatibility          *renewalCompatibility
 }
 
 var leaseRenewInterval time.Duration
@@ -39,10 +41,14 @@ var leaseShipSlice = 200 * time.Millisecond
 var leaseCloseBudget = 10 * time.Second
 var leaseMaxLifetime = 11*time.Hour + 50*time.Minute
 
-func newBatchLease(parent context.Context, client *sqs.SQS, queue string, messages []*sqs.Message, receivedBefore time.Time) *batchLease {
+func newBatchLease(parent context.Context, client *sqs.SQS, queue string, messages []*sqs.Message, receivedBefore time.Time, policies ...*renewalCompatibility) *batchLease {
+	policy := newRenewalCompatibility(nil)
+	if len(policies) > 0 && policies[0] != nil {
+		policy = policies[0]
+	}
 	ctx, cancel := context.WithCancelCause(parent)
 	renewCtx, stop := context.WithCancel(ctx)
-	l := &batchLease{ctx: ctx, cancel: cancel, renewCtx: renewCtx, stopRenew: stop, stopRequested: make(chan struct{}), done: make(chan struct{}), client: client, queue: queue, deadline: receivedBefore.Add(sourceLeaseBudget), hardDeadline: receivedBefore.Add(leaseMaxLifetime)}
+	l := &batchLease{ctx: ctx, cancel: cancel, renewCtx: renewCtx, stopRenew: stop, stopRequested: make(chan struct{}), done: make(chan struct{}), client: client, queue: queue, deadline: receivedBefore.Add(sourceLeaseBudget), hardDeadline: receivedBefore.Add(leaseMaxLifetime), originalDeadline: receivedBefore.Add(sourceLeaseBudget), compatibility: policy}
 	seen := map[string]bool{}
 	for i, m := range messages {
 		if m == nil || m.ReceiptHandle == nil || *m.ReceiptHandle == "" || seen[*m.ReceiptHandle] {
@@ -53,7 +59,7 @@ func newBatchLease(parent context.Context, client *sqs.SQS, queue string, messag
 		l.entries = append(l.entries, &sqs.ChangeMessageVisibilityBatchRequestEntry{Id: aws.String(strconv.Itoa(i)), ReceiptHandle: m.ReceiptHandle, VisibilityTimeout: aws.Int64(60)})
 	}
 	if !time.Now().Before(minTime(l.deadline, l.hardDeadline)) {
-		cancel(context.DeadlineExceeded)
+		l.expire()
 	}
 	go l.renew()
 	return l
@@ -61,14 +67,13 @@ func newBatchLease(parent context.Context, client *sqs.SQS, queue string, messag
 func (l *batchLease) renew() {
 	defer close(l.done)
 	for {
-		l.mu.Lock()
-		deadline := l.deadline
-		l.mu.Unlock()
-		if hard := l.hardDeadline; hard.Before(deadline) {
-			deadline = hard
+		if l.compatibility.isDisabled() {
+			l.waitOriginalLease()
+			return
 		}
+		deadline := l.knownDeadline()
 		if !time.Now().Before(deadline) {
-			l.cancel(context.DeadlineExceeded)
+			l.expire()
 			return
 		}
 		// Renew well before expiry, with time for a bounded RPC. Budgeting from
@@ -79,6 +84,10 @@ func (l *batchLease) renew() {
 		}
 		timer := time.NewTimer(delay)
 		select {
+		case <-l.compatibility.disabled:
+			timer.Stop()
+			l.waitOriginalLease()
+			return
 		case <-l.stopRequested:
 			timer.Stop()
 			return
@@ -91,6 +100,9 @@ func (l *batchLease) renew() {
 		// start another RPC. A stop racing the RPC start still joins that
 		// bounded request without canceling its ownership evidence.
 		select {
+		case <-l.compatibility.disabled:
+			l.waitOriginalLease()
+			return
 		case <-l.stopRequested:
 			return
 		case <-l.renewCtx.Done():
@@ -99,12 +111,22 @@ func (l *batchLease) renew() {
 		}
 		started := time.Now()
 		if !started.Before(deadline) {
-			l.cancel(context.DeadlineExceeded)
+			l.expire()
 			return
 		}
 		rpcCtx, stop := context.WithDeadline(l.renewCtx, minTime(deadline, started.Add(leaseRPCBudget)))
 		out, err := l.client.ChangeMessageVisibilityBatchWithContext(rpcCtx, &sqs.ChangeMessageVisibilityBatchInput{QueueUrl: &l.queue, Entries: l.entries})
+		rpcContextErr := rpcCtx.Err()
 		stop()
+		if renewalPermissionDenied(out, err, len(l.entries)) {
+			l.compatibility.disable()
+			l.waitOriginalLease()
+			return
+		}
+		if l.compatibilityExpired() && rpcContextErr != nil {
+			l.expire()
+			return
+		}
 		if err == nil {
 			if out == nil || len(out.Failed) != 0 || len(out.Successful) != len(l.entries) {
 				err = errors.New("incomplete SQS visibility renewal")
@@ -130,7 +152,7 @@ func (l *batchLease) renew() {
 			return
 		}
 		if !time.Now().Before(deadline) {
-			l.cancel(context.DeadlineExceeded)
+			l.expire()
 			return
 		}
 		l.mu.Lock()
@@ -154,12 +176,8 @@ func (l *batchLease) stopAndJoin() error {
 	if err := context.Cause(l.ctx); err != nil {
 		return err
 	}
-	l.mu.Lock()
-	deadline := l.deadline
-	l.mu.Unlock()
-	if !time.Now().Before(deadline) {
-		l.cancel(context.DeadlineExceeded)
-		return context.DeadlineExceeded
+	if !time.Now().Before(l.knownDeadline()) {
+		return l.expire()
 	}
 	return nil
 }
@@ -167,9 +185,7 @@ func (l *batchLease) cleanupContext() (context.Context, context.CancelFunc, erro
 	if err := l.stopAndJoin(); err != nil {
 		return nil, nil, err
 	}
-	l.mu.Lock()
-	deadline := l.deadline
-	l.mu.Unlock()
+	deadline := l.knownDeadline()
 	ctx, cancel := context.WithDeadline(l.ctx, minTime(deadline, time.Now().Add(leaseRPCBudget)))
 	return ctx, cancel, nil
 }
