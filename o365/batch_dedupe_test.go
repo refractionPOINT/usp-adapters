@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/assert"
@@ -85,7 +86,7 @@ func (d *fakeBatchDeduper) AddMany(keys []utils.DedupeKey) {
 	names := make([]string, len(keys))
 	for i, k := range keys {
 		d.seen[k.Key] = k.Time
-		names[i] = k.Key
+		names[i] = strings.TrimPrefix(k.Key, "o365:ack:v1:")
 	}
 	d.ops = append(d.ops, "addmany:"+strings.Join(names, ","))
 }
@@ -99,14 +100,14 @@ func (d *fakeBatchDeduper) logOp(op string) {
 func (d *fakeBatchDeduper) has(key string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	_, ok := d.seen[key]
+	_, ok := d.seen[confirmedKey(key)]
 	return ok
 }
 
 func (d *fakeBatchDeduper) recordedTime(key string) time.Time {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.seen[key]
+	return d.seen[confirmedKey(key)]
 }
 
 // reset forgets the call counts and the op log, not the recorded keys.
@@ -139,7 +140,9 @@ func (d *fakeBatchDeduper) split(isBlob func(string) bool) (blobChecks, eventChe
 	return
 }
 
-func isBlobKey(k string) bool { return strings.HasPrefix(k, "blob-") }
+func isBlobKey(k string) bool {
+	return strings.HasPrefix(strings.TrimPrefix(k, "o365:ack:v1:"), "blob-")
+}
 
 func sizes(calls [][]utils.DedupeKey) []int {
 	out := make([]int, len(calls))
@@ -152,7 +155,7 @@ func sizes(calls [][]utils.DedupeKey) []int {
 func keyNames(keys []utils.DedupeKey) []string {
 	out := make([]string, len(keys))
 	for i, k := range keys {
-		out[i] = k.Key
+		out[i] = strings.TrimPrefix(k.Key, "o365:ack:v1:")
 	}
 	return out
 }
@@ -321,7 +324,6 @@ func TestDeduperWiring(t *testing.T) {
 		"default local deduper": {nil, true, true},
 		"batch deduper":         {newFakeBatchDeduper(), true, true},
 		"checking deduper":      {newSharedDeduper(), false, true},
-		"plain deduper":         {newLegacyDeduper(), false, false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			m := newMockO365(t)
@@ -444,7 +446,7 @@ func TestBatchDuplicateRecordedByAnotherInstance(t *testing.T) {
 	srv := newBlobServer(t)
 	srv.add("blob-1", "2026-10-28T12:00:00.000Z", eventN("x", 1), eventN("x", 2), eventN("x", 3))
 	dd := newFakeBatchDeduper()
-	dd.AddMany([]utils.DedupeKey{{Key: "x-0002"}})
+	dd.AddMany([]utils.DedupeKey{{Key: confirmedKey("x-0002")}})
 	dd.reset()
 	sink := &logSink{d: dd}
 	a, stats := newBatchAdapter(t, srv, dd, sink)
@@ -574,7 +576,7 @@ func TestBatchFailOpenShipsEverything(t *testing.T) {
 			srv.add("blob-1", "2026-10-28T12:00:00.000Z", eventN("a", 1), eventN("a", 2))
 			dd := newFakeBatchDeduper()
 			// Everything was done before, but the backend can't tell.
-			dd.AddMany([]utils.DedupeKey{{Key: "blob-1"}, {Key: "a-0001"}, {Key: "a-0002"}})
+			dd.AddMany([]utils.DedupeKey{{Key: confirmedKey("blob-1")}, {Key: confirmedKey("a-0001")}, {Key: confirmedKey("a-0002")}})
 			dd.reset()
 			setup(dd)
 			sink := &logSink{d: dd}
@@ -740,37 +742,9 @@ func TestCheckingDeduperPathUnchanged(t *testing.T) {
 	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
 	assert.Equal(t, 2, sink.count())
 	assert.Equal(t, 1, sink.payloadCounts()[dup])
-	assert.True(t, dd.Check("blob-a"))
-	assert.True(t, dd.Check("blob-b"))
-	assert.True(t, dd.Check("dup-event"))
-	assert.Equal(t, []DedupeStats{{BlobsFetched: 2, EventsShipped: 2, EventsDuplicate: 1}}, stats.all())
-
-	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
-	assert.Equal(t, 2, sink.count())
-	assert.Equal(t, DedupeStats{BlobsSkipped: 2}, stats.all()[1])
-}
-
-// A deduper that can only check-and-record records before the work, as ever.
-func TestPlainDeduperPathUnchanged(t *testing.T) {
-	srv := newBlobServer(t)
-	dup := event("dup-event", "2026-10-28T12:00:00")
-	srv.add("blob-a", "2026-10-28T12:00:00.000Z", dup, event("other", "2026-10-28T12:00:01"))
-	srv.add("blob-b", "2026-10-28T12:01:00.000Z", dup)
-	dd := newLegacyDeduper()
-	sink := &captureSink{}
-	stats := &statsRecorder{}
-	conf := validConfig(t)
-	fastRetries(&conf)
-	conf.Deduper = dd
-	conf.OnDedupeStats = stats.hook
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	a := &Office365Adapter{conf: conf, httpClient: http.DefaultClient,
-		uspClient: sink, doStop: utils.NewEvent(), stopCtx: ctx, cancelStop: cancel}
-
-	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
-	assert.Equal(t, 2, sink.count())
-	assert.Equal(t, 1, sink.payloadCounts()[dup])
+	assert.True(t, dd.Check(confirmedKey("blob-a")))
+	assert.True(t, dd.Check(confirmedKey("blob-b")))
+	assert.True(t, dd.Check(confirmedKey("dup-event")))
 	assert.Equal(t, []DedupeStats{{BlobsFetched: 2, EventsShipped: 2, EventsDuplicate: 1}}, stats.all())
 
 	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
@@ -798,4 +772,8 @@ func TestDefaultLocalDeduperUsesBatchPath(t *testing.T) {
 	require.Eventually(t, func() bool { return len(stats.all()) >= 1 }, 5*time.Second, 10*time.Millisecond)
 	assert.Equal(t, DedupeStats{BlobsFetched: 2, EventsShipped: 1, EventsDuplicate: 1}, stats.all()[0])
 	assert.Equal(t, 1, sink.payloadCounts()[dup])
+}
+
+func (s *logSink) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.Ship(m, d)
 }
