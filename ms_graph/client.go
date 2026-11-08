@@ -3,18 +3,22 @@ package usp_ms_graph
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -23,6 +27,8 @@ const URLPrefix = "https://graph.microsoft.com/v1.0/"
 const defaultLoginEndpoint = "https://login.microsoftonline.com"
 const defaultPollInterval = 30 * time.Second
 const defaultTimestampField = "createdDateTime"
+const maxShipWait = time.Minute
+const maxRetryAfter = 15 * time.Minute
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
@@ -44,9 +50,12 @@ type MsGraphAdapter struct {
 
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
-	doStop    *utils.Event
 
-	ctx context.Context
+	ctx                 context.Context
+	cancel              context.CancelFunc
+	notifier            vendorerr.Notifier
+	runtime             graphRuntime
+	lastSuccessfulFetch time.Time
 }
 
 type MsGraphConfig struct {
@@ -104,11 +113,18 @@ func NewMsGraphAdapter(ctx context.Context, conf MsGraphConfig) (*MsGraphAdapter
 // is non-nil it is used in place of a real LimaCharlie client -- the seam
 // tests use to capture shipped events.
 func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*MsGraphAdapter, chan struct{}, error) {
+	return newMsGraphAdapterWithRuntime(ctx, conf, sink, defaultGraphRuntime())
+}
+
+func newMsGraphAdapterWithRuntime(ctx context.Context, conf MsGraphConfig, sink uspSink, runtime graphRuntime) (*MsGraphAdapter, chan struct{}, error) {
 	a := &MsGraphAdapter{
-		conf:   conf,
-		ctx:    context.Background(),
-		doStop: utils.NewEvent(),
+		conf:                conf,
+		ctx:                 context.Background(),
+		runtime:             runtime,
+		lastSuccessfulFetch: runtime.now(),
 	}
+
+	a.ctx, a.cancel = context.WithCancel(ctx)
 
 	a.loginEndpoint = strings.TrimSuffix(conf.LoginEndpoint, "/")
 	if a.loginEndpoint == "" {
@@ -124,6 +140,7 @@ func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*
 	} else {
 		uspClient, err := uspclient.NewClient(ctx, conf.ClientOptions)
 		if err != nil {
+			a.cancel()
 			return nil, nil, err
 		}
 		a.uspClient = uspClient
@@ -131,6 +148,9 @@ func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*
 
 	a.httpClient = &http.Client{
 		Timeout: 10 * time.Second,
+		// Refuse redirects before either bearer tokens or client credentials can
+		// be forwarded. Continuations are validated separately against the origin.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
 		Transport: &http.Transport{
 			Dial: (&net.Dialer{
 				Timeout: 10 * time.Second,
@@ -167,8 +187,9 @@ func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*
 func (a *MsGraphAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
-	a.doStop.Set()
+	a.cancel()
 	a.wgSenders.Wait()
+	a.notifier.Close()
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.httpClient.CloseIdleConnections()
@@ -180,202 +201,320 @@ func (a *MsGraphAdapter) Close() error {
 	return err2
 }
 
-func (a *MsGraphAdapter) fetchToken() (string, error) {
+var errRetry = errors.New("retryable Graph failure")
+var errPermanent = errors.New("Graph authentication or configuration failure")
 
-	url := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
-	payload := fmt.Sprintf("client_id=%s&scope=%s&grant_type=%s&client_secret=%s", a.conf.ClientID, scope, "client_credentials", a.conf.ClientSecret)
+const graphTimeLayout = "2006-01-02T15:04:05.0000000Z"
 
-	req, err := http.NewRequest("POST", url, bytes.NewBufferString(payload))
-	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+// Carries scheduling and status without exposing unredacted response text.
+type graphHTTPError struct {
+	error
+	status  int
+	retryAt time.Time
+}
+
+func (e *graphHTTPError) Unwrap() error { return e.error }
+
+func retryAfter(value string, now time.Time) time.Duration {
+	// Clamp before converting to a duration, including numeric overflow, so
+	// a malformed proxy delay cannot silence requests indefinitely.
+	if n, err := strconv.ParseUint(value, 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+		if n > uint64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		return time.Duration(n) * time.Second
 	}
+	if t, err := http.ParseTime(value); err == nil && t.After(now) {
+		return min(t.Sub(now), maxRetryAfter)
+	}
+	return 0
+}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+func (a *MsGraphAdapter) wait(delay time.Duration) error {
+	return a.runtime.wait(a.ctx, delay)
+}
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+// request handles both token and collection exchanges. Error status takes
+// precedence over body read failures; only bounded, redacted diagnostics escape.
+func (a *MsGraphAdapter) request(method, raw, payload, bearer string) ([]byte, error) {
+	secrets := []string{a.conf.ClientSecret, bearer}
+	req, err := http.NewRequestWithContext(a.ctx, method, raw, bytes.NewBufferString(payload))
 	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+		return nil, vendorerr.Kind(errPermanent, "building request: "+err.Error(), err, secrets...)
+	}
+	if req.URL.Host == "" || req.URL.User != nil || req.URL.Fragment != "" || (req.URL.Scheme != "http" && req.URL.Scheme != "https") {
+		return nil, vendorerr.Kind(errPermanent, "invalid request endpoint", nil)
+	}
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	resp, err := a.httpClient.Do(req)
+	if err != nil {
+		kind := errRetry
+		var certificate *tls.CertificateVerificationError
+		if errors.As(err, &certificate) {
+			kind = errPermanent
+		}
+		return nil, a.requestFailure(vendorerr.Kind(kind, err.Error(), err, secrets...))
 	}
 	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		now := a.runtime.now()
+		kind := errPermanent
+		if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			kind = errRetry
+		}
+		body, cut := vendorerr.ReadBody(resp)
+		return nil, a.requestFailure(&graphHTTPError{error: vendorerr.Kind(kind, vendorerr.HTTPText(resp, body, cut, secrets...), nil, secrets...), status: resp.StatusCode, retryAt: now.Add(retryAfter(resp.Header.Get("Retry-After"), now))})
+	}
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+		return nil, a.requestFailure(vendorerr.Kind(errRetry, "reading response: "+err.Error(), err, secrets...))
 	}
-
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+	if method == http.MethodGet {
+		a.lastSuccessfulFetch = a.runtime.now()
 	}
-
-	accessToken, ok := result["access_token"].(string)
-	if !ok {
-		return "", fmt.Errorf("no bearer token returned: %#v", result)
-	}
-
-	return accessToken, nil
-
+	return body, nil
 }
 
-func (a *MsGraphAdapter) fetchEvents(url string) {
+func (a *MsGraphAdapter) fetchToken() (string, error) {
+	tokenURL := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
+	payload := url.Values{"client_id": {a.conf.ClientID}, "scope": {scope}, "grant_type": {"client_credentials"}, "client_secret": {a.conf.ClientSecret}}.Encode()
+	body, err := a.request(http.MethodPost, tokenURL, payload, "")
+	if err != nil {
+		return "", vendorerr.Wrap("fetching token", err, a.conf.ClientSecret)
+	}
+	var result struct {
+		Token string `json:"access_token"`
+	}
+	// Never include a successful token response in diagnostics.
+	if err := json.Unmarshal(body, &result); err != nil || result.Token == "" {
+		return "", vendorerr.Kind(errRetry, "token endpoint returned no usable access token", nil)
+	}
+	return result.Token, nil
+}
+
+// graphCursor is committed only after every page has been shipped. The inclusive
+// boundary retains all IDs at the maximum parsed instant, independent of order.
+type graphCursor struct {
+	since time.Time
+	ids   map[string]bool
+}
+
+type graphRecordKey struct {
+	id      string
+	instant time.Time
+}
+
+func (a *MsGraphAdapter) fetchEvents(eventsURL string) {
 	defer a.wgSenders.Done()
-	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
-
-	lastEventId := ""
-	// since := time.Date(2022, time.June, 1, 0, 0, 0, 0, time.UTC).Format("2006-01-02T15:04:05.000000Z")
-	since := time.Now().Format("2006-01-02T15:04:05.000000Z")
-
-	for !a.doStop.WaitFor(a.pollInterval) {
-		// The makeOneRequest function handles error
-		// handling and fatal error handling.
-		items, newSince, eventId, _ := a.makeOneListRequest(url, since, lastEventId)
-		since = newSince
-		lastEventId = eventId
-		if items == nil {
-			continue
+	cursor := graphCursor{since: a.runtime.now().UTC().Truncate(100 * time.Nanosecond), ids: map[string]bool{}}
+	// Retain successful shipments while retrying an incomplete scan, including
+	// older records that would otherwise be skipped by a premature watermark.
+	delivered := map[graphRecordKey]bool{}
+	delay := a.pollInterval
+	for {
+		if err := a.wait(delay); err != nil {
+			return
 		}
 
-		for _, item := range items {
-			msg := &protocol.DataMessage{
-				JsonPayload: item,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
-				}
-				if err == nil {
-					continue
-				}
-				if err != uspclient.ErrorClosed {
-					a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-				}
-				a.doStop.Set()
+		next, err := a.poll(eventsURL, cursor, delivered)
+		if err != nil {
+			if a.ctx.Err() != nil || errors.Is(err, uspclient.ErrorClosed) {
 				return
 			}
+			if errors.Is(err, errRetry) {
+				a.conf.ClientOptions.OnWarning(err.Error())
+				delay = a.pollInterval
+				var httpErr *graphHTTPError
+				if errors.As(err, &httpErr) && httpErr.retryAt.Sub(a.runtime.now()) > delay {
+					delay = httpErr.retryAt.Sub(a.runtime.now())
+				}
+				continue
+			}
+			a.notifyFatal(err)
+			return
 		}
+		cursor = next
+		delay = a.pollInterval
+		delivered = map[graphRecordKey]bool{}
 	}
 }
 
-func (a *MsGraphAdapter) makeOneListRequest(eventsUrl string, since string, lastEventId string) ([]map[string]interface{}, string, string, error) {
-	var alerts []map[string]interface{}
-	var lastDetectionTime, eventId string
-
-	// Retry up to 3 times
-	tsField := a.conf.TimestampField
-	if tsField == "" {
-		tsField = defaultTimestampField
+func (a *MsGraphAdapter) timestampField() string {
+	if a.conf.TimestampField != "" {
+		return a.conf.TimestampField
 	}
+	return defaultTimestampField
+}
 
+// poll streams pages, but keeps the committed watermark unchanged on any
+// request, decoding, validation or shipping failure. delivered is retry state.
+func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered map[graphRecordKey]bool) (graphCursor, error) {
+	malformed := 0
+	defer func() {
+		if malformed > 0 {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("skipped %d malformed Graph record(s)", malformed))
+		}
+	}()
+	origin, err := url.Parse(eventsURL)
+	if err != nil {
+		return cursor, errors.New("invalid Graph endpoint")
+	}
+	if origin.Host == "" || origin.User != nil || (origin.Scheme != "https" && origin.Scheme != "http") {
+		return cursor, errors.New("invalid Graph endpoint")
+	}
+	query, err := url.ParseQuery(origin.RawQuery)
+	if err != nil {
+		return cursor, errors.New("invalid Graph query")
+	}
+	filter := a.timestampField() + " ge " + cursor.since.UTC().Truncate(100*time.Nanosecond).Format(graphTimeLayout)
+	if existing := query.Get("$filter"); existing != "" {
+		filter = "(" + existing + ") and (" + filter + ")"
+	}
+	query.Set("$filter", filter)
+	first := *origin
+	first.RawQuery = query.Encode()
+	current := &first
+	visited := map[string]bool{}
+	token := ""
+	candidate := graphCursor{since: cursor.since, ids: map[string]bool{}}
+	for id := range cursor.ids {
+		candidate.ids[id] = true
+	}
+	for {
+		if a.ctx.Err() != nil {
+			return cursor, a.ctx.Err()
+		}
+		if visited[current.String()] {
+			return cursor, vendorerr.Kind(errRetry, "Graph continuation cycle", nil)
+		}
+		visited[current.String()] = true
+		body, err := a.requestPage(current.String(), &token)
+		if err != nil {
+			return cursor, err
+		}
+		var page struct {
+			Value json.RawMessage `json:"value"`
+			Next  string          `json:"@odata.nextLink"`
+		}
+		if err := json.Unmarshal(body, &page); err != nil {
+			return cursor, vendorerr.Kind(errRetry, "invalid Graph page JSON", nil)
+		}
+		var records []json.RawMessage
+		if len(page.Value) == 0 || string(page.Value) == "null" {
+			return cursor, vendorerr.Kind(errRetry, "missing Graph value array", nil)
+		}
+		if err := json.Unmarshal(page.Value, &records); err != nil {
+			return cursor, vendorerr.Kind(errRetry, "invalid Graph value array", nil)
+		}
+		for _, raw := range records {
+			var record map[string]interface{}
+			if err := json.Unmarshal(raw, &record); err != nil || record == nil {
+				malformed++
+				continue
+			}
+			id, _ := record["id"].(string)
+			stamp, _ := record[a.timestampField()].(string)
+			instant, err := time.Parse(time.RFC3339Nano, stamp)
+			if err != nil || strings.TrimSpace(id) == "" {
+				malformed++
+				continue
+			}
+			instant = instant.UTC()
+			if instant.Before(cursor.since) {
+				continue
+			}
+			key := graphRecordKey{id: id, instant: instant}
+			if !(instant.Equal(cursor.since) && cursor.ids[id]) && !delivered[key] {
+				if a.ctx.Err() != nil {
+					return cursor, a.ctx.Err()
+				}
+				msg := &protocol.DataMessage{JsonPayload: record, TimestampMs: uint64(time.Now().UnixMilli())}
+				err = a.uspClient.Ship(msg, 10*time.Second)
+				if err == uspclient.ErrorBufferFull {
+					a.conf.ClientOptions.OnWarning("stream falling behind")
+					err = a.uspClient.Ship(msg, maxShipWait)
+				}
+				if err != nil {
+					return cursor, vendorerr.Kind(errRetry, "shipping record: "+err.Error(), err, a.conf.ClientSecret, token)
+				}
+				delivered[key] = true
+			}
+			if instant.After(candidate.since) {
+				candidate.since = instant
+				candidate.ids = map[string]bool{}
+			}
+			if instant.Equal(candidate.since) {
+				candidate.ids[id] = true
+			}
+		}
+		var nextURL *url.URL
+		if page.Next != "" {
+			link, err := url.Parse(page.Next)
+			if err != nil {
+				return cursor, vendorerr.Kind(errRetry, "invalid Graph continuation", nil)
+			}
+			nextURL = current.ResolveReference(link)
+			if !strings.EqualFold(nextURL.Scheme, origin.Scheme) || !strings.EqualFold(nextURL.Host, origin.Host) || nextURL.User != nil || nextURL.Fragment != "" {
+				return cursor, errors.New("Graph continuation must use the configured origin")
+			}
+		}
+		if nextURL == nil {
+			return candidate, nil
+		}
+
+		// nextLink is opaque: never reconstruct its query or add the filter again.
+		current = nextURL
+	}
+}
+
+func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, error) {
+	refreshed := false
 	for attempt := 1; attempt <= 3; attempt++ {
-		// Create query parameters
-		filter := "%24"
-		query := "%20ge%20"
-		date_filter := fmt.Sprintf("?%sfilter=%s%s%s", filter, tsField, query, strings.Replace(since, ":", "%3A", -1))
-
-		// Create the full request URL with query parameters (don't modify eventsUrl to avoid corruption on retries)
-		requestUrl := eventsUrl + date_filter
-
-		authToken, err := a.fetchToken()
-		if err != nil {
-			// Retry if token fetch failed, but continue to the next iteration
-			if attempt < 3 {
-				a.conf.ClientOptions.OnWarning(fmt.Sprintf("error fetching token (attempt %d), retrying: %s", attempt, err))
-				time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
+		var err error
+		if *token == "" {
+			*token, err = a.fetchToken()
+		}
+		if err == nil {
+			var body []byte
+			body, err = a.request(http.MethodGet, pageURL, "", *token)
+			if err == nil {
+				// The fetch reset the request clock. Finish its page with
+				// bounded sends; there are no clock checks between records.
+				return body, nil
+			}
+			var httpErr *graphHTTPError
+			if errors.As(err, &httpErr) && httpErr.status == http.StatusUnauthorized && !refreshed {
+				refreshed = true
+				*token = ""
+				attempt--
 				continue
 			}
-			// Return after 3 failed attempts
-			a.conf.ClientOptions.OnError(fmt.Errorf("error fetching token after 3 attempts: %s", err))
-			return nil, since, "", fmt.Errorf("error fetching token after 3 attempts: %s", err)
 		}
-
-		req, err := http.NewRequest("GET", requestUrl, nil)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error creating request: %s", err))
-			return nil, since, "", err
+		if a.ctx.Err() != nil {
+			return nil, a.ctx.Err()
 		}
-
-		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", authToken))
-		req.Header.Set("Content-Type", "application/json")
-
-		client := &http.Client{}
-		resp, err := client.Do(req)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error making request: %s", err))
-			return nil, since, "", err
+		if !errors.Is(err, errRetry) {
+			return nil, err
 		}
-		defer resp.Body.Close()
-
-		body, err := ioutil.ReadAll(resp.Body)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error reading response: %s", err))
-			return nil, since, "", err
+		if attempt == 3 {
+			return nil, err
 		}
-
-		if resp.StatusCode != http.StatusOK {
-			// Check for retryable status codes (503, 504) - likely Microsoft infrastructure issues
-			isRetryable := resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusGatewayTimeout
-
-			if isRetryable {
-				// Retry for transient infrastructure errors
-				if attempt < 3 {
-					a.conf.ClientOptions.OnWarning(fmt.Sprintf("Microsoft API returned %d (attempt %d), retrying: %s", resp.StatusCode, attempt, body))
-					time.Sleep(time.Duration(attempt) * time.Second) // Exponential backoff
-					continue
-				}
-				// Final attempt for retryable error
-				a.conf.ClientOptions.OnError(fmt.Errorf("Microsoft API returned %d after 3 attempts: %s", resp.StatusCode, body))
-				return nil, since, "", fmt.Errorf("Microsoft API returned %d after 3 attempts: %s", resp.StatusCode, body)
-			} else {
-				// Non-retryable error (auth, permission, etc) - fail immediately
-				a.conf.ClientOptions.OnError(fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s", body))
-				return nil, since, "", fmt.Errorf("error response from Microsoft API, be sure to verify permissions and Microsoft API status: %s", body)
-			}
+		a.conf.ClientOptions.OnWarning(err.Error())
+		delay := time.Duration(attempt) * time.Second
+		var httpErr *graphHTTPError
+		if errors.As(err, &httpErr) && httpErr.retryAt.Sub(a.runtime.now()) > delay {
+			delay = httpErr.retryAt.Sub(a.runtime.now())
 		}
-
-		// If the response is OK, parse the body and process detections
-		var data map[string]interface{}
-		err = json.Unmarshal(body, &data)
-		detections, _ := data["value"].([]interface{})
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("error parsing JSON: %v", err))
-			return nil, since, "", err
+		if err := a.wait(delay); err != nil {
+			return nil, err
 		}
-
-		items := detections
-
-		lastDetectionTime = since
-		for _, detection := range items {
-			detectMap, ok := detection.(map[string]interface{})
-			if !ok {
-				a.conf.ClientOptions.DebugLog("error parsing detectMap JSON")
-				continue
-			}
-
-			id, ok := detectMap["id"].(string)
-			if !ok {
-				a.conf.ClientOptions.DebugLog("error parsing ID from detectMap JSON")
-				continue
-			}
-			eventId = id
-
-			if id != lastEventId {
-				eventTime, ok := detectMap[tsField].(string)
-				if !ok {
-					a.conf.ClientOptions.DebugLog(fmt.Sprintf("error parsing %s from detectMap JSON", tsField))
-					continue
-				}
-
-				lastDetectionTime = eventTime
-				alerts = append(alerts, detectMap)
-			}
-		}
-
-		// Break out of the loop if successful
-		break
 	}
-
-	return alerts, lastDetectionTime, eventId, nil
+	return nil, vendorerr.Kind(errRetry, "Graph retries exhausted", nil)
 }

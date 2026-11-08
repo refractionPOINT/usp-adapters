@@ -274,6 +274,17 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 		}
 		backoff = time.Second
 		episode = failureEpisode{}
+		// Count malformed events before admission, which may block on delivery.
+		// Keep the warning bounded and never include vendor payloads or IDs.
+		invalid := 0
+		for _, item := range page.items {
+			if id, _ := item["uuid"].(string); id == "" {
+				invalid++
+			}
+		}
+		if invalid > 0 && a.conf.ClientOptions.OnWarning != nil {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("okta collection: skipped %d event(s) with missing or invalid uuid", invalid))
+		}
 		g.page++
 		for _, item := range page.items {
 			if ctx.Err() != nil {
@@ -281,8 +292,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 			id, _ := item["uuid"].(string)
 			if id == "" {
-				a.issue("invalid_event")
-				return
+				continue
 			}
 			digest := eventDigest(id)
 			entry, exists := g.live[digest]

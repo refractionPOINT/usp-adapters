@@ -20,6 +20,8 @@ const (
 	logsURL             = "https://api.hubapi.com/account-info/v3/activity/audit-logs"
 	overlapPeriod       = 30 * time.Minute
 	defaultPollInterval = 30 * time.Second
+	// Restart an uncommitted scan if its continuation keeps failing.
+	maxContinuationFailures = 8
 )
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
@@ -52,6 +54,16 @@ type HubSpotAdapter struct {
 	ctx context.Context
 
 	dedupe map[string]int64
+	scan   *auditScan
+}
+
+// auditScan retains a fixed query window and its collected pages on request errors.
+// Records are not added to the overlap deduper until the complete result is returned.
+type auditScan struct {
+	start, until, after  string
+	items                []utils.Dict
+	seen                 map[string]bool
+	continuationFailures int
 }
 
 type HubSpotConfig struct {
@@ -187,25 +199,49 @@ func (a *HubSpotAdapter) fetchEvents() {
 }
 
 func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
-	var allItems []utils.Dict
-	currentTime := time.Now()
-	var start string
+	if a.scan == nil {
+		currentTime := time.Now()
+		var start string
 
-	if t := currentTime.Add(-overlapPeriod); t.Before(notBefore) {
-		start = notBefore.UTC().Format(time.RFC3339)
-	} else {
-		start = currentTime.Add(-overlapPeriod).UTC().Format(time.RFC3339)
+		if t := currentTime.Add(-overlapPeriod); t.Before(notBefore) {
+			start = notBefore.UTC().Format(time.RFC3339)
+		} else {
+			start = currentTime.Add(-overlapPeriod).UTC().Format(time.RFC3339)
+		}
+		until := currentTime.UTC().Format(time.RFC3339)
+
+		a.scan = &auditScan{start: start, until: until, seen: make(map[string]bool)}
 	}
-	until := currentTime.UTC().Format(time.RFC3339)
+	scan := a.scan
+	complete := false
+	defer func() {
+		if complete || scan.after == "" {
+			return
+		}
+		scan.continuationFailures++
+		if scan.continuationFailures >= maxContinuationFailures {
+			// Keep the window and collected records; refresh only its paging cursor.
+			scan.after = ""
+			scan.continuationFailures = 0
+		}
+	}()
 
 	for {
 		// Prepare the request.
-		req, err := http.NewRequest("GET", fmt.Sprintf("%s?occurredAfter=%s&occurredBefore=%s", a.apiURL, start, until), nil)
-		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s starting at %s until %s", a.apiURL, start, until))
+		req, err := http.NewRequest("GET", a.apiURL, nil)
+		a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s starting at %s until %s", a.apiURL, scan.start, scan.until))
 		if err != nil {
 			a.doStop.Set()
 			return nil
 		}
+		q := req.URL.Query()
+		q.Set("occurredAfter", scan.start)
+		q.Set("occurredBefore", scan.until)
+		if scan.after != "" {
+			q.Set("after", scan.after)
+		}
+		req.URL.RawQuery = q.Encode()
+
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", a.conf.AccessToken))
 
@@ -215,16 +251,17 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 			a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 			return nil
 		}
-		defer resp.Body.Close()
 
 		// Evaluate if success.
 		if resp.StatusCode != http.StatusOK {
 			body, _ := ioutil.ReadAll(resp.Body)
+			resp.Body.Close()
 			a.conf.ClientOptions.OnError(fmt.Errorf("hubspot api non-200: %s\nREQUEST: %s\nRESPONSE: %s", resp.Status, string(body), string(body)))
 			return nil
 		}
 
 		body, err := ioutil.ReadAll(resp.Body)
+		resp.Body.Close()
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("error: %v", err))
 			return nil
@@ -247,27 +284,36 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		}
 		//a.conf.ClientOptions.DebugLog(fmt.Sprintf("results: %s", response))
 
+		scan.continuationFailures = 0
+
 		// Collect items.
 		items := response.Results
 		var newItems []utils.Dict
 		for _, item := range items {
-			timestamp, _ := item["occurredAt"].(string)
 			eventid, _ := item["id"].(string)
-			if _, ok := a.dedupe[eventid]; ok {
+			if _, ok := a.dedupe[eventid]; ok || scan.seen[eventid] {
 				continue
 			}
-			epoch, _ := time.Parse(time.RFC3339, timestamp)
-			a.dedupe[eventid] = epoch.Unix()
+			scan.seen[eventid] = true
 			newItems = append(newItems, item)
 		}
-		allItems = append(allItems, newItems...)
+		scan.items = append(scan.items, newItems...)
 
-		// Handle pagination if there is a next link.
-		if response.Paging.Next.Link == "" {
+		// Follow the opaque token without changing the time window.
+		if response.Paging.Next.After == "" {
 			break
 		}
-		start = response.Paging.Next.After
+		scan.after = response.Paging.Next.After
 	}
+
+	for _, item := range scan.items {
+		timestamp, _ := item["occurredAt"].(string)
+		eventid, _ := item["id"].(string)
+		epoch, _ := time.Parse(time.RFC3339, timestamp)
+		a.dedupe[eventid] = epoch.Unix()
+	}
+	complete = true
+	a.scan = nil
 
 	// Cull old dedupe entries.
 	for k, v := range a.dedupe {
@@ -276,5 +322,5 @@ func (a *HubSpotAdapter) makeOneRequest(notBefore time.Time) []utils.Dict {
 		}
 	}
 
-	return allItems
+	return scan.items
 }

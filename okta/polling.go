@@ -113,11 +113,6 @@ func (a *OktaAdapter) requestPage(ctx context.Context, raw string) (oktaPage, er
 	if page.items == nil || len(page.items) > 1000 {
 		return page, vendorerr.Kind(errInvalidPage, "response is not a log page (null or more than 1000 events); received "+received(), nil, secrets...)
 	}
-	for _, item := range page.items {
-		if id, ok := item["uuid"].(string); !ok || id == "" {
-			return oktaPage{}, vendorerr.Kind(errInvalidPage, "response event lacks a uuid", nil)
-		}
-	}
 	page.next, err = nextLink(resp.Header.Values("Link"))
 	if err != nil {
 		return oktaPage{}, vendorerr.Kind(errInvalidPage, "response Link header has no single valid rel=\"next\" link: "+strings.Join(resp.Header.Values("Link"), ", "), nil, secrets...)

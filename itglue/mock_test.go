@@ -490,16 +490,8 @@ func TestMockMidRunEventShips(t *testing.T) {
 		5*time.Second, 10*time.Millisecond, "the mid-run log should ship on a later poll")
 }
 
-// TestMockPaginationOnlyFirstPageConsumed pins the adapter's actual pagination
-// behavior against the real IT Glue envelope -- a known limitation. IT Glue,
-// per the JSON API spec, returns the next-page URL nested under top-level
-// "links" ({"links": {"next": ...}}), but the adapter looks the cursor up with
-// FindOneString("next"), which only matches a *top-level* "next" key. The
-// cursor is therefore never found: only page[number]=1 is ever requested, and
-// records beyond the first page are never shipped. If the adapter is ever
-// fixed to read "links/next", this test must be updated to assert full
-// multi-page consumption.
-func TestMockPaginationOnlyFirstPageConsumed(t *testing.T) {
+// TestMockPaginationFullDataset follows the JSON:API links.next chain.
+func TestMockPaginationFullDataset(t *testing.T) {
 	const token = "itg.fake-api-key-1111"
 
 	now := time.Now()
@@ -519,20 +511,11 @@ func TestMockPaginationOnlyFirstPageConsumed(t *testing.T) {
 	adapter, _, sink := startAdapter(t, server.URL, token)
 	defer adapter.Close()
 
-	// Wait for several polls so the adapter had every opportunity to follow
-	// the links.next URL it was given.
-	require.Eventually(t, func() bool { return mock.hitsForPage(1) >= 3 },
-		5*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return len(sink.idsShipped()) == 5 },
+		2*time.Second, 10*time.Millisecond)
+	assert.GreaterOrEqual(t, mock.hitsForPage(2), 1)
+	assert.GreaterOrEqual(t, mock.hitsForPage(3), 1)
 
-	assert.Equal(t, 0, mock.hitsForPage(2),
-		"the JSON:API links.next cursor is never followed (FindOneString(\"next\") only matches a top-level key)")
-
-	ids := sink.idsShipped()
-	assert.NotContains(t, ids, "9000003", "second-page records never ship")
-	assert.NotContains(t, ids, "9000004", "second-page records never ship")
-	assert.NotContains(t, ids, "9000005", "third-page records never ship")
-	assert.GreaterOrEqual(t, ids["9000001"], 1, "first-page records ship")
-	assert.GreaterOrEqual(t, ids["9000002"], 1, "first-page records ship")
 }
 
 // TestMockBadAPIKeyShipsNothing verifies that with a rejected API key nothing

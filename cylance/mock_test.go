@@ -677,22 +677,14 @@ func TestMockNewDetectionMidRunShipsOnce(t *testing.T) {
 // (page_size is a fixed 100) is walked to the last page and every record's
 // detail document is shipped exactly once.
 //
-// All records share one timestamp. That keeps the server-side result set
-// stable across the walk: the adapter advances its start filter to the newest
-// record seen *while also* incrementing the page number, so against the
-// documented server-side start filters (?start on detections,
-// ?start_time on threats and memory protection -- all honored by this mock),
-// a multi-page poll over records with distinct timestamps skips every record
-// that lands between the new filter position and the next page boundary.
-// That data loss is existing adapter behavior, not a mock artifact; this test
-// pins down the one shape of multi-page poll the adapter does fully consume.
+// Distinct timestamps must not shift the numbered-page result set.
 func TestMockPaginationFullDataset(t *testing.T) {
 	const total = 250 // 3 pages at the adapter's fixed page_size of 100
 
 	mock := newMockCylance(t)
 	base := time.Now().UTC().Truncate(time.Second).Add(-30 * time.Minute)
 	for i := 0; i < total; i++ {
-		mock.addThreat(fmt.Sprintf("%064d", i), base)
+		mock.addThreat(fmt.Sprintf("%064d", i), base.Add(time.Duration(i)*time.Second))
 	}
 
 	opts, _ := testClientOptions(t)
