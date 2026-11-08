@@ -792,7 +792,16 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 		}
 	}()
 
-	for _, e := range chunk {
+	// Request a prompt cumulative ACK at the chunk barrier. Trailing known
+	// duplicates and repeats are skipped, so the last array item may not ship.
+	lastToSend := -1
+	for i, e := range chunk {
+		knownDuplicate := e.checkIdx >= 0 && e.checkIdx < len(known) && known[e.checkIdx]
+		if !e.repeated && !knownDuplicate {
+			lastToSend = i
+		}
+	}
+	for i, e := range chunk {
 		if e.repeated {
 			counts.repeated++
 			continue
@@ -802,7 +811,7 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 			counts.duplicate++
 			continue
 		}
-		receipt, ok := a.admitContext(ctx, e.raw)
+		receipt, ok := a.admitContext(ctx, e.raw, i == lastToSend)
 		if !ok {
 			return false
 		}
@@ -814,7 +823,7 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 
 func (a *Office365Adapter) reportConfirmationTimeout(ctx context.Context) {
 	if ctx.Err() == context.DeadlineExceeded {
-		a.conf.ClientOptions.OnWarning("office365 delivery confirmation timed out; leaving content eligible for replay")
+		a.conf.ClientOptions.OnWarning("office365 admission or delivery confirmation timed out; leaving content eligible for replay")
 	}
 }
 
@@ -825,10 +834,11 @@ func (a *Office365Adapter) confirmationTimeout() time.Duration {
 	return 10 * time.Minute
 }
 
-func (a *Office365Adapter) admitContext(ctx context.Context, raw string) (uspclient.AdmissionReceipt, bool) {
+func (a *Office365Adapter) admitContext(ctx context.Context, raw string, ackRequested bool) (uspclient.AdmissionReceipt, bool) {
 	msg := &protocol.DataMessage{
-		TextPayload: raw,
-		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+		TextPayload:  raw,
+		AckRequested: ackRequested,
+		TimestampMs:  uint64(time.Now().UnixNano() / int64(time.Millisecond)),
 	}
 	var receipt uspclient.AdmissionReceipt
 	var err error

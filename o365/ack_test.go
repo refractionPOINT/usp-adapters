@@ -51,9 +51,9 @@ func (c *trackingACKClient) Ship(m *protocol.DataMessage, d time.Duration) error
 	return err
 }
 
-// A real compressed USP websocket peer. Tests explicitly decide which frames
-// the proxy accepts; admission and network transmission alone never ACK them.
-func ackClient(t *testing.T) (*uspclient.Client, <-chan ackFrame) {
+// A real compressed USP websocket peer. Tests either explicitly ACK frames or
+// enable ACKs only for requested frames; there is no background ACK timer.
+func ackClient(t *testing.T, ackOnlyRequested ...bool) (*uspclient.Client, <-chan ackFrame) {
 	t.Helper()
 	frames := make(chan ackFrame, 2048)
 	var mu sync.Mutex
@@ -93,6 +93,11 @@ func ackClient(t *testing.T) (*uspclient.Client, <-chan ackFrame) {
 				return
 			}
 			frames <- ackFrame{c, msg}
+			if len(ackOnlyRequested) != 0 && ackOnlyRequested[0] && msg.AckRequested {
+				if c.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageACK, SeqNum: msg.SeqNum}) != nil {
+					return
+				}
+			}
 		}
 	}))
 	c, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
@@ -313,5 +318,56 @@ func TestConfirmedACKCheckingChunkBarrier(t *testing.T) {
 	case <-frames:
 		t.Fatal("confirmed blob replayed")
 	default:
+	}
+}
+
+// This peer has no ACK timer: a chunk can finish only if an admitted frame
+// requests an ACK. Duplicates at the tail must not swallow that request.
+func TestConfirmedACKRequestsChunkTail(t *testing.T) {
+	noID := event("", "2026-10-28T12:00:00")
+	many := make([]string, dedupeBatchSize+1)
+	for i := range many {
+		many[i] = noID
+	}
+	for _, tc := range []struct {
+		name           string
+		events         []string
+		sent           []string
+		barrierIndexes []int
+	}{
+		{"trailing repeat", []string{eventN("a", 1), eventN("a", 2), eventN("a", 1)}, []string{eventN("a", 1), eventN("a", 2)}, []int{1}},
+		{"trailing known", []string{eventN("a", 1), eventN("a", 2), eventN("known", 1)}, []string{eventN("a", 1), eventN("a", 2)}, []int{1}},
+		{"idless before skipped tail", []string{eventN("a", 1), noID, eventN("a", 1), eventN("known", 1)}, []string{eventN("a", 1), noID}, []int{1}},
+		{"idless tail", []string{eventN("a", 1), noID}, []string{eventN("a", 1), noID}, []int{1}},
+		{"multiple chunks", many, many, []int{dedupeBatchSize - 1, dedupeBatchSize}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newBlobServer(t)
+			srv.add("blob-1", "", tc.events...)
+			dd := newFakeBatchDeduper()
+			dd.AddMany([]utils.DedupeKey{{Key: confirmedKey("known-0001")}})
+			c, frames := ackClient(t, true)
+			a, _ := newBatchAdapter(t, srv, dd, c)
+			a.conf.confirmationTimeout = 2 * time.Second
+			done := pollAsync(a, srv)
+			require.True(t, pollResult(t, done), "peer ACKs only requested frames")
+			var received []protocol.DataMessage
+			for range tc.sent {
+				received = append(received, nextACKFrame(t, frames).msg)
+			}
+			for i, raw := range tc.sent {
+				require.Equal(t, raw, received[i].TextPayload)
+			}
+			for _, i := range tc.barrierIndexes {
+				require.True(t, received[i].AckRequested, "chunk tail %d must request an ACK", i)
+			}
+			require.True(t, dd.has("blob-1"))
+			require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
+			select {
+			case <-frames:
+				t.Fatal("confirmed blob replayed")
+			default:
+			}
+		})
 	}
 }

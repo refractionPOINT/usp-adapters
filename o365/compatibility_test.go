@@ -65,7 +65,7 @@ func TestAdmissionBackpressureWarnsOncePerAttempt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for attempt := 1; attempt <= 2; attempt++ {
-		_, ok := a.admitContext(ctx, "record")
+		_, ok := a.admitContext(ctx, "record", false)
 		require.True(t, ok)
 		require.Equal(t, attempt, warnings)
 	}
@@ -96,7 +96,7 @@ func TestAdmissionBackpressureWarningOnFailureOrCancellation(t *testing.T) {
 			conf := validConfig(t)
 			conf.ClientOptions.OnWarning = func(msg string) { require.Equal(t, "stream falling behind", msg); warnings++ }
 			a := &Office365Adapter{conf: conf, uspClient: sink, doStop: utils.NewEvent()}
-			_, ok := a.admitContext(ctx, "record")
+			_, ok := a.admitContext(ctx, "record", false)
 			require.False(t, ok)
 			require.Equal(t, 1, warnings)
 			if cancelled {
