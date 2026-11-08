@@ -657,16 +657,9 @@ func (a *HarmonyAdapter) fetchEventsForService(service string) {
 		var canceled *taskCanceledError
 		switch {
 		case errors.As(err, &canceled):
-			// Soft failure: the gateway accepted the query but couldn't
-			// fulfill it for this service (commonly: the service isn't
-			// provisioned for the tenant). Warn once per poll with the
-			// gateway's error detail, advance the cursor so we don't keep
-			// re-querying the same window, and let the next poll try
-			// again — most non-provisioned services stay non-provisioned,
-			// so the operator should remove them from cloud_services if
-			// they want the warnings to stop.
-			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — skipping window", service, canceled))
-			nextStart = endTime
+			// A canceled task has not collected this window. Keep its start
+			// for the next attempt, just as for a failed page request.
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("harmony[events:%s]: %v — retaining window for retry", service, canceled))
 		case errors.Is(err, uspclient.ErrorClosed):
 			// The adapter is shutting down, nothing to report.
 		case err != nil:

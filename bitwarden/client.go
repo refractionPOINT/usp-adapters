@@ -250,48 +250,24 @@ func (a *BitwardenAdapter) fetchEvents() {
 	defer a.wgSenders.Done()
 	defer a.conf.ClientOptions.DebugLog("Bitwarden event collection stopping")
 
+	var endTime time.Time
+	continuationToken := ""
+	seenTokens := map[string]bool{}
 	for !a.doStop.WaitFor(a.pollInterval) {
-		// Capture end time before fetching to avoid gaps
-		endTime := time.Now()
-
-		items, continuationToken, err := a.makeOneRequest("", &endTime)
-		if err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("failed to fetch events: %v", err))
-			continue
+		if endTime.IsZero() {
+			// Keep this window and its continuation until every page succeeds.
+			endTime = time.Now()
 		}
-
-		for _, item := range items {
-			msg := &protocol.DataMessage{
-				JsonPayload: item,
-				TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
-			}
-			if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-				if err == uspclient.ErrorBufferFull {
-					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, 1*time.Hour)
-				}
-				if err != nil {
-					if err != uspclient.ErrorClosed {
-						a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-					}
-					a.doStop.Set()
-					return
-				}
-			}
-		}
-
-		// If there's a continuation token, fetch more pages immediately
-		for continuationToken != "" {
-			if a.doStop.IsSet() {
-				return
-			}
-
+		for !a.doStop.IsSet() {
 			items, newToken, err := a.makeOneRequest(continuationToken, &endTime)
 			if err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("failed to fetch events with continuation: %v", err))
+				a.conf.ClientOptions.OnError(fmt.Errorf("failed to fetch events: %v", err))
 				break
 			}
-
+			if newToken != "" && (newToken == continuationToken || seenTokens[newToken]) {
+				a.conf.ClientOptions.OnError(fmt.Errorf("repeated events continuation token"))
+				break
+			}
 			for _, item := range items {
 				msg := &protocol.DataMessage{
 					JsonPayload: item,
@@ -311,12 +287,17 @@ func (a *BitwardenAdapter) fetchEvents() {
 					}
 				}
 			}
-
+			if newToken == "" {
+				checkpoint := endTime
+				a.lastStartDate = &checkpoint
+				endTime = time.Time{}
+				continuationToken = ""
+				seenTokens = map[string]bool{}
+				break
+			}
+			seenTokens[newToken] = true
 			continuationToken = newToken
 		}
-
-		// Update checkpoint to the endTime we used for this fetch cycle
-		a.lastStartDate = &endTime
 	}
 }
 
