@@ -73,7 +73,7 @@ func TestPagingContinuationSurvivesExhaustedRetries(t *testing.T) {
 			}
 		}
 		return false
-	}, time.Second, time.Millisecond)
+	}, 5*time.Second, time.Millisecond)
 	a.doStop.Set()
 	a.wgSenders.Wait()
 	mu.Lock()

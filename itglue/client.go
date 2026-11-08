@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -228,7 +229,7 @@ func (a *ITGlueAdapter) makeOneRequest(endpoint string, lastCursor string) ([]ut
 		return nil, lastCursor
 	}
 	resolved := base.ResolveReference(req.URL)
-	if resolved.Scheme != base.Scheme || resolved.Host != base.Host || resolved.User != nil {
+	if !samePageOrigin(base, resolved) || resolved.User != nil {
 		a.conf.ClientOptions.OnError(errors.New("itglue: refusing continuation outside configured scheme and host"))
 		a.doStop.Set()
 		return nil, lastCursor
@@ -248,7 +249,7 @@ func (a *ITGlueAdapter) makeOneRequest(endpoint string, lastCursor string) ([]ut
 	client := *a.httpClient
 	previousRedirect := client.CheckRedirect
 	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
-		if next.URL.Scheme != base.Scheme || next.URL.Host != base.Host || next.URL.User != nil {
+		if !samePageOrigin(base, next.URL) || next.URL.User != nil {
 			return errors.New("itglue: refusing redirect outside configured scheme and host")
 		}
 		if previousRedirect != nil {
@@ -291,4 +292,21 @@ func (a *ITGlueAdapter) makeOneRequest(endpoint string, lastCursor string) ([]ut
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", respData))
 
 	return items, lastCursor
+}
+
+// Compare origins using case-insensitive hostnames and effective default ports.
+func samePageOrigin(base, next *url.URL) bool {
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		switch u.Scheme {
+		case "https":
+			return "443"
+		case "http":
+			return "80"
+		}
+		return ""
+	}
+	return base.Scheme == next.Scheme && strings.EqualFold(base.Hostname(), next.Hostname()) && port(base) == port(next)
 }

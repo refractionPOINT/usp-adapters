@@ -75,6 +75,8 @@ func TestPagingLinksStayOnConfiguredOrigin(t *testing.T) {
 		allowed, redirect bool
 	}{
 		{name: "relative", link: "/logs?page[number]=2", allowed: true},
+		{name: "equivalent_origin", link: "https://API.EXAMPLE.TEST:443/logs?page=2", allowed: true},
+		{name: "different_port", link: "https://api.example.test:8443/logs"},
 		{name: "hostile_host", link: "https://hostile.example.test/logs"},
 		{name: "changed_scheme", link: "http://api.example.test/logs"},
 		{name: "hostile_redirect", link: "/redirect", redirect: true},
@@ -86,7 +88,8 @@ func TestPagingLinksStayOnConfiguredOrigin(t *testing.T) {
 			a.httpClient = &http.Client{Transport: pagingTransport(func(r *http.Request) (*http.Response, error) {
 				calls++
 				require.Equal(t, "https", r.URL.Scheme, "refused request reached transport")
-				require.Equal(t, "api.example.test", r.URL.Host, "credentials reached a foreign host")
+				require.True(t, strings.EqualFold("api.example.test", r.URL.Hostname()), "credentials reached a foreign host")
+				require.True(t, r.URL.Port() == "" || r.URL.Port() == "443", "credentials reached another port")
 				require.Equal(t, "test-only", r.Header.Get("x-api-key"))
 				body := `{"data":[],"links":{}}`
 				status := 200
