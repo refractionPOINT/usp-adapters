@@ -223,7 +223,8 @@ func (m *mockBitwarden) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	q := r.URL.Query()
-	var matched []utils.Dict
+	// An empty successful result is a JSON array, not null.
+	matched := make([]utils.Dict, 0)
 
 	if ct := q.Get("continuationToken"); ct != "" {
 		m.mu.Lock()

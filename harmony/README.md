@@ -56,7 +56,13 @@ harmony:
     limit: 5000       # per-cloud-service window cap; gateway minimum is 10
 ```
 
-If a configured `cloud_service` is not provisioned for the tenant the gateway returns the query in state `Canceled`; the adapter logs one warning per poll and keeps going (it does not surface as an error). Remove the service from `cloud_services` to silence the warning.
+A gateway query can return state `Canceled`, including when a configured
+`cloud_service` is not provisioned. The adapter warns once per poll and retries
+the same captured start and end; cancellation never skips the window. After all
+pages succeed, collection continues from that window's end. Catch-up queries
+span at most one hour, so a prolonged cancellation cannot grow a query without
+bound. A permanently unprovisioned service keeps retrying; remove it from
+`cloud_services` to stop those warnings.
 
 Each shipped record is annotated:
 
