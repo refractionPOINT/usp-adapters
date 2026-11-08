@@ -19,9 +19,28 @@ import (
 func manualAdapter(t *testing.T, conf MsGraphConfig, sink uspSink) *MsGraphAdapter {
 	t.Helper()
 	conf.PollInterval = time.Hour
-	a, _, err := newMsGraphAdapter(context.Background(), conf, sink)
+	// Park the background reader before manually driving a scan. Only one
+	// goroutine may own cursor/retry health, just as in production.
+	runtime := defaultGraphRuntime()
+	wait := runtime.wait
+	parked := make(chan struct{})
+	var waits atomic.Int32
+	runtime.wait = func(ctx context.Context, delay time.Duration) error {
+		if waits.Add(1) == 1 {
+			close(parked)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+		return wait(ctx, delay)
+	}
+	a, _, err := newMsGraphAdapterWithRuntime(context.Background(), conf, sink, runtime)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = a.Close() })
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("background reader did not park")
+	}
 	return a
 }
 
@@ -51,7 +70,11 @@ func TestMsGraphPermanentMalformedRecords(t *testing.T) {
 				}, "@odata.nextLink": "/last"})
 			})
 			var warnings []string
-			conf.ClientOptions.OnWarning = func(s string) { warnings = append(warnings, s) }
+			conf.ClientOptions.OnWarning = func(s string) {
+				if strings.Contains(s, "malformed Graph record(s)") {
+					warnings = append(warnings, s)
+				}
+			}
 			sink := &captureSink{}
 			var targetSink uspSink = sink
 			if mode == "shipping" {

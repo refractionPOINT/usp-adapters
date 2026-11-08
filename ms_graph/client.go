@@ -52,6 +52,8 @@ type MsGraphAdapter struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 	notifier vendorerr.Notifier
+	runtime  graphRuntime
+	retries  graphRetryHealth
 }
 
 type MsGraphConfig struct {
@@ -109,9 +111,14 @@ func NewMsGraphAdapter(ctx context.Context, conf MsGraphConfig) (*MsGraphAdapter
 // is non-nil it is used in place of a real LimaCharlie client -- the seam
 // tests use to capture shipped events.
 func newMsGraphAdapter(ctx context.Context, conf MsGraphConfig, sink uspSink) (*MsGraphAdapter, chan struct{}, error) {
+	return newMsGraphAdapterWithRuntime(ctx, conf, sink, defaultGraphRuntime())
+}
+
+func newMsGraphAdapterWithRuntime(ctx context.Context, conf MsGraphConfig, sink uspSink, runtime graphRuntime) (*MsGraphAdapter, chan struct{}, error) {
 	a := &MsGraphAdapter{
-		conf: conf,
-		ctx:  context.Background(),
+		conf:    conf,
+		ctx:     context.Background(),
+		runtime: runtime,
 	}
 
 	a.ctx, a.cancel = context.WithCancel(ctx)
@@ -216,14 +223,16 @@ func retryAfter(value string, now time.Time) time.Duration {
 }
 
 func (a *MsGraphAdapter) wait(delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-a.ctx.Done():
-		return a.ctx.Err()
-	case <-timer.C:
-		return nil
+	if err := a.retries.escalation(a.runtime.now()); err != nil {
+		return err
 	}
+	if remaining := a.retries.remaining(a.runtime.now()); !a.retries.firstFailure.IsZero() && remaining < delay {
+		delay = remaining
+	}
+	if err := a.runtime.wait(a.ctx, delay); err != nil {
+		return err
+	}
+	return a.retries.escalation(a.runtime.now())
 }
 
 // request handles both token and collection exchanges. Error status takes
@@ -256,7 +265,7 @@ func (a *MsGraphAdapter) request(method, raw, payload, bearer string) ([]byte, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		now := time.Now()
+		now := a.runtime.now()
 		kind := errPermanent
 		if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
 			kind = errRetry
@@ -302,18 +311,17 @@ type graphRecordKey struct {
 
 func (a *MsGraphAdapter) fetchEvents(eventsURL string) {
 	defer a.wgSenders.Done()
-	cursor := graphCursor{since: time.Now().UTC().Truncate(100 * time.Nanosecond), ids: map[string]bool{}}
+	cursor := graphCursor{since: a.runtime.now().UTC().Truncate(100 * time.Nanosecond), ids: map[string]bool{}}
 	// Retain successful shipments while retrying an incomplete scan, including
 	// older records that would otherwise be skipped by a premature watermark.
 	delivered := map[graphRecordKey]bool{}
 	delay := a.pollInterval
 	for {
-		timer := time.NewTimer(delay)
-		select {
-		case <-a.ctx.Done():
-			timer.Stop()
+		if err := a.wait(delay); err != nil {
+			if a.ctx.Err() == nil {
+				a.notifier.Notify(err, a.conf.ClientOptions.OnError)
+			}
 			return
-		case <-timer.C:
 		}
 
 		next, err := a.poll(eventsURL, cursor, delivered)
@@ -322,17 +330,27 @@ func (a *MsGraphAdapter) fetchEvents(eventsURL string) {
 				return
 			}
 			if errors.Is(err, errRetry) {
+				a.retries.note(a.runtime.now(), err)
+				if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
+					a.notifier.Notify(fatal, a.conf.ClientOptions.OnError)
+					return
+				}
 				a.conf.ClientOptions.OnWarning(err.Error())
 				delay = a.pollInterval
 				var httpErr *graphHTTPError
-				if errors.As(err, &httpErr) && time.Until(httpErr.retryAt) > delay {
-					delay = time.Until(httpErr.retryAt)
+				if errors.As(err, &httpErr) && httpErr.retryAt.Sub(a.runtime.now()) > delay {
+					delay = httpErr.retryAt.Sub(a.runtime.now())
 				}
 				continue
 			}
 			a.notifier.Notify(err, a.conf.ClientOptions.OnError)
 			return
 		}
+		if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
+			a.notifier.Notify(fatal, a.conf.ClientOptions.OnError)
+			return
+		}
+		a.retries.reset()
 		cursor = next
 		delay = a.pollInterval
 		delivered = map[graphRecordKey]bool{}
@@ -407,6 +425,9 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 			return cursor, vendorerr.Kind(errRetry, "invalid Graph value array", nil)
 		}
 		for _, raw := range records {
+			if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
+				return cursor, fatal
+			}
 			var record map[string]interface{}
 			if err := json.Unmarshal(raw, &record); err != nil || record == nil {
 				malformed++
@@ -431,8 +452,13 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 				msg := &protocol.DataMessage{JsonPayload: record, TimestampMs: uint64(time.Now().UnixMilli())}
 				err = a.uspClient.Ship(msg, 10*time.Second)
 				if err == uspclient.ErrorBufferFull {
+					a.retries.note(a.runtime.now(), vendorerr.Kind(errRetry, "shipping buffer full", err))
 					a.conf.ClientOptions.OnWarning("stream falling behind")
-					err = a.uspClient.Ship(msg, time.Hour)
+					remaining := a.retries.remaining(a.runtime.now())
+					if remaining <= 0 {
+						return cursor, a.retries.escalation(a.runtime.now())
+					}
+					err = a.uspClient.Ship(msg, min(time.Hour, remaining))
 				}
 				if err != nil {
 					return cursor, vendorerr.Kind(errRetry, "shipping record: "+err.Error(), err, a.conf.ClientSecret, token)
@@ -466,6 +492,9 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, error) {
 	refreshed := false
 	for attempt := 1; attempt <= 3; attempt++ {
+		if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
+			return nil, fatal
+		}
 		var err error
 		if *token == "" {
 			*token, err = a.fetchToken()
@@ -474,6 +503,9 @@ func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, err
 			var body []byte
 			body, err = a.request(http.MethodGet, pageURL, "", *token)
 			if err == nil {
+				if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
+					return nil, fatal
+				}
 				return body, nil
 			}
 			var httpErr *graphHTTPError
@@ -487,13 +519,21 @@ func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, err
 		if a.ctx.Err() != nil {
 			return nil, a.ctx.Err()
 		}
-		if !errors.Is(err, errRetry) || attempt == 3 {
+		if !errors.Is(err, errRetry) {
 			return nil, err
 		}
+		a.retries.note(a.runtime.now(), err)
+		if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
+			return nil, fatal
+		}
+		if attempt == 3 {
+			return nil, err
+		}
+		a.conf.ClientOptions.OnWarning(err.Error())
 		delay := time.Duration(attempt) * time.Second
 		var httpErr *graphHTTPError
-		if errors.As(err, &httpErr) && time.Until(httpErr.retryAt) > delay {
-			delay = time.Until(httpErr.retryAt)
+		if errors.As(err, &httpErr) && httpErr.retryAt.Sub(a.runtime.now()) > delay {
+			delay = httpErr.retryAt.Sub(a.runtime.now())
 		}
 		if err := a.wait(delay); err != nil {
 			return nil, err
