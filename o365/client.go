@@ -62,7 +62,8 @@ const (
 // it as an interface lets tests substitute an in-memory sink for the real
 // LimaCharlie client; *uspclient.Client satisfies it unchanged.
 type uspSink interface {
-	Ship(message *protocol.DataMessage, timeout time.Duration) error
+	ShipWithReceipt(message *protocol.DataMessage, timeout time.Duration) (uspclient.AdmissionReceipt, error)
+	ObserveReceipt(uspclient.AdmissionReceipt) uspclient.ReceiptObservation
 	Drain(timeout time.Duration) error
 	Close() ([]*protocol.DataMessage, error)
 }
@@ -75,7 +76,8 @@ type DedupeStats struct {
 	BlobsFetched int
 	// BlobsSkipped is the number of listed blobs skipped as already done.
 	BlobsSkipped int
-	// EventsShipped is the number of events shipped.
+	// EventsShipped counts SDK admissions, including an unconfirmed tail if
+	// the poll aborts. Dedupe markers require separate ACK confirmation.
 	EventsShipped int
 	// EventsDuplicate is the number of events skipped because the deduper
 	// had already recorded their Id (typically shipped from another blob).
@@ -142,7 +144,7 @@ type Office365Adapter struct {
 	cancelStop context.CancelFunc
 
 	// checker is conf.Deduper when it can check a key without recording it.
-	// Content is then recorded as done only once it was shipped.
+	// Content is recorded only after the peer confirms delivery.
 	checker utils.CheckingDeduper
 
 	// batcher is conf.Deduper when it can also check and record many keys per
@@ -184,11 +186,12 @@ type Office365Config struct {
 	PollInterval time.Duration `json:"-" yaml:"-"`
 
 	// Retry timing; zero means the default. Tests shorten them.
-	retryBaseDelay    time.Duration
-	retryMaxDelay     time.Duration
-	maxRetryAfter     time.Duration
-	failureEscalation time.Duration
-	contentRetryLimit time.Duration
+	retryBaseDelay      time.Duration
+	retryMaxDelay       time.Duration
+	maxRetryAfter       time.Duration
+	failureEscalation   time.Duration
+	contentRetryLimit   time.Duration
+	confirmationTimeout time.Duration
 }
 
 func (c *Office365Config) Validate() error {
@@ -235,6 +238,16 @@ func NewOffice365Adapter(ctx context.Context, conf Office365Config) (*Office365A
 // sink is non-nil it is used in place of a real LimaCharlie client -- the seam
 // tests use to capture shipped events.
 func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink) (*Office365Adapter, chan struct{}, error) {
+	// Validate receipt and deduper compatibility before creating any clients,
+	// local dedupers, transports or collection goroutines.
+	if sink == nil && conf.ClientOptions.TestSinkMode {
+		return nil, nil, errors.New("office365: TestSinkMode is unsupported because delivery confirmation requires USP receipts")
+	}
+	if conf.Deduper != nil {
+		if _, ok := conf.Deduper.(utils.CheckingDeduper); !ok {
+			return nil, nil, errors.New("office365: Deduper must implement utils.CheckingDeduper (utils.BatchDeduper is also supported)")
+		}
+	}
 	var err error
 
 	if conf.PollInterval <= 0 {
@@ -275,8 +288,6 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 		a.checker = bd
 	} else if cd, ok := conf.Deduper.(utils.CheckingDeduper); ok {
 		a.checker = cd
-	} else {
-		a.conf.ClientOptions.DebugLog("deduper can't check without recording: content is recorded as done before it is downloaded")
 	}
 
 	if isURLEndpoint(conf.Endpoint) {
@@ -434,7 +445,7 @@ func (a *Office365Adapter) pollOnce(pageURL string, fs *failureState) bool {
 
 // processItems downloads and ships the content blobs of one listing page. With
 // a CheckingDeduper, a blob is recorded as done only once all of its events
-// were shipped, so a blob interrupted by an error or by Close is fetched again
+// were confirmed, so a blob interrupted by an error or by Close is fetched again
 // by the next poll, or by the next instance sharing the deduper. complete is
 // false when transient retries were exhausted; abort is true when the poll
 // must stop. Other unprocessed blobs have a separate failure clock.
@@ -555,10 +566,6 @@ func (a *Office365Adapter) processPage(items []listItem, fs *failureState, stats
 // transient retries also get an independent clock: other successful blobs
 // must not hide one that keeps failing until it ages out of the listing.
 func (a *Office365Adapter) leaveBlob(item listItem, fs *failureState, track bool, err error) {
-	if a.checker == nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("office365 content api: blob was recorded as seen before download and cannot be retried on the next poll with this deduper: %v", err))
-		return
-	}
 	a.conf.ClientOptions.OnWarning(fmt.Sprintf("office365 content api, leaving blob for the next poll: %v", err))
 	if !track {
 		return
@@ -631,35 +638,16 @@ func (a *Office365Adapter) reportLeftBlobs(fs *failureState, now time.Time, mess
 // shipContent ships every event of a content blob. There is apparently no
 // standard deduplication key in these logs and MS makes no guarantees of
 // uniqueness, so we take a best stab by using the ID per event, recorded only
-// once the event was shipped. It returns false if shipping failed, in which
-// case the adapter is stopping.
+// once the peer confirms it. It returns false if admission or confirmation fails.
 func (a *Office365Adapter) shipContent(content []byte) (int, int, bool) {
-	nShipped := 0
-	nSkipped := 0
-	ok := true
-	gjson.ParseBytes(content).ForEach(func(_, event gjson.Result) bool {
-		ID := event.Get("Id").String()
-		if ID != "" && a.isDone(ID) {
-			nSkipped++
-			return true
-		}
-		if !a.ship(event.Raw) {
-			ok = false
-			return false
-		}
-		if ID != "" {
-			a.markDone(ID)
-		}
-		nShipped++
-		return true
-	})
-	return nShipped, nSkipped, ok
+	counts, ok := a.shipContentBatch(content)
+	return counts.shipped, counts.duplicate + counts.repeated, ok
 }
 
 // blobKey is the dedupe key of a listed content blob, timed by the blob's
 // contentCreated (zero if missing or unparseable).
 func blobKey(item listItem) utils.DedupeKey {
-	return utils.DedupeKey{Key: item.ContentID, Time: parseSourceTime(item.ContentCreated)}
+	return utils.DedupeKey{Key: confirmedKey(item.ContentID), Time: parseSourceTime(item.ContentCreated)}
 }
 
 // parseSourceTime parses a time reported by the Management API: RFC 3339 with
@@ -699,12 +687,13 @@ type batchEvent struct {
 	repeated bool
 }
 
-// shipContentBatch is shipContent for a BatchDeduper: the events of a blob are
-// checked a chunk at a time with one call, and the shipped ones are recorded
-// with one call per chunk. Events shipped before a failure are still recorded,
+// shipContentBatch checks and confirms the events of a blob in bounded chunks.
+// A BatchDeduper checks and records keys in one call per chunk; a CheckingDeduper
+// uses individual key operations around the same chunk confirmation barrier.
+// Events confirmed before a failure are still recorded,
 // so a retry of the blob doesn't ship them again. Repeats of an Id inside the
 // blob are skipped here, since the deduper can't see them before they are
-// recorded. It returns false if shipping failed or the adapter is stopping.
+// recorded. It returns false if admission or confirmation fails.
 func (a *Office365Adapter) shipContentBatch(content []byte) (eventCounts, bool) {
 	var counts eventCounts
 	seen := map[string]struct{}{}
@@ -719,7 +708,7 @@ func (a *Office365Adapter) shipContentBatch(content []byte) (eventCounts, bool) 
 	ok := true
 	gjson.ParseBytes(content).ForEach(func(_, event gjson.Result) bool {
 		chunk = append(chunk, batchEvent{raw: event.Raw, key: utils.DedupeKey{
-			Key:  event.Get("Id").String(),
+			Key:  confirmedKey(event.Get("Id").String()),
 			Time: parseSourceTime(event.Get("CreationTime").String()),
 		}})
 		if len(chunk) < dedupeBatchSize {
@@ -736,11 +725,10 @@ func (a *Office365Adapter) shipContentBatch(content []byte) (eventCounts, bool) 
 
 // shipChunk deduplicates, ships and records one chunk of a blob's events. seen
 // holds the Ids of the blob's earlier chunks and is extended with this one's.
-// Shipped events are recorded once per chunk, not one by one: if the process
-// dies mid-chunk, or an overlapping instance shares the deduper while a Ship
-// waits for a full buffer, the chunk's already shipped events can ship again.
-// That costs duplicates, never data.
-func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{}, counts *eventCounts) bool {
+// Markers are written after the chunk's confirmation barrier, using a batch
+// call when supported. A crash before those writes or an overlapping instance
+// can replay confirmed events. That costs duplicates, never undelivered data.
+func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{}, counts *eventCounts) (complete bool) {
 	if a.doStop.IsSet() {
 		return false
 	}
@@ -762,18 +750,58 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 	}
 	var known []bool
 	if len(toCheck) != 0 {
-		known = a.batcher.CheckMany(toCheck)
+		if a.batcher != nil {
+			known = a.batcher.CheckMany(toCheck)
+		} else if a.checker != nil {
+			known = make([]bool, len(toCheck))
+			for i, key := range toCheck {
+				known[i] = a.checker.Check(key.Key)
+			}
+		}
 	}
 
-	var shipped []utils.DedupeKey
-	// Record what was shipped even when shipping fails midway.
+	type pendingEvent struct {
+		key     utils.DedupeKey
+		receipt uspclient.AdmissionReceipt
+	}
+	ctx, cancel := context.WithTimeout(a.stopCtx, a.confirmationTimeout())
+	defer cancel()
+	defer a.reportConfirmationTimeout(ctx)
+	var pending []pendingEvent
+	// Keep at most one chunk of receipts, including ID-less records. A partial
+	// failure can commit confirmed events, but never the whole blob.
 	defer func() {
-		if len(shipped) != 0 {
-			a.batcher.AddMany(shipped)
+		var confirmed []utils.DedupeKey
+		for _, p := range pending {
+			if !a.waitConfirmedContext(ctx, p.receipt) {
+				complete = false
+				continue
+			}
+			if p.key.Key != "" {
+				confirmed = append(confirmed, p.key)
+			}
+		}
+		if len(confirmed) != 0 {
+			if a.batcher != nil {
+				a.batcher.AddMany(confirmed)
+			} else if a.checker != nil {
+				for _, key := range confirmed {
+					a.checker.CheckAndAdd(key.Key)
+				}
+			}
 		}
 	}()
 
-	for _, e := range chunk {
+	// Request a prompt cumulative ACK at the chunk barrier. Trailing known
+	// duplicates and repeats are skipped, so the last array item may not ship.
+	lastToSend := -1
+	for i, e := range chunk {
+		knownDuplicate := e.checkIdx >= 0 && e.checkIdx < len(known) && known[e.checkIdx]
+		if !e.repeated && !knownDuplicate {
+			lastToSend = i
+		}
+	}
+	for i, e := range chunk {
 		if e.repeated {
 			counts.repeated++
 			continue
@@ -783,57 +811,118 @@ func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{
 			counts.duplicate++
 			continue
 		}
-		if !a.ship(e.raw) {
+		receipt, ok := a.admitContext(ctx, e.raw, i == lastToSend)
+		if !ok {
+			// Fatal admission must not wait for an ACK request that never shipped.
+			// The deferred observer can still commit an already confirmed prefix.
+			cancel()
 			return false
 		}
-		if e.key.Key != "" {
-			shipped = append(shipped, e.key)
-		}
+		pending = append(pending, pendingEvent{key: e.key, receipt: receipt})
 		counts.shipped++
 	}
 	return true
 }
 
-// ship sends one event to LimaCharlie. It returns false if shipping failed, in
-// which case the adapter is stopping.
-func (a *Office365Adapter) ship(raw string) bool {
-	msg := &protocol.DataMessage{
-		TextPayload: raw,
-		TimestampMs: uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+func (a *Office365Adapter) reportConfirmationTimeout(ctx context.Context) {
+	if ctx.Err() == context.DeadlineExceeded {
+		a.conf.ClientOptions.OnWarning("office365 admission or delivery confirmation timed out; leaving content eligible for replay")
 	}
-	err := a.uspClient.Ship(msg, 10*time.Second)
-	if err == uspclient.ErrorBufferFull {
-		a.conf.ClientOptions.OnWarning("stream falling behind")
-		err = a.uspClient.Ship(msg, 1*time.Hour)
+}
+
+func (a *Office365Adapter) confirmationTimeout() time.Duration {
+	if a.conf.confirmationTimeout > 0 {
+		return a.conf.confirmationTimeout
+	}
+	return 10 * time.Minute
+}
+
+func (a *Office365Adapter) admitContext(ctx context.Context, raw string, ackRequested bool) (uspclient.AdmissionReceipt, bool) {
+	msg := &protocol.DataMessage{
+		TextPayload:  raw,
+		AckRequested: ackRequested,
+		TimestampMs:  uint64(time.Now().UnixNano() / int64(time.Millisecond)),
+	}
+	var receipt uspclient.AdmissionReceipt
+	var err error
+	warned := false
+	for {
+		if ctx.Err() != nil {
+			return receipt, false
+		}
+		receipt, err = a.uspClient.ShipWithReceipt(msg, 100*time.Millisecond)
+		if err != uspclient.ErrorBufferFull {
+			break
+		}
+		if !warned {
+			a.conf.ClientOptions.OnWarning("stream falling behind")
+			warned = true
+		}
 	}
 	if err != nil {
 		if err != uspclient.ErrorClosed {
 			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
 		}
 		a.doStop.Set()
-		return false
+		return receipt, false
 	}
-	return true
+	return receipt, true
 }
 
-// isDone reports whether a content blob or event was already shipped. With a
-// deduper that can't check without recording (CheckingDeduper), the key is
-// recorded here, before the work is done, as it always was.
+// confirmedKey separates ACK-confirmed markers from older admission markers.
+// Older markers are ignored; source timestamps and backend TTLs are unchanged.
+// Empty event IDs must remain empty, so they never become dedupe keys.
+func confirmedKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	return "o365:ack:v1:" + key
+}
+
+// waitConfirmed observes a receipt and stops promptly on
+// shutdown. A stalled ACK ends this attempt after a bounded interval, leaving
+// its event and blob eligible for replay. An SDK close is never confirmation.
+func (a *Office365Adapter) waitConfirmedContext(ctx context.Context, receipt uspclient.AdmissionReceipt) bool {
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		obs := a.uspClient.ObserveReceipt(receipt)
+		if obs.Lifetime != uspclient.ReceiptLive {
+			return false
+		}
+		if obs.Frame == uspclient.ReceiptAcknowledged {
+			return true
+		}
+		if obs.Frame != uspclient.ReceiptRetained {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			// An ACK may race cancellation while the observer is asleep.
+			obs = a.uspClient.ObserveReceipt(receipt)
+			return obs.Frame == uspclient.ReceiptAcknowledged && obs.Lifetime == uspclient.ReceiptLive
+		case <-tick.C:
+		}
+	}
+}
+
+// isDone checks a blob's confirmed marker without writing anything. Older
+// admission markers are ignored. The constructor requires a CheckingDeduper.
 func (a *Office365Adapter) isDone(key string) bool {
 	if a.checker != nil {
-		return a.checker.Check(key)
+		return a.checker.Check(confirmedKey(key))
 	}
-	return a.conf.Deduper.CheckAndAdd(key)
+	// Defensive fallback for an incompletely initialized adapter.
+	return false
 }
 
-// markDone records a content blob or event as shipped. Shipped means accepted
-// by the USP client, which delivers it from its buffer: what a Close drops
-// from that buffer is not re-fetched.
+// markDone records a blob after all required events have been confirmed by
+// peer ACKs observed while the SDK client was live.
 func (a *Office365Adapter) markDone(key string) {
 	if a.checker != nil {
 		// Overlapping instances can duplicate work between Check and this
 		// commit. Preserving unshipped data takes priority over that race.
-		a.checker.CheckAndAdd(key)
+		a.checker.CheckAndAdd(confirmedKey(key))
 	}
 }
 

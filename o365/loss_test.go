@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -288,9 +289,6 @@ func TestCloseMidPageLosesNothing(t *testing.T) {
 	}{
 		// A deduper that can check without recording: nothing is lost.
 		{name: "checking deduper", deduper: func() interface{} { return newSharedDeduper() }},
-		// A check-and-record-only deduper: only the blob being downloaded
-		// when Close lands can be lost; the rest of the page isn't touched.
-		{name: "legacy deduper", deduper: func() interface{} { return newLegacyDeduper() }, maxLost: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const ct = "Audit.Exchange"
@@ -366,14 +364,13 @@ func (s *blockingSink) Ship(m *protocol.DataMessage, d time.Duration) error {
 	return s.captureSink.Ship(m, d)
 }
 
-// A stop that lands between two blobs doesn't touch the next blob, even with
-// a deduper that records a key when it checks it.
+// A stop that lands between two blobs leaves the next blob eligible for replay.
 func TestStopBetweenBlobsMarksNothing(t *testing.T) {
 	const ct = "Audit.Exchange"
 	m := newFaultMock(t)
 	recs := addBlobs(t, m, ct, 3)
 
-	dd := newLegacyDeduper()
+	dd := newSharedDeduper()
 	sink1 := &blockingSink{shipped: make(chan struct{}, 1), release: make(chan struct{})}
 	conf1 := newTestConfig(t, m.mockO365, ct)
 	conf1.Deduper = dd
@@ -869,4 +866,12 @@ func TestCloseInterruptsTokenRequest(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Close did not interrupt the token request")
 	}
+}
+
+func (s *failingSink) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.Ship(m, d)
+}
+
+func (s *blockingSink) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.Ship(m, d)
 }

@@ -25,10 +25,8 @@ import (
 // The mock reproduces the API as the adapter uses it: it authenticates the
 // Bearer token, filters the in-memory audit-log set by the
 // occurredAfter/occurredBefore window, and paginates with the documented
-// {"results": [...], "paging": {"next": {"after", "link"}}} envelope. One
-// deliberate deviation from the real service: the adapter feeds paging.next.
-// after back through the occurredAfter query parameter (not the documented
-// `after` parameter), so the mock accepts a cursor token there too.
+// {"results": [...], "paging": {"next": {"after", "link"}}} envelope.
+// Continuations use the separate `after` query parameter.
 
 // testToken is a clearly fake HubSpot private-app access token.
 const testToken = "fake-hubspot-token-1111"
@@ -156,11 +154,10 @@ func (m *mockHubSpot) handler() http.HandlerFunc {
 		afterRaw := q.Get("occurredAfter")
 		beforeRaw := q.Get("occurredBefore")
 
-		// Continuation: the adapter echoes paging.next.after back through the
-		// occurredAfter parameter, so a cursor token shows up here.
-		if remaining, ok := m.cursors[afterRaw]; ok {
+		// Continuation tokens are separate from the time filter.
+		if remaining, ok := m.cursors[q.Get("after")]; ok {
 			m.cursorHits++
-			delete(m.cursors, afterRaw)
+			delete(m.cursors, q.Get("after"))
 			m.writePage(w, r, remaining)
 			return
 		}

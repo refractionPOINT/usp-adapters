@@ -580,20 +580,16 @@ func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, a
 	page := 1
 	pageSize := pageLimit
 
-	defer func() {
-		for k, v := range api.dedupe {
-			if v < since.Unix() {
-				delete(api.dedupe, k)
-			}
-		}
-	}()
+	// Stage suppression markers until every page has been collected. On
+	// failure the caller replays the same window without losing prior pages.
+	pending := make(map[string]int64)
 
 	for {
-		url := fmt.Sprintf("%s?page=%d&page_size=%d&%s=%s", pageUrl, page, pageSize, api.startFilterField, lastDetectionTime.UTC().Format(api.returnedTimeFormat))
+		url := fmt.Sprintf("%s?page=%d&page_size=%d&%s=%s", pageUrl, page, pageSize, api.startFilterField, since.UTC().Format(api.returnedTimeFormat))
 
 		response, err := a.doWithRetry(ctx, url, api.key, &CylanceEventsResponse{})
 		if err != nil {
-			return nil, lastDetectionTime, err
+			return nil, since, err
 		}
 
 		var newItems []utils.Dict
@@ -609,14 +605,16 @@ func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, a
 				continue
 			}
 
-			if _, seen := api.dedupe[id]; !seen {
+			_, seen := api.dedupe[id]
+			_, staged := pending[id]
+			if !seen && !staged {
 				CreatedAt, err := time.Parse(api.returnedTimeFormat, createdAtStr)
 				if err != nil {
 					a.conf.ClientOptions.OnError(fmt.Errorf("cylance %s api invalid timestamp: %v", api.key, err))
 					continue
 				}
 				if CreatedAt.After(since) {
-					api.dedupe[id] = CreatedAt.Unix()
+					pending[id] = CreatedAt.Unix()
 					newItems = append(newItems, event)
 					if CreatedAt.After(lastDetectionTime) {
 						lastDetectionTime = CreatedAt
@@ -633,6 +631,14 @@ func (a *CylanceAdapter) getEventsRequest(ctx context.Context, pageUrl string, a
 		page++
 	}
 
+	for k, v := range api.dedupe {
+		if v < since.Unix() {
+			delete(api.dedupe, k)
+		}
+	}
+	for k, v := range pending {
+		api.dedupe[k] = v
+	}
 	return allItems, lastDetectionTime, nil
 }
 

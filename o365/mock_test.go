@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -41,7 +42,9 @@ const (
 
 // --- in-memory USP sink -------------------------------------------------------
 
-// captureSink is an in-memory uspSink that records every shipped message.
+// captureSink records messages and simulates immediate confirmation for vendor
+// API and deduper unit tests. It does not validate delivery safety; ack_test.go
+// uses the real SDK and websocket peer for withheld-ACK crash/replay regressions.
 type captureSink struct {
 	mu       sync.Mutex
 	messages []*protocol.DataMessage
@@ -849,4 +852,12 @@ func TestMockStartTimeFirstPoll(t *testing.T) {
 	counts := sink.payloadCounts()
 	assert.Equal(t, 1, counts[oldRec])
 	assert.Equal(t, 1, counts[newRec])
+}
+
+func (s *captureSink) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.Ship(m, d)
+}
+
+func (s *captureSink) ObserveReceipt(uspclient.AdmissionReceipt) uspclient.ReceiptObservation {
+	return uspclient.ReceiptObservation{Frame: uspclient.ReceiptAcknowledged, Lifetime: uspclient.ReceiptLive}
 }

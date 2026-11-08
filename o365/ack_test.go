@@ -1,0 +1,416 @@
+package usp_o365
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/refractionPOINT/gjson"
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/utils"
+	"github.com/stretchr/testify/require"
+	"github.com/vmihailenco/msgpack/v5"
+)
+
+type ackFrame struct {
+	conn *websocket.Conn
+	msg  protocol.DataMessage
+}
+
+type trackingACKClient struct {
+	*uspclient.Client
+	receipts      chan uspclient.AdmissionReceipt
+	calls         int
+	failOn        int
+	beforeFailure func()
+}
+
+func (c *trackingACKClient) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	c.calls++
+	if c.calls == c.failOn {
+		if c.beforeFailure != nil {
+			c.beforeFailure()
+		}
+		return uspclient.AdmissionReceipt{}, errors.New("synthetic admission failure")
+	}
+	r, e := c.Client.ShipWithReceipt(m, d)
+	if e == nil {
+		c.receipts <- r
+	}
+	return r, e
+}
+
+// Keep the same admission fault injection when testing an older Ship caller.
+func (c *trackingACKClient) Ship(m *protocol.DataMessage, d time.Duration) error {
+	_, err := c.ShipWithReceipt(m, d)
+	return err
+}
+
+// A real compressed USP websocket peer. Tests either explicitly ACK frames or
+// enable ACKs only for requested frames; there is no background ACK timer.
+func ackClient(t *testing.T, ackOnlyRequested ...bool) (*uspclient.Client, <-chan ackFrame) {
+	t.Helper()
+	frames := make(chan ackFrame, 2048)
+	var mu sync.Mutex
+	var conns []*websocket.Conn
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		mu.Lock()
+		conns = append(conns, c)
+		mu.Unlock()
+		var h protocol.ConnectionHeader
+		if c.ReadJSON(&h) != nil {
+			return
+		}
+		if c.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageREADY}) != nil {
+			return
+		}
+		if c.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageFLOW, WindowSize: 1024}) != nil {
+			return
+		}
+		for {
+			_, raw, err := c.ReadMessage()
+			if err != nil {
+				return
+			}
+			z, err := gzip.NewReader(bytes.NewReader(raw))
+			if err != nil {
+				return
+			}
+			var msg protocol.DataMessage
+			err = msgpack.NewDecoder(z).Decode(&msg)
+			z.Close()
+			if err != nil {
+				return
+			}
+			frames <- ackFrame{c, msg}
+			if len(ackOnlyRequested) != 0 && ackOnlyRequested[0] && msg.AckRequested {
+				if c.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageACK, SeqNum: msg.SeqNum}) != nil {
+					return
+				}
+			}
+		}
+	}))
+	c, err := uspclient.NewClient(context.Background(), uspclient.ClientOptions{
+		Identity: uspclient.Identity{Oid: "00000000-0000-4000-8000-000000000001", InstallationKey: "synthetic-only"},
+		DestURL:  "ws" + strings.TrimPrefix(server.URL, "http") + "/usp", Platform: "text", IsCompressed: true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		c.Close()
+		mu.Lock()
+		for _, c := range conns {
+			c.Close()
+		}
+		mu.Unlock()
+		server.Close()
+	})
+	return c, frames
+}
+
+func nextACKFrame(t *testing.T, frames <-chan ackFrame) ackFrame {
+	t.Helper()
+	select {
+	case f := <-frames:
+		return f
+	case <-time.After(5 * time.Second):
+		t.Fatal("no USP frame")
+		return ackFrame{}
+	}
+}
+func acceptFrame(t *testing.T, f ackFrame) {
+	t.Helper()
+	require.NoError(t, f.conn.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageACK, SeqNum: f.msg.SeqNum}))
+}
+func pollAsync(a *Office365Adapter, s *blobServer) <-chan bool {
+	done := make(chan bool, 1)
+	go func() { done <- a.pollOnce(s.listURL(), &failureState{}) }()
+	return done
+}
+func pollResult(t *testing.T, done <-chan bool) bool {
+	t.Helper()
+	return pollResultWithin(t, done, 5*time.Second)
+}
+
+func pollResultWithin(t *testing.T, done <-chan bool, timeout time.Duration) bool {
+	t.Helper()
+	select {
+	case ok := <-done:
+		return ok
+	case <-time.After(timeout):
+		t.Fatal("poll did not stop")
+		return false
+	}
+}
+
+func TestConfirmedACKReplacementReplay(t *testing.T) {
+	for _, idless := range []bool{false, true} {
+		t.Run(map[bool]string{false: "identified", true: "idless"}[idless], func(t *testing.T) {
+			srv := newBlobServer(t)
+			raw := eventN("a", 1)
+			if idless {
+				raw = event("", "2026-10-28T12:00:00")
+			}
+			srv.add("blob-1", "", raw)
+			dd := newFakeBatchDeduper()
+			c, frames := ackClient(t)
+			a, _ := newBatchAdapter(t, srv, dd, c)
+			done := pollAsync(a, srv)
+			first := nextACKFrame(t, frames)
+			require.Equal(t, raw, first.msg.TextPayload)
+			require.Never(t, func() bool { dd.mu.Lock(); defer dd.mu.Unlock(); return len(dd.addMany) != 0 }, 80*time.Millisecond, 5*time.Millisecond)
+			// Abrupt client loss, with no adapter drain, models a crashed instance.
+			_, err := c.Close()
+			require.NoError(t, err)
+			require.False(t, pollResult(t, done))
+			require.False(t, dd.has("blob-1"))
+			require.False(t, dd.has("a-0001"))
+			replacement, replayed := ackClient(t)
+			b, _ := newBatchAdapter(t, srv, dd, replacement)
+			done = pollAsync(b, srv)
+			f := nextACKFrame(t, replayed)
+			require.Equal(t, raw, f.msg.TextPayload)
+			acceptFrame(t, f)
+			require.True(t, pollResult(t, done))
+			require.True(t, dd.has("blob-1"))
+			if !idless {
+				require.True(t, dd.has("a-0001"))
+			}
+			require.True(t, b.pollOnce(srv.listURL(), &failureState{}))
+			select {
+			case <-replayed:
+				t.Fatal("confirmed blob replayed")
+			default:
+			}
+			// Event dedup also survives a new blob containing the same event.
+			if !idless {
+				srv.add("blob-2", "", raw)
+				require.True(t, b.pollOnce(srv.listURL(), &failureState{}))
+				select {
+				case <-replayed:
+					t.Fatal("confirmed event replayed")
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestConfirmedACKPartialAndShutdown(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1), event("", ""), eventN("a", 2))
+	dd := newFakeBatchDeduper()
+	c, frames := ackClient(t)
+	tracked := &trackingACKClient{Client: c, receipts: make(chan uspclient.AdmissionReceipt, 3)}
+	a, _ := newBatchAdapter(t, srv, dd, tracked)
+	done := pollAsync(a, srv)
+	first := nextACKFrame(t, frames)
+	nextACKFrame(t, frames)
+	nextACKFrame(t, frames)
+	acceptFrame(t, first)
+	receipt := <-tracked.receipts
+	require.Eventually(t, func() bool { return c.ObserveReceipt(receipt).Frame == uspclient.ReceiptAcknowledged }, 5*time.Second, time.Millisecond)
+	// Cancellation must release the wait without marking an unconfirmed tail.
+	a.cancelStop()
+	require.False(t, pollResult(t, done))
+	require.True(t, dd.has("a-0001"))
+	require.False(t, dd.has("a-0002"))
+	require.False(t, dd.has("blob-1"))
+	replacement, replay := ackClient(t)
+	b, _ := newBatchAdapter(t, srv, dd, replacement)
+	done = pollAsync(b, srv)
+	f := nextACKFrame(t, replay)
+	require.Empty(t, gjson.Get(f.msg.TextPayload, "Id").String())
+	f = nextACKFrame(t, replay)
+	require.Equal(t, eventN("a", 2), f.msg.TextPayload)
+	acceptFrame(t, f)
+	require.True(t, pollResult(t, done))
+	require.True(t, dd.has("blob-1"))
+}
+func TestConfirmedACKTimeout(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1))
+	dd := newFakeBatchDeduper()
+	c, frames := ackClient(t)
+	a, _ := newBatchAdapter(t, srv, dd, c)
+	a.conf.confirmationTimeout = 200 * time.Millisecond
+	done := pollAsync(a, srv)
+	nextACKFrame(t, frames)
+	require.False(t, pollResult(t, done))
+	require.False(t, dd.has("a-0001"))
+	require.False(t, dd.has("blob-1"))
+}
+
+func TestConfirmedACKIgnoresLegacyMarkers(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1))
+	dd := newFakeBatchDeduper()
+	dd.AddMany([]utils.DedupeKey{{Key: "blob-1"}, {Key: "a-0001"}})
+	c, frames := ackClient(t)
+	a, _ := newBatchAdapter(t, srv, dd, c)
+	done := pollAsync(a, srv)
+	f := nextACKFrame(t, frames)
+	acceptFrame(t, f)
+	require.True(t, pollResult(t, done))
+	require.True(t, dd.has("blob-1"))
+	require.True(t, dd.has("a-0001"))
+}
+
+func TestConfirmedACKPartialAdmissionFailure(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1), eventN("a", 2), eventN("a", 3))
+	dd := newFakeBatchDeduper()
+	c, frames := ackClient(t)
+	releaseFailure := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(releaseFailure) }) }
+	t.Cleanup(release)
+	tracked := &trackingACKClient{Client: c, receipts: make(chan uspclient.AdmissionReceipt, 3), failOn: 3,
+		beforeFailure: func() { <-releaseFailure }}
+	a, _ := newBatchAdapter(t, srv, dd, tracked)
+	done := pollAsync(a, srv)
+	first := nextACKFrame(t, frames)
+	nextACKFrame(t, frames)
+	acceptFrame(t, first)
+	receipt := <-tracked.receipts
+	require.Eventually(t, func() bool { return c.ObserveReceipt(receipt).Frame == uspclient.ReceiptAcknowledged }, 5*time.Second, time.Millisecond)
+	// Only now permit the fatal admission error: this ACK was learned while
+	// the collector was still running, rather than during its failure exit.
+	release()
+	require.False(t, pollResult(t, done))
+	require.True(t, dd.has("a-0001"))
+	require.False(t, dd.has("a-0002"))
+	require.False(t, dd.has("a-0003"))
+	require.False(t, dd.has("blob-1"))
+	replacement, replay := ackClient(t)
+	b, _ := newBatchAdapter(t, srv, dd, replacement)
+	done = pollAsync(b, srv)
+	require.Equal(t, eventN("a", 2), nextACKFrame(t, replay).msg.TextPayload)
+	f := nextACKFrame(t, replay)
+	require.Equal(t, eventN("a", 3), f.msg.TextPayload)
+	acceptFrame(t, f)
+	require.True(t, pollResult(t, done))
+	require.True(t, dd.has("blob-1"))
+}
+
+// The per-key deduper uses the same chunk barrier as a batch deduper: every
+// event in the chunk can reach the wire before the peer ACKs any of them.
+func TestConfirmedACKCheckingChunkBarrier(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1), event("", ""), eventN("a", 2))
+	dd := newSharedDeduper()
+	c, frames := ackClient(t)
+	a, _ := newBatchAdapter(t, srv, newFakeBatchDeduper(), c)
+	a.batcher = nil
+	a.checker = dd
+	a.conf.Deduper = dd
+	done := pollAsync(a, srv)
+	nextACKFrame(t, frames)
+	nextACKFrame(t, frames)
+	last := nextACKFrame(t, frames)
+	require.False(t, dd.Check(confirmedKey("a-0001")))
+	require.False(t, dd.Check(confirmedKey("a-0002")))
+	require.False(t, dd.Check(confirmedKey("blob-1")))
+	acceptFrame(t, last)
+	require.True(t, pollResult(t, done))
+	require.True(t, dd.Check(confirmedKey("a-0001")))
+	require.True(t, dd.Check(confirmedKey("a-0002")))
+	require.True(t, dd.Check(confirmedKey("blob-1")))
+	require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
+	select {
+	case <-frames:
+		t.Fatal("confirmed blob replayed")
+	default:
+	}
+}
+
+// This peer has no ACK timer: a chunk can finish only if an admitted frame
+// requests an ACK. Duplicates at the tail must not swallow that request.
+func TestConfirmedACKRequestsChunkTail(t *testing.T) {
+	noID := event("", "2026-10-28T12:00:00")
+	many := make([]string, dedupeBatchSize+1)
+	for i := range many {
+		many[i] = noID
+	}
+	for _, tc := range []struct {
+		name           string
+		events         []string
+		sent           []string
+		barrierIndexes []int
+	}{
+		{"trailing repeat", []string{eventN("a", 1), eventN("a", 2), eventN("a", 1)}, []string{eventN("a", 1), eventN("a", 2)}, []int{1}},
+		{"trailing known", []string{eventN("a", 1), eventN("a", 2), eventN("known", 1)}, []string{eventN("a", 1), eventN("a", 2)}, []int{1}},
+		{"idless before skipped tail", []string{eventN("a", 1), noID, eventN("a", 1), eventN("known", 1)}, []string{eventN("a", 1), noID}, []int{1}},
+		{"idless tail", []string{eventN("a", 1), noID}, []string{eventN("a", 1), noID}, []int{1}},
+		{"multiple chunks", many, many, []int{dedupeBatchSize - 1, dedupeBatchSize}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newBlobServer(t)
+			srv.add("blob-1", "", tc.events...)
+			dd := newFakeBatchDeduper()
+			dd.AddMany([]utils.DedupeKey{{Key: confirmedKey("known-0001")}})
+			c, frames := ackClient(t, true)
+			a, _ := newBatchAdapter(t, srv, dd, c)
+			a.conf.confirmationTimeout = 20 * time.Second
+			done := pollAsync(a, srv)
+			require.True(t, pollResultWithin(t, done, 30*time.Second), "peer ACKs only requested frames")
+			var received []protocol.DataMessage
+			for range tc.sent {
+				received = append(received, nextACKFrame(t, frames).msg)
+			}
+			for i, raw := range tc.sent {
+				require.Equal(t, raw, received[i].TextPayload)
+			}
+			for _, i := range tc.barrierIndexes {
+				require.True(t, received[i].AckRequested, "chunk tail %d must request an ACK", i)
+			}
+			require.True(t, dd.has("blob-1"))
+			require.True(t, a.pollOnce(srv.listURL(), &failureState{}))
+			select {
+			case <-frames:
+				t.Fatal("confirmed blob replayed")
+			default:
+			}
+		})
+	}
+}
+
+func TestConfirmedACKFatalAdmissionDoesNotWaitForTail(t *testing.T) {
+	srv := newBlobServer(t)
+	srv.add("blob-1", "", eventN("a", 1), eventN("a", 2), eventN("a", 3))
+	dd := newFakeBatchDeduper()
+	// No ACK timer and no manual ACKs. The requested chunk tail will fail
+	// admission, so neither of the first two records can be confirmed.
+	c, frames := ackClient(t, true)
+	tracked := &trackingACKClient{Client: c, receipts: make(chan uspclient.AdmissionReceipt, 3), failOn: 3}
+	a, _ := newBatchAdapter(t, srv, dd, tracked)
+	done := pollAsync(a, srv)
+	for range 2 {
+		require.False(t, nextACKFrame(t, frames).msg.AckRequested)
+	}
+	require.False(t, pollResult(t, done), "fatal admission must stop without cancelStop or the chunk deadline")
+	require.NoError(t, a.stopCtx.Err(), "test did not cancel the adapter")
+	for _, key := range []string{"a-0001", "a-0002", "a-0003", "blob-1"} {
+		require.False(t, dd.has(key))
+	}
+	replacement, replayed := ackClient(t, true)
+	b, _ := newBatchAdapter(t, srv, dd, replacement)
+	require.True(t, pollResult(t, pollAsync(b, srv)))
+	for i := 1; i <= 3; i++ {
+		require.Equal(t, eventN("a", i), nextACKFrame(t, replayed).msg.TextPayload)
+	}
+	require.True(t, dd.has("blob-1"))
+}
