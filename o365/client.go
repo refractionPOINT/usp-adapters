@@ -76,7 +76,8 @@ type DedupeStats struct {
 	BlobsFetched int
 	// BlobsSkipped is the number of listed blobs skipped as already done.
 	BlobsSkipped int
-	// EventsShipped is the number of events shipped.
+	// EventsShipped counts SDK admissions, including an unconfirmed tail if
+	// the poll aborts. Dedupe markers require separate ACK confirmation.
 	EventsShipped int
 	// EventsDuplicate is the number of events skipped because the deduper
 	// had already recorded their Id (typically shipped from another blob).
@@ -278,7 +279,7 @@ func newOffice365Adapter(ctx context.Context, conf Office365Config, sink uspSink
 	} else if cd, ok := conf.Deduper.(utils.CheckingDeduper); ok {
 		a.checker = cd
 	} else {
-		a.conf.ClientOptions.DebugLog("deduper cannot check without recording: duplicate suppression is disabled")
+		a.conf.ClientOptions.DebugLog("deduper cannot check without recording: stored markers are ignored; only repeated IDs within a blob are suppressed")
 	}
 
 	if isURLEndpoint(conf.Endpoint) {
@@ -716,10 +717,9 @@ func (a *Office365Adapter) shipContentBatch(content []byte) (eventCounts, bool) 
 
 // shipChunk deduplicates, ships and records one chunk of a blob's events. seen
 // holds the Ids of the blob's earlier chunks and is extended with this one's.
-// Confirmed events are recorded once per chunk, not one by one: if the process
-// dies mid-chunk, or an overlapping instance shares the deduper while a Ship
-// waits for a full buffer, the chunk's already shipped events can ship again.
-// That costs duplicates, never data.
+// Markers are written after the chunk's confirmation barrier, using a batch
+// call when supported. A crash before those writes or an overlapping instance
+// can replay confirmed events. That costs duplicates, never undelivered data.
 func (a *Office365Adapter) shipChunk(chunk []batchEvent, seen map[string]struct{}, counts *eventCounts) (complete bool) {
 	if a.doStop.IsSet() {
 		return false
@@ -844,6 +844,7 @@ func (a *Office365Adapter) admitContext(ctx context.Context, raw string) (uspcli
 }
 
 // confirmedKey separates ACK-confirmed markers from older admission markers.
+// Older markers are ignored; source timestamps and backend TTLs are unchanged.
 // Empty event IDs must remain empty, so they never become dedupe keys.
 func confirmedKey(key string) string {
 	if key == "" {
@@ -879,8 +880,8 @@ func (a *Office365Adapter) waitConfirmedContext(ctx context.Context, receipt usp
 	}
 }
 
-// isDone reports whether a content blob or event was already shipped. With a
-// deduper that cannot check without recording, duplicate suppression is disabled.
+// isDone checks a blob's confirmed marker without writing anything. Older
+// admission markers are ignored. A check-and-add-only deduper fails open.
 func (a *Office365Adapter) isDone(key string) bool {
 	if a.checker != nil {
 		return a.checker.Check(confirmedKey(key))
@@ -889,7 +890,8 @@ func (a *Office365Adapter) isDone(key string) bool {
 	return false
 }
 
-// markDone records a content blob or event as shipped. Shipped means confirmed by a live USP client after the peer ACK.
+// markDone records a blob after all required events have been confirmed by
+// peer ACKs observed while the SDK client was live.
 func (a *Office365Adapter) markDone(key string) {
 	if a.checker != nil {
 		// Overlapping instances can duplicate work between Check and this

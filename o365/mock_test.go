@@ -42,7 +42,9 @@ const (
 
 // --- in-memory USP sink -------------------------------------------------------
 
-// captureSink is an in-memory uspSink that records every shipped message.
+// captureSink records messages and simulates immediate confirmation for vendor
+// API and deduper unit tests. It does not validate delivery safety; ack_test.go
+// uses the real SDK and websocket peer for withheld-ACK crash/replay regressions.
 type captureSink struct {
 	mu       sync.Mutex
 	messages []*protocol.DataMessage
