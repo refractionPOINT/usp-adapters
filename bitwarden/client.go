@@ -252,6 +252,7 @@ func (a *BitwardenAdapter) fetchEvents() {
 
 	var endTime time.Time
 	continuationToken := ""
+	continuationFailures := 0
 	seenTokens := map[string]bool{}
 	for !a.doStop.WaitFor(a.pollInterval) {
 		if endTime.IsZero() {
@@ -262,12 +263,26 @@ func (a *BitwardenAdapter) fetchEvents() {
 			items, newToken, err := a.makeOneRequest(continuationToken, &endTime)
 			if err != nil {
 				a.conf.ClientOptions.OnError(fmt.Errorf("failed to fetch events: %v", err))
+				if continuationToken != "" {
+					continuationFailures++
+					if continuationFailures >= 3 {
+						// The token may have expired. Replay the same window;
+						// duplicates are preferable to skipping its remainder.
+						continuationToken = ""
+						seenTokens = map[string]bool{}
+						continuationFailures = 0
+					}
+				}
 				break
 			}
 			if newToken != "" && (newToken == continuationToken || seenTokens[newToken]) {
 				a.conf.ClientOptions.OnError(fmt.Errorf("repeated events continuation token"))
+				continuationToken = ""
+				seenTokens = map[string]bool{}
+				continuationFailures = 0
 				break
 			}
+			continuationFailures = 0
 			for _, item := range items {
 				msg := &protocol.DataMessage{
 					JsonPayload: item,
@@ -313,9 +328,15 @@ func (a *BitwardenAdapter) makeOneRequest(continuationToken string, endTime *tim
 
 	if continuationToken != "" {
 		queryParams.Set("continuationToken", continuationToken)
-	} else if a.lastStartDate != nil && endTime != nil {
-		// Use explicit start and end times for the query
-		queryParams.Set("start", a.lastStartDate.Format(time.RFC3339))
+	}
+	if endTime != nil {
+		// Pin the default initial 30-day range too, so restarting a stale
+		// continuation cannot silently move the first window's bounds.
+		startTime := endTime.UTC().Truncate(24*time.Hour).AddDate(0, 0, -30)
+		if a.lastStartDate != nil {
+			startTime = *a.lastStartDate
+		}
+		queryParams.Set("start", startTime.Format(time.RFC3339))
 		queryParams.Set("end", endTime.Format(time.RFC3339))
 	}
 

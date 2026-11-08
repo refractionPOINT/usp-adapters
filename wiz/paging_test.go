@@ -72,8 +72,12 @@ func TestPagingCompleteBeforeCheckpoint(t *testing.T) {
 					want = 3
 				}
 				require.Len(t, items, want)
-				if mode != "empty-page" {
+				if mode == "empty-page" {
+					require.Equal(t, "2026-01-01T01:00:00Z", since)
+					require.Equal(t, "old", id)
+				} else {
 					require.Equal(t, "2026-01-02T00:00:00Z", since)
+					require.Equal(t, "new", id)
 				}
 			}
 			wantCalls := 2

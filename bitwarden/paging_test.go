@@ -59,7 +59,7 @@ func TestPagingFailureRetainsWindow(t *testing.T) {
 			if !firstWindow {
 				require.Equal(t, start.Format(time.RFC3339), rootStart)
 			} else {
-				require.Empty(t, rootStart)
+				require.Equal(t, time.Now().UTC().Truncate(24*time.Hour).AddDate(0, 0, -30).Format(time.RFC3339), rootStart)
 			}
 			require.Equal(t, 3, pages)
 			require.Equal(t, 3, a.uspClient.(*captureSink).count())

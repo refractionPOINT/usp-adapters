@@ -229,6 +229,9 @@ func (a *WizAdapter) fetchEvents() {
 
 	for !a.doStop.WaitFor(a.conf.PollInterval) {
 		items, newSince, eventId, err := a.makeOneGraphQLRequest(since, lastEventId)
+		if errors.Is(err, uspclient.ErrorClosed) {
+			return
+		}
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("error making GraphQL request: %v", err))
 			continue
@@ -284,6 +287,9 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 		alerts = append(alerts, items...)
 		if next == "" {
 			return alerts, newSince, newID, nil
+		}
+		if err := a.validateCursorQuery(); err != nil {
+			return nil, since, lastEventId, err
 		}
 		if seen[next] {
 			return nil, since, lastEventId, fmt.Errorf("repeated GraphQL continuation cursor")
@@ -369,7 +375,12 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 	}
 
 	if errs, ok := result["errors"].([]interface{}); ok && len(errs) != 0 {
-		return nil, since, "", "", fmt.Errorf("GraphQL response contains errors")
+		if !a.onlyOptionalGraphQLErrors(errs) {
+			return nil, since, "", "", fmt.Errorf("GraphQL response contains errors affecting required data")
+		}
+		if a.conf.ClientOptions.OnWarning != nil {
+			a.conf.ClientOptions.OnWarning("GraphQL response contains errors on optional fields; collecting valid records")
+		}
 	}
 
 	// Navigate through the data path to find the items
@@ -405,12 +416,12 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 			for i, item := range items {
 				itemMap, ok := item.(map[string]interface{})
 				if !ok {
-					continue
+					return nil, since, "", "", fmt.Errorf("invalid GraphQL record")
 				}
 
 				id, ok := itemMap[a.conf.IDField].(string)
-				if !ok {
-					continue
+				if !ok || id == "" {
+					return nil, since, "", "", fmt.Errorf("missing GraphQL record ID")
 				}
 
 				if id == lastEventId {
@@ -418,8 +429,8 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 				}
 
 				timeValue, ok := itemMap[a.conf.TimeField].(string)
-				if !ok {
-					continue
+				if !ok || timeValue == "" {
+					return nil, since, "", "", fmt.Errorf("missing GraphQL record time")
 				}
 
 				if i == 0 {
