@@ -281,15 +281,48 @@ func (a *S3Adapter) Close() error {
 }
 
 func (a *S3Adapter) lookForFiles() (bool, error) {
-	resp, err := a.awsS3.ListObjectsV2(&s3.ListObjectsV2Input{
+	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(a.conf.BucketName),
 		Prefix: &a.conf.Prefix,
-	})
-	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("s3.ListObjectsV2() @ %s: %v", a.region, err))
-		// Ignore the error upstream so that we just keep retrying.
-		return false, nil
 	}
+	found := false
+	for {
+		if atomic.LoadUint32(&a.isStop) == 1 {
+			return found, nil
+		}
+		resp, err := a.awsS3.ListObjectsV2(input)
+		if err != nil {
+			err = fmt.Errorf("s3.ListObjectsV2() @ %s: %w", a.region, err)
+			a.conf.ClientOptions.OnError(err)
+			if a.conf.IsOneTimeLoad {
+				return found, err
+			}
+			// Continuous collection retries retained objects on the next scan.
+			return found, nil
+		}
+		pageFound, err := a.processListing(resp)
+		found = found || pageFound
+		if err != nil {
+			return found, err
+		}
+		if !aws.BoolValue(resp.IsTruncated) {
+			return found, nil
+		}
+		next := aws.StringValue(resp.NextContinuationToken)
+		if next == "" || next == aws.StringValue(input.ContinuationToken) {
+			err := errors.New("s3.ListObjectsV2(): truncated listing has no advancing continuation token")
+			a.conf.ClientOptions.OnError(err)
+			if !a.conf.IsOneTimeLoad {
+				return found, nil
+			}
+			return found, err
+		}
+		input.ContinuationToken = aws.String(next)
+	}
+}
+
+func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
+	var err error
 
 	// We pipeline the downloading of files from S3 to support
 	// high throughputs. It is important we keep file ordering
