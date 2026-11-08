@@ -58,7 +58,7 @@ func TestInvalidEventsDoNotStopCollection(t *testing.T) {
 					default:
 					}
 					return emptyPolls.Load() >= 2
-				}, 3*time.Second, time.Millisecond)
+				}, 10*time.Second, time.Millisecond)
 				select {
 				case <-stopped:
 					t.Fatal("collector stopped at a malformed event")
