@@ -5,12 +5,9 @@ import (
 	"time"
 )
 
-// Leave ten seconds of the 60-second visibility lease unused. The budget starts
-// before Receive, so long polling, all admissions, and cleanup share it. On
-// expiry the receiver reports OnError and exits without deleting the batch.
-// Messages become visible again after their source lease; the adapter owner
-// must restart collection. Already delivered members may replay on restart.
-// Visibility is not renewed, so persistently slow batches can repeatedly retry.
+// Known leases reserve ten seconds of the server's 60-second visibility window.
+// The renewer extends them during long work. Uncertain renewal abandons the batch,
+// reports OnError, and stops collection; the owner can restart and replay it.
 var sourceLeaseBudget = 50 * time.Second
 
 func (a *SQSFilesAdapter) awaitDelivery(deadline time.Time) error {

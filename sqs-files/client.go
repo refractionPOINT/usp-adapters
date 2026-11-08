@@ -32,6 +32,9 @@ type SQSFilesAdapter struct {
 	uspClient      acktrack.SDKClient
 	tracker        *acktrack.ACKTracker
 	receiveStopped <-chan struct{}
+	collectionOnce sync.Once
+	collectCtx     context.Context
+	stopCollection context.CancelFunc
 
 	chFiles chan fileInfo
 
@@ -182,7 +185,17 @@ func (a *SQSFilesAdapter) Close() error {
 	defer utils.StopBlockedProducers(a.uspClient)()
 	a.conf.ClientOptions.DebugLog("closing")
 	a.isStop.Store(true)
-	a.wg.Wait()
+	a.collectionContext()
+	a.stopCollection()
+	joined := make(chan struct{})
+	go func() { a.wg.Wait(); close(joined) }()
+	select {
+	case <-joined:
+	case <-time.After(leaseCloseBudget):
+		a.uspClient.BeginDrain()
+		_, err := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
+		return errors.Join(errors.New("SQS file workers did not stop within shutdown budget"), err)
+	}
 	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {
 		return err
 	}
@@ -227,9 +240,11 @@ func (a *SQSFilesAdapter) receiveEvents() (receiveErr error) {
 
 	defer close(a.chFiles)
 
+	collectCtx := a.collectionContext()
 	for !a.isStop.Load() {
-		deadline := time.Now().Add(sourceLeaseBudget)
-		receiveCtx, receiveCancel := context.WithDeadline(a.ctx, deadline)
+		receivedBefore := time.Now()
+		deadline := receivedBefore.Add(min(sourceLeaseBudget, 10*time.Second))
+		receiveCtx, receiveCancel := context.WithDeadline(collectCtx, deadline)
 		result, err := a.sqsClient.ReceiveMessageWithContext(receiveCtx, &sqs.ReceiveMessageInput{
 			AttributeNames:        []*string{},
 			MessageAttributeNames: []*string{},
@@ -246,30 +261,8 @@ func (a *SQSFilesAdapter) receiveEvents() (receiveErr error) {
 		if len(result.Messages) == 0 {
 			continue
 		}
-		if a.tracker == nil {
-			a.tracker, _ = acktrack.NewACKTracker(a.uspClient, 1, 16)
-		}
-		batchCtx, cancel := context.WithDeadline(a.ctx, deadline)
-		err = a.processBatch(batchCtx, result.Messages)
-		cancel()
-		if err != nil {
+		if err := a.handleBatch(collectCtx, result.Messages, receivedBefore); err != nil {
 			return err
-		}
-		if err := a.awaitDelivery(deadline); err != nil {
-			return err
-		}
-		req := &sqs.DeleteMessageBatchInput{QueueUrl: &a.conf.QueueURL}
-		for _, msg := range result.Messages {
-			req.Entries = append(req.Entries, &sqs.DeleteMessageBatchRequestEntry{Id: msg.MessageId, ReceiptHandle: msg.ReceiptHandle})
-		}
-		deleteCtx, deleteCancel := context.WithDeadline(a.ctx, deadline)
-		res, err := a.sqsClient.DeleteMessageBatchWithContext(deleteCtx, req)
-		deleteCancel()
-		if err != nil {
-			return err
-		}
-		if len(res.Failed) != 0 {
-			return errors.New("sqsClient.DeleteMessageBatch: failed to delete some messages")
 		}
 
 	}
@@ -350,14 +343,23 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 	if _, err := a.awsDownloader.DownloadWithContext(f.ctx, writerAt, &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}); err != nil {
 		return empty, err
 	}
-	data, compressed, err := utils.PrepareBundleData(path, writerAt.Bytes())
+	if err := f.ctx.Err(); err != nil {
+		return empty, context.Cause(f.ctx)
+	}
+	data, compressed, err := prepareBundleData(f.ctx, path, writerAt.Bytes())
 	if err != nil {
 		return empty, err
 	}
-	return a.shipEvent(data, compressed)
+	if err := f.ctx.Err(); err != nil {
+		return empty, context.Cause(f.ctx)
+	}
+	return a.shipEventContext(f.ctx, data, compressed)
 }
 
 func (a *SQSFilesAdapter) shipEvent(data []byte, isCompressed bool) (acktrack.ACKDependency, error) {
+	return a.shipEventContext(context.Background(), data, isCompressed)
+}
+func (a *SQSFilesAdapter) shipEventContext(ctx context.Context, data []byte, isCompressed bool) (acktrack.ACKDependency, error) {
 	// Since we're dealing with files, we use the
 	// bundle payloads to avoid having to go through
 	// the whole unmarshal+marshal roundtrip.
@@ -374,9 +376,39 @@ func (a *SQSFilesAdapter) shipEvent(data []byte, isCompressed bool) (acktrack.AC
 		}
 	}
 
-	dep, err := a.tracker.Ship(msg, 2*time.Second)
-	if err == uspclient.ErrorBufferFull {
-		dep, err = a.tracker.Ship(msg, 2*time.Second)
+	return a.shipContext(ctx, msg)
+}
+
+func (a *SQSFilesAdapter) handleBatch(ctx context.Context, messages []*sqs.Message, receivedBefore time.Time) error {
+	if a.tracker == nil {
+		a.tracker, _ = acktrack.NewACKTracker(a.uspClient, 1, 16)
 	}
-	return dep, err
+	l := newBatchLease(ctx, a.sqsClient, a.conf.QueueURL, messages, receivedBefore)
+	defer l.abort()
+	if l.ctx.Err() != nil {
+		return context.Cause(l.ctx)
+	}
+	if err := a.processBatch(l.ctx, messages); err != nil {
+		return err
+	}
+	if err := a.awaitDeliveryContext(l.ctx); err != nil {
+		return err
+	}
+	deleteCtx, cancel, err := l.cleanupContext()
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	req := &sqs.DeleteMessageBatchInput{QueueUrl: &a.conf.QueueURL}
+	for i, m := range messages {
+		req.Entries = append(req.Entries, &sqs.DeleteMessageBatchRequestEntry{Id: aws.String(fmt.Sprint(i)), ReceiptHandle: m.ReceiptHandle})
+	}
+	out, err := a.sqsClient.DeleteMessageBatchWithContext(deleteCtx, req)
+	if err != nil {
+		return err
+	}
+	if out == nil || len(out.Failed) != 0 {
+		return errors.New("sqsClient.DeleteMessageBatch: failed to delete some messages")
+	}
+	return nil
 }

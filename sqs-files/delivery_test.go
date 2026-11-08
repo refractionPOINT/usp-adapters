@@ -63,6 +63,8 @@ func TestDeliveryConfirmedSourceDelete(t *testing.T) {
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []map[string]string{{"MessageId": "test", "ReceiptHandle": "receipt", "Body": "{\"bucket\":\"test\",\"files\":[{\"path\":\"test\"}]}"}}})
+		case "AmazonSQS.ChangeMessageVisibilityBatch":
+			fmt.Fprint(w, `{"Successful":[{"Id":"0"}]}`)
 		case "AmazonSQS.DeleteMessageBatch":
 			deleted.Store(true)
 			fmt.Fprint(w, `{"Successful":[{"Id":"test"}]}`)
@@ -92,6 +94,8 @@ func TestDeliveryConfirmedSourceDelete(t *testing.T) {
 	if deleted.Load() {
 		t.Error("source deleted before delivery confirmation")
 	}
+	a.collectionContext()
+	a.stopCollection()
 	c.Close()
 	select {
 	case <-done:
@@ -139,6 +143,8 @@ func TestSourceDeleteOnlyAfterReceipt(t *testing.T) {
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []map[string]string{{"MessageId": "test", "ReceiptHandle": "receipt", "Body": "{\"bucket\":\"test\",\"files\":[{\"path\":\"test\"}]}"}}})
+		case "AmazonSQS.ChangeMessageVisibilityBatch":
+			fmt.Fprint(w, `{"Successful":[{"Id":"0"}]}`)
 		case "AmazonSQS.DeleteMessageBatch":
 			deleted.Store(true)
 			fmt.Fprint(w, `{"Successful":[{"Id":"test"}]}`)

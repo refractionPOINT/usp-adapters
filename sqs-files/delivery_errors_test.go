@@ -18,7 +18,7 @@ import (
 )
 
 func TestReceiverFailuresReachOnError(t *testing.T) {
-	for _, kind := range []string{"ship", "observe", "expiry", "delete_rpc", "delete_partial", "parse", "download", "decode"} {
+	for _, kind := range []string{"ship", "observe", "renewal_uncertain", "delete_rpc", "delete_partial", "parse", "download", "decode"} {
 		t.Run(kind, func(t *testing.T) {
 			old := sourceLeaseBudget
 			sourceLeaseBudget = 150 * time.Millisecond
@@ -31,7 +31,7 @@ func TestReceiverFailuresReachOnError(t *testing.T) {
 			if kind == "observe" {
 				c.observeErr = sentinel
 			}
-			if kind == "expiry" {
+			if kind == "renewal_uncertain" {
 				c.autoACK = false
 			}
 			body := `{"bucket":"test","files":[{"path":"test.txt"}]}`
@@ -55,6 +55,8 @@ func TestReceiverFailuresReachOnError(t *testing.T) {
 				switch r.Header.Get("X-Amz-Target") {
 				case "AmazonSQS.ReceiveMessage":
 					json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []map[string]string{{"MessageId": "test", "ReceiptHandle": "test", "Body": body}}})
+				case "AmazonSQS.ChangeMessageVisibilityBatch":
+					fmt.Fprint(w, `{"Successful":[]}`)
 				case "AmazonSQS.DeleteMessageBatch":
 					deletes.Add(1)
 					if kind == "delete_rpc" {
