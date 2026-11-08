@@ -34,7 +34,7 @@ func TestReviewPartialGraphQL(t *testing.T) {
 				fmt.Fprintf(w, `{"data":%s,"errors":[{"message":"unavailable","path":%s}]}`, tc.data, tc.path)
 			}))
 			defer srv.Close()
-			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: `{ issues { nodes { id createdAt } } }`, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt", ClientOptions: uspclient.ClientOptions{OnWarning: func(string) { warnings++ }}}, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
+			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: `query($after:String) { issues(after:$after) { nodes { id createdAt } pageInfo { hasNextPage endCursor } } }`, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt", ClientOptions: uspclient.ClientOptions{OnWarning: func(string) { warnings++ }}}, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
 			items, since, id, err := a.makeOneGraphQLRequest("before", "previous")
 			if tc.fail {
 				require.Error(t, err)
@@ -52,11 +52,14 @@ func TestReviewPartialGraphQL(t *testing.T) {
 }
 
 func TestReviewUnsupportedCursorKeepsCollecting(t *testing.T) {
-	for _, query := range []string{
-		`{ issues { nodes { id createdAt } pageInfo { hasNextPage endCursor } } }`,
-		"query($after: String) { issues { nodes { id createdAt } pageInfo { hasNextPage endCursor } } } # after: $after",
+	for _, tc := range []struct{ query, pageInfo string }{
+		{`{ issues { nodes { id createdAt } pageInfo { hasNextPage endCursor } } }`, `{"hasNextPage":true,"endCursor":"ignored"}`},
+		{"query($after: String) { issues { nodes { id createdAt } pageInfo { hasNextPage endCursor } } } # after: $after", `{"hasNextPage":true,"endCursor":"ignored"}`},
+		{`{ issues { nodes { id createdAt } pageInfo { hasNextPage } } }`, `{"hasNextPage":true}`},
+		{`{ issues { nodes { id createdAt } pageInfo { endCursor } } }`, `{"endCursor":"ignored"}`},
+		{`{ issues { nodes { id createdAt } pageInfo { endCursor } } }`, `null`},
 	} {
-		t.Run(query, func(t *testing.T) {
+		t.Run(tc.query+tc.pageInfo, func(t *testing.T) {
 			calls, errorsSeen := 0, 0
 			warnings := []string{}
 			stop := utils.NewEvent()
@@ -76,11 +79,11 @@ func TestReviewUnsupportedCursorKeepsCollecting(t *testing.T) {
 					nextFloor = body.Variables["filterBy"].(map[string]interface{})["createdAt"].(map[string]interface{})["after"].(string)
 					stop.Set()
 				}
-				fmt.Fprintf(w, `{"data":{"issues":{"nodes":[{"id":"event-%d","createdAt":%q}],"pageInfo":{"hasNextPage":true,"endCursor":"ignored"}}}}`, calls, stamp)
+				fmt.Fprintf(w, `{"data":{"issues":{"nodes":[{"id":"event-%d","createdAt":%q}],"pageInfo":%s}}}`, calls, stamp, tc.pageInfo)
 			}))
 			defer srv.Close()
 			sink := &captureSink{}
-			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: query, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt", PollInterval: time.Millisecond, ClientOptions: uspclient.ClientOptions{DebugLog: func(string) {}, OnWarning: func(s string) { warnings = append(warnings, s) }, OnError: func(error) { errorsSeen++ }}}, doStop: stop, uspClient: sink, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
+			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: tc.query, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt", PollInterval: time.Millisecond, ClientOptions: uspclient.ClientOptions{DebugLog: func(string) {}, OnWarning: func(s string) { warnings = append(warnings, s) }, OnError: func(error) { errorsSeen++ }}}, doStop: stop, uspClient: sink, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
 			a.wgSenders.Add(1)
 			a.fetchEvents()
 			require.Equal(t, 2, calls, "one first-page request per poll")

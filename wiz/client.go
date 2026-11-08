@@ -271,11 +271,12 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 	newSince, newID := since, lastEventId
 	after := ""
 	seen := map[string]bool{}
+	cursorQueryOK := a.validateCursorQuery() == nil
 	for {
 		if a.doStop != nil && a.doStop.IsSet() {
 			return nil, since, lastEventId, uspclient.ErrorClosed
 		}
-		items, pageSince, pageID, next, err := a.makeGraphQLPage(since, lastEventId, after)
+		items, pageSince, pageID, next, hasPaging, err := a.makeGraphQLPage(since, lastEventId, after, cursorQueryOK)
 		if err != nil {
 			return nil, since, lastEventId, err
 		}
@@ -285,15 +286,15 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 			newSince, newID = pageSince, pageID
 		}
 		alerts = append(alerts, items...)
-		if next == "" {
-			return alerts, newSince, newID, nil
-		}
-		if err := a.validateCursorQuery(); err != nil {
+		if hasPaging && !cursorQueryOK {
 			// Preserve single-page collection for existing query shapes.
 			// This is a warning, never the adapter's fatal/Org Error callback.
 			if a.conf.ClientOptions.OnWarning != nil {
 				a.conf.ClientOptions.OnWarning("Wiz pagination: collecting the first page only; wiz/README.md requires a query declaring $after: String, passing after: $after on the selected connection, and selecting pageInfo { hasNextPage endCursor }")
 			}
+			return alerts, newSince, newID, nil
+		}
+		if next == "" {
 			return alerts, newSince, newID, nil
 		}
 		if seen[next] {
@@ -304,7 +305,7 @@ func (a *WizAdapter) makeOneGraphQLRequest(since string, lastEventId string) ([]
 	}
 }
 
-func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after string) ([]map[string]interface{}, string, string, string, error) {
+func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after string, cursorQueryOK bool) ([]map[string]interface{}, string, string, string, bool, error) {
 	var alerts []map[string]interface{}
 	var lastDetectionTime, eventId string
 
@@ -343,17 +344,17 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 
 	jsonBody, err := json.Marshal(requestBody)
 	if err != nil {
-		return nil, since, "", "", fmt.Errorf("error marshaling request body: %v", err)
+		return nil, since, "", "", false, fmt.Errorf("error marshaling request body: %v", err)
 	}
 
 	token, err := a.fetchToken()
 	if err != nil {
-		return nil, since, "", "", fmt.Errorf("error fetching token: %v", err)
+		return nil, since, "", "", false, fmt.Errorf("error fetching token: %v", err)
 	}
 
 	req, err := http.NewRequest("POST", a.conf.URL, bytes.NewBuffer(jsonBody))
 	if err != nil {
-		return nil, since, "", "", fmt.Errorf("error creating request: %v", err)
+		return nil, since, "", "", false, fmt.Errorf("error creating request: %v", err)
 	}
 
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", token))
@@ -361,27 +362,27 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		return nil, since, "", "", fmt.Errorf("error making request: %v", err)
+		return nil, since, "", "", false, fmt.Errorf("error making request: %v", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, since, "", "", fmt.Errorf("error reading response: %v", err)
+		return nil, since, "", "", false, fmt.Errorf("error reading response: %v", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, since, "", "", fmt.Errorf("error response from Wiz API (%d): %s", resp.StatusCode, string(body))
+		return nil, since, "", "", false, fmt.Errorf("error response from Wiz API (%d): %s", resp.StatusCode, string(body))
 	}
 
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, since, "", "", fmt.Errorf("error parsing response: %v", err)
+		return nil, since, "", "", false, fmt.Errorf("error parsing response: %v", err)
 	}
 
 	if errs, ok := result["errors"].([]interface{}); ok && len(errs) != 0 {
 		if !a.onlyOptionalGraphQLErrors(errs) {
-			return nil, since, "", "", fmt.Errorf("GraphQL response contains errors affecting required data")
+			return nil, since, "", "", false, fmt.Errorf("GraphQL response contains errors affecting required data")
 		}
 		if a.conf.ClientOptions.OnWarning != nil {
 			a.conf.ClientOptions.OnWarning("GraphQL response contains errors on optional fields; collecting valid records")
@@ -397,23 +398,24 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 			// Last path element should be an array
 			items, ok := current[path].([]interface{})
 			if !ok {
-				return nil, since, "", "", fmt.Errorf("expected array at path %s, got %T", path, current[path])
+				return nil, since, "", "", false, fmt.Errorf("expected array at path %s, got %T", path, current[path])
 			}
 
 			nextCursor := ""
-			if raw, exists := current["pageInfo"]; exists {
+			raw, hasPaging := current["pageInfo"]
+			if hasPaging && cursorQueryOK {
 				pageInfo, ok := raw.(map[string]interface{})
 				if !ok {
-					return nil, since, "", "", fmt.Errorf("invalid GraphQL pageInfo")
+					return nil, since, "", "", false, fmt.Errorf("invalid GraphQL pageInfo")
 				}
 				hasNext, ok := pageInfo["hasNextPage"].(bool)
 				if !ok {
-					return nil, since, "", "", fmt.Errorf("missing GraphQL hasNextPage")
+					return nil, since, "", "", false, fmt.Errorf("missing GraphQL hasNextPage")
 				}
 				if hasNext {
 					nextCursor, _ = pageInfo["endCursor"].(string)
 					if nextCursor == "" {
-						return nil, since, "", "", fmt.Errorf("missing GraphQL endCursor")
+						return nil, since, "", "", false, fmt.Errorf("missing GraphQL endCursor")
 					}
 				}
 			}
@@ -462,16 +464,16 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 				eventId = lastEventId
 			}
 
-			return alerts, lastDetectionTime, eventId, nextCursor, nil
+			return alerts, lastDetectionTime, eventId, nextCursor, hasPaging, nil
 		}
 
 		// Not the last path element, should be an object
 		next, ok := current[path].(map[string]interface{})
 		if !ok {
-			return nil, since, "", "", fmt.Errorf("expected object at path %s, got %T", path, current[path])
+			return nil, since, "", "", false, fmt.Errorf("expected object at path %s, got %T", path, current[path])
 		}
 		current = next
 	}
 
-	return alerts, lastDetectionTime, eventId, "", nil
+	return alerts, lastDetectionTime, eventId, "", false, nil
 }

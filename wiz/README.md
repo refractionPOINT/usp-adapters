@@ -13,7 +13,8 @@ records, paging information, IDs or times, fail the window. Malformed individual
 records are skipped with warnings, preserving the existing record-level behavior
 without blocking otherwise usable pages.
 
-A failed page, required-data GraphQL error, missing continuation cursor or repeated cursor
+For queries that consume the cursor, a failed page, required-data GraphQL error,
+missing continuation cursor or repeated cursor
 leaves the time checkpoint unchanged. The next poll retries the window.
 The checkpoint advances only after the complete result has been submitted to
 the local USP client. This does not add a durable delivery checkpoint.
@@ -27,7 +28,8 @@ Before following a cursor, the adapter parses the query's GraphQL syntax to
 verify that its single query operation declares `$after` and passes
 `after: $after` directly on the connection identified by `data_path`. A query
 that exposes pagination without consuming the cursor keeps its existing
-first-page collection behavior. It emits one pagination warning per poll naming
+first-page collection behavior even when pagination metadata is partial or null.
+It emits one pagination warning per poll naming
 this required query shape; this case never calls the fatal error callback. The check does not infer a vendor schema or rewrite
 the query. Connection paths expressed through fragments, multiple operations,
 and nonstandard cursor argument names also use the first-page compatibility
