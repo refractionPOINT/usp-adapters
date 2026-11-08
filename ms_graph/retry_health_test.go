@@ -93,24 +93,28 @@ func TestMsGraphSuccessfulFetchResetsRequestClock(t *testing.T) {
 	}
 }
 
-func TestMsGraphRetryAfterDoesNotEscalateWithoutRequest(t *testing.T) {
-	clock := newGraphTestClock()
-	var calls atomic.Int32
-	_, conf := scriptedGraph(t, func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) == 1 {
-			w.Header().Set("Retry-After", "7200")
-			w.WriteHeader(429)
-			return
-		}
-		page(w, []map[string]interface{}{}, "")
-	})
-	a := manualAdapter(t, conf, &captureSink{}, clock.runtime())
-	start := clock.now()
-	_, err := a.poll(conf.GraphEndpoint+testResource, graphCursor{since: start}, map[graphRecordKey]bool{})
-	require.NoError(t, err, "waiting past one hour must not kill a successful next fetch")
-	assert.EqualValues(t, 2, calls.Load())
-	assert.Equal(t, start.Add(2*time.Hour), clock.now())
-	assert.Equal(t, clock.now(), a.lastSuccessfulFetch)
+func TestMsGraphRetryAfterCapped(t *testing.T) {
+	for _, header := range []string{"7200", "2147483647", "99999999999999999999999999999999", "Fri, 01 Jan 2100 00:00:00 GMT"} {
+		t.Run(header, func(t *testing.T) {
+			clock := newGraphTestClock()
+			var calls atomic.Int32
+			_, conf := scriptedGraph(t, func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					w.Header().Set("Retry-After", header)
+					w.WriteHeader(429)
+					return
+				}
+				page(w, []map[string]interface{}{}, "")
+			})
+			a := manualAdapter(t, conf, &captureSink{}, clock.runtime())
+			start := clock.now()
+			_, err := a.poll(conf.GraphEndpoint+testResource, graphCursor{since: start}, map[graphRecordKey]bool{})
+			require.NoError(t, err)
+			assert.EqualValues(t, 2, calls.Load())
+			assert.Equal(t, start.Add(15*time.Minute), clock.now(), "oversized delay must be capped before retrying")
+			assert.Equal(t, clock.now(), a.lastSuccessfulFetch)
+		})
+	}
 }
 
 func TestMsGraphFetchedPageFinishesAcrossOldDeadline(t *testing.T) {

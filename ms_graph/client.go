@@ -28,6 +28,7 @@ const defaultLoginEndpoint = "https://login.microsoftonline.com"
 const defaultPollInterval = 30 * time.Second
 const defaultTimestampField = "createdDateTime"
 const maxShipWait = time.Minute
+const maxRetryAfter = 15 * time.Minute
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
@@ -215,11 +216,16 @@ type graphHTTPError struct {
 func (e *graphHTTPError) Unwrap() error { return e.error }
 
 func retryAfter(value string, now time.Time) time.Duration {
-	if n, err := strconv.ParseInt(value, 10, 32); err == nil && n >= 0 {
+	// Clamp before converting to a duration, including numeric overflow, so
+	// a malformed proxy delay cannot silence requests indefinitely.
+	if n, err := strconv.ParseUint(value, 10, 64); err == nil || errors.Is(err, strconv.ErrRange) {
+		if n > uint64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
 		return time.Duration(n) * time.Second
 	}
 	if t, err := http.ParseTime(value); err == nil && t.After(now) {
-		return t.Sub(now)
+		return min(t.Sub(now), maxRetryAfter)
 	}
 	return 0
 }
