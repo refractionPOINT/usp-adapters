@@ -8,6 +8,8 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,12 +155,19 @@ func (a *ITGlueAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastCursor := ""
-	for !a.doStop.WaitFor(a.pollInterval) {
+	for !a.doStop.IsSet() {
+		// Drain continuations immediately; only completed walks wait to poll again.
+		if lastCursor == "" && a.doStop.WaitFor(a.pollInterval) {
+			return
+		}
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newCursor := a.makeOneRequest(url, lastCursor)
-		lastCursor = newCursor
 		if items == nil {
+			lastCursor = newCursor
+			if a.doStop.WaitFor(a.pollInterval) {
+				return
+			}
 			continue
 		}
 
@@ -182,10 +191,11 @@ func (a *ITGlueAdapter) fetchEvents(url string) {
 				return
 			}
 		}
+		lastCursor = newCursor
 	}
 }
 
-func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.Dict, string) {
+func (a *ITGlueAdapter) makeOneRequest(endpoint string, lastCursor string) ([]utils.Dict, string) {
 
 	// Prepare the request body.
 	reqData := opRequest{}
@@ -202,7 +212,7 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 	formattedTime := thirtySecondsAgo.Format(timeFormat)
 
 	// Prepare the request.
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", a.baseURL, url, formattedTime), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", a.baseURL, endpoint, formattedTime), nil)
 	//debugTimestamp := formattedTime
 	if lastCursor != "" {
 		req, err = http.NewRequest("GET", fmt.Sprintf("%s", lastCursor), nil)
@@ -212,6 +222,22 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 		a.doStop.Set()
 		return nil, ""
 	}
+	base, parseErr := url.Parse(a.baseURL)
+	if parseErr != nil || base.Scheme == "" || base.Host == "" {
+		a.conf.ClientOptions.OnError(errors.New("itglue: invalid configured base URL"))
+		a.doStop.Set()
+		return nil, lastCursor
+	}
+	resolved := base.ResolveReference(req.URL)
+	if !samePageOrigin(base, resolved) || resolved.User != nil {
+		a.conf.ClientOptions.OnError(errors.New("itglue: refusing continuation outside configured scheme and host"))
+		a.doStop.Set()
+		return nil, lastCursor
+	}
+	req.URL = resolved
+	// Keep the exact first-page URL too, so a failed request cannot slide
+	// the rolling time filter forward on retry.
+	lastCursor = req.URL.String()
 	req.Header.Set("Content-Type", "application/vnd.api+json")
 	req.Header.Set("x-api-key", a.conf.Token)
 
@@ -219,7 +245,22 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s", URL, url, debugTimestamp))
 
 	// Issue the request.
-	resp, err := a.httpClient.Do(req)
+	// Redirects must obey the same boundary as response-supplied links.
+	client := *a.httpClient
+	previousRedirect := client.CheckRedirect
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if !samePageOrigin(base, next.URL) || next.URL.User != nil {
+			return errors.New("itglue: refusing redirect outside configured scheme and host")
+		}
+		if previousRedirect != nil {
+			return previousRedirect(next, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("itglue: stopped after 10 redirects")
+		}
+		return nil
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 		return nil, lastCursor
@@ -246,9 +287,26 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 
 	// Report if a cursor was returned
 	// as well as the items.
-	lastCursor = respData.FindOneString("next")
+	lastCursor = respData.FindOneString("links/next")
 	items, _ := respData.GetListOfDict("data")
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", respData))
 
 	return items, lastCursor
+}
+
+// Compare origins using case-insensitive hostnames and effective default ports.
+func samePageOrigin(base, next *url.URL) bool {
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		switch u.Scheme {
+		case "https":
+			return "443"
+		case "http":
+			return "80"
+		}
+		return ""
+	}
+	return base.Scheme == next.Scheme && strings.EqualFold(base.Hostname(), next.Hostname()) && port(base) == port(next)
 }
