@@ -214,3 +214,81 @@ func TestPagingDescendingChainUsesNewestFloor(t *testing.T) {
 		}
 	}
 }
+
+func TestPagingRejectedContinuationRefreshesDuoRoot(t *testing.T) {
+	for _, kind := range []string{"auth", "admin"} {
+		t.Run(kind, func(t *testing.T) {
+			sink := &pagingSink{}
+			var mu sync.Mutex
+			rootFloor := ""
+			roots, failures := 0, 0
+			stamp := time.Now().Unix() + 10
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				q := r.URL.Query()
+				if rootFloor == "" {
+					rootFloor = q.Get("mintime")
+				}
+				root := q.Get("next_offset") == "" && q.Get("mintime") == rootFloor
+				if !root {
+					failures++
+					http.Error(w, "expired continuation", 400)
+					return
+				}
+				roots++
+				logs := []utils.Dict{}
+				if roots == 1 {
+					n := 1
+					if kind == "admin" {
+						n = 1000
+					}
+					for i := 0; i < n; i++ {
+						logs = append(logs, utils.Dict{"id": fmt.Sprint(i), "timestamp": stamp + int64(i)})
+					}
+				} else if roots == 2 {
+					logs = append(logs, utils.Dict{"id": "recovered", "timestamp": stamp + 1001})
+				}
+				if kind == "auth" {
+					meta := utils.Dict{}
+					if roots == 1 {
+						meta["next_offset"] = []string{"stale"}
+					}
+					json.NewEncoder(w).Encode(utils.Dict{"stat": "OK", "response": utils.Dict{"authlogs": logs, "metadata": meta}})
+				} else {
+					json.NewEncoder(w).Encode(utils.Dict{"stat": "OK", "response": logs})
+				}
+			}))
+			defer srv.Close()
+			api := duoapi.NewDuoApi("fake", "fake", strings.TrimPrefix(srv.URL, "https://"), "test")
+			api.SetCustomHTTPClient(srv.Client())
+			a := &DuoAdapter{uspClient: sink, adminClient: duoadmin.New(*api), doStop: utils.NewEvent(), pollInterval: time.Millisecond, conf: DuoConfig{ClientOptions: uspclient.ClientOptions{OnError: func(error) {}, OnWarning: func(string) {}, DebugLog: func(string) {}}}}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				if kind == "auth" {
+					a.fetchAuthLogs()
+				} else {
+					a.fetchAdminLogs()
+				}
+			}()
+			defer func() { a.doStop.Set(); <-done }()
+			require.Eventually(t, func() bool {
+				sink.mu.Lock()
+				defer sink.mu.Unlock()
+				for _, id := range sink.ids {
+					if id == "recovered" {
+						return true
+					}
+				}
+				return false
+			}, 10*time.Second, time.Millisecond)
+			a.doStop.Set()
+			<-done
+			mu.Lock()
+			defer mu.Unlock()
+			require.GreaterOrEqual(t, roots, 2)
+			require.GreaterOrEqual(t, failures, 8)
+		})
+	}
+}

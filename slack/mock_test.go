@@ -73,8 +73,7 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 //
 // Ordering: the real API returns entries newest-first ("the default ordering
 // being descending (most to least recent)" per the methods reference). The
-// mock defaults to serving oldest-first -- the ordering under which the
-// mock serves entries in ascending order -- and offers newestFirst to
+// mock defaults to ascending order and offers newestFirst to
 // exercise the documented ordering in TestNewestFirstPaginationWatermark.
 type mockSlack struct {
 	mu       sync.Mutex
@@ -809,5 +808,5 @@ func TestFailedPageResumesFromItsCursor(t *testing.T) {
 	}
 }
 
-// A continuation that fails past the former retry budget remains pending.
-// Recovery and fixed query bounds are covered by TestPagingRetainsCursorPastFiveFailures.
+// Failed continuations retain the floor; repeated failures refresh the root.
+// Paging recovery tests cover both transient retries and stale-cursor refresh.

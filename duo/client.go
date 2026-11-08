@@ -17,7 +17,8 @@ import (
 )
 
 const (
-	inTenYears = 10 * 365 * 24 * time.Hour
+	inTenYears              = 10 * 365 * 24 * time.Hour
+	maxContinuationFailures = 8
 )
 
 type uspSink interface {
@@ -130,6 +131,7 @@ func (a *DuoAdapter) fetchAuthLogs() {
 	var err error
 	var next func(*url.Values)
 	pendingTime := minTime
+	continuationFailures := 0
 	wait := time.Duration(0)
 	for !a.doStop.WaitFor(wait) {
 		wait = a.pollDelay()
@@ -146,8 +148,16 @@ func (a *DuoAdapter) fetchAuthLogs() {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from auth api: %v %p => %d: %v", minTime, next, resLen, err))
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAuthLogs: %v", err))
+			if next != nil {
+				continuationFailures++
+				if continuationFailures >= maxContinuationFailures {
+					next = nil
+					continuationFailures = 0
+				}
+			}
 			continue
 		}
+		continuationFailures = 0
 		for _, al := range results.Response.Logs {
 			msg := &protocol.DataMessage{
 				JsonPayload: al,
@@ -203,6 +213,7 @@ func (a *DuoAdapter) fetchAdminLogs() {
 	var err error
 	var next func(*url.Values)
 	pendingTime := minTime
+	continuationFailures := 0
 	wait := time.Duration(0)
 	for !a.doStop.WaitFor(wait) {
 		wait = a.pollDelay()
@@ -219,8 +230,16 @@ func (a *DuoAdapter) fetchAdminLogs() {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetch from admin api: %v %p => %d: %v", minTime, next, logLen, err))
 		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("GetAdminLogs: %v", err))
+			if next != nil {
+				continuationFailures++
+				if continuationFailures >= maxContinuationFailures {
+					next = nil
+					continuationFailures = 0
+				}
+			}
 			continue
 		}
+		continuationFailures = 0
 		for _, al := range results.Logs {
 			msg := &protocol.DataMessage{
 				JsonPayload: al,
