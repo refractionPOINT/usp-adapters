@@ -35,6 +35,10 @@ type SQSFilesAdapter struct {
 	collectionOnce sync.Once
 	collectCtx     context.Context
 	stopCollection context.CancelFunc
+	intakeCtx      context.Context
+	stopIntake     context.CancelFunc
+	deliveryOnce   sync.Once
+	delivery       *batchDelivery
 
 	chFiles chan fileInfo
 
@@ -43,12 +47,8 @@ type SQSFilesAdapter struct {
 	awsSession *session.Session
 	sqsClient  *sqs.SQS
 
-	// S3
-	isS3Inited    bool
-	awsS3Config   *aws.Config
-	awsS3Session  *session.Session
-	awsS3         *s3.S3
-	awsDownloader *s3manager.Downloader
+	// Captured downloaders are immutable and safe for concurrent workers.
+	bucketDownloaders map[string]*s3manager.Downloader
 
 	ctx    context.Context
 	isStop atomic.Bool
@@ -79,10 +79,11 @@ type fileResult struct {
 }
 
 type fileInfo struct {
-	bucket string
-	path   string
-	done   chan fileResult
-	ctx    context.Context
+	bucket     string
+	path       string
+	done       chan fileResult
+	ctx        context.Context
+	downloader *s3manager.Downloader
 }
 
 func (c *SQSFilesConfig) Validate() error {
@@ -134,10 +135,6 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 
 	a.sqsClient = sqs.New(a.awsSession)
 
-	// The S3 SDK will be initialized at run-time
-	// once we get the first file from an SQS event.
-	a.isS3Inited = false
-
 	a.chFiles = make(chan fileInfo)
 
 	a.uspClient, err = acktrack.NewClient(ctx, conf.ClientOptions)
@@ -182,140 +179,176 @@ func NewSQSFilesAdapter(ctx context.Context, conf SQSFilesConfig) (*SQSFilesAdap
 }
 
 func (a *SQSFilesAdapter) Close() error {
-	defer utils.StopBlockedProducers(a.uspClient)()
-	a.conf.ClientOptions.DebugLog("closing")
-	a.isStop.Store(true)
-	a.collectionContext()
-	a.stopCollection()
 	joined := make(chan struct{})
 	go func() { a.wg.Wait(); close(joined) }()
+	return a.closeBatches(joined)
+}
+
+const maxBucketDownloaders = 64
+
+func (a *SQSFilesAdapter) downloaderForBucket(ctx context.Context, bucket string) (*s3manager.Downloader, error) {
+	state := a.ensureDelivery()
 	select {
-	case <-joined:
-	case <-time.After(leaseCloseBudget):
-		a.uspClient.BeginDrain()
-		_, err := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
-		return errors.Join(errors.New("SQS file workers did not stop within shutdown budget"), err)
+	case <-state.sourceInit:
+	case <-ctx.Done():
+		return nil, context.Cause(ctx)
 	}
-	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {
-		return err
+	defer func() { state.sourceInit <- struct{}{} }()
+	if ctx.Err() != nil {
+		return nil, context.Cause(ctx)
 	}
-	return nil
-}
-
-func (a *SQSFilesAdapter) initS3SDKs(ctx context.Context, bucket string) error {
-	if a.isS3Inited {
-		return nil
+	if cached := a.bucketDownloaders[bucket]; cached != nil {
+		return cached, nil
 	}
-	region, err := a.getBucketRegion(ctx, bucket)
+	base := a.awsConfig
+	if base == nil {
+		base = &a.sqsClient.Config
+	}
+	sess, err := session.NewSession(base.Copy(&aws.Config{Region: aws.String("us-east-1")}))
 	if err != nil {
-		return fmt.Errorf("s3.Region: %v", err)
+		return nil, fmt.Errorf("s3.NewSession: %w", err)
 	}
-	a.awsS3Config = &aws.Config{
-		Region:      aws.String(region),
-		Credentials: credentials.NewStaticCredentials(a.conf.AccessKey, a.conf.SecretKey, ""),
+	lookupCtx, cancel := context.WithTimeout(ctx, leaseRPCBudget)
+	region, err := s3manager.GetBucketRegionWithClient(lookupCtx, s3.New(sess), bucket)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("s3.Region: %w", err)
 	}
-
-	if a.awsS3Session, err = session.NewSession(a.awsS3Config); err != nil {
-		return fmt.Errorf("s3.NewSession(): %v", err)
+	if ctx.Err() != nil {
+		return nil, context.Cause(ctx)
 	}
-
-	a.awsS3 = s3.New(a.awsS3Session)
-	a.awsDownloader = s3manager.NewDownloader(a.awsS3Session)
-	a.isS3Inited = true
-	return nil
-}
-
-func (a *SQSFilesAdapter) getBucketRegion(ctx context.Context, bucket string) (string, error) {
-	return s3manager.GetBucketRegion(ctx, session.Must(session.NewSession(&aws.Config{})), bucket, "us-east-1")
+	regional, err := session.NewSession(base.Copy(&aws.Config{Region: aws.String(region)}))
+	if err != nil {
+		return nil, fmt.Errorf("s3.NewSession: %w", err)
+	}
+	downloader := s3manager.NewDownloader(regional)
+	if a.bucketDownloaders == nil {
+		a.bucketDownloaders = make(map[string]*s3manager.Downloader)
+	}
+	if len(a.bucketDownloaders) >= maxBucketDownloaders {
+		// Eviction drops only this cache reference. In-flight workers retain their
+		// exact immutable downloader; never rewrite a client used by another bucket.
+		for key := range a.bucketDownloaders {
+			delete(a.bucketDownloaders, key)
+			break
+		}
+	}
+	a.bucketDownloaders[bucket] = downloader
+	return downloader, nil
 }
 
 func (a *SQSFilesAdapter) receiveEvents() (receiveErr error) {
-	// All receiver failures, including worker and late cleanup errors, reach
-	// the existing error callback before the stopped channel is closed.
 	defer func() {
-		if receiveErr != nil && !errors.Is(receiveErr, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
+		if a.expectedClose(receiveErr) {
+			receiveErr = nil
+		}
+		if receiveErr != nil && !a.expectedClose(receiveErr) && !errors.Is(receiveErr, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("SQS receive stopped: %w", receiveErr))
 		}
 	}()
-
 	defer close(a.chFiles)
-
-	collectCtx := a.collectionContext()
-	for !a.isStop.Load() {
-		receivedBefore := time.Now()
-		deadline := receivedBefore.Add(min(sourceLeaseBudget, 10*time.Second))
-		receiveCtx, receiveCancel := context.WithDeadline(collectCtx, deadline)
-		result, err := a.sqsClient.ReceiveMessageWithContext(receiveCtx, &sqs.ReceiveMessageInput{
-			AttributeNames:        []*string{},
-			MessageAttributeNames: []*string{},
-			QueueUrl:              &a.conf.QueueURL,
-			MaxNumberOfMessages:   aws.Int64(10),
-			VisibilityTimeout:     aws.Int64(60), // 60 seconds
-			WaitTimeSeconds:       aws.Int64(5),
-		})
-		receiveCancel()
-		if err != nil {
-			return err
-		}
-
-		if len(result.Messages) == 0 {
-			continue
-		}
-		if err := a.handleBatch(collectCtx, result.Messages, receivedBefore); err != nil {
-			return err
-		}
-
-	}
-	return nil
+	return a.receiveBatches()
 }
 
-func (a *SQSFilesAdapter) processBatch(ctx context.Context, messages []*sqs.Message) error {
+// Permanent notification errors are retained for the queue's redrive/DLQ policy.
+// OnWarning keeps hosted owners running; OnError is reserved for fatal source,
+// transport, admission, observation, or lease failures. These retained failures
+// never authorize deletion. Source redrive/DLQ policy is required to quarantine
+// them; without it they can replay until the source retention window expires.
+type permanentNotificationError struct{ error }
+
+// S3 sends this control notice when notification delivery is configured. It has
+// no telemetry to admit. Retain it for redrive/DLQ without raising a fatal error.
+var errS3TestEvent = errors.New("S3 TestEvent control notice retained for queue redrive/DLQ")
+
+func permanent(err error) error { return &permanentNotificationError{err} }
+
+func (a *SQSFilesAdapter) prepareBatch(ctx context.Context, messages []*sqs.Message) ([]*sqs.Message, acktrack.ACKDependency, error) {
+	var eligible []*sqs.Message
 	var dependency acktrack.ACKDependency
-	for _, message := range messages {
-		d := utils.Dict{}
-		if message.Body == nil {
-			return errors.New("missing notification body")
-		}
-		if err := json.Unmarshal([]byte(*message.Body), &d); err != nil {
-			return err
-		}
-		bucket := a.conf.Bucket
-		if bucket == "" {
-			bucket = d.ExpandableFindOneString(a.conf.BucketPath)
-		}
-		paths := d.ExpandableFindString(a.conf.FilePath)
-		if bucket == "" || len(paths) == 0 {
-			return errors.New("notification missing bucket or files")
-		}
-		if err := a.initS3SDKs(ctx, bucket); err != nil {
-			return err
-		}
-		// Buffer one result per file so workers never get stranded on errors.
-		results := make(chan fileResult, len(paths))
-		for _, path := range paths {
-			select {
-			case a.chFiles <- fileInfo{bucket: bucket, path: path, done: results, ctx: ctx}:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-		for range paths {
-			select {
-			case r := <-results:
-				if r.err != nil {
-					return r.err
+	for _, m := range messages {
+		dep, err := a.processNotification(ctx, m)
+		if err != nil {
+			if errors.Is(err, errS3TestEvent) && ctx.Err() == nil {
+				if a.conf.ClientOptions.OnWarning != nil {
+					a.conf.ClientOptions.OnWarning(err.Error())
 				}
-				var err error
-				dependency, err = dependency.Include(r.dep)
-				if err != nil {
-					return err
-				}
-			case <-ctx.Done():
-				return ctx.Err()
+				continue
 			}
+			var bad *permanentNotificationError
+			if errors.As(err, &bad) && ctx.Err() == nil {
+				if a.conf.ClientOptions.OnWarning != nil {
+					a.conf.ClientOptions.OnWarning(fmt.Sprintf("retaining unprocessable SQS notification for redrive/DLQ: %v", bad.error))
+				}
+				continue
+			}
+			return nil, dependency, err
+		}
+		dependency, err = dependency.Include(dep)
+		if err != nil {
+			return nil, dependency, err
+		}
+		eligible = append(eligible, m)
+	}
+	return eligible, dependency, nil
+}
+func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.Message) (acktrack.ACKDependency, error) {
+	var dependency acktrack.ACKDependency
+	d := utils.Dict{}
+	if message.Body == nil {
+		return dependency, permanent(errors.New("missing notification body"))
+	}
+	if err := json.Unmarshal([]byte(*message.Body), &d); err != nil {
+		return dependency, permanent(err)
+	}
+	_, hasRecords := d["Records"]
+	if !hasRecords && d.ExpandableFindOneString("Event") == "s3:TestEvent" && d.ExpandableFindOneString("Service") == "Amazon S3" {
+		return dependency, errS3TestEvent
+	}
+	bucket := a.conf.Bucket
+	if bucket == "" {
+		bucket = d.ExpandableFindOneString(a.conf.BucketPath)
+	}
+	paths := d.ExpandableFindString(a.conf.FilePath)
+	if bucket == "" || len(paths) == 0 {
+		return dependency, permanent(errors.New("notification missing bucket or files"))
+	}
+	downloader, err := a.downloaderForBucket(ctx, bucket)
+	if err != nil {
+		return dependency, err
+	}
+	fileCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan fileResult, len(paths))
+	for _, path := range paths {
+		select {
+		case a.chFiles <- fileInfo{bucket: bucket, path: path, done: results, ctx: fileCtx, downloader: downloader}:
+		case <-ctx.Done():
+			return dependency, context.Cause(ctx)
 		}
 	}
-	return a.tracker.Candidate("batch", []byte{1}, dependency)
+	var permanentErr error
+	for range paths {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				var bad *permanentNotificationError
+				if errors.As(r.err, &bad) && ctx.Err() == nil {
+					permanentErr = bad
+					continue
+				}
+				return dependency, r.err
+			}
+			var err error
+			dependency, err = dependency.Include(r.dep)
+			if err != nil {
+				return dependency, err
+			}
+		case <-ctx.Done():
+			return dependency, context.Cause(ctx)
+		}
+	}
+	return dependency, permanentErr
 }
 
 func (a *SQSFilesAdapter) processFiles() error {
@@ -336,11 +369,11 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 		var err error
 		path, err = url.QueryUnescape(path)
 		if err != nil {
-			return empty, err
+			return empty, permanent(err)
 		}
 	}
 	writerAt := aws.NewWriteAtBuffer([]byte{})
-	if _, err := a.awsDownloader.DownloadWithContext(f.ctx, writerAt, &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}); err != nil {
+	if _, err := f.downloader.DownloadWithContext(f.ctx, writerAt, &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}); err != nil {
 		return empty, err
 	}
 	if err := f.ctx.Err(); err != nil {
@@ -348,7 +381,10 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 	}
 	data, compressed, err := prepareBundleData(f.ctx, path, writerAt.Bytes())
 	if err != nil {
-		return empty, err
+		if f.ctx.Err() != nil {
+			return empty, context.Cause(f.ctx)
+		}
+		return empty, permanent(err)
 	}
 	if err := f.ctx.Err(); err != nil {
 		return empty, context.Cause(f.ctx)
@@ -356,9 +392,6 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 	return a.shipEventContext(f.ctx, data, compressed)
 }
 
-func (a *SQSFilesAdapter) shipEvent(data []byte, isCompressed bool) (acktrack.ACKDependency, error) {
-	return a.shipEventContext(context.Background(), data, isCompressed)
-}
 func (a *SQSFilesAdapter) shipEventContext(ctx context.Context, data []byte, isCompressed bool) (acktrack.ACKDependency, error) {
 	// Since we're dealing with files, we use the
 	// bundle payloads to avoid having to go through
@@ -377,38 +410,4 @@ func (a *SQSFilesAdapter) shipEventContext(ctx context.Context, data []byte, isC
 	}
 
 	return a.shipContext(ctx, msg)
-}
-
-func (a *SQSFilesAdapter) handleBatch(ctx context.Context, messages []*sqs.Message, receivedBefore time.Time) error {
-	if a.tracker == nil {
-		a.tracker, _ = acktrack.NewACKTracker(a.uspClient, 1, 16)
-	}
-	l := newBatchLease(ctx, a.sqsClient, a.conf.QueueURL, messages, receivedBefore)
-	defer l.abort()
-	if l.ctx.Err() != nil {
-		return context.Cause(l.ctx)
-	}
-	if err := a.processBatch(l.ctx, messages); err != nil {
-		return err
-	}
-	if err := a.awaitDeliveryContext(l.ctx); err != nil {
-		return err
-	}
-	deleteCtx, cancel, err := l.cleanupContext()
-	if err != nil {
-		return err
-	}
-	defer cancel()
-	req := &sqs.DeleteMessageBatchInput{QueueUrl: &a.conf.QueueURL}
-	for i, m := range messages {
-		req.Entries = append(req.Entries, &sqs.DeleteMessageBatchRequestEntry{Id: aws.String(fmt.Sprint(i)), ReceiptHandle: m.ReceiptHandle})
-	}
-	out, err := a.sqsClient.DeleteMessageBatchWithContext(deleteCtx, req)
-	if err != nil {
-		return err
-	}
-	if out == nil || len(out.Failed) != 0 {
-		return errors.New("sqsClient.DeleteMessageBatch: failed to delete some messages")
-	}
-	return nil
 }

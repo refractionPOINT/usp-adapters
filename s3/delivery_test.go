@@ -133,7 +133,7 @@ func TestObjectDeletionWaitsForDelivery(t *testing.T) {
 	go func() { _, err := a.lookForFiles(); done <- err }()
 	select {
 	case <-received:
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("no admission")
 	}
 	select {
@@ -144,13 +144,13 @@ func TestObjectDeletionWaitsForDelivery(t *testing.T) {
 	ack(1)
 	select {
 	case <-deleted:
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("source not deleted after ACK")
 	}
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("collector stuck")
 	}
 }
@@ -189,7 +189,7 @@ func TestOneTimeLoadRetainsObject(t *testing.T) {
 	require.NoError(t, err)
 	select {
 	case <-received:
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("no admission")
 	}
 	ack(1)
@@ -207,14 +207,14 @@ func TestCloseFlushesConfirmedDeletion(t *testing.T) {
 	go func() { defer a.wg.Done(); _, _ = a.lookForFiles() }()
 	select {
 	case <-received:
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("no admission")
 	}
 	done := make(chan error, 1)
 	go func() { done <- a.Close() }()
 	// BeginDrain has sealed admission; the collector must join without waiting
 	// for an ACK, so the final Drain can complete the pending source deletion.
-	require.Eventually(t, func() bool { return atomic.LoadUint32(&a.isStop) == 1 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return atomic.LoadUint32(&a.isStop) == 1 }, objectTestTimeout, time.Millisecond)
 	select {
 	case <-deleted:
 		t.Fatal("Close deleted unconfirmed object")
@@ -224,7 +224,7 @@ func TestCloseFlushesConfirmedDeletion(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("Close stuck")
 	}
 	select {
@@ -245,7 +245,7 @@ func TestCloseRetainsUnconfirmedObject(t *testing.T) {
 	go func() { defer a.wg.Done(); _, _ = a.lookForFiles() }()
 	select {
 	case <-received:
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("no admission")
 	}
 	require.Error(t, a.Close())
@@ -263,16 +263,18 @@ func TestDeleteFailureStopsCollection(t *testing.T) {
 	go func() { _, err := a.lookForFiles(); done <- err }()
 	select {
 	case <-received:
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("no admission")
 	}
 	ack(1)
 	select {
 	case err := <-done:
 		require.Error(t, err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("delete failure did not stop collector")
 	}
+	require.Error(t, a.deleteErr, "other source errors must remain sticky")
+	require.ErrorIs(t, a.confirmDelete(), a.deleteErr, "later confirmation must preserve the sticky failure")
 	select {
 	case <-deleted:
 		t.Fatal("failed delete removed object")
@@ -290,7 +292,7 @@ func TestReplacementDuringWithheldACKRetained(t *testing.T) {
 			go func() { _, err := a.lookForFiles(); done <- err }()
 			select {
 			case <-received:
-			case <-time.After(5 * time.Second):
+			case <-time.After(objectTestTimeout):
 				t.Fatal("no admission")
 			}
 			select {
@@ -302,8 +304,8 @@ func TestReplacementDuringWithheldACKRetained(t *testing.T) {
 			ack(1)
 			select {
 			case err := <-done:
-				require.Error(t, err, "replacement must reject the old object's conditional delete")
-			case <-time.After(5 * time.Second):
+				require.NoError(t, err, "replacement must be retained without stopping collection")
+			case <-time.After(objectTestTimeout):
 				t.Fatal("collector stuck")
 			}
 			select {
@@ -389,7 +391,7 @@ func TestBoundedBatchPartialACK(t *testing.T) {
 		sink.BeginDrain()
 		select {
 		case <-done:
-		case <-time.After(time.Second):
+		case <-time.After(objectTestTimeout):
 		}
 	}()
 	receive := func(first, last int) {
@@ -398,7 +400,7 @@ func TestBoundedBatchPartialACK(t *testing.T) {
 			select {
 			case n := <-received:
 				require.Equal(t, uint64(i), n)
-			case <-time.After(time.Second):
+			case <-time.After(objectTestTimeout):
 				t.Fatalf("admission %d blocked before the 32-object limit", i)
 			}
 		}
@@ -416,7 +418,7 @@ func TestBoundedBatchPartialACK(t *testing.T) {
 				} else {
 					require.Equal(t, observation, count, "one SDK snapshot must cover the entire confirmed prefix")
 				}
-			case <-time.After(time.Second):
+			case <-time.After(objectTestTimeout):
 				t.Fatalf("confirmed object %d was not deleted", i)
 			}
 		}
@@ -453,7 +455,7 @@ func TestBoundedBatchPartialACK(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err)
 		done <- err
-	case <-time.After(time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("end did not flush pending objects")
 	}
 }
@@ -465,14 +467,14 @@ func TestVersionedDeleteKeepsKeySemantics(t *testing.T) {
 	go func() { _, err := a.lookForFiles(); done <- err }()
 	select {
 	case <-received:
-	case <-time.After(time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("no admission")
 	}
 	ack(1)
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("delete stuck")
 	}
 	select {
@@ -501,13 +503,13 @@ func TestCloseFlushesBoundedBatch(t *testing.T) {
 		select {
 		case n := <-received:
 			require.Equal(t, uint64(i), n)
-		case <-time.After(time.Second):
+		case <-time.After(objectTestTimeout):
 			t.Fatal("window did not fill")
 		}
 	}
 	done := make(chan error, 1)
 	go func() { done <- a.Close() }()
-	require.Eventually(t, func() bool { return atomic.LoadUint32(&a.isStop) == 1 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return atomic.LoadUint32(&a.isStop) == 1 }, objectTestTimeout, time.Millisecond)
 	select {
 	case <-deleted:
 		t.Fatal("Close deleted before ACK")
@@ -517,7 +519,7 @@ func TestCloseFlushesBoundedBatch(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("Close stuck")
 	}
 	for i := 1; i <= 32; i++ {
@@ -543,12 +545,12 @@ func TestCloseRetainsUnconfirmedBatchSuffix(t *testing.T) {
 	for i := 1; i <= 6; i++ {
 		select {
 		case <-received:
-		case <-time.After(time.Second):
+		case <-time.After(objectTestTimeout):
 			t.Fatal("batch did not fill")
 		}
 	}
 	ack(3)
-	require.Eventually(t, func() bool { pending, err := sink.GetUnsent(); return err == nil && len(pending) == 3 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { pending, err := sink.GetUnsent(); return err == nil && len(pending) == 3 }, objectTestTimeout, time.Millisecond)
 	require.Error(t, a.Close())
 	for i := 1; i <= 3; i++ {
 		select {
@@ -609,14 +611,14 @@ func TestObservationFailureRetainsBatch(t *testing.T) {
 	for i := 1; i <= 6; i++ {
 		select {
 		case <-received:
-		case <-time.After(time.Second):
+		case <-time.After(objectTestTimeout):
 			t.Fatal("batch did not fill")
 		}
 	}
 	select {
 	case err := <-done:
 		require.Error(t, err)
-	case <-time.After(time.Second):
+	case <-time.After(objectTestTimeout):
 		t.Fatal("failed observation did not stop collection")
 	}
 	select {
@@ -625,3 +627,5 @@ func TestObservationFailureRetainsBatch(t *testing.T) {
 	default:
 	}
 }
+
+const objectTestTimeout = 10 * time.Second

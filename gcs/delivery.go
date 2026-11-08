@@ -2,12 +2,16 @@ package usp_gcs
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"google.golang.org/api/googleapi"
 )
 
 const maxPendingObjectDeletes = 32
@@ -99,7 +103,10 @@ func (a *GCSAdapter) confirmDelete() error {
 		if len(raw) != 8 || binary.BigEndian.Uint64(raw) < next.marker {
 			return nil
 		}
-		if err := next.remove(); err != nil {
+		// A changed or externally removed object is normal source churn.
+		// Retire only this delivered identity and let the next listing discover
+		// a replacement. Other delete failures still stop this client lifetime.
+		if err := next.remove(); err != nil && !objectDeleteRace(err) {
 			a.deleteErr = fmt.Errorf("gcs.DeleteObject(): %w", err)
 			a.conf.ClientOptions.OnError(a.deleteErr)
 			return a.deleteErr
@@ -109,4 +116,12 @@ func (a *GCSAdapter) confirmDelete() error {
 		a.pendingDeletes = a.pendingDeletes[1:]
 	}
 	return nil
+}
+
+func objectDeleteRace(err error) bool {
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return true
+	}
+	var apiError *googleapi.Error
+	return errors.As(err, &apiError) && (apiError.Code == http.StatusNotFound || apiError.Code == http.StatusPreconditionFailed)
 }

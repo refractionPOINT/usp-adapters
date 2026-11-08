@@ -2,10 +2,13 @@ package usp_s3
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"net/http"
 	"sync/atomic"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 )
@@ -99,7 +102,10 @@ func (a *S3Adapter) confirmDelete() error {
 		if len(raw) != 8 || binary.BigEndian.Uint64(raw) < next.marker {
 			return nil
 		}
-		if err := next.remove(); err != nil {
+		// A changed or externally removed object is normal source churn.
+		// Retire only this delivered identity and let the next listing discover
+		// a replacement. Other delete failures still stop this client lifetime.
+		if err := next.remove(); err != nil && !objectDeleteRace(err) {
 			a.deleteErr = fmt.Errorf("s3.DeleteObject(): %w", err)
 			a.conf.ClientOptions.OnError(a.deleteErr)
 			return a.deleteErr
@@ -109,4 +115,19 @@ func (a *S3Adapter) confirmDelete() error {
 		a.pendingDeletes = a.pendingDeletes[1:]
 	}
 	return nil
+}
+
+func objectDeleteRace(err error) bool {
+	var requestFailure awserr.RequestFailure
+	if errors.As(err, &requestFailure) && (requestFailure.StatusCode() == http.StatusNotFound || requestFailure.StatusCode() == http.StatusPreconditionFailed) {
+		return true
+	}
+	var apiError awserr.Error
+	if errors.As(err, &apiError) {
+		switch apiError.Code() {
+		case "NoSuchKey", "NotFound", "PreconditionFailed":
+			return true
+		}
+	}
+	return false
 }

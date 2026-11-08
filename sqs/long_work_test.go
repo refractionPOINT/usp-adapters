@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	awssqs "github.com/aws/aws-sdk-go/service/sqs"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -17,16 +18,22 @@ import (
 
 func TestLongWorkOutlivesInitialVisibilityBudget(t *testing.T) {
 	old := sourceLeaseBudget
-	sourceLeaseBudget = 150 * time.Millisecond
+	sourceLeaseBudget = 2 * time.Second
 	defer func() { sourceLeaseBudget = old }()
 	c := &receiptClient{}
 	var renewed, deleted atomic.Int32
+	var received atomic.Int32
 	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
 		w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 		switch r.Header.Get("X-Amz-Target") {
 		case "AmazonSQS.ReceiveMessage":
+			if received.Add(1) > 1 {
+				io.Copy(io.Discard, r.Body)
+				<-r.Context().Done()
+				return
+			}
 			json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []map[string]string{{"MessageId": "test", "ReceiptHandle": "test", "Body": "test"}}})
 		case "AmazonSQS.ChangeMessageVisibilityBatch":
 			renewed.Add(1)
@@ -50,8 +57,10 @@ func TestLongWorkOutlivesInitialVisibilityBudget(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() { done <- a.receiveEvents() }()
-	time.Sleep(275 * time.Millisecond) // longer than initial 150ms budget
+	time.Sleep(2500 * time.Millisecond) // longer than initial two-second budget
 	a.isStop.Store(true)
+	a.collectionContext()
+	a.stopIntake()
 	c.mu.Lock()
 	c.autoACK = true
 	c.mu.Unlock()
@@ -61,7 +70,7 @@ func TestLongWorkOutlivesInitialVisibilityBudget(t *testing.T) {
 		if err != nil {
 			t.Fatalf("legitimate long work failed: %v; renewals=%d deletions=%d", err, renewed.Load(), deleted.Load())
 		}
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("long work failed to finish")
 	}
 

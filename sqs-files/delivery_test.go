@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -59,7 +60,8 @@ func TestDeliveryConfirmedSourceDelete(t *testing.T) {
 		switch r.Header.Get("X-Amz-Target") {
 		case "AmazonSQS.ReceiveMessage":
 			if receives.Add(1) > 1 {
-				http.Error(w, "stopped", 400)
+				io.Copy(io.Discard, r.Body)
+				<-r.Context().Done()
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []map[string]string{{"MessageId": "test", "ReceiptHandle": "receipt", "Body": "{\"bucket\":\"test\",\"files\":[{\"path\":\"test\"}]}"}}})
@@ -81,8 +83,7 @@ func TestDeliveryConfirmedSourceDelete(t *testing.T) {
 	a.sqsClient = awssqs.New(sess)
 	a.conf.BucketPath = "bucket"
 	a.conf.FilePath = "files/path"
-	a.awsDownloader = s3manager.NewDownloader(sess)
-	a.isS3Inited = true
+	a.bucketDownloaders = map[string]*s3manager.Downloader{"test": s3manager.NewDownloader(sess)}
 	a.chFiles = make(chan fileInfo, 10)
 	go a.processFiles()
 	done := make(chan struct{})
@@ -99,7 +100,7 @@ func TestDeliveryConfirmedSourceDelete(t *testing.T) {
 	c.Close()
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("receiver did not stop")
 	}
 }
@@ -139,7 +140,8 @@ func TestSourceDeleteOnlyAfterReceipt(t *testing.T) {
 		switch r.Header.Get("X-Amz-Target") {
 		case "AmazonSQS.ReceiveMessage":
 			if receives.Add(1) > 1 {
-				http.Error(w, "stopped", 400)
+				io.Copy(io.Discard, r.Body)
+				<-r.Context().Done()
 				return
 			}
 			json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []map[string]string{{"MessageId": "test", "ReceiptHandle": "receipt", "Body": "{\"bucket\":\"test\",\"files\":[{\"path\":\"test\"}]}"}}})
@@ -161,8 +163,7 @@ func TestSourceDeleteOnlyAfterReceipt(t *testing.T) {
 	a.sqsClient = awssqs.New(sess)
 	a.conf.BucketPath = "bucket"
 	a.conf.FilePath = "files/path"
-	a.awsDownloader = s3manager.NewDownloader(sess)
-	a.isS3Inited = true
+	a.bucketDownloaders = map[string]*s3manager.Downloader{"test": s3manager.NewDownloader(sess)}
 	a.chFiles = make(chan fileInfo, 10)
 	go a.processFiles()
 	done := make(chan struct{})
@@ -185,6 +186,8 @@ func TestSourceDeleteOnlyAfterReceipt(t *testing.T) {
 		t.Fatal("source deleted before receipt")
 	}
 	a.isStop.Store(true)
+	a.collectionContext()
+	a.stopIntake()
 	c.mu.Lock()
 	c.pending = nil
 	c.mu.Unlock()

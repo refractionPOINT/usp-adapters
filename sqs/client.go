@@ -16,7 +16,6 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
-	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
@@ -31,6 +30,10 @@ type SQSAdapter struct {
 	collectionOnce sync.Once
 	collectCtx     context.Context
 	stopCollection context.CancelFunc
+	intakeCtx      context.Context
+	stopIntake     context.CancelFunc
+	deliveryOnce   sync.Once
+	delivery       *batchDelivery
 
 	awsConfig  *aws.Config
 	awsSession *session.Session
@@ -116,67 +119,27 @@ func NewSQSAdapter(ctx context.Context, conf SQSConfig) (*SQSAdapter, chan struc
 }
 
 func (a *SQSAdapter) Close() error {
-	defer utils.StopBlockedProducers(a.uspClient)()
-	a.conf.ClientOptions.DebugLog("closing")
-	a.isStop.Store(true)
-	a.collectionContext()
-	a.stopCollection()
-	if a.receiveStopped != nil {
-		select {
-		case <-a.receiveStopped:
-		case <-time.After(leaseCloseBudget):
-			a.uspClient.BeginDrain()
-			_, err := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
-			return errors.Join(errors.New("SQS workers did not stop within shutdown budget"), err)
-		}
+	joined := a.receiveStopped
+	if joined == nil {
+		empty := make(chan struct{})
+		close(empty)
+		joined = empty
 	}
-	if _, err := utils.DrainCloseUSP(a.uspClient, a.conf.ClientOptions); err != nil {
-		return err
-	}
-	return nil
+	return a.closeBatches(joined)
 }
-
 func (a *SQSAdapter) receiveEvents() (receiveErr error) {
-	// All receiver failures, including worker and late cleanup errors, reach
-	// the existing error callback before the stopped channel is closed.
 	defer func() {
-		if receiveErr != nil && !errors.Is(receiveErr, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
+		if a.expectedClose(receiveErr) {
+			receiveErr = nil
+		}
+		if receiveErr != nil && !a.expectedClose(receiveErr) && !errors.Is(receiveErr, uspclient.ErrorClosed) && a.conf.ClientOptions.OnError != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("SQS receive stopped: %w", receiveErr))
 		}
 	}()
 
-	collectCtx := a.collectionContext()
-	for !a.isStop.Load() {
-		receivedBefore := time.Now()
-		deadline := receivedBefore.Add(min(sourceLeaseBudget, 10*time.Second))
-		receiveCtx, receiveCancel := context.WithDeadline(collectCtx, deadline)
-		result, err := a.sqsClient.ReceiveMessageWithContext(receiveCtx, &sqs.ReceiveMessageInput{
-			AttributeNames:        []*string{},
-			MessageAttributeNames: []*string{},
-			QueueUrl:              &a.conf.QueueURL,
-			MaxNumberOfMessages:   aws.Int64(10),
-			VisibilityTimeout:     aws.Int64(60), // 60 seconds
-			WaitTimeSeconds:       aws.Int64(5),
-		})
-		receiveCancel()
-		if err != nil {
-			return err
-		}
-
-		if len(result.Messages) == 0 {
-			continue
-		}
-		if err := a.handleBatch(collectCtx, result.Messages, receivedBefore); err != nil {
-			return err
-		}
-
-	}
-	return nil
+	return a.receiveBatches()
 }
 
-func (a *SQSAdapter) processEvent(message *string) (acktrack.ACKDependency, error) {
-	return a.processEventContext(context.Background(), message)
-}
 func (a *SQSAdapter) processEventContext(ctx context.Context, message *string) (acktrack.ACKDependency, error) {
 	if message == nil {
 		return acktrack.ACKDependency{}, errors.New("missing message body")
@@ -188,47 +151,25 @@ func (a *SQSAdapter) processEventContext(ctx context.Context, message *string) (
 	return a.shipContext(ctx, msg)
 }
 
-func (a *SQSAdapter) handleBatch(ctx context.Context, messages []*sqs.Message, receivedBefore time.Time) error {
-	if a.tracker == nil {
-		a.tracker, _ = acktrack.NewACKTracker(a.uspClient, 1, 16)
-	}
-	l := newBatchLease(ctx, a.sqsClient, a.conf.QueueURL, messages, receivedBefore)
-	defer l.abort()
-	if l.ctx.Err() != nil {
-		return context.Cause(l.ctx)
-	}
-	var dependency acktrack.ACKDependency
-	for _, message := range messages {
-		dep, err := a.processEventContext(l.ctx, message.Body)
-		if err != nil {
-			return err
+func (a *SQSAdapter) prepareBatch(ctx context.Context, messages []*sqs.Message) ([]*sqs.Message, acktrack.ACKDependency, error) {
+	var dep acktrack.ACKDependency
+	var eligible []*sqs.Message
+	for _, m := range messages {
+		if m.Body == nil {
+			if a.conf.ClientOptions.OnWarning != nil {
+				a.conf.ClientOptions.OnWarning("retaining SQS notification missing body for redrive/DLQ")
+			}
+			continue
 		}
-		dependency, err = dependency.Include(dep)
+		next, err := a.processEventContext(ctx, m.Body)
 		if err != nil {
-			return err
+			return nil, dep, err
 		}
+		dep, err = dep.Include(next)
+		if err != nil {
+			return nil, dep, err
+		}
+		eligible = append(eligible, m)
 	}
-	if err := a.tracker.Candidate("batch", []byte{1}, dependency); err != nil {
-		return err
-	}
-	if err := a.awaitDeliveryContext(l.ctx); err != nil {
-		return err
-	}
-	deleteCtx, cancel, err := l.cleanupContext()
-	if err != nil {
-		return err
-	}
-	defer cancel()
-	req := &sqs.DeleteMessageBatchInput{QueueUrl: &a.conf.QueueURL}
-	for i, m := range messages {
-		req.Entries = append(req.Entries, &sqs.DeleteMessageBatchRequestEntry{Id: aws.String(fmt.Sprint(i)), ReceiptHandle: m.ReceiptHandle})
-	}
-	out, err := a.sqsClient.DeleteMessageBatchWithContext(deleteCtx, req)
-	if err != nil {
-		return err
-	}
-	if out == nil || len(out.Failed) != 0 {
-		return errors.New("sqsClient.DeleteMessageBatch: failed to delete some messages")
-	}
-	return nil
+	return eligible, dep, nil
 }

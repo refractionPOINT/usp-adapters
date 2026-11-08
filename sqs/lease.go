@@ -30,6 +30,8 @@ type batchLease struct {
 	deadline, hardDeadline time.Time
 }
 
+var leaseRenewInterval time.Duration
+
 var leaseRPCBudget = 5 * time.Second
 var leaseShipSlice = 200 * time.Millisecond
 var leaseCloseBudget = 10 * time.Second
@@ -70,6 +72,9 @@ func (l *batchLease) renew() {
 		// Renew well before expiry, with time for a bounded RPC. Budgeting from
 		// request start (not response arrival) keeps server/client clock skew out.
 		delay := min(sourceLeaseBudget/3, time.Until(deadline)/2)
+		if leaseRenewInterval > 0 {
+			delay = min(leaseRenewInterval, time.Until(deadline)/2)
+		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-l.renewCtx.Done():
@@ -162,28 +167,9 @@ func (a *SQSAdapter) collectionContext() context.Context {
 			parent = context.Background()
 		}
 		a.collectCtx, a.stopCollection = context.WithCancel(parent)
+		a.intakeCtx, a.stopIntake = context.WithCancel(a.collectCtx)
 	})
 	return a.collectCtx
-}
-func (a *SQSAdapter) awaitDeliveryContext(ctx context.Context) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return context.Cause(ctx)
-		}
-		confirmed, err := a.tracker.Confirm()
-		if err != nil {
-			return err
-		}
-		if err := ctx.Err(); err != nil {
-			return context.Cause(ctx)
-		}
-		if _, ok := confirmed["batch"]; ok {
-			return nil
-		}
-		if !acktrack.Wait(ctx, 20*time.Millisecond) {
-			return context.Cause(ctx)
-		}
-	}
 }
 func (a *SQSAdapter) shipContext(ctx context.Context, msg *protocol.DataMessage) (acktrack.ACKDependency, error) {
 	for {

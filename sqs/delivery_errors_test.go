@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	awssqs "github.com/aws/aws-sdk-go/service/sqs"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -20,7 +21,10 @@ func TestReceiverFailuresReachOnError(t *testing.T) {
 	for _, kind := range []string{"ship", "observe", "renewal_uncertain", "delete_rpc", "delete_partial"} {
 		t.Run(kind, func(t *testing.T) {
 			old := sourceLeaseBudget
-			sourceLeaseBudget = 150 * time.Millisecond
+			sourceLeaseBudget = 10 * time.Second
+			oldInterval := leaseRenewInterval
+			leaseRenewInterval = 20 * time.Millisecond
+			defer func() { leaseRenewInterval = oldInterval }()
 			defer func() { sourceLeaseBudget = old }()
 			c := &receiptClient{autoACK: true}
 			sentinel := errors.New("test failure")
@@ -35,11 +39,17 @@ func TestReceiverFailuresReachOnError(t *testing.T) {
 			}
 			body := "test"
 			var deletes atomic.Int32
+			var receives atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 
 				w.Header().Set("Content-Type", "application/x-amz-json-1.0")
 				switch r.Header.Get("X-Amz-Target") {
 				case "AmazonSQS.ReceiveMessage":
+					if receives.Add(1) > 1 {
+						io.Copy(io.Discard, r.Body)
+						<-r.Context().Done()
+						return
+					}
 					json.NewEncoder(w).Encode(map[string]interface{}{"Messages": []map[string]string{{"MessageId": "test", "ReceiptHandle": "test", "Body": body}}})
 				case "AmazonSQS.ChangeMessageVisibilityBatch":
 					fmt.Fprint(w, `{"Successful":[]}`)

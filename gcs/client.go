@@ -314,7 +314,11 @@ func (a *GCSAdapter) processListing(page []*storage.ObjectAttrs) (bool, error) {
 		}
 
 		key, generation := localFile.Attrs.Name, localFile.Attrs.Generation
-		a.pendingDeletes = append(a.pendingDeletes, pendingObjectDelete{marker: a.admitted, dependency: a.lastDependency, remove: func() error { return a.bucket.Object(key).Generation(generation).Delete(a.ctx) }})
+		// Condition deletion of the live object; a generation-targeted delete
+		// would permanently remove that version from versioned buckets.
+		a.pendingDeletes = append(a.pendingDeletes, pendingObjectDelete{marker: a.admitted, dependency: a.lastDependency, remove: func() error {
+			return a.bucket.Object(key).If(storage.Conditions{GenerationMatch: generation}).Delete(a.ctx)
+		}})
 		isDataFound = true
 	}
 

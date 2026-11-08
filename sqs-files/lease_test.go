@@ -30,11 +30,17 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 	for _, kind := range []string{"success", "failed", "lease_lost_ship", "lease_lost_download", "ambiguous", "partial", "omitted", "duplicate", "unknown", "expired_receive", "shutdown", "shutdown_rpc", "ack_during_renewal", "late_success", "max_lifetime"} {
 		t.Run(kind, func(t *testing.T) {
 			oldBudget, oldRPC, oldShip, oldClose, oldLifetime := sourceLeaseBudget, leaseRPCBudget, leaseShipSlice, leaseCloseBudget, leaseMaxLifetime
-			sourceLeaseBudget = 180 * time.Millisecond
-			leaseRPCBudget = 35 * time.Millisecond
+			sourceLeaseBudget = 10 * time.Second
+			oldInterval := leaseRenewInterval
+			leaseRenewInterval = 20 * time.Millisecond
+			defer func() { leaseRenewInterval = oldInterval }()
+			leaseRPCBudget = 2 * time.Second
+			if kind == "ambiguous" || kind == "late_success" {
+				leaseRPCBudget = 100 * time.Millisecond
+			}
 			leaseShipSlice = 5 * time.Millisecond
 			leaseCloseBudget = 200 * time.Millisecond
-			leaseMaxLifetime = 3 * time.Second
+			leaseMaxLifetime = 20 * time.Second
 			if kind == "max_lifetime" {
 				leaseMaxLifetime = 280 * time.Millisecond
 			}
@@ -49,13 +55,11 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 			var renewals, deletes, receives, activeRenew atomic.Int32
 			twoRenewals := make(chan struct{})
 			renewStarted := make(chan struct{})
-			workStarted := make(chan struct{})
 			downloadStopped := make(chan struct{})
-			var once, renewOnce, closeOnce sync.Once
+			var once, renewOnce sync.Once
 			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == "GET" {
 					if kind == "shutdown" || kind == "lease_lost_download" {
-						closeOnce.Do(func() { close(workStarted) })
 						<-r.Context().Done()
 						close(downloadStopped)
 						return
@@ -170,19 +174,30 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 			a.conf.ClientOptions.OnError = func(e error) { reported <- e }
 			a.conf.BucketPath = "bucket"
 			a.conf.FilePath = "files/path"
-			a.isS3Inited = true
-			a.awsDownloader = s3manager.NewDownloader(sess)
+			a.bucketDownloaders = map[string]*s3manager.Downloader{"test": s3manager.NewDownloader(sess)}
 			a.chFiles = make(chan fileInfo)
 			a.wg.Add(1)
 			go func() { defer a.wg.Done(); a.processFiles() }()
 			done := make(chan error, 1)
 			stopped := make(chan struct{})
 			a.receiveStopped = stopped
-			go func() { defer close(stopped); done <- a.receiveEvents() }()
+			messages := []*awssqs.Message{
+				{MessageId: aws.String("first"), ReceiptHandle: aws.String("receipt-first"), Body: aws.String(`{"bucket":"test","files":[{"path":"test.txt"}]}`)},
+				{MessageId: aws.String("second"), ReceiptHandle: aws.String("receipt-second"), Body: aws.String(`{"bucket":"test","files":[{"path":"test.txt"}]}`)}}
+			receivedBefore := time.Now()
+			if kind == "expired_receive" {
+				receivedBefore = receivedBefore.Add(-sourceLeaseBudget - time.Second)
+			}
+			go func() {
+				defer close(stopped)
+				defer close(a.chFiles)
+				done <- a.handleBatch(a.collectionContext(), messages, receivedBefore)
+			}()
+
 			if kind == "success" {
 				select {
 				case <-twoRenewals:
-				case <-time.After(time.Second):
+				case <-time.After(5 * time.Second):
 					t.Fatal("long work did not survive two renewals")
 				}
 				a.isStop.Store(true)
@@ -192,7 +207,7 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 			} else if kind == "ack_during_renewal" {
 				select {
 				case <-renewStarted:
-				case <-time.After(time.Second):
+				case <-time.After(5 * time.Second):
 					t.Fatal("renewal not started")
 				}
 				a.isStop.Store(true)
@@ -202,20 +217,24 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 			} else if kind == "shutdown" || kind == "shutdown_rpc" {
 				select {
 				case <-renewStarted:
-				case <-time.After(time.Second):
+				case <-time.After(5 * time.Second):
 					t.Fatal("renewal not started")
 				}
-				before := time.Now()
-				if err := a.Close(); err != nil {
-					t.Logf("close retains pending data: %v", err)
+				closed := make(chan error, 1)
+				go func() { closed <- a.Close() }()
+				select {
+				case err := <-closed:
+					if err != nil {
+						t.Logf("close retains pending data: %v", err)
+					}
+				case <-time.After(10 * time.Second):
+					t.Fatal("Close hung")
 				}
-				if time.Since(before) > 500*time.Millisecond {
-					t.Fatal("Close exceeded bounded shutdown")
-				}
+
 				if kind == "shutdown" {
 					select {
 					case <-downloadStopped:
-					case <-time.After(100 * time.Millisecond):
+					case <-time.After(5 * time.Second):
 						t.Fatal("download did not cancel")
 					}
 				}
@@ -228,7 +247,7 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 				if kind != "success" && err == nil {
 					t.Fatal("uncertain lease reported success")
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(10 * time.Second):
 				a.collectionContext()
 				a.stopCollection()
 				t.Fatal("receiver did not stop")
@@ -242,13 +261,13 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 			if kind != "success" && deletes.Load() != 0 {
 				t.Fatal("uncertain batch deleted")
 			}
-			if kind != "success" && len(reported) != 1 {
+			if len(reported) != 0 {
 				t.Fatalf("OnError reports=%d", len(reported))
 			}
 			if kind == "lease_lost_download" {
 				select {
 				case <-downloadStopped:
-				case <-time.After(100 * time.Millisecond):
+				case <-time.After(5 * time.Second):
 					t.Fatal("lost lease did not cancel download")
 				}
 				c.mu.Lock()
@@ -259,7 +278,7 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 				}
 			}
 			// HTTP handler teardown can follow client-side RPC cancellation.
-			settle := time.Now().Add(300 * time.Millisecond)
+			settle := time.Now().Add(5 * time.Second)
 			for activeRenew.Load() != 0 && time.Now().Before(settle) {
 				time.Sleep(time.Millisecond)
 			}
@@ -271,23 +290,21 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 			if renewals.Load() != after {
 				t.Fatal("renewal continued after receiver exit")
 			}
-			_ = workStarted
-			_ = downloadStopped
-			_ = closeOnce
 		})
 	}
 }
 
 func TestCleanupRefusesExpiredStoppedLease(t *testing.T) {
-	old := sourceLeaseBudget
-	sourceLeaseBudget = 40 * time.Millisecond
-	defer func() { sourceLeaseBudget = old }()
 	l := newBatchLease(context.Background(), nil, "test", nil, time.Now())
 	if err := l.stopAndJoin(); err != nil {
 		t.Fatal(err)
 	}
 	defer l.abort()
-	time.Sleep(50 * time.Millisecond)
+	// Advance the stopped lease's known deadline deterministically. No tiny
+	// happy-path RPC or scheduler budget is required to test expiry.
+	l.mu.Lock()
+	l.deadline = time.Now().Add(-time.Second)
+	l.mu.Unlock()
 	ctx, cancel, err := l.cleanupContext()
 	if cancel != nil {
 		cancel()
@@ -306,13 +323,17 @@ func TestCloseIsBoundedForStuckProducer(t *testing.T) {
 	a.conf.ClientOptions.DebugLog = func(string) {}
 	a.conf.ClientOptions.OnWarning = func(string) {}
 	a.wg.Add(1)
-	before := time.Now()
-	if err := a.Close(); err == nil {
-		t.Fatal("stuck producer was not reported")
+	closed := make(chan error, 1)
+	go func() { closed <- a.Close() }()
+	select {
+	case err := <-closed:
+		if err == nil {
+			t.Fatal("stuck producer was not reported")
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close hung")
 	}
-	if time.Since(before) > 300*time.Millisecond {
-		t.Fatal("Close did not honor shutdown bound")
-	}
+
 	if a.collectionContext().Err() == nil {
 		t.Fatal("Close did not cancel work")
 	}

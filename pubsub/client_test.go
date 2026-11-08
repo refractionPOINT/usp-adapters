@@ -134,7 +134,8 @@ func TestFailedStartStopsReceiveLoop(t *testing.T) {
 
 // A backend that accepts connections and data but never acks, so the client's
 // buffer (window of 1) stays full.
-func newNeverAckServer(t *testing.T) string {
+func newNeverAckServer(t *testing.T, received ...chan struct{}) string {
+	var delivered sync.Once
 	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := up.Upgrade(w, r, nil)
@@ -151,6 +152,9 @@ func newNeverAckServer(t *testing.T) string {
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {
 				return
+			}
+			if len(received) > 0 {
+				delivered.Do(func() { close(received[0]) })
 			}
 		}
 	}))

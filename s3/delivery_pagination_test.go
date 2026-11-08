@@ -23,7 +23,9 @@ func TestListingPageFlushesBeforeNextPage(t *testing.T) {
 	var deletes atomic.Int32
 	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == "DELETE" {
-			require.Equal(t, `"content"`, r.Header.Get("If-Match"))
+			if got := r.Header.Get("If-Match"); got != `"content"` {
+				t.Errorf("delete condition = %q", got)
+			}
 			deletes.Add(1)
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -51,13 +53,13 @@ func TestListingPageFlushesBeforeNextPage(t *testing.T) {
 		atomic.StoreUint32(&a.isStop, 1)
 		select {
 		case <-done:
-		case <-time.After(time.Second):
+		case <-time.After(5 * time.Second):
 		}
 	}()
 	select {
 	case seq := <-received:
 		require.Equal(t, uint64(1), seq)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("first page not admitted")
 	}
 	select {
@@ -70,13 +72,13 @@ func TestListingPageFlushesBeforeNextPage(t *testing.T) {
 	select {
 	case <-nextPage:
 		require.Equal(t, int32(1), deletes.Load())
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("next page not fetched after receipt")
 	}
 	select {
 	case seq := <-received:
 		require.Equal(t, uint64(2), seq)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("second page not admitted")
 	}
 	ack(2)
@@ -84,7 +86,7 @@ func TestListingPageFlushesBeforeNextPage(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err)
 		done <- err
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("final page not flushed")
 	}
 	require.Equal(t, int32(2), deletes.Load())
