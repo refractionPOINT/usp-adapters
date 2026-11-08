@@ -3,8 +3,10 @@ package usp_sqs_files
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -14,6 +16,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -239,10 +242,18 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 					}
 				}
 			}
+			uncertainCompletion := false
 			select {
 			case err := <-done:
 				if kind == "success" && err != nil {
-					t.Fatalf("long work failed: %v", err)
+					// The receipt can arrive while another renewal is in flight.
+					// Canceling that RPC deliberately retains the source batch.
+					var sdkErr awserr.Error
+					if !errors.As(err, &sdkErr) || sdkErr.Code() != "RequestCanceled" || !strings.Contains(err.Error(), "SQS visibility ownership uncertain") {
+						t.Fatalf("long work failed unexpectedly: %v", err)
+					}
+					uncertainCompletion = true
+					t.Log("receipt raced renewal cancellation; source retained")
 				}
 				if kind != "success" && err == nil {
 					t.Fatal("uncertain lease reported success")
@@ -254,7 +265,11 @@ func TestVisibilityRenewalLifecycle(t *testing.T) {
 			}
 			a.wg.Wait()
 			if kind == "success" {
-				if renewals.Load() < 2 || deletes.Load() != 1 {
+				wantDeletes := int32(1)
+				if uncertainCompletion {
+					wantDeletes = 0
+				}
+				if renewals.Load() < 4 || deletes.Load() != wantDeletes {
 					t.Fatalf("renewals=%d deletes=%d", renewals.Load(), deletes.Load())
 				}
 			}
