@@ -16,12 +16,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func manualAdapter(t *testing.T, conf MsGraphConfig, sink uspSink) *MsGraphAdapter {
+func manualAdapter(t *testing.T, conf MsGraphConfig, sink uspSink, runtimes ...graphRuntime) *MsGraphAdapter {
 	t.Helper()
 	conf.PollInterval = time.Hour
 	// Park the background reader before manually driving a scan. Only one
 	// goroutine may own cursor/retry health, just as in production.
 	runtime := defaultGraphRuntime()
+	if len(runtimes) > 0 {
+		runtime = runtimes[0]
+	}
 	wait := runtime.wait
 	parked := make(chan struct{})
 	var waits atomic.Int32

@@ -8,51 +8,35 @@ import (
 	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 )
 
-const maxNoProgressInterval = time.Hour
+const maxRequestFailureInterval = time.Hour
 
-var errRetryWindow = errors.New("Graph retry window exhausted")
+var errRetryWindow = errors.New("Graph request failure interval exceeded")
 
-// Only the reader goroutine accesses this state. A fetched page resets the
-// failure clock only once all usable records on it have shipped. Replaying an
-// already completed page without new shipments is not fresh forward progress.
-type graphRetryHealth struct {
-	windowStart    time.Time
-	lastError      error
-	completedPages map[string]bool
+// Escalate only a failed request. Any successful Graph fetch resets this
+// timestamp, even if its envelope is malformed or a later page remains stuck.
+// Rotating continuation tokens and successful head responses can therefore
+// keep a failing tail alive; this is an accepted limit, not replay detection.
+func (a *MsGraphAdapter) requestFailure(err error) error {
+	if errors.Is(err, errRetry) && a.runtime.now().Sub(a.lastSuccessfulFetch) > maxRequestFailureInterval {
+		// A fatal hosted restart starts from now and can abandon older backlog.
+		return vendorerr.Kind(errRetryWindow, "request failed more than one hour after the last successful Graph fetch: "+err.Error(), nil)
+	}
+	return err
 }
 
-func (h *graphRetryHealth) note(now time.Time, err error) {
-	if h.windowStart.IsZero() {
-		h.windowStart = now
+// Complete fatal delivery before the sender returns and chStopped closes.
+// A callback may synchronously Close this adapter, cancelling ctx and waiting
+// for the sender, so cancellation must be able to break the Flush wait.
+func (a *MsGraphAdapter) notifyFatal(err error) {
+	if !a.notifier.Notify(err, a.conf.ClientOptions.OnError) {
+		return
 	}
-	h.lastError = err
-}
-func (h *graphRetryHealth) pageComplete(now time.Time, key string, shippedNew bool) {
-	if h.completedPages == nil {
-		h.completedPages = map[string]bool{}
+	flushed := make(chan struct{})
+	go func() { a.notifier.Flush(); close(flushed) }()
+	select {
+	case <-flushed:
+	case <-a.ctx.Done():
 	}
-	if !h.completedPages[key] || shippedNew {
-		h.windowStart = now
-		h.lastError = nil
-	}
-	h.completedPages[key] = true
-}
-func (h *graphRetryHealth) reset(now time.Time) { *h = graphRetryHealth{windowStart: now} }
-func (h *graphRetryHealth) remaining(now time.Time) time.Duration {
-	if h.windowStart.IsZero() {
-		return maxNoProgressInterval
-	}
-	return maxNoProgressInterval - now.Sub(h.windowStart)
-}
-func (h *graphRetryHealth) escalation(now time.Time) error {
-	if h.lastError == nil || h.windowStart.IsZero() || h.remaining(now) > 0 {
-		return nil
-	}
-	// The host restarts a fatal instance from now, losing its in-memory cursor
-	// and possibly leaving backlog behind. This backlog-loss tradeoff is accepted
-	// after one hour without a fully shipped page making forward progress. A
-	// recovering scan draining pages is allowed to continue beyond one hour.
-	return vendorerr.Kind(errRetryWindow, "no Graph page progress for at least one hour; last error: "+h.lastError.Error(), nil)
 }
 
 type graphRuntime struct {

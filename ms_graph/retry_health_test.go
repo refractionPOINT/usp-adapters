@@ -3,15 +3,15 @@ package usp_ms_graph
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
-	"strings"
+	goruntime "runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
+	"github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,209 +19,253 @@ import (
 type graphTestClock struct {
 	mu      sync.Mutex
 	current time.Time
-	waits   []time.Duration
 }
 
 func (c *graphTestClock) now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.current }
+func (c *graphTestClock) advance(d time.Duration) {
+	c.mu.Lock()
+	c.current = c.current.Add(d)
+	c.mu.Unlock()
+}
 func (c *graphTestClock) runtime() graphRuntime {
-	return graphRuntime{now: c.now, wait: func(ctx context.Context, delay time.Duration) error {
+	return graphRuntime{now: c.now, wait: func(ctx context.Context, d time.Duration) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c.mu.Lock()
-		c.waits = append(c.waits, delay)
-		c.current = c.current.Add(delay)
-		c.mu.Unlock()
+		c.advance(d)
 		return nil
 	}}
 }
-
-func TestMsGraphRetryHealthBoundary(t *testing.T) {
-	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	retry := vendorerr.Kind(errRetry, "synthetic retryable failure", nil)
-	var h graphRetryHealth
-	require.Nil(t, h.escalation(now.Add(24*time.Hour)), "no failures cannot escalate")
-	h.note(now, retry)
-	h.note(now.Add(20*time.Minute), retry)
-	assert.Nil(t, h.escalation(now.Add(time.Hour-time.Nanosecond)))
-	fatal := h.escalation(now.Add(time.Hour))
-	require.Error(t, fatal)
-	assert.True(t, errors.Is(fatal, errRetryWindow))
-	assert.False(t, errors.Is(fatal, errRetry), "fatal escalation must not be retried again")
-	assert.Contains(t, fatal.Error(), "synthetic retryable failure")
-	h.reset(now.Add(2 * time.Hour))
-	assert.Nil(t, h.escalation(now.Add(2*time.Hour)))
-	h.note(now.Add(2*time.Hour), retry)
-	assert.Nil(t, h.escalation(now.Add(3*time.Hour-time.Nanosecond)))
-	assert.Error(t, h.escalation(now.Add(3*time.Hour)))
+func newGraphTestClock() *graphTestClock {
+	return &graphTestClock{current: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 }
 
-// This callback closes the actual instance, rather than merely logging fatal
-// errors. The fake clock drives retries and the hour threshold without sleeping.
-func TestMsGraphHostedFailureWindow(t *testing.T) {
-	for _, mode := range []string{"escalate", "reset", "retry-after", "permanent-403", "expired-secret", "bad-config"} {
-		t.Run(mode, func(t *testing.T) {
-			start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-			clock := &graphTestClock{current: start}
-			var polls, lasts atomic.Int32
-			var failureTimesMu sync.Mutex
-			var failureTimes []time.Time
-			var firstQuery string
-			var secondWindow time.Time
+type requestClockSink struct {
+	captureSink
+	ship func(*protocol.DataMessage, time.Duration) error
+}
+
+func (s *requestClockSink) Ship(m *protocol.DataMessage, d time.Duration) error {
+	if err := s.ship(m, d); err != nil {
+		return err
+	}
+	return s.captureSink.Ship(m, d)
+}
+
+func TestMsGraphSuccessfulFetchResetsRequestClock(t *testing.T) {
+	for _, malformed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "valid", true: "malformed"}[malformed], func(t *testing.T) {
+			clock := newGraphTestClock()
+			var fail atomic.Bool
 			_, conf := scriptedGraph(t, func(w http.ResponseWriter, r *http.Request) {
-				if mode == "permanent-403" {
-					w.WriteHeader(403)
+				if fail.Load() {
+					w.WriteHeader(503)
 					return
 				}
-				if r.URL.Path != "/last" {
-					n := polls.Add(1)
-					if n == 1 {
-						firstQuery = r.URL.Query().Get("$filter")
-					}
-					// A reset scenario succeeds on its third full poll (40 minutes after
-					// failure began), then begins another period without progress.
-					// Replayed completed head pages must not hide a stalled tail.
-					if mode == "reset" && n == 3 {
-						page(w, []map[string]interface{}{graphSecurityAlert("newest", graphTimestamp(start.Add(24*time.Hour)))}, "")
-						return
-					}
-					if n > 1 && !(mode == "reset" && n > 3) {
-						assert.Equal(t, firstQuery, r.URL.Query().Get("$filter"), "incomplete scans must retain the cursor")
-					}
-					page(w, []map[string]interface{}{graphSecurityAlert("newest", graphTimestamp(start.Add(24*time.Hour)))}, "/last")
+				if malformed {
+					writeJSON(w, 200, map[string]interface{}{"value": nil})
 					return
 				}
-				lasts.Add(1)
-				failureTimesMu.Lock()
-				failureTimes = append(failureTimes, clock.now())
-				failureTimesMu.Unlock()
-				if mode == "retry-after" {
-					w.Header().Set("Retry-After", "7200")
-					w.WriteHeader(429)
-					return
-				}
-				if mode == "reset" && polls.Load() == 4 {
-					secondWindow = clock.now()
-				}
-				// A transient envelope failure ends the scan immediately, allowing the
-				// scripted 20-minute poll intervals to exercise the exact hour boundary.
-				writeJSON(w, 200, map[string]interface{}{"value": nil})
+				page(w, []map[string]interface{}{}, "")
 			})
-			conf.PollInterval = 20 * time.Minute
-			if mode == "bad-config" {
-				conf.URL = "../invalid?%not-encoded"
-			}
-			if mode == "expired-secret" {
-				conf.ClientSecret = "synthetic-expired-secret"
-			}
-			var warnings, fatals atomic.Int32
-			closed := make(chan struct{})
-			ready := make(chan *MsGraphAdapter, 1)
-			fatalAt := make(chan time.Time, 1)
-			conf.ClientOptions.OnWarning = func(string) { warnings.Add(1) }
-			conf.ClientOptions.OnError = func(err error) {
-				fatals.Add(1)
-				fatalAt <- clock.now()
-				if mode == "escalate" || mode == "reset" || mode == "retry-after" {
-					assert.Contains(t, err.Error(), "one hour")
-				}
-				a := <-ready
-				_ = a.Close()
-				close(closed)
-			}
-			sink := &captureSink{}
-			a, _, err := newMsGraphAdapterWithRuntime(context.Background(), conf, sink, clock.runtime())
-			require.NoError(t, err)
-			ready <- a
-			defer a.Close()
-			select {
-			case <-closed:
-			case <-time.After(5 * time.Second):
-				t.Fatal("fatal callback did not close instance")
-			}
-			at := <-fatalAt
-			assert.EqualValues(t, 1, fatals.Load(), "reader must stop after the fatal callback, also on-prem")
-			select {
-			case <-a.chStopped:
-			default:
-				t.Fatal("reader did not stop")
-			}
-			if mode == "escalate" || mode == "reset" || mode == "retry-after" {
-				failureTimesMu.Lock()
-				first := failureTimes[0]
-				failureTimesMu.Unlock()
-				if mode == "reset" {
-					assert.Equal(t, first.Add(2*time.Hour), at, "a completed page and later new traversal reset the window")
-					assert.Equal(t, secondWindow.Add(time.Hour), at)
+			a := manualAdapter(t, conf, &captureSink{}, clock.runtime())
+			cursor := graphCursor{since: clock.now()}
+			for i := 0; i < 3; i++ {
+				clock.advance(55 * time.Minute)
+				_, err := a.poll(conf.GraphEndpoint+testResource, cursor, map[graphRecordKey]bool{})
+				if malformed {
+					require.Error(t, err)
+					assert.ErrorIs(t, err, errRetry)
 				} else {
-					assert.Equal(t, first.Add(time.Hour), at)
+					require.NoError(t, err)
 				}
-				assert.Positive(t, warnings.Load())
-				ids := map[string]int{}
-				for _, msg := range sink.snapshot() {
-					ids[msg.JsonPayload["id"].(string)]++
-				}
-				assert.Equal(t, map[string]int{"newest": 1}, ids, "partial shipments survive retries and are not duplicated")
-				if mode == "retry-after" {
-					assert.EqualValues(t, 1, lasts.Load(), "escalate at one hour without retrying before the two-hour Retry-After")
-				}
-			} else {
-				assert.Zero(t, warnings.Load(), "permanent failures must be fatal immediately")
+				assert.Equal(t, clock.now(), a.lastSuccessfulFetch, "every successful Graph fetch resets the clock")
 			}
+			fail.Store(true)
+			clock.advance(55 * time.Minute)
+			_, err := a.poll(conf.GraphEndpoint+testResource, cursor, map[graphRecordKey]bool{})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, errRetry, "a failed request less than one hour since a fetch stays retryable")
+			clock.advance(6 * time.Minute)
+			_, err = a.poll(conf.GraphEndpoint+testResource, cursor, map[graphRecordKey]bool{})
+			assert.ErrorIs(t, err, errRetryWindow, "failed request over an hour since a fetch must escalate")
 		})
 	}
 }
 
-func TestMsGraphSuccessfulPollResetsTransientHistory(t *testing.T) {
-	// The complete hosted tests above prove reset followed by a new escalation.
-	// This checks that the internal window itself never carries the old cause.
-	var h graphRetryHealth
-	now := time.Now()
-	h.note(now, vendorerr.Kind(errRetry, "first failure", nil))
-	h.reset(now.Add(3 * time.Hour))
-	h.note(now.Add(3*time.Hour), vendorerr.Kind(errRetry, "second failure", nil))
-	err := h.escalation(now.Add(4 * time.Hour))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "second failure")
-	assert.False(t, strings.Contains(err.Error(), "first failure"), fmt.Sprint(err))
+func TestMsGraphRetryAfterDoesNotEscalateWithoutRequest(t *testing.T) {
+	clock := newGraphTestClock()
+	var calls atomic.Int32
+	_, conf := scriptedGraph(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "7200")
+			w.WriteHeader(429)
+			return
+		}
+		page(w, []map[string]interface{}{}, "")
+	})
+	a := manualAdapter(t, conf, &captureSink{}, clock.runtime())
+	start := clock.now()
+	_, err := a.poll(conf.GraphEndpoint+testResource, graphCursor{since: start}, map[graphRecordKey]bool{})
+	require.NoError(t, err, "waiting past one hour must not kill a successful next fetch")
+	assert.EqualValues(t, 2, calls.Load())
+	assert.Equal(t, start.Add(2*time.Hour), clock.now())
+	assert.Equal(t, clock.now(), a.lastSuccessfulFetch)
 }
 
-func TestMsGraphFatalStopsWithoutHost(t *testing.T) {
-	for _, mode := range []string{"permanent", "escalation"} {
-		t.Run(mode, func(t *testing.T) {
-			clock := &graphTestClock{current: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+func TestMsGraphFetchedPageFinishesAcrossOldDeadline(t *testing.T) {
+	for _, buffered := range []bool{false, true} {
+		t.Run(map[bool]string{false: "ordinary", true: "buffered"}[buffered], func(t *testing.T) {
+			clock := newGraphTestClock()
+			start := clock.now()
+			var polls, waits, ships, fatals atomic.Int32
+			checked := make(chan string, 1)
 			_, conf := scriptedGraph(t, func(w http.ResponseWriter, r *http.Request) {
-				if mode == "permanent" {
-					w.WriteHeader(403)
+				n := polls.Add(1)
+				if n == 1 {
+					writeJSON(w, 200, map[string]interface{}{"value": nil})
 					return
 				}
-				writeJSON(w, 200, map[string]interface{}{"value": nil})
+				if n >= 3 {
+					select {
+					case checked <- r.URL.Query().Get("$filter"):
+					default:
+					}
+					page(w, []map[string]interface{}{}, "")
+					return
+				}
+				clock.advance(5*time.Minute + 30*time.Second) // request at 55m succeeds at 60m30s
+				page(w, []map[string]interface{}{
+					graphSecurityAlert("a", graphTimestamp(start.Add(24*time.Hour))),
+					graphSecurityAlert("b", graphTimestamp(start.Add(25*time.Hour))),
+				}, "")
 			})
-			conf.PollInterval = 20 * time.Minute
-			fatal := make(chan error, 1)
-			var fatals atomic.Int32
-			conf.ClientOptions.OnError = func(err error) {
-				fatals.Add(1)
-				select {
-				case fatal <- err:
+			rt := clock.runtime()
+			rt.wait = func(ctx context.Context, d time.Duration) error {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				switch waits.Add(1) {
+				case 1:
+					return nil
+				case 2:
+					clock.advance(55 * time.Minute)
+					return nil
+				case 3:
+					return nil
 				default:
+					<-ctx.Done()
+					return ctx.Err()
 				}
 			}
+			sink := &requestClockSink{ship: func(m *protocol.DataMessage, d time.Duration) error {
+				assert.LessOrEqual(t, d, time.Minute, "finish fetched pages with bounded sends")
+				n := ships.Add(1)
+				if buffered && n == 1 {
+					return uspclient.ErrorBufferFull
+				}
+				clock.advance(70 * time.Minute)
+				return nil
+			}}
+			ready := make(chan *MsGraphAdapter, 1)
+			closed := make(chan struct{})
 			conf.ClientOptions.OnWarning = func(string) {}
-			a, stopped, err := newMsGraphAdapterWithRuntime(context.Background(), conf, &captureSink{}, clock.runtime())
+			conf.ClientOptions.OnError = func(error) { fatals.Add(1); a := <-ready; _ = a.Close(); close(closed) }
+			a, _, err := newMsGraphAdapterWithRuntime(context.Background(), conf, sink, rt)
 			require.NoError(t, err)
+			ready <- a
 			defer a.Close()
+			var query string
 			select {
-			case <-stopped:
+			case query = <-checked:
+			case <-closed:
+				t.Fatal("fetched multi-record page went fatal before completion")
 			case <-time.After(5 * time.Second):
-				t.Fatal("fatal reader kept running without a host closing it")
+				t.Fatal("page did not finish")
 			}
-			select {
-			case <-fatal:
-			case <-time.After(5 * time.Second):
-				t.Fatal("fatal callback missing")
+			require.NoError(t, a.Close())
+			assert.Zero(t, fatals.Load())
+			assert.Equal(t, "createdDateTime ge "+start.Add(25*time.Hour).Format("2006-01-02T15:04:05.0000000Z"), query)
+			ids := map[string]int{}
+			for _, msg := range sink.snapshot() {
+				ids[msg.JsonPayload["id"].(string)]++
 			}
-			assert.EqualValues(t, 1, fatals.Load())
+			assert.Equal(t, map[string]int{"a": 1, "b": 1}, ids)
 		})
+	}
+}
+
+func TestMsGraphOldClockDoesNotEscalateShippingFailure(t *testing.T) {
+	clock := newGraphTestClock()
+	start := clock.now()
+	_, conf := scriptedGraph(t, func(w http.ResponseWriter, r *http.Request) {
+		page(w, []map[string]interface{}{graphSecurityAlert("a", graphTimestamp(start.Add(24*time.Hour)))}, "")
+	})
+	var calls atomic.Int32
+	sink := &requestClockSink{ship: func(m *protocol.DataMessage, d time.Duration) error {
+		if calls.Add(1) == 1 {
+			clock.advance(2 * time.Hour)
+			return errors.New("synthetic shipment failure")
+		}
+		return nil
+	}}
+	a := manualAdapter(t, conf, sink, clock.runtime())
+	cursor := graphCursor{since: start, ids: map[string]bool{}}
+	delivered := map[graphRecordKey]bool{}
+	next, err := a.poll(conf.GraphEndpoint+testResource, cursor, delivered)
+	require.ErrorIs(t, err, errRetry)
+	assert.NotErrorIs(t, err, errRetryWindow)
+	assert.Equal(t, cursor, next)
+	next, err = a.poll(conf.GraphEndpoint+testResource, cursor, delivered)
+	require.NoError(t, err)
+	assert.Equal(t, start.Add(24*time.Hour), next.since)
+	assert.Equal(t, 1, sink.count())
+}
+
+func TestMsGraphFailedRequestEscalatesAndStops(t *testing.T) {
+	clock := newGraphTestClock()
+	var calls, fatals atomic.Int32
+	_, conf := scriptedGraph(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		clock.advance(61 * time.Minute)
+		w.WriteHeader(503)
+	})
+	conf.ClientOptions.OnWarning = func(string) {}
+	fatal := make(chan error, 1)
+	conf.ClientOptions.OnError = func(err error) { fatals.Add(1); fatal <- err }
+	a, stopped, err := newMsGraphAdapterWithRuntime(context.Background(), conf, &captureSink{}, clock.runtime())
+	require.NoError(t, err)
+	defer a.Close()
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed request did not stop the reader")
+	}
+	err = <-fatal
+	assert.ErrorIs(t, err, errRetryWindow)
+	assert.EqualValues(t, 1, calls.Load())
+	assert.EqualValues(t, 1, fatals.Load())
+}
+
+func TestMsGraphFatalDeliveredBeforeStoppedOwnerClose(t *testing.T) {
+	previous := goruntime.GOMAXPROCS(1)
+	defer goruntime.GOMAXPROCS(previous)
+	for i := 0; i < 100; i++ {
+		conf := validTestConfig(t)
+		conf.URL = "bad?%invalid-query" // permanent config failure, no network
+		clock := newGraphTestClock()
+		var count, before atomic.Int32
+		conf.ClientOptions.OnError = func(error) { goruntime.Gosched(); goruntime.Gosched(); count.Add(1) }
+		a, stopped, err := newMsGraphAdapterWithRuntime(context.Background(), conf, &captureSink{}, clock.runtime())
+		require.NoError(t, err)
+		ownerDone := make(chan struct{})
+		go func() { <-stopped; before.Store(count.Load()); _ = a.Close(); close(ownerDone) }()
+		select {
+		case <-ownerDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("stopped-channel owner could not close")
+		}
+		require.EqualValues(t, 1, before.Load(), "fatal callback must be delivered before stopped-channel cleanup")
+		require.EqualValues(t, 1, count.Load(), "fatal callback delivered exactly once")
 	}
 }
