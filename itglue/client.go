@@ -8,6 +8,7 @@ import (
 	"io/ioutil"
 	"net"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -193,7 +194,7 @@ func (a *ITGlueAdapter) fetchEvents(url string) {
 	}
 }
 
-func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.Dict, string) {
+func (a *ITGlueAdapter) makeOneRequest(endpoint string, lastCursor string) ([]utils.Dict, string) {
 
 	// Prepare the request body.
 	reqData := opRequest{}
@@ -210,7 +211,7 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 	formattedTime := thirtySecondsAgo.Format(timeFormat)
 
 	// Prepare the request.
-	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", a.baseURL, url, formattedTime), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s%s?filter[created_at]=%s&sort=created_at&page[size]=1000", a.baseURL, endpoint, formattedTime), nil)
 	//debugTimestamp := formattedTime
 	if lastCursor != "" {
 		req, err = http.NewRequest("GET", fmt.Sprintf("%s", lastCursor), nil)
@@ -220,6 +221,19 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 		a.doStop.Set()
 		return nil, ""
 	}
+	base, parseErr := url.Parse(a.baseURL)
+	if parseErr != nil || base.Scheme == "" || base.Host == "" {
+		a.conf.ClientOptions.OnError(errors.New("itglue: invalid configured base URL"))
+		a.doStop.Set()
+		return nil, lastCursor
+	}
+	resolved := base.ResolveReference(req.URL)
+	if resolved.Scheme != base.Scheme || resolved.Host != base.Host || resolved.User != nil {
+		a.conf.ClientOptions.OnError(errors.New("itglue: refusing continuation outside configured scheme and host"))
+		a.doStop.Set()
+		return nil, lastCursor
+	}
+	req.URL = resolved
 	// Keep the exact first-page URL too, so a failed request cannot slide
 	// the rolling time filter forward on retry.
 	lastCursor = req.URL.String()
@@ -230,7 +244,22 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("requesting from %s%s starting at %s", URL, url, debugTimestamp))
 
 	// Issue the request.
-	resp, err := a.httpClient.Do(req)
+	// Redirects must obey the same boundary as response-supplied links.
+	client := *a.httpClient
+	previousRedirect := client.CheckRedirect
+	client.CheckRedirect = func(next *http.Request, via []*http.Request) error {
+		if next.URL.Scheme != base.Scheme || next.URL.Host != base.Host || next.URL.User != nil {
+			return errors.New("itglue: refusing redirect outside configured scheme and host")
+		}
+		if previousRedirect != nil {
+			return previousRedirect(next, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("itglue: stopped after 10 redirects")
+		}
+		return nil
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		a.conf.ClientOptions.OnError(fmt.Errorf("http.Client.Do(): %v", err))
 		return nil, lastCursor

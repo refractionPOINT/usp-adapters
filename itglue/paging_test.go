@@ -2,8 +2,11 @@ package usp_itglue
 
 import (
 	"encoding/json"
+	"github.com/refractionPOINT/go-uspclient"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -60,4 +63,57 @@ func TestPagingFailuresRetryExactPage(t *testing.T) {
 	defer mu.Unlock()
 	require.False(t, changed, "first-page time filter must survive errors")
 	require.Equal(t, 2, firstTailHits, "retry the failed continuation before polling again")
+}
+
+type pagingTransport func(*http.Request) (*http.Response, error)
+
+func (f pagingTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestPagingLinksStayOnConfiguredOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name, link        string
+		allowed, redirect bool
+	}{
+		{name: "relative", link: "/logs?page[number]=2", allowed: true},
+		{name: "hostile_host", link: "https://hostile.example.test/logs"},
+		{name: "changed_scheme", link: "http://api.example.test/logs"},
+		{name: "hostile_redirect", link: "/redirect", redirect: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			reported := 0
+			a := &ITGlueAdapter{baseURL: "https://api.example.test", doStop: utils.NewEvent(), conf: ITGlueConfig{Token: "test-only", ClientOptions: uspclient.ClientOptions{OnError: func(error) { reported++ }, OnWarning: func(string) {}}}}
+			a.httpClient = &http.Client{Transport: pagingTransport(func(r *http.Request) (*http.Response, error) {
+				calls++
+				require.Equal(t, "https", r.URL.Scheme, "refused request reached transport")
+				require.Equal(t, "api.example.test", r.URL.Host, "credentials reached a foreign host")
+				require.Equal(t, "test-only", r.Header.Get("x-api-key"))
+				body := `{"data":[],"links":{}}`
+				status := 200
+				headers := make(http.Header)
+				if calls == 1 {
+					encoded, _ := json.Marshal(map[string]interface{}{"data": []interface{}{}, "links": map[string]string{"next": tc.link}})
+					body = string(encoded)
+				}
+				if tc.redirect && calls == 2 {
+					status = 302
+					headers.Set("Location", "https://hostile.example.test/logs")
+				}
+				return &http.Response{StatusCode: status, Status: http.StatusText(status), Header: headers, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+			})}
+			_, next := a.makeOneRequest("/logs", "")
+			require.Equal(t, tc.link, next)
+			a.makeOneRequest("/logs", next)
+			want := 1
+			if tc.allowed || tc.redirect {
+				want = 2
+			}
+			require.Equal(t, want, calls)
+			if tc.allowed {
+				require.Zero(t, reported)
+			} else {
+				require.Equal(t, 1, reported, "refusal must be visible")
+			}
+		})
+	}
 }
