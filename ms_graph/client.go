@@ -27,6 +27,7 @@ const URLPrefix = "https://graph.microsoft.com/v1.0/"
 const defaultLoginEndpoint = "https://login.microsoftonline.com"
 const defaultPollInterval = 30 * time.Second
 const defaultTimestampField = "createdDateTime"
+const maxShipWait = time.Minute
 
 // uspSink is the subset of *uspclient.Client the adapter depends on. Expressing
 // it as an interface lets tests substitute an in-memory sink for the real
@@ -119,6 +120,7 @@ func newMsGraphAdapterWithRuntime(ctx context.Context, conf MsGraphConfig, sink 
 		conf:    conf,
 		ctx:     context.Background(),
 		runtime: runtime,
+		retries: graphRetryHealth{windowStart: runtime.now()},
 	}
 
 	a.ctx, a.cancel = context.WithCancel(ctx)
@@ -226,7 +228,7 @@ func (a *MsGraphAdapter) wait(delay time.Duration) error {
 	if err := a.retries.escalation(a.runtime.now()); err != nil {
 		return err
 	}
-	if remaining := a.retries.remaining(a.runtime.now()); !a.retries.firstFailure.IsZero() && remaining < delay {
+	if remaining := a.retries.remaining(a.runtime.now()); a.retries.lastError != nil && remaining < delay {
 		delay = remaining
 	}
 	if err := a.runtime.wait(a.ctx, delay); err != nil {
@@ -346,11 +348,9 @@ func (a *MsGraphAdapter) fetchEvents(eventsURL string) {
 			a.notifier.Notify(err, a.conf.ClientOptions.OnError)
 			return
 		}
-		if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
-			a.notifier.Notify(fatal, a.conf.ClientOptions.OnError)
-			return
-		}
-		a.retries.reset()
+		// A successful final page wins over the old deadline, including a
+		// last Ship that completed just after it. Never discard that result.
+		a.retries.reset(a.runtime.now())
 		cursor = next
 		delay = a.pollInterval
 		delivered = map[graphRecordKey]bool{}
@@ -424,10 +424,8 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 		if err := json.Unmarshal(page.Value, &records); err != nil {
 			return cursor, vendorerr.Kind(errRetry, "invalid Graph value array", nil)
 		}
+		shippedOnPage := false
 		for _, raw := range records {
-			if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
-				return cursor, fatal
-			}
 			var record map[string]interface{}
 			if err := json.Unmarshal(raw, &record); err != nil || record == nil {
 				malformed++
@@ -449,6 +447,14 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 				if a.ctx.Err() != nil {
 					return cursor, a.ctx.Err()
 				}
+				// Accept the fetched page's first bounded shipment even if
+				// its successful request crossed the old deadline. A partial
+				// shipment does not reset the clock or excuse an unshipped tail.
+				if shippedOnPage {
+					if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
+						return cursor, fatal
+					}
+				}
 				msg := &protocol.DataMessage{JsonPayload: record, TimestampMs: uint64(time.Now().UnixMilli())}
 				err = a.uspClient.Ship(msg, 10*time.Second)
 				if err == uspclient.ErrorBufferFull {
@@ -458,12 +464,13 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 					if remaining <= 0 {
 						return cursor, a.retries.escalation(a.runtime.now())
 					}
-					err = a.uspClient.Ship(msg, min(time.Hour, remaining))
+					err = a.uspClient.Ship(msg, min(maxShipWait, remaining))
 				}
 				if err != nil {
 					return cursor, vendorerr.Kind(errRetry, "shipping record: "+err.Error(), err, a.conf.ClientSecret, token)
 				}
 				delivered[key] = true
+				shippedOnPage = true
 			}
 			if instant.After(candidate.since) {
 				candidate.since = instant
@@ -473,19 +480,26 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 				candidate.ids[id] = true
 			}
 		}
-		if page.Next == "" {
+		var nextURL *url.URL
+		if page.Next != "" {
+			link, err := url.Parse(page.Next)
+			if err != nil {
+				return cursor, vendorerr.Kind(errRetry, "invalid Graph continuation", nil)
+			}
+			nextURL = current.ResolveReference(link)
+			if !strings.EqualFold(nextURL.Scheme, origin.Scheme) || !strings.EqualFold(nextURL.Host, origin.Host) || nextURL.User != nil || nextURL.Fragment != "" {
+				return cursor, errors.New("Graph continuation must use the configured origin")
+			}
+		}
+		// Count progress only after envelope/continuation validation and every
+		// usable record has shipped. Empty valid pages can advance pagination.
+		a.retries.pageComplete(a.runtime.now(), current.String(), shippedOnPage)
+		if nextURL == nil {
 			return candidate, nil
 		}
-		link, err := url.Parse(page.Next)
-		if err != nil {
-			return cursor, vendorerr.Kind(errRetry, "invalid Graph continuation", nil)
-		}
-		link = current.ResolveReference(link)
-		if !strings.EqualFold(link.Scheme, origin.Scheme) || !strings.EqualFold(link.Host, origin.Host) || link.User != nil || link.Fragment != "" {
-			return cursor, errors.New("Graph continuation must use the configured origin")
-		}
+
 		// nextLink is opaque: never reconstruct its query or add the filter again.
-		current = link
+		current = nextURL
 	}
 }
 
@@ -503,9 +517,8 @@ func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, err
 			var body []byte
 			body, err = a.request(http.MethodGet, pageURL, "", *token)
 			if err == nil {
-				if fatal := a.retries.escalation(a.runtime.now()); fatal != nil {
-					return nil, fatal
-				}
+				// The request already succeeded: let page validation and
+				// bounded shipping decide progress, not its prior deadline.
 				return body, nil
 			}
 			var httpErr *graphHTTPError

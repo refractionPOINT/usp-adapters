@@ -49,7 +49,7 @@ func TestMsGraphRetryHealthBoundary(t *testing.T) {
 	assert.True(t, errors.Is(fatal, errRetryWindow))
 	assert.False(t, errors.Is(fatal, errRetry), "fatal escalation must not be retried again")
 	assert.Contains(t, fatal.Error(), "synthetic retryable failure")
-	h.reset()
+	h.reset(now.Add(2 * time.Hour))
 	assert.Nil(t, h.escalation(now.Add(2*time.Hour)))
 	h.note(now.Add(2*time.Hour), retry)
 	assert.Nil(t, h.escalation(now.Add(3*time.Hour-time.Nanosecond)))
@@ -79,8 +79,8 @@ func TestMsGraphHostedFailureWindow(t *testing.T) {
 						firstQuery = r.URL.Query().Get("$filter")
 					}
 					// A reset scenario succeeds on its third full poll (40 minutes after
-					// failure began), then begins another hour of failure. Partial page
-					// success must never reset the interval.
+					// failure began), then begins another period without progress.
+					// Replayed completed head pages must not hide a stalled tail.
 					if mode == "reset" && n == 3 {
 						page(w, []map[string]interface{}{graphSecurityAlert("newest", graphTimestamp(start.Add(24*time.Hour)))}, "")
 						return
@@ -151,7 +151,7 @@ func TestMsGraphHostedFailureWindow(t *testing.T) {
 				first := failureTimes[0]
 				failureTimesMu.Unlock()
 				if mode == "reset" {
-					assert.Equal(t, first.Add(2*time.Hour), at, "the intervening successful poll must reset the hour")
+					assert.Equal(t, first.Add(2*time.Hour), at, "a completed page and later new traversal reset the window")
 					assert.Equal(t, secondWindow.Add(time.Hour), at)
 				} else {
 					assert.Equal(t, first.Add(time.Hour), at)
@@ -178,7 +178,7 @@ func TestMsGraphSuccessfulPollResetsTransientHistory(t *testing.T) {
 	var h graphRetryHealth
 	now := time.Now()
 	h.note(now, vendorerr.Kind(errRetry, "first failure", nil))
-	h.reset()
+	h.reset(now.Add(3 * time.Hour))
 	h.note(now.Add(3*time.Hour), vendorerr.Kind(errRetry, "second failure", nil))
 	err := h.escalation(now.Add(4 * time.Hour))
 	require.Error(t, err)

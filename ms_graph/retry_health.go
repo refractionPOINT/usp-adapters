@@ -8,38 +8,51 @@ import (
 	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 )
 
-const maxUnsuccessfulPollInterval = time.Hour
+const maxNoProgressInterval = time.Hour
 
 var errRetryWindow = errors.New("Graph retry window exhausted")
 
-// Only the reader goroutine accesses this state. Successful pages and shipments
-// do not reset it: only a complete successful poll does.
+// Only the reader goroutine accesses this state. A fetched page resets the
+// failure clock only once all usable records on it have shipped. Replaying an
+// already completed page without new shipments is not fresh forward progress.
 type graphRetryHealth struct {
-	firstFailure time.Time
-	lastError    error
+	windowStart    time.Time
+	lastError      error
+	completedPages map[string]bool
 }
 
 func (h *graphRetryHealth) note(now time.Time, err error) {
-	if h.firstFailure.IsZero() {
-		h.firstFailure = now
+	if h.windowStart.IsZero() {
+		h.windowStart = now
 	}
 	h.lastError = err
 }
-func (h *graphRetryHealth) reset() { *h = graphRetryHealth{} }
-func (h *graphRetryHealth) remaining(now time.Time) time.Duration {
-	if h.firstFailure.IsZero() {
-		return maxUnsuccessfulPollInterval
+func (h *graphRetryHealth) pageComplete(now time.Time, key string, shippedNew bool) {
+	if h.completedPages == nil {
+		h.completedPages = map[string]bool{}
 	}
-	return maxUnsuccessfulPollInterval - now.Sub(h.firstFailure)
+	if !h.completedPages[key] || shippedNew {
+		h.windowStart = now
+		h.lastError = nil
+	}
+	h.completedPages[key] = true
+}
+func (h *graphRetryHealth) reset(now time.Time) { *h = graphRetryHealth{windowStart: now} }
+func (h *graphRetryHealth) remaining(now time.Time) time.Duration {
+	if h.windowStart.IsZero() {
+		return maxNoProgressInterval
+	}
+	return maxNoProgressInterval - now.Sub(h.windowStart)
 }
 func (h *graphRetryHealth) escalation(now time.Time) error {
-	if h.firstFailure.IsZero() || h.remaining(now) > 0 {
+	if h.lastError == nil || h.windowStart.IsZero() || h.remaining(now) > 0 {
 		return nil
 	}
 	// The host restarts a fatal instance from now, losing its in-memory cursor
 	// and possibly leaving backlog behind. This backlog-loss tradeoff is accepted
-	// after one hour without a successful poll, rather than retrying forever.
-	return vendorerr.Kind(errRetryWindow, "no successful Graph poll for at least one hour after a retryable failure; last error: "+h.lastError.Error(), nil)
+	// after one hour without a fully shipped page making forward progress. A
+	// recovering scan draining pages is allowed to continue beyond one hour.
+	return vendorerr.Kind(errRetryWindow, "no Graph page progress for at least one hour; last error: "+h.lastError.Error(), nil)
 }
 
 type graphRuntime struct {

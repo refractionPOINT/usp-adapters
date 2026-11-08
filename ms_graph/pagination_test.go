@@ -272,10 +272,8 @@ func TestMsGraphRefreshTokenOnSamePage(t *testing.T) {
 			conf := testConfig(t, server)
 			conf.PollInterval = time.Hour // drive exactly one scan below
 			sink := &captureSink{}
-			a, _, err := newMsGraphAdapter(context.Background(), conf, sink)
-			require.NoError(t, err)
-			defer a.Close()
-			_, err = a.poll(server.URL+"/v1.0/"+testResource, graphCursor{since: time.Now().UTC()}, map[graphRecordKey]bool{})
+			a := manualAdapter(t, conf, sink)
+			_, err := a.poll(server.URL+"/v1.0/"+testResource, graphCursor{since: time.Now().UTC()}, map[graphRecordKey]bool{})
 			if persistent {
 				require.ErrorContains(t, err, "401")
 				assert.Equal(t, 1, sink.count())
