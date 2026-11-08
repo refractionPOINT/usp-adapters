@@ -341,41 +341,17 @@ func TestUnlistedLeftBlobExpiresAndReports(t *testing.T) {
 	}
 }
 
-func TestLegacyDeduperReportsUnretryableBlob(t *testing.T) {
-	for _, kind := range []string{"transient", "gone", "invalid json"} {
-		t.Run(kind, func(t *testing.T) {
-			var hits atomic.Int32
-			a, base := pollFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				hits.Add(1)
-				switch kind {
-				case "transient":
-					w.WriteHeader(http.StatusServiceUnavailable)
-				case "gone":
-					w.WriteHeader(http.StatusNotFound)
-				default:
-					_, _ = w.Write([]byte(`[{`))
-				}
-			}))
-			a.conf.Deduper = newLegacyDeduper()
-			a.checker = nil
-			var messages []string
-			a.conf.ClientOptions.OnError = func(err error) { messages = append(messages, err.Error()) }
-			var warnings []string
-			a.conf.ClientOptions.OnWarning = func(msg string) { warnings = append(warnings, msg) }
-			fs := &failureState{}
-			items := []listItem{{ContentID: "legacy-blob", ContentURI: base}}
-			a.processItems(items, fs)
-			require.Len(t, messages, 1)
-			assert.Contains(t, messages[0], "cannot be retried on the next poll")
-			for _, warning := range warnings {
-				assert.NotContains(t, warning, "leaving blob for the next poll")
-			}
-			n := hits.Load()
-			a.processItems(items, fs)
-			assert.Equal(t, n, hits.Load(), "the legacy deduper already recorded the blob")
-			assert.Len(t, messages, 1, "a skipped blob must not flood errors on later polls")
-		})
-	}
+// A check-and-add-only backend must not poison retry eligibility.
+func TestLegacyDeduperLeavesBlobRetryable(t *testing.T) {
+	var hits atomic.Int32
+	a, base := pollFixture(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1); w.Write([]byte(`[{`)) }))
+	a.conf.Deduper = newLegacyDeduper()
+	a.checker = nil
+	fs := &failureState{}
+	items := []listItem{{ContentID: "legacy-blob", ContentURI: base}}
+	a.processItems(items, fs)
+	a.processItems(items, fs)
+	assert.EqualValues(t, 2, hits.Load())
 }
 
 func TestBackoffJitterAndBounds(t *testing.T) {
@@ -418,7 +394,7 @@ func TestEmptyJSONArrayCompletesBlob(t *testing.T) {
 	cb.install(t, &a.conf)
 	fs := &failureState{}
 	assert.True(t, a.pollOnce(base+"/list", fs))
-	assert.True(t, a.checker.Check("empty-array"), "valid empty content must be marked complete")
+	assert.True(t, a.checker.Check(confirmedKey("empty-array")), "valid empty content must be marked complete")
 	assert.Empty(t, fs.leftBlobs)
 	assert.Empty(t, cb.errors())
 }

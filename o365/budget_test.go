@@ -52,8 +52,8 @@ func TestContentBudgetBoundsRetryAfterAndPreservesCooldown(t *testing.T) {
 	require.Less(t, time.Since(start), 500*time.Millisecond, "a long Retry-After must not hold up healthy content")
 	require.Equal(t, int32(2), failedHits.Load(), "exhausting the budget must not issue an early retry")
 	require.Equal(t, 1, a.uspClient.(*captureSink).count())
-	require.False(t, a.checker.Check("deferred"), "the deferred blob must remain eligible")
-	require.True(t, a.checker.Check("healthy"))
+	require.False(t, a.checker.Check(confirmedKey("deferred")), "the deferred blob must remain eligible")
+	require.True(t, a.checker.Check(confirmedKey("healthy")))
 	left := fs.leftBlobs["deferred"]
 	assert.False(t, left.notBefore.Before(time.Unix(0, throttledAt.Load()).Add(time.Second)), "retain the full retry time from the response")
 	firstOutage := fs.since
@@ -77,7 +77,7 @@ func TestContentBudgetBoundsRetryAfterAndPreservesCooldown(t *testing.T) {
 
 	time.Sleep(time.Until(left.notBefore) + 10*time.Millisecond)
 	assert.True(t, a.pollOnce(base+"/list", fs))
-	assert.True(t, a.checker.Check("deferred"))
+	assert.True(t, a.checker.Check(confirmedKey("deferred")))
 	assert.Equal(t, int32(3), failedHits.Load())
 	assert.Equal(t, int32(1), healthyHits.Load(), "the shared checking deduper must skip completed content")
 	assert.Equal(t, 2, a.uspClient.(*captureSink).count())
@@ -149,8 +149,8 @@ func TestContentBudgetCancelsInFlightRequestsAndRecovers(t *testing.T) {
 			require.Eventually(t, cancelled.Load, time.Second, time.Millisecond, "the vendor request itself must be cancelled")
 			assert.Equal(t, 1, a.uspClient.(*captureSink).count())
 			assert.Empty(t, cb.errors(), "budget exhaustion is retryable, not fatal")
-			assert.False(t, a.checker.Check("hung"))
-			assert.False(t, a.checker.Check("recovered-event"))
+			assert.False(t, a.checker.Check(confirmedKey("hung")))
+			assert.False(t, a.checker.Check(confirmedKey("recovered-event")))
 			assert.Contains(t, fs.leftBlobs, "hung")
 			if phase == "body" {
 				assert.True(t, fs.leftBlobs["hung"].notBefore.After(start.Add(time.Second)),
@@ -164,7 +164,7 @@ func TestContentBudgetCancelsInFlightRequestsAndRecovers(t *testing.T) {
 			restarted := &Office365Adapter{conf: a.conf, checker: a.checker, httpClient: a.httpClient,
 				uspClient: a.uspClient, doStop: utils.NewEvent(), stopCtx: a.stopCtx}
 			assert.True(t, restarted.pollOnce(base+"/list", &failureState{}))
-			assert.True(t, a.checker.Check("hung"))
+			assert.True(t, a.checker.Check(confirmedKey("hung")))
 			assert.Equal(t, 2, a.uspClient.(*captureSink).count())
 			assert.Equal(t, int32(1), healthyHits.Load())
 			wantBadHits := int32(2)
@@ -231,8 +231,8 @@ func TestContentCooldownAtTrackingCapacity(t *testing.T) {
 	a.processItems(items, fs)
 	assert.Equal(t, int32(1), hits.Load(), "the bounded fallback must retain the retry time across polls")
 	assert.Len(t, cb.errors(), 1, "capacity exhaustion remains visible without flooding")
-	assert.False(t, a.checker.Check("overflow"))
-	assert.False(t, a.checker.Check("untracked"))
+	assert.False(t, a.checker.Check(confirmedKey("overflow")))
+	assert.False(t, a.checker.Check(confirmedKey("untracked")))
 }
 
 // A content request must not inherit another collector's longer token-refresh

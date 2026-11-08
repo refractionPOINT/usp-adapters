@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -849,4 +850,12 @@ func TestMockStartTimeFirstPoll(t *testing.T) {
 	counts := sink.payloadCounts()
 	assert.Equal(t, 1, counts[oldRec])
 	assert.Equal(t, 1, counts[newRec])
+}
+
+func (s *captureSink) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.Ship(m, d)
+}
+
+func (s *captureSink) ObserveReceipt(uspclient.AdmissionReceipt) uspclient.ReceiptObservation {
+	return uspclient.ReceiptObservation{Frame: uspclient.ReceiptAcknowledged, Lifetime: uspclient.ReceiptLive}
 }

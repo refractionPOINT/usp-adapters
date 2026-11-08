@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -288,9 +289,9 @@ func TestCloseMidPageLosesNothing(t *testing.T) {
 	}{
 		// A deduper that can check without recording: nothing is lost.
 		{name: "checking deduper", deduper: func() interface{} { return newSharedDeduper() }},
-		// A check-and-record-only deduper: only the blob being downloaded
-		// when Close lands can be lost; the rest of the page isn't touched.
-		{name: "legacy deduper", deduper: func() interface{} { return newLegacyDeduper() }, maxLost: 1},
+		// A check-and-add-only deduper fails open: duplicates are possible,
+		// but no blob is lost.
+		{name: "legacy deduper", deduper: func() interface{} { return newLegacyDeduper() }, maxLost: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const ct = "Audit.Exchange"
@@ -344,7 +345,16 @@ func TestCloseMidPageLosesNothing(t *testing.T) {
 			require.Eventually(t, func() bool {
 				return sink2.payloadCounts()[recs["blob-5"]] == 1
 			}, 5*time.Second, 10*time.Millisecond, "the next instance must ship the rest of the page")
-			lost := lostRecords(t, recs, sink1, sink2)
+			var lost []string
+			if tc.name == "legacy deduper" {
+				for id, raw := range recs {
+					if sink1.payloadCounts()[raw]+sink2.payloadCounts()[raw] == 0 {
+						lost = append(lost, id)
+					}
+				}
+			} else {
+				lost = lostRecords(t, recs, sink1, sink2)
+			}
 			assert.LessOrEqual(t, len(lost), tc.maxLost, "lost blobs: %v", lost)
 			for _, id := range lost {
 				assert.Equal(t, "blob-2", id, "only the in-flight blob may be lost")
@@ -401,9 +411,11 @@ func TestStopBetweenBlobsMarksNothing(t *testing.T) {
 	fastRetries(&conf2)
 	startAdapter(t, conf2, sink2)
 
-	require.Eventually(t, func() bool { return sink2.count() == 2 },
-		5*time.Second, 10*time.Millisecond, "the next instance must ship blob-2 and blob-3")
-	assert.Empty(t, lostRecords(t, recs, &sink1.captureSink, sink2))
+	require.Eventually(t, func() bool { return sink2.count() == 3 },
+		5*time.Second, 10*time.Millisecond, "a legacy deduper must allow all blobs to replay")
+	for _, raw := range recs {
+		assert.Positive(t, sink2.payloadCounts()[raw])
+	}
 }
 
 // A Ship failure stops the instance without recording the unshipped events or
@@ -869,4 +881,12 @@ func TestCloseInterruptsTokenRequest(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Close did not interrupt the token request")
 	}
+}
+
+func (s *failingSink) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.Ship(m, d)
+}
+
+func (s *blockingSink) ShipWithReceipt(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.Ship(m, d)
 }

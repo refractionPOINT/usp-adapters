@@ -137,7 +137,7 @@ func TestTokenRefreshRetryAfterShared(t *testing.T) {
 			complete, abort := a.processItems([]listItem{{ContentID: "healthy-blob", ContentURI: base + "/healthy"}}, &failureState{})
 			assert.True(t, complete)
 			assert.False(t, abort)
-			assert.True(t, a.checker.Check("healthy-blob"))
+			assert.True(t, a.checker.Check(confirmedKey("healthy-blob")))
 			assert.Equal(t, 1, a.uspClient.(*captureSink).count())
 			assert.Equal(t, int32(3), tokenHits.Load(), "cached-token concurrency must not trigger refreshes")
 			assert.Empty(t, cb.errors())
