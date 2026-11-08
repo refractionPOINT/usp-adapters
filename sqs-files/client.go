@@ -220,10 +220,9 @@ func (a *SQSFilesAdapter) downloaderForBucket(ctx context.Context, bucket string
 		if lookupErr != nil {
 			return nil, fmt.Errorf("s3.Region: %w", lookupErr)
 		}
-		if sourceIsAbsent(err, "NoSuchBucket", "NotFound") {
-			return nil, &absentSourceError{err}
-		}
-		return nil, fmt.Errorf("s3.Region: %w", err)
+		// Bucket lookup failures commonly mean a wrong configuration. They
+		// must retain notifications and reach the visible error callback.
+		return nil, fmt.Errorf("s3.Region for bucket %q: %w", bucket, err)
 	}
 	if ctx.Err() != nil {
 		return nil, context.Cause(ctx)
@@ -340,11 +339,6 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	}
 	downloader, err := a.downloaderForBucket(ctx, bucket)
 	if err != nil {
-		var absent *absentSourceError
-		if errors.As(err, &absent) && ctx.Err() == nil {
-			a.warnAbsent(absent)
-			return dependency, false, nil
-		}
 		return dependency, hasDependency, err
 	}
 	fileCtx, cancel := context.WithCancel(ctx)
@@ -461,8 +455,8 @@ func (a *SQSFilesAdapter) shipEventContext(ctx context.Context, data []byte, isC
 	return a.shipContext(ctx, msg)
 }
 
-// An absent source has no remaining bytes to admit; unlike malformed data, it
-// is complete rather than retained for DLQ. Authorization, server, transport,
+// An absent object in an existing bucket has no bytes to admit. Unlike
+// malformed data, it is complete rather than retained for DLQ. Authorization, server, transport,
 // and cancellation failures must never be mistaken for absence.
 type absentSourceError struct{ error }
 
@@ -471,7 +465,7 @@ func sourceIsAbsent(err error, codes ...string) bool {
 		return false
 	}
 	var api awserr.Error
-	if errors.As(err, &api) && (api.Code() == "AccessDenied" || api.Code() == "Forbidden") {
+	if errors.As(err, &api) && (api.Code() == "AccessDenied" || api.Code() == "Forbidden" || api.Code() == "NoSuchBucket") {
 		return false
 	}
 	var failure awserr.RequestFailure

@@ -29,7 +29,7 @@ type absenceFixture struct {
 	fatal    chan error
 }
 
-func newAbsenceFixture(t *testing.T, bodies []string, withhold, allAbsent bool) *absenceFixture {
+func newAbsenceFixture(t *testing.T, bodies []string, withhold, allAbsent bool, fixedBucket ...string) *absenceFixture {
 	t.Helper()
 	f := &absenceFixture{c: &receiptClient{autoACK: !withhold, observed: make(chan struct{}, 20)}, deleted: map[string]bool{}, warnings: make(chan string, 20), fatal: make(chan error, 20)}
 	if allAbsent {
@@ -45,10 +45,23 @@ func newAbsenceFixture(t *testing.T, bodies []string, withhold, allAbsent bool) 
 				w.WriteHeader(404)
 				return
 			}
+			if parts[0] == "denied-bucket" {
+				w.WriteHeader(403)
+				return
+			}
+			if parts[0] == "unavailable-bucket" {
+				w.WriteHeader(503)
+				return
+			}
 			w.Header().Set("X-Amz-Bucket-Region", "us-east-1")
 			return
 		}
 		if r.Method == "GET" {
+			if parts[0] == "deleted-bucket" {
+				w.WriteHeader(404)
+				fmt.Fprint(w, "<Error><Code>NoSuchBucket</Code></Error>")
+				return
+			}
 			if len(parts) == 2 && strings.HasPrefix(parts[1], "gone") {
 				w.Header().Set("Content-Type", "application/xml")
 				w.WriteHeader(404)
@@ -110,6 +123,9 @@ func newAbsenceFixture(t *testing.T, bodies []string, withhold, allAbsent bool) 
 	a.conf.QueueURL = server.URL
 	a.conf.BucketPath = "bucket"
 	a.conf.FilePath = "files/path"
+	if len(fixedBucket) > 0 {
+		a.conf.Bucket = fixedBucket[0]
+	}
 	a.conf.ClientOptions.DebugLog = func(string) {}
 	a.conf.ClientOptions.OnWarning = func(s string) { f.warnings <- s }
 	a.conf.ClientOptions.OnError = func(err error) { f.fatal <- err; cancel() } // actual hosted owner policy
@@ -146,17 +162,48 @@ func TestAbsentObjectThenValidNotificationContinues(t *testing.T) {
 		t.Fatalf("deleted=%d warnings=%d", f.deletedCount(), len(f.warnings))
 	}
 }
-func TestAbsentBucketThenValidNotificationContinues(t *testing.T) {
-	f := newAbsenceFixture(t, []string{
-		`{"bucket":"missing-bucket","files":[{"path":"event.txt"}]}`,
-		`{"bucket":"test","files":[{"path":"valid.txt"}]}`,
-	}, false, false)
-	waitReview(t, "absent bucket stopped later valid work", func() bool { return f.deletedCount() == 2 || len(f.fatal) > 0 })
-	if len(f.fatal) != 0 {
-		t.Fatalf("absent bucket raised fatal callback: %v", <-f.fatal)
-	}
-	if f.deletedCount() != 2 || len(f.warnings) != 1 {
-		t.Fatalf("deleted=%d warnings=%d", f.deletedCount(), len(f.warnings))
+func TestBucketFailureRetainsNotificationAndReportsError(t *testing.T) {
+	for _, tc := range []struct {
+		name, bucket string
+		fixed        bool
+	}{
+		{"mistyped_fixed_bucket", "missing-bucket", true},
+		{"wrong_bucket_path", "missing-bucket", false},
+		{"fixed_access_denied", "denied-bucket", true},
+		{"dynamic_access_denied", "denied-bucket", false},
+		{"fixed_server_failure", "unavailable-bucket", true},
+		{"dynamic_server_failure", "unavailable-bucket", false},
+		{"bucket_deleted_after_lookup", "deleted-bucket", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var fixed []string
+			if tc.fixed {
+				fixed = []string{tc.bucket}
+			}
+			f := newAbsenceFixture(t, []string{fmt.Sprintf(`{"bucket":%q,"files":[{"path":"event.txt"}]}`, tc.bucket)}, false, true, fixed...)
+			select {
+			case err := <-f.fatal:
+				if err == nil {
+					t.Fatal("bucket failure did not report an error")
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("bucket failure did not report visible error")
+			}
+			select {
+			case <-f.a.receiveStopped:
+			case <-time.After(10 * time.Second):
+				t.Fatal("receiver did not join")
+			}
+			if got := f.deletedCount(); got != 0 {
+				t.Fatalf("bucket failure deleted %d notifications", got)
+			}
+			f.c.mu.Lock()
+			admitted := f.c.next
+			f.c.mu.Unlock()
+			if admitted != 0 || len(f.c.observed) != 0 {
+				t.Fatal("bucket failure authorized admission or receipt observation")
+			}
+		})
 	}
 }
 func TestMixedAbsentFileWaitsForRemainingReceipt(t *testing.T) {
@@ -203,8 +250,9 @@ func TestSourceAbsenceClassificationPreservesFatalErrors(t *testing.T) {
 		want bool
 	}{
 		{"object_code", awserr.New("NoSuchKey", "absent", nil), true},
-		{"bucket_code", awserr.New("NoSuchBucket", "absent", nil), true},
+		{"bucket_code", awserr.New("NoSuchBucket", "absent", nil), false},
 		{"not_found", awserr.New("NotFound", "absent", nil), true},
+		{"missing_bucket_http_404", awserr.NewRequestFailure(awserr.New("NoSuchBucket", "absent", nil), 404, ""), false},
 		{"http_404", awserr.NewRequestFailure(awserr.New("NotFound", "absent", nil), 404, ""), true},
 		{"access_denied", awserr.NewRequestFailure(awserr.New("AccessDenied", "denied", nil), 403, ""), false},
 		{"misleading_code_403", awserr.NewRequestFailure(awserr.New("NoSuchKey", "denied", nil), 403, ""), false},
@@ -215,7 +263,7 @@ func TestSourceAbsenceClassificationPreservesFatalErrors(t *testing.T) {
 		{"deadline", context.DeadlineExceeded, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := sourceIsAbsent(tc.err, "NoSuchKey", "NoSuchBucket", "NotFound"); got != tc.want {
+			if got := sourceIsAbsent(tc.err, "NoSuchKey", "NotFound"); got != tc.want {
 				t.Fatalf("absent=%v want %v", got, tc.want)
 			}
 		})

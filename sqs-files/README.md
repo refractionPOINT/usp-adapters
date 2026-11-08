@@ -2,7 +2,9 @@
 
 A notification is deleted from SQS only after all of its readable referenced files have been downloaded, decoded, and acknowledged by USP. Delivery is at least once: interrupted processing, uncertain visibility renewal, or incomplete cleanup can replay records that were already delivered.
 
-A definitively absent source object or bucket (404 / NoSuchKey / NoSuchBucket / NotFound, as appropriate for the request) produces a warning and counts as complete: there are no bytes left to deliver. If the notification also refers to existing files, those files still require USP delivery acknowledgement before deletion. An all-absent notification needs no delivery dependency, but deletion still requires known SQS lease ownership. Permission errors, server failures, transport failures, and cancellation do not count as absence.
+A definitively missing object in an existing bucket (404 / NoSuchKey / NotFound from the object read) produces a warning and counts as complete: there are no bytes left to deliver. If the notification also refers to existing files, those files still require USP delivery acknowledgement before deletion. An all-missing-object notification needs no delivery dependency, but deletion still requires known SQS lease ownership.
+
+Bucket-level failures, including missing buckets, access denied, region lookup errors and a bucket disappearing after lookup, retain the notification and invoke the error callback. They may indicate a wrong bucket setting or mapping and must not silently consume the queue. Permission errors, server failures, transport failures, and cancellation never count as missing-object completion.
 
 A file that was successfully downloaded but cannot be decoded is skipped with an existing warning callback. Each warning reports `skipped_undecodable_files=1`, the bucket, and the actual object key used for the download (after configured key decoding). The original object is left untouched in its bucket. The notification can delete after every readable file is acknowledged by USP; a decode-only notification needs no delivery dependency. Decode failures do not require a quarantine or dead-letter queue.
 
