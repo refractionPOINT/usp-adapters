@@ -22,6 +22,8 @@ type batchLease struct {
 	cancel                 context.CancelCauseFunc
 	renewCtx               context.Context
 	stopRenew              context.CancelFunc
+	stopRequested          chan struct{}
+	requestStop            sync.Once
 	done                   chan struct{}
 	client                 *sqs.SQS
 	queue                  string
@@ -40,7 +42,7 @@ var leaseMaxLifetime = 11*time.Hour + 50*time.Minute
 func newBatchLease(parent context.Context, client *sqs.SQS, queue string, messages []*sqs.Message, receivedBefore time.Time) *batchLease {
 	ctx, cancel := context.WithCancelCause(parent)
 	renewCtx, stop := context.WithCancel(ctx)
-	l := &batchLease{ctx: ctx, cancel: cancel, renewCtx: renewCtx, stopRenew: stop, done: make(chan struct{}), client: client, queue: queue, deadline: receivedBefore.Add(sourceLeaseBudget), hardDeadline: receivedBefore.Add(leaseMaxLifetime)}
+	l := &batchLease{ctx: ctx, cancel: cancel, renewCtx: renewCtx, stopRenew: stop, stopRequested: make(chan struct{}), done: make(chan struct{}), client: client, queue: queue, deadline: receivedBefore.Add(sourceLeaseBudget), hardDeadline: receivedBefore.Add(leaseMaxLifetime)}
 	seen := map[string]bool{}
 	for i, m := range messages {
 		if m == nil || m.ReceiptHandle == nil || *m.ReceiptHandle == "" || seen[*m.ReceiptHandle] {
@@ -77,10 +79,23 @@ func (l *batchLease) renew() {
 		}
 		timer := time.NewTimer(delay)
 		select {
+		case <-l.stopRequested:
+			timer.Stop()
+			return
 		case <-l.renewCtx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
+		}
+		// If the timer and graceful stop became ready together, do not
+		// start another RPC. A stop racing the RPC start still joins that
+		// bounded request without canceling its ownership evidence.
+		select {
+		case <-l.stopRequested:
+			return
+		case <-l.renewCtx.Done():
+			return
+		default:
 		}
 		started := time.Now()
 		if !started.Before(deadline) {
@@ -130,11 +145,11 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
-// stopAndJoin cancels even an in-flight renewal RPC and joins it. A canceled
-// in-flight RPC is ambiguous, so renewal marks ownership uncertain and cleanup
-// is forbidden. Cancellation while the renewer is idle is safe.
+// stopAndJoin requests no further renewals and joins the current bounded
+// request. Normal receipt completion must not cancel an RPC and manufacture
+// ownership uncertainty. Abort/shutdown and RPC/lease deadlines still cancel.
 func (l *batchLease) stopAndJoin() error {
-	l.stopRenew()
+	l.requestStop.Do(func() { close(l.stopRequested) })
 	<-l.done
 	if err := context.Cause(l.ctx); err != nil {
 		return err
