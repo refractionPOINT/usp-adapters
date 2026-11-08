@@ -18,12 +18,12 @@ func TestReviewPartialGraphQL(t *testing.T) {
 		name, path, data string
 		fail             bool
 	}{
-		{"optional-item", `["issues","nodes",0,"description"]`, `{"issues":{"nodes":[{"id":"a","createdAt":"2026-01-02T00:00:00Z","description":null}],"pageInfo":{"hasNextPage":false}}}`, false},
+		{"optional-item", `["issues","nodes",0,"description"]`, `{"issues":{"nodes":[{"id":"bad","createdAt":"2026-01-02T00:00:00Z","description":null},{"id":"a","createdAt":"2026-01-02T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}`, false},
 		{"optional-sibling", `["issues","totalCount"]`, `{"issues":{"nodes":[{"id":"a","createdAt":"2026-01-02T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}`, false},
 		{"other-root", `["other"]`, `{"issues":{"nodes":[{"id":"a","createdAt":"2026-01-02T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}`, false},
 		{"connection", `["issues"]`, `{"issues":null}`, true},
-		{"id", `["issues","nodes",0,"id"]`, `{"issues":{"nodes":[{"id":null,"createdAt":"2026-01-02T00:00:00Z"}]}}`, true},
-		{"time", `["issues","nodes",0,"createdAt"]`, `{"issues":{"nodes":[{"id":"a","createdAt":null}]}}`, true},
+		{"id", `["issues","nodes",0,"id"]`, `{"issues":{"nodes":[{"id":null,"createdAt":"2026-01-02T00:00:00Z"},{"id":"a","createdAt":"2026-01-02T00:00:00Z"}]}}`, false},
+		{"time", `["issues","nodes",0,"createdAt"]`, `{"issues":{"nodes":[{"id":"bad","createdAt":null},{"id":"a","createdAt":"2026-01-02T00:00:00Z"}]}}`, false},
 		{"pageInfo", `["issues","pageInfo"]`, `{"issues":{"nodes":[],"pageInfo":null}}`, true},
 		{"error-only", `["issues"]`, `null`, true},
 		{"unscoped", `null`, `{"issues":{"nodes":[]}}`, true},
@@ -161,6 +161,54 @@ func TestReviewMalformedRecordDoesNotBlockLaterPolls(t *testing.T) {
 				want = 2
 			}
 			require.Equal(t, want, a.uspClient.(*captureSink).count())
+		})
+	}
+}
+
+func TestFinalScopedGraphQLErrorsKeepUsableRecords(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy-paging=%v", legacy), func(t *testing.T) {
+			stop := utils.NewEvent()
+			polls, errorsSeen := 0, 0
+			warnings := []string{}
+			const stamp = "2026-11-09T00:00:00Z"
+			query := `query($after:String) { issues(after:$after) { nodes { id createdAt } pageInfo { hasNextPage endCursor } } }`
+			if legacy {
+				query = `{ issues { nodes { id createdAt } pageInfo { endCursor } } }`
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				polls++
+				if polls == 2 {
+					stop.Set()
+				}
+				if legacy {
+					fmt.Fprintf(w, `{"data":{"issues":{"nodes":[{"id":"good-%d","createdAt":%q}],"pageInfo":null}},"errors":[{"path":["issues","pageInfo","endCursor"],"message":"unavailable"}]}`, polls, stamp)
+				} else {
+					// A field error marks only its indexed record, even when values remain
+					// present. Two field errors on one record must produce one skip warning.
+					fmt.Fprintf(w, `{"data":{"issues":{"nodes":[{"id":"bad","createdAt":%q},{"id":"good-%d","createdAt":%q}],"pageInfo":{"hasNextPage":false}}},"errors":[{"path":["issues","nodes",0,"id"]},{"path":["issues","nodes",0,"createdAt"]}]}`, stamp, polls, stamp)
+				}
+			}))
+			defer srv.Close()
+			sink := &captureSink{}
+			a := &WizAdapter{conf: WizConfig{URL: srv.URL, Query: query, DataPath: []string{"data", "issues", "nodes"}, IDField: "id", TimeField: "createdAt", PollInterval: time.Millisecond, ClientOptions: uspclient.ClientOptions{DebugLog: func(string) {}, OnWarning: func(s string) { warnings = append(warnings, s) }, OnError: func(error) { errorsSeen++; stop.Set() }}}, doStop: stop, uspClient: sink, httpClient: srv.Client(), accessToken: "test", expiresAt: time.Now().Add(time.Hour)}
+			a.wgSenders.Add(1)
+			a.fetchEvents()
+			require.Equal(t, 2, polls)
+			require.Zero(t, errorsSeen, "scoped errors must not enter the fatal/Org Error path")
+			require.Len(t, warnings, 2, "one relevant warning per poll")
+			messages := sink.snapshot()
+			require.Len(t, messages, 2)
+			for _, message := range messages {
+				require.NotEqual(t, "bad", message.JsonPayload["id"])
+			}
+			for _, warning := range warnings {
+				if legacy {
+					require.Contains(t, warning, "wiz/README.md")
+				} else {
+					require.Equal(t, "skipping GraphQL record after field error", warning)
+				}
+			}
 		})
 	}
 }

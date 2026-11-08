@@ -7,11 +7,15 @@ newest first by the configured time field, as required by the time checkpoint.
 The adapter follows each returned cursor with the same time filter, including
 when an intermediate page contains no records.
 
-Optional-field GraphQL errors with explicit paths produce a warning while valid
-records continue. Errors without a path, or errors affecting the connection,
-records, paging information, IDs or times, fail the window. Malformed individual
-records are skipped with warnings, preserving the existing record-level behavior
-without blocking otherwise usable pages.
+GraphQL errors on optional connection fields or unrelated roots produce a
+warning while usable records continue. A field error scoped to one record skips
+only that record with one warning, including errors on its ID or time. Multiple
+field errors on the same record still produce one skip warning. Malformed
+individual records are also skipped with warnings.
+
+Unscoped and connection-level GraphQL errors fail the window. Paging errors
+remain strict for correct cursor queries. For legacy queries, paging metadata
+and errors on it are advisory and use the single pagination warning below.
 
 For queries that consume the cursor, a failed page, required-data GraphQL error,
 missing continuation cursor or repeated cursor

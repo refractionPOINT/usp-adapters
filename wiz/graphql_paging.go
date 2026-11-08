@@ -55,31 +55,38 @@ func (a *WizAdapter) validateCursorQuery() error {
 }
 
 // GraphQL error paths use response names and omit the outer "data" key.
-// Unscoped errors and errors on ancestors, records, paging, ID or time cannot
-// safely be treated as optional, even if some data was returned.
-func (a *WizAdapter) onlyOptionalGraphQLErrors(errs []interface{}) bool {
+// Record field failures drop only that record; legacy paging errors are advisory.
+// Unscoped, connection and correct-query paging failures still fail the window.
+type graphQLErrorDisposition struct {
+	skipRecords       map[int]bool
+	warnOptional      bool
+	legacyPagingError bool
+}
+
+func (a *WizAdapter) classifyGraphQLErrors(errs []interface{}, cursorQueryOK bool) (graphQLErrorDisposition, bool) {
+	out := graphQLErrorDisposition{skipRecords: make(map[int]bool)}
 	if len(a.conf.DataPath) < 2 || a.conf.DataPath[0] != "data" {
-		return false
+		return out, false
 	}
 	connection := a.conf.DataPath[1 : len(a.conf.DataPath)-1]
 	records := a.conf.DataPath[len(a.conf.DataPath)-1]
 	for _, raw := range errs {
 		e, ok := raw.(map[string]interface{})
 		if !ok {
-			return false
+			return out, false
 		}
 		path, ok := e["path"].([]interface{})
 		if !ok || len(path) == 0 {
-			return false
+			return out, false
 		}
 		unrelated := false
 		for i, name := range connection {
 			if i >= len(path) {
-				return false
+				return out, false
 			}
 			part, ok := path[i].(string)
 			if !ok {
-				return false
+				return out, false
 			}
 			if part != name {
 				unrelated = true
@@ -87,32 +94,43 @@ func (a *WizAdapter) onlyOptionalGraphQLErrors(errs []interface{}) bool {
 			}
 		}
 		if unrelated {
+			out.warnOptional = true
 			continue
 		}
 		rest := path[len(connection):]
 		if len(rest) == 0 {
-			return false
+			return out, false
 		}
 		field, ok := rest[0].(string)
 		if !ok {
-			return false
+			return out, false
 		}
 		if field == "pageInfo" {
-			return false
+			if cursorQueryOK {
+				return out, false
+			}
+			out.legacyPagingError = true
+			continue
 		}
 		if field != records {
+			out.warnOptional = true
 			continue
 		}
 		if len(rest) < 3 {
-			return false
+			return out, false
 		}
-		if _, ok := rest[1].(float64); !ok {
-			return false
+		index, ok := rest[1].(float64)
+		if !ok {
+			return out, false
 		}
-		field, ok = rest[2].(string)
-		if !ok || field == a.conf.IDField || field == a.conf.TimeField {
-			return false
+		i := int(index)
+		if i < 0 || float64(i) != index {
+			return out, false
 		}
+		if _, ok := rest[2].(string); !ok {
+			return out, false
+		}
+		out.skipRecords[i] = true
 	}
-	return true
+	return out, true
 }

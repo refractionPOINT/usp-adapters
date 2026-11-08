@@ -380,11 +380,14 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 		return nil, since, "", "", false, fmt.Errorf("error parsing response: %v", err)
 	}
 
+	var disposition graphQLErrorDisposition
 	if errs, ok := result["errors"].([]interface{}); ok && len(errs) != 0 {
-		if !a.onlyOptionalGraphQLErrors(errs) {
+		var valid bool
+		disposition, valid = a.classifyGraphQLErrors(errs, cursorQueryOK)
+		if !valid {
 			return nil, since, "", "", false, fmt.Errorf("GraphQL response contains errors affecting required data")
 		}
-		if a.conf.ClientOptions.OnWarning != nil {
+		if disposition.warnOptional && a.conf.ClientOptions.OnWarning != nil {
 			a.conf.ClientOptions.OnWarning("GraphQL response contains errors on optional fields; collecting valid records")
 		}
 	}
@@ -403,6 +406,7 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 
 			nextCursor := ""
 			raw, hasPaging := current["pageInfo"]
+			hasPaging = hasPaging || disposition.legacyPagingError
 			if hasPaging && cursorQueryOK {
 				pageInfo, ok := raw.(map[string]interface{})
 				if !ok {
@@ -420,7 +424,13 @@ func (a *WizAdapter) makeGraphQLPage(since string, lastEventId string, after str
 				}
 			}
 
-			for _, item := range items {
+			for index, item := range items {
+				if disposition.skipRecords[index] {
+					if a.conf.ClientOptions.OnWarning != nil {
+						a.conf.ClientOptions.OnWarning("skipping GraphQL record after field error")
+					}
+					continue
+				}
 				itemMap, ok := item.(map[string]interface{})
 				if !ok {
 					if a.conf.ClientOptions.OnWarning != nil {
