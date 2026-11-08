@@ -8,9 +8,9 @@ The adapter follows each returned cursor with the same time filter, including
 when an intermediate page contains no records.
 
 GraphQL errors on optional connection fields or unrelated roots produce a
-warning while usable records continue. A field error scoped to one record skips
-only that record with one warning, including errors on its ID or time. Multiple
-field errors on the same record still produce one skip warning. Malformed
+warning while usable records continue. Errors on optional record fields also
+keep the record with a warning. Only an error on the configured ID or time field
+skips that record, with one warning even when both fields have errors. Malformed
 individual records are also skipped with warnings.
 
 Unscoped and connection-level GraphQL errors fail the window. Paging errors

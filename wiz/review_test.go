@@ -18,7 +18,7 @@ func TestReviewPartialGraphQL(t *testing.T) {
 		name, path, data string
 		fail             bool
 	}{
-		{"optional-item", `["issues","nodes",0,"description"]`, `{"issues":{"nodes":[{"id":"bad","createdAt":"2026-01-02T00:00:00Z","description":null},{"id":"a","createdAt":"2026-01-02T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}`, false},
+		{"optional-item", `["issues","nodes",0,"description"]`, `{"issues":{"nodes":[{"id":"a","createdAt":"2026-01-02T00:00:00Z","description":null}],"pageInfo":{"hasNextPage":false}}}`, false},
 		{"optional-sibling", `["issues","totalCount"]`, `{"issues":{"nodes":[{"id":"a","createdAt":"2026-01-02T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}`, false},
 		{"other-root", `["other"]`, `{"issues":{"nodes":[{"id":"a","createdAt":"2026-01-02T00:00:00Z"}],"pageInfo":{"hasNextPage":false}}}`, false},
 		{"connection", `["issues"]`, `{"issues":null}`, true},

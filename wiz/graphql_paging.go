@@ -55,7 +55,8 @@ func (a *WizAdapter) validateCursorQuery() error {
 }
 
 // GraphQL error paths use response names and omit the outer "data" key.
-// Record field failures drop only that record; legacy paging errors are advisory.
+// ID/time field failures drop only that record; optional fields keep the record.
+// Legacy paging errors are advisory.
 // Unscoped, connection and correct-query paging failures still fail the window.
 type graphQLErrorDisposition struct {
 	skipRecords       map[int]bool
@@ -127,10 +128,15 @@ func (a *WizAdapter) classifyGraphQLErrors(errs []interface{}, cursorQueryOK boo
 		if i < 0 || float64(i) != index {
 			return out, false
 		}
-		if _, ok := rest[2].(string); !ok {
+		field, ok = rest[2].(string)
+		if !ok {
 			return out, false
 		}
-		out.skipRecords[i] = true
+		if field == a.conf.IDField || field == a.conf.TimeField {
+			out.skipRecords[i] = true
+		} else {
+			out.warnOptional = true
+		}
 	}
 	return out, true
 }
