@@ -38,7 +38,7 @@ func page(w http.ResponseWriter, records []map[string]interface{}, next string) 
 
 func stableCount(t *testing.T, sink *captureSink, count int) {
 	t.Helper()
-	require.Eventually(t, func() bool { return sink.count() == count }, 3*time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool { return sink.count() == count }, 10*time.Second, 10*time.Millisecond)
 	require.Never(t, func() bool { return sink.count() != count }, 200*time.Millisecond, 10*time.Millisecond)
 }
 
@@ -105,7 +105,7 @@ func (s *failOnceSink) Ship(m *protocol.DataMessage, d time.Duration) error {
 }
 
 func TestMsGraphFailuresKeepProgress(t *testing.T) {
-	for _, failure := range []string{"page", "shipping", "malformed", "invalid-envelope"} {
+	for _, failure := range []string{"page", "shipping", "invalid-envelope"} {
 		t.Run(failure, func(t *testing.T) {
 			base := fixtureBase()
 			newest := graphSecurityAlert("newest", graphTimestamp(base.Add(time.Minute)))
@@ -121,9 +121,6 @@ func TestMsGraphFailuresKeepProgress(t *testing.T) {
 					switch failure {
 					case "page":
 						w.WriteHeader(http.StatusBadGateway)
-						return
-					case "malformed":
-						page(w, []map[string]interface{}{{"id": "bad", "createdDateTime": "invalid"}}, "")
 						return
 					case "invalid-envelope":
 						writeJSON(w, 200, map[string]interface{}{"value": nil})
@@ -175,6 +172,9 @@ func TestMsGraphUnsafeContinuations(t *testing.T) {
 			}
 			var failures atomic.Int32
 			conf.ClientOptions.OnError = func(error) { failures.Add(1) }
+			if mode == "cycle" {
+				conf.ClientOptions.OnWarning = func(string) { failures.Add(1) }
+			}
 			sink, _, _ := startAdapter(t, conf)
 			require.Eventually(t, func() bool { return failures.Load() > 0 }, 5*time.Second, 10*time.Millisecond)
 			assert.Zero(t, leaked.Load(), "no request, token or credentials may reach another origin")

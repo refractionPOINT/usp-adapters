@@ -652,9 +652,7 @@ func TestMsGraphPagedSetFullyConsumed(t *testing.T) {
 }
 
 // TestMsGraphBadClientSecretShipsNothing pins the adapter's behavior on a
-// failed credential exchange: fetchToken is retried 3 times, an error is
-// surfaced, nothing ships, the Graph endpoint is never called -- and the
-// adapter keeps running (it does not stop on auth failure).
+// permanent credential rejection: one fatal error, no Graph calls, and stop.
 func TestMsGraphBadClientSecretShipsNothing(t *testing.T) {
 	mock := newMockMsGraph()
 	base := fixtureBase()
@@ -666,34 +664,32 @@ func TestMsGraphBadClientSecretShipsNothing(t *testing.T) {
 	conf.ClientSecret = "wrong-secret"
 	conf.ClientOptions.OnError = func(err error) {
 		t.Logf("ERR: %v", err)
-		if strings.Contains(err.Error(), "error fetching token after 3 attempts") {
-			tokenFailures.Add(1)
-		}
+		tokenFailures.Add(1)
 	}
 
 	sink, _, chStopped := startAdapter(t, conf)
 
-	// The retry path sleeps 1s + 2s inside the adapter before giving up.
+	// Permanent credentials are not retried.
 	require.Eventually(t, func() bool { return tokenFailures.Load() >= 1 },
 		15*time.Second, 50*time.Millisecond, "expected the token failure to be reported")
 
 	assert.Equal(t, 0, sink.count(), "nothing should ship when authentication fails")
 	tokenReqs, graphReqs, _ := mock.counts()
-	assert.GreaterOrEqual(t, tokenReqs, 3, "the token exchange should be retried 3 times")
+	assert.Equal(t, 1, tokenReqs, "permanent credential failures must not be retried")
 	assert.Equal(t, 0, graphReqs, "Graph must not be called without a token")
 
-	select {
-	case <-chStopped:
-		t.Fatal("the adapter is not expected to stop on an auth failure; it keeps polling")
-	default:
-	}
+	require.Eventually(t, func() bool {
+		select {
+		case <-chStopped:
+			return true
+		default:
+			return false
+		}
+	}, 10*time.Second, 10*time.Millisecond)
 }
 
-// TestMsGraphRejectedTokenKeepsPolling pins the adapter's behavior when Graph
-// itself rejects the Bearer token (e.g. missing API permissions): the error is
-// surfaced without retry, nothing ships, and the adapter keeps polling on its
-// interval rather than stopping.
-func TestMsGraphRejectedTokenKeepsPolling(t *testing.T) {
+// TestMsGraphRejectedTokenStops verifies one refresh followed by a fatal error.
+func TestMsGraphRejectedTokenStops(t *testing.T) {
 	mock := newMockMsGraph()
 	base := fixtureBase()
 	mock.addRecord(graphSecurityAlert("alert-a", graphTimestamp(base.Add(1*time.Minute))))
@@ -704,24 +700,24 @@ func TestMsGraphRejectedTokenKeepsPolling(t *testing.T) {
 	conf := testConfig(t, server)
 	conf.ClientOptions.OnError = func(err error) {
 		t.Logf("ERR: %v", err)
-		if strings.Contains(err.Error(), "verify permissions") {
-			graphErrors.Add(1)
-		}
+		graphErrors.Add(1)
 	}
 
 	sink, _, chStopped := startAdapter(t, conf)
 
-	// At least two poll cycles must report the error -- proof the adapter
-	// keeps polling instead of stopping or retrying a non-retryable status.
-	require.Eventually(t, func() bool { return graphErrors.Load() >= 2 },
-		5*time.Second, 20*time.Millisecond, "expected repeated Graph auth errors across polls")
+	require.Eventually(t, func() bool { return graphErrors.Load() == 1 }, 10*time.Second, 10*time.Millisecond)
 
 	assert.Equal(t, 0, sink.count(), "nothing should ship when Graph rejects the token")
-	select {
-	case <-chStopped:
-		t.Fatal("the adapter is not expected to stop on a Graph 401; it keeps polling")
-	default:
-	}
+	require.Eventually(t, func() bool {
+		select {
+		case <-chStopped:
+			return true
+		default:
+			return false
+		}
+	}, 10*time.Second, 10*time.Millisecond)
+	_, graphReqs, _ := mock.counts()
+	assert.Equal(t, 2, graphReqs, "exactly one token refresh before rejecting a persistent 401")
 }
 
 // TestMsGraphTransient503Retried verifies a 503 from Graph is retried within

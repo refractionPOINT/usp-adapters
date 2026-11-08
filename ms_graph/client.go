@@ -3,19 +3,22 @@ package usp_ms_graph
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -46,8 +49,9 @@ type MsGraphAdapter struct {
 	chStopped chan struct{}
 	wgSenders sync.WaitGroup
 
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx      context.Context
+	cancel   context.CancelFunc
+	notifier vendorerr.Notifier
 }
 
 type MsGraphConfig struct {
@@ -175,6 +179,7 @@ func (a *MsGraphAdapter) Close() error {
 	a.conf.ClientOptions.DebugLog("closing")
 	a.cancel()
 	a.wgSenders.Wait()
+	a.notifier.Close()
 	err1 := a.uspClient.Drain(1 * time.Minute)
 	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 	a.httpClient.CloseIdleConnections()
@@ -186,44 +191,101 @@ func (a *MsGraphAdapter) Close() error {
 	return err2
 }
 
-func (a *MsGraphAdapter) fetchToken() (string, error) {
+var errRetry = errors.New("retryable Graph failure")
+var errPermanent = errors.New("Graph authentication or configuration failure")
 
-	tokenURL := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
-	payload := url.Values{"client_id": {a.conf.ClientID}, "scope": {scope}, "grant_type": {"client_credentials"}, "client_secret": {a.conf.ClientSecret}}.Encode()
+const graphTimeLayout = "2006-01-02T15:04:05.0000000Z"
 
-	req, err := http.NewRequestWithContext(a.ctx, "POST", tokenURL, bytes.NewBufferString(payload))
-	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+// Carries scheduling and status without exposing unredacted response text.
+type graphHTTPError struct {
+	error
+	status  int
+	retryAt time.Time
+}
+
+func (e *graphHTTPError) Unwrap() error { return e.error }
+
+func retryAfter(value string, now time.Time) time.Duration {
+	if n, err := strconv.ParseInt(value, 10, 32); err == nil && n >= 0 {
+		return time.Duration(n) * time.Second
 	}
+	if t, err := http.ParseTime(value); err == nil && t.After(now) {
+		return t.Sub(now)
+	}
+	return 0
+}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+func (a *MsGraphAdapter) wait(delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-a.ctx.Done():
+		return a.ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
 
+// request handles both token and collection exchanges. Error status takes
+// precedence over body read failures; only bounded, redacted diagnostics escape.
+func (a *MsGraphAdapter) request(method, raw, payload, bearer string) ([]byte, error) {
+	secrets := []string{a.conf.ClientSecret, bearer}
+	req, err := http.NewRequestWithContext(a.ctx, method, raw, bytes.NewBufferString(payload))
+	if err != nil {
+		return nil, vendorerr.Kind(errPermanent, "building request: "+err.Error(), err, secrets...)
+	}
+	if req.URL.Host == "" || req.URL.User != nil || req.URL.Fragment != "" || (req.URL.Scheme != "http" && req.URL.Scheme != "https") {
+		return nil, vendorerr.Kind(errPermanent, "invalid request endpoint", nil)
+	}
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	} else {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
 	resp, err := a.httpClient.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+		kind := errRetry
+		var certificate *tls.CertificateVerificationError
+		if errors.As(err, &certificate) {
+			kind = errPermanent
+		}
+		return nil, vendorerr.Kind(kind, err.Error(), err, secrets...)
 	}
 	defer resp.Body.Close()
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
-	}
-
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("token endpoint returned HTTP %d", resp.StatusCode)
+		now := time.Now()
+		kind := errPermanent
+		if resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			kind = errRetry
+		}
+		body, cut := vendorerr.ReadBody(resp)
+		return nil, &graphHTTPError{error: vendorerr.Kind(kind, vendorerr.HTTPText(resp, body, cut, secrets...), nil, secrets...), status: resp.StatusCode, retryAt: now.Add(retryAfter(resp.Header.Get("Retry-After"), now))}
 	}
-	var result map[string]interface{}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return "", fmt.Errorf("no bearer token returned: %s", err)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, vendorerr.Kind(errRetry, "reading response: "+err.Error(), err, secrets...)
 	}
+	return body, nil
+}
 
-	accessToken, ok := result["access_token"].(string)
-	if !ok || accessToken == "" {
-		return "", errors.New("no bearer token returned")
+func (a *MsGraphAdapter) fetchToken() (string, error) {
+	tokenURL := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
+	payload := url.Values{"client_id": {a.conf.ClientID}, "scope": {scope}, "grant_type": {"client_credentials"}, "client_secret": {a.conf.ClientSecret}}.Encode()
+	body, err := a.request(http.MethodPost, tokenURL, payload, "")
+	if err != nil {
+		return "", vendorerr.Wrap("fetching token", err, a.conf.ClientSecret)
 	}
-
-	return accessToken, nil
-
+	var result struct {
+		Token string `json:"access_token"`
+	}
+	// Never include a successful token response in diagnostics.
+	if err := json.Unmarshal(body, &result); err != nil || result.Token == "" {
+		return "", vendorerr.Kind(errRetry, "token endpoint returned no usable access token", nil)
+	}
+	return result.Token, nil
 }
 
 // graphCursor is committed only after every page has been shipped. The inclusive
@@ -240,12 +302,13 @@ type graphRecordKey struct {
 
 func (a *MsGraphAdapter) fetchEvents(eventsURL string) {
 	defer a.wgSenders.Done()
-	cursor := graphCursor{since: time.Now().UTC(), ids: map[string]bool{}}
+	cursor := graphCursor{since: time.Now().UTC().Truncate(100 * time.Nanosecond), ids: map[string]bool{}}
 	// Retain successful shipments while retrying an incomplete scan, including
 	// older records that would otherwise be skipped by a premature watermark.
 	delivered := map[graphRecordKey]bool{}
+	delay := a.pollInterval
 	for {
-		timer := time.NewTimer(a.pollInterval)
+		timer := time.NewTimer(delay)
 		select {
 		case <-a.ctx.Done():
 			timer.Stop()
@@ -258,10 +321,20 @@ func (a *MsGraphAdapter) fetchEvents(eventsURL string) {
 			if a.ctx.Err() != nil || errors.Is(err, uspclient.ErrorClosed) {
 				return
 			}
-			a.conf.ClientOptions.OnError(err)
-			continue
+			if errors.Is(err, errRetry) {
+				a.conf.ClientOptions.OnWarning(err.Error())
+				delay = a.pollInterval
+				var httpErr *graphHTTPError
+				if errors.As(err, &httpErr) && time.Until(httpErr.retryAt) > delay {
+					delay = time.Until(httpErr.retryAt)
+				}
+				continue
+			}
+			a.notifier.Notify(err, a.conf.ClientOptions.OnError)
+			return
 		}
 		cursor = next
+		delay = a.pollInterval
 		delivered = map[graphRecordKey]bool{}
 	}
 }
@@ -276,9 +349,15 @@ func (a *MsGraphAdapter) timestampField() string {
 // poll streams pages, but keeps the committed watermark unchanged on any
 // request, decoding, validation or shipping failure. delivered is retry state.
 func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered map[graphRecordKey]bool) (graphCursor, error) {
+	malformed := 0
+	defer func() {
+		if malformed > 0 {
+			a.conf.ClientOptions.OnWarning(fmt.Sprintf("skipped %d malformed Graph record(s)", malformed))
+		}
+	}()
 	origin, err := url.Parse(eventsURL)
 	if err != nil {
-		return cursor, err
+		return cursor, errors.New("invalid Graph endpoint")
 	}
 	if origin.Host == "" || origin.User != nil || (origin.Scheme != "https" && origin.Scheme != "http") {
 		return cursor, errors.New("invalid Graph endpoint")
@@ -287,7 +366,7 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 	if err != nil {
 		return cursor, errors.New("invalid Graph query")
 	}
-	filter := a.timestampField() + " ge " + cursor.since.UTC().Format(time.RFC3339Nano)
+	filter := a.timestampField() + " ge " + cursor.since.UTC().Truncate(100*time.Nanosecond).Format(graphTimeLayout)
 	if existing := query.Get("$filter"); existing != "" {
 		filter = "(" + existing + ") and (" + filter + ")"
 	}
@@ -306,7 +385,7 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 			return cursor, a.ctx.Err()
 		}
 		if visited[current.String()] {
-			return cursor, errors.New("Graph continuation cycle")
+			return cursor, vendorerr.Kind(errRetry, "Graph continuation cycle", nil)
 		}
 		visited[current.String()] = true
 		body, err := a.requestPage(current.String(), &token)
@@ -318,21 +397,27 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 			Next  string          `json:"@odata.nextLink"`
 		}
 		if err := json.Unmarshal(body, &page); err != nil {
-			return cursor, errors.New("invalid Graph page JSON")
+			return cursor, vendorerr.Kind(errRetry, "invalid Graph page JSON", nil)
 		}
-		var records []map[string]interface{}
+		var records []json.RawMessage
 		if len(page.Value) == 0 || string(page.Value) == "null" {
-			return cursor, errors.New("missing Graph value array")
+			return cursor, vendorerr.Kind(errRetry, "missing Graph value array", nil)
 		}
 		if err := json.Unmarshal(page.Value, &records); err != nil {
-			return cursor, errors.New("invalid Graph value array")
+			return cursor, vendorerr.Kind(errRetry, "invalid Graph value array", nil)
 		}
-		for _, record := range records {
+		for _, raw := range records {
+			var record map[string]interface{}
+			if err := json.Unmarshal(raw, &record); err != nil || record == nil {
+				malformed++
+				continue
+			}
 			id, _ := record["id"].(string)
 			stamp, _ := record[a.timestampField()].(string)
 			instant, err := time.Parse(time.RFC3339Nano, stamp)
-			if err != nil || id == "" {
-				return cursor, errors.New("Graph record requires an ID and valid timestamp")
+			if err != nil || strings.TrimSpace(id) == "" {
+				malformed++
+				continue
 			}
 			instant = instant.UTC()
 			if instant.Before(cursor.since) {
@@ -350,7 +435,7 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 					err = a.uspClient.Ship(msg, time.Hour)
 				}
 				if err != nil {
-					return cursor, fmt.Errorf("Ship(): %w", err)
+					return cursor, vendorerr.Kind(errRetry, "shipping record: "+err.Error(), err, a.conf.ClientSecret, token)
 				}
 				delivered[key] = true
 			}
@@ -367,7 +452,7 @@ func (a *MsGraphAdapter) poll(eventsURL string, cursor graphCursor, delivered ma
 		}
 		link, err := url.Parse(page.Next)
 		if err != nil {
-			return cursor, errors.New("invalid Graph continuation")
+			return cursor, vendorerr.Kind(errRetry, "invalid Graph continuation", nil)
 		}
 		link = current.ResolveReference(link)
 		if !strings.EqualFold(link.Scheme, origin.Scheme) || !strings.EqualFold(link.Host, origin.Host) || link.User != nil || link.Fragment != "" {
@@ -385,50 +470,34 @@ func (a *MsGraphAdapter) requestPage(pageURL string, token *string) ([]byte, err
 		if *token == "" {
 			*token, err = a.fetchToken()
 		}
-		if err != nil {
-			if attempt == 3 {
-				return nil, fmt.Errorf("error fetching token after 3 attempts: %w", err)
-			}
-		} else {
-			req, err := http.NewRequestWithContext(a.ctx, "GET", pageURL, nil)
-			if err != nil {
-				return nil, err
-			}
-			req.Header.Set("Authorization", "Bearer "+*token)
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := a.httpClient.Do(req)
-			if err != nil {
-				return nil, errors.New("Graph request failed")
-			}
-			body, readErr := ioutil.ReadAll(resp.Body)
-			resp.Body.Close()
-			if readErr != nil {
-				return nil, errors.New("error reading Graph response")
-			}
-			if resp.StatusCode == http.StatusOK {
+		if err == nil {
+			var body []byte
+			body, err = a.request(http.MethodGet, pageURL, "", *token)
+			if err == nil {
 				return body, nil
 			}
-			// A long scan can outlive its token. Refresh at most once per
-			// page and retry the exact URL, without restarting pagination or
-			// spending the transient-error retry budget on the refresh.
-			if resp.StatusCode == http.StatusUnauthorized && !refreshed {
+			var httpErr *graphHTTPError
+			if errors.As(err, &httpErr) && httpErr.status == http.StatusUnauthorized && !refreshed {
 				refreshed = true
 				*token = ""
 				attempt--
 				continue
 			}
-			if (resp.StatusCode != http.StatusServiceUnavailable && resp.StatusCode != http.StatusGatewayTimeout) || attempt == 3 {
-				return nil, fmt.Errorf("Microsoft API returned HTTP %d; verify permissions and Microsoft API status", resp.StatusCode)
-			}
 		}
-		// Cancellable backoff also bounds shutdown during authentication failures.
-		timer := time.NewTimer(time.Duration(attempt) * time.Second)
-		select {
-		case <-a.ctx.Done():
-			timer.Stop()
+		if a.ctx.Err() != nil {
 			return nil, a.ctx.Err()
-		case <-timer.C:
+		}
+		if !errors.Is(err, errRetry) || attempt == 3 {
+			return nil, err
+		}
+		delay := time.Duration(attempt) * time.Second
+		var httpErr *graphHTTPError
+		if errors.As(err, &httpErr) && time.Until(httpErr.retryAt) > delay {
+			delay = time.Until(httpErr.retryAt)
+		}
+		if err := a.wait(delay); err != nil {
+			return nil, err
 		}
 	}
-	return nil, errors.New("Graph retries exhausted")
+	return nil, vendorerr.Kind(errRetry, "Graph retries exhausted", nil)
 }
