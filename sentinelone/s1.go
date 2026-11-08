@@ -393,7 +393,6 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 				if eventCreatedAt == "" {
 					a.conf.ClientOptions.OnError(fmt.Errorf("createdAt not found in event: %v", event))
 					now = time.Now()
-					eventCreatedAt = now.Format(s1TimeFormat)
 					ts = uint64(now.UnixMilli())
 				}
 
@@ -403,6 +402,10 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 					TimestampMs: ts,
 				}) {
 					return
+				}
+				// A local timestamp used for shipping cannot advance source progress.
+				if eventCreatedAt == "" {
+					continue
 				}
 				candidate, _ := time.Parse(s1TimeFormat, eventCreatedAt)
 				if previous, err := time.Parse(s1TimeFormat, latestCreatedAt); err != nil || candidate.After(previous) {

@@ -81,3 +81,35 @@ func TestPagingContinuationSurvivesExhaustedRetries(t *testing.T) {
 	require.False(t, changed, "failed continuation must retain the original query bounds")
 	require.GreaterOrEqual(t, continuationCalls, 3)
 }
+
+func TestPagingMalformedTimeDoesNotAdvanceBoundary(t *testing.T) {
+	const stamp = "2026-01-01T00:00:01Z"
+	var mu sync.Mutex
+	var nextFloor string
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls == 1 {
+			json.NewEncoder(w).Encode(map[string]interface{}{"data": []map[string]interface{}{{"id": "valid", "createdAt": stamp}, {"id": "bad-time"}}})
+			return
+		}
+		nextFloor = r.URL.Query().Get("createdAt__gt")
+		json.NewEncoder(w).Encode(map[string]interface{}{"data": []interface{}{}})
+	}))
+	defer server.Close()
+	sink := &memorySink{}
+	a, _, err := newSentinelOneAdapter(context.Background(), SentinelOneConfig{
+		Domain: server.URL, APIKey: "test-only", URLs: "/web/api/v2.1/activities", StartTime: "2026-01-01T00:00:00Z", TimeBetweenRequests: time.Millisecond,
+		ClientOptions: uspclient.ClientOptions{TestSinkMode: true, OnError: func(error) {}, OnWarning: func(string) {}, DebugLog: func(string) {}},
+	}, sink)
+	require.NoError(t, err)
+	defer a.Close()
+	require.Eventually(t, func() bool { mu.Lock(); defer mu.Unlock(); return calls >= 2 }, 5*time.Second, time.Millisecond)
+	a.doStop.Set()
+	a.wgSenders.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, stamp, nextFloor, "local fallback clock must not advance the source window")
+}

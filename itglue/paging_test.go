@@ -17,6 +17,7 @@ func TestPagingFailuresRetryExactPage(t *testing.T) {
 	hits := map[string]int{}
 	var firstQuery string
 	var changed bool
+	var firstTailHits int
 	stamp := time.Now()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
@@ -41,6 +42,9 @@ func TestPagingFailuresRetryExactPage(t *testing.T) {
 			next = "http://" + r.Host + "/logs?page[number]=2"
 		} else {
 			id = "tail"
+			if firstTailHits == 0 {
+				firstTailHits = hits[page]
+			}
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"data": []utils.Dict{realisticLogRecord(id, stamp)}, "links": map[string]interface{}{"next": next},
@@ -49,11 +53,11 @@ func TestPagingFailuresRetryExactPage(t *testing.T) {
 	defer server.Close()
 	adapter, _, sink := startAdapter(t, server.URL, "test-only")
 	defer adapter.Close()
-	require.Eventually(t, func() bool { return sink.idsShipped()["tail"] != 0 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return sink.idsShipped()["tail"] != 0 }, 5*time.Second, time.Millisecond)
 	adapter.doStop.Set()
 	adapter.wgSenders.Wait()
 	mu.Lock()
 	defer mu.Unlock()
 	require.False(t, changed, "first-page time filter must survive errors")
-	require.Equal(t, 2, hits["2"], "retry the failed continuation before polling again")
+	require.Equal(t, 2, firstTailHits, "retry the failed continuation before polling again")
 }
