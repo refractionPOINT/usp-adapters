@@ -153,12 +153,19 @@ func (a *ITGlueAdapter) fetchEvents(url string) {
 	defer a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching of %s events exiting", url))
 
 	lastCursor := ""
-	for !a.doStop.WaitFor(a.pollInterval) {
+	for !a.doStop.IsSet() {
+		// Drain continuations immediately; only completed walks wait to poll again.
+		if lastCursor == "" && a.doStop.WaitFor(a.pollInterval) {
+			return
+		}
 		// The makeOneRequest function handles error
 		// handling and fatal error handling.
 		items, newCursor := a.makeOneRequest(url, lastCursor)
-		lastCursor = newCursor
 		if items == nil {
+			lastCursor = newCursor
+			if a.doStop.WaitFor(a.pollInterval) {
+				return
+			}
 			continue
 		}
 
@@ -182,6 +189,7 @@ func (a *ITGlueAdapter) fetchEvents(url string) {
 				return
 			}
 		}
+		lastCursor = newCursor
 	}
 }
 
@@ -212,6 +220,9 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 		a.doStop.Set()
 		return nil, ""
 	}
+	// Keep the exact first-page URL too, so a failed request cannot slide
+	// the rolling time filter forward on retry.
+	lastCursor = req.URL.String()
 	req.Header.Set("Content-Type", "application/vnd.api+json")
 	req.Header.Set("x-api-key", a.conf.Token)
 
@@ -246,7 +257,7 @@ func (a *ITGlueAdapter) makeOneRequest(url string, lastCursor string) ([]utils.D
 
 	// Report if a cursor was returned
 	// as well as the items.
-	lastCursor = respData.FindOneString("next")
+	lastCursor = respData.FindOneString("links/next")
 	items, _ := respData.GetListOfDict("data")
 	//a.conf.ClientOptions.DebugLog(fmt.Sprintf("response data: %s", respData))
 

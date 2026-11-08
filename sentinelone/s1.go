@@ -356,6 +356,7 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 		isFirstRun = false
 		nextPage := ""
 		nFetched := 0
+		latestCreatedAt := lastCreatedAt
 		for !a.doStop.IsSet() {
 			if nextPage != "" {
 				qValues.Set("cursor", nextPage)
@@ -366,9 +367,12 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 				return
 			}
 			if resp == nil {
-				// Retries exhausted; break out of the pagination loop to try
-				// again after TimeBetweenRequests.
-				break
+				// Retain the cursor and original time bounds until this
+				// continuation succeeds, even after a retry budget is spent.
+				if a.doStop.WaitFor(a.conf.TimeBetweenRequests) {
+					return
+				}
+				continue
 			}
 			nextPage = resp.NextPageCursor()
 			for _, event := range resp.Data {
@@ -377,19 +381,19 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 
 				// The creeatedAt field varies per data source, but it's always either at the root
 				// or one level deep. So look for both.
-				lastCreatedAt, _ = getTimestampElement(event, "createdAt")
+				eventCreatedAt, _ := getTimestampElement(event, "createdAt")
 				var ts uint64
-				if lastCreatedAt != "" {
-					if it, err := time.Parse(s1TimeFormat, lastCreatedAt); err == nil {
+				if eventCreatedAt != "" {
+					if it, err := time.Parse(s1TimeFormat, eventCreatedAt); err == nil {
 						ts = uint64(it.UnixMilli())
 					} else {
-						lastCreatedAt = ""
+						eventCreatedAt = ""
 					}
 				}
-				if lastCreatedAt == "" {
+				if eventCreatedAt == "" {
 					a.conf.ClientOptions.OnError(fmt.Errorf("createdAt not found in event: %v", event))
 					now = time.Now()
-					lastCreatedAt = now.Format(s1TimeFormat)
+					eventCreatedAt = now.Format(s1TimeFormat)
 					ts = uint64(now.UnixMilli())
 				}
 
@@ -398,10 +402,15 @@ func (a *SentinelOneAdapter) fetchEvents(endpoint string) {
 					JsonPayload: event,
 					TimestampMs: ts,
 				}) {
-					break
+					return
+				}
+				candidate, _ := time.Parse(s1TimeFormat, eventCreatedAt)
+				if previous, err := time.Parse(s1TimeFormat, latestCreatedAt); err != nil || candidate.After(previous) {
+					latestCreatedAt = eventCreatedAt
 				}
 			}
 			if nextPage == "" {
+				lastCreatedAt = latestCreatedAt
 				break
 			}
 		}
@@ -447,7 +456,7 @@ func (a *SentinelOneAdapter) ship(msg *protocol.DataMessage) bool {
 // backoff. The bool result is false when the calling goroutine should exit:
 // the adapter is stopping, or a permanent error (auth failure, bad request)
 // stopped it. A (nil, true) result means the retries were exhausted and the
-// caller should abandon the current poll and try again next interval.
+// caller should retain its query and retry the same page next interval.
 func (a *SentinelOneAdapter) getWithRetry(endpoint string, qValues url.Values) (*SentinelOnePagedData, bool) {
 	a.applyScope(qValues)
 	a.conf.ClientOptions.DebugLog(fmt.Sprintf("fetching from %s?%s", endpoint, qValues.Encode()))
