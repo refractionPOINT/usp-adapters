@@ -35,6 +35,7 @@ type uspSink interface {
 }
 
 type OktaConfig struct {
+	Lookback *utils.LookbackConfig `json:"-" yaml:"-"`
 	// ClientOptions.OnError is delivered asynchronously from a single goroutine,
 	// after the failure was observed and possibly out of step with the adapter's
 	// other activity. It may call Close; reports are dropped if the callback
@@ -47,6 +48,9 @@ type OktaConfig struct {
 }
 
 func (c *OktaConfig) Validate() error {
+	if err := c.Lookback.Validate(); err != nil {
+		return err
+	}
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
@@ -94,6 +98,9 @@ func NewOktaAdapter(ctx context.Context, conf OktaConfig) (*OktaAdapter, chan st
 }
 
 func newOktaAdapter(ctx context.Context, conf OktaConfig, sink uspSink) (*OktaAdapter, chan struct{}, error) {
+	if err := conf.Lookback.Validate(); err != nil {
+		return nil, nil, err
+	}
 	endpoint, err := oktaEndpoint(conf.URL)
 	if err != nil {
 		return nil, nil, err
@@ -194,8 +201,8 @@ func (a *OktaAdapter) issue(code string) {
 func (a *OktaAdapter) initialPosition() oktaPosition {
 	u := *a.endpoint
 	q := u.Query()
-	// Fix the ordinary first-worker baseline once; never rewind an expired cursor.
-	q.Set("since", time.Now().UTC().Format(time.RFC3339))
+	// Capture startup once; hosted mode deliberately includes its recent window.
+	q.Set("since", a.conf.Lookback.Start(time.Now()).UTC().Format(time.RFC3339))
 	q.Set("sortOrder", "ASCENDING")
 	u.RawQuery = q.Encode()
 	return oktaPosition{Next: u.String()}
@@ -242,9 +249,15 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				return
 			}
 			if errors.Is(err, errInvalidContinuation) {
-				// Keep retrying the exact opaque cursor. Rewinding could duplicate
-				// earlier pages; replacing it with now could skip source records.
+				// Ordinary mode retains the cursor. Hosted mode can safely re-read
+				// its fixed recent window, but cannot promise recovery of older gaps.
 				a.issue("continuation_stalled")
+				if a.conf.Lookback != nil {
+					next = a.initialPosition().Next
+					if a.conf.ClientOptions.OnWarning != nil {
+						a.conf.ClientOptions.OnWarning("okta continuation expired; replaying configured lookback; older gaps may not be recovered")
+					}
+				}
 				a.vendorDetail(err)
 				a.retryFailure(&episode, err)
 			} else if errors.Is(err, errVendorCredential) {
@@ -286,7 +299,38 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("okta collection: skipped %d event(s) with missing or invalid uuid", invalid))
 		}
 		g.page++
+		if a.conf.Lookback != nil {
+			events := make([]utils.ReplayEvent, 0, len(page.items))
+			for _, item := range page.items {
+				id, _ := item["uuid"].(string)
+				if id == "" {
+					continue
+				}
+				stamp, _ := item["published"].(string)
+				sourceTime, _ := time.Parse(time.RFC3339Nano, stamp)
+				events = append(events, utils.ReplayEvent{Key: a.conf.Lookback.Key(sourceTime, "okta", utils.LookbackSource(a.conf.URL), "system-log", id), Message: &protocol.DataMessage{JsonPayload: item, TimestampMs: uint64(time.Now().UnixMilli())}})
+			}
+			observer, ok := a.uspClient.(utils.ReceiptObserver)
+			if !ok {
+				a.notify(uspclient.ErrorReceiptUnavailable)
+				return
+			}
+			if err := utils.DeliverLookback(ctx, a.conf.Lookback, observer, events, func(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+				_, receipt, err := a.tracker.ShipWithReceipt(m, d)
+				return receipt, err
+			}, a.conf.ClientOptions.OnWarning); err != nil {
+				if errors.Is(err, acktrack.ErrSequence) || errors.Is(err, acktrack.ErrDependency) || errors.Is(err, acktrack.ErrLimit) {
+					a.issue("admission_tracking_failed")
+				} else if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
+					a.notify(err)
+				}
+				return
+			}
+		}
 		for _, item := range page.items {
+			if a.conf.Lookback != nil {
+				break
+			}
 			if ctx.Err() != nil {
 				return
 			}

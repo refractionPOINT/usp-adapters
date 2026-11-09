@@ -127,6 +127,7 @@ type EntraIDAdapter struct {
 }
 
 type EntraIDConfig struct {
+	Lookback *utils.LookbackConfig `json:"-" yaml:"-"`
 	// ClientOptions.OnError is delivered asynchronously from a single goroutine,
 	// after the failure was observed and possibly out of step with the adapter's
 	// other activity. It may call Close; reports are dropped if the callback
@@ -252,6 +253,9 @@ func (c EntraIDConfig) streams() ([]entraStream, error) {
 }
 
 func (c *EntraIDConfig) Validate() error {
+	if err := c.Lookback.Validate(); err != nil {
+		return err
+	}
 	if err := c.ClientOptions.Validate(); err != nil {
 		return fmt.Errorf("client_options: %v", err)
 	}
@@ -281,8 +285,11 @@ func newEntraIDAdapter(ctx context.Context, conf EntraIDConfig, sink uspSink) (*
 	return newEntraIDAdapterWithRuntime(ctx, conf, sink, defaultRuntime())
 }
 
-// Private runtime injection leaves the public configuration layout unchanged.
+// Private runtime injection supplies deterministic collector clocks in tests.
 func newEntraIDAdapterWithRuntime(ctx context.Context, conf EntraIDConfig, sink uspSink, rt entraRuntime) (*EntraIDAdapter, chan struct{}, error) {
+	if err := conf.Lookback.Validate(); err != nil {
+		return nil, nil, err
+	}
 	streams, err := conf.streams()
 	if err != nil {
 		return nil, nil, err

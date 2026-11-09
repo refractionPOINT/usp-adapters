@@ -148,6 +148,7 @@ func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer s
 	if err := json.Unmarshal(data, out); err != nil {
 		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error()+"; received "+received(), err, secrets...)
 	}
+
 	for _, check := range validate {
 		if err := check(); err != nil {
 			// A 200 without an access_token is classed errPage like every other
@@ -460,6 +461,21 @@ func (a *EntraIDAdapter) scanLane(ctx context.Context, g *entraGeneration, strea
 			if ctx.Err() != nil {
 				return start, ctx.Err()
 			}
+			if a.conf.Lookback != nil {
+				endOffset := min(work.offset+utils.LookbackChunkSize, len(page.Items))
+				if err := a.shipLookback(ctx, g, stream, page.Items[work.offset:endOffset], start, work.end); err != nil {
+					return start, err
+				}
+				for _, item := range page.Items[work.offset:endOffset] {
+					id, _ := item["id"].(string)
+					work.ids[eventDigest(a.sourceFingerprint(), stream.name, id)] = struct{}{}
+				}
+				work.offset = endOffset
+				if len(work.ids) > 128000 {
+					return start, errIncomplete
+				}
+				continue
+			}
 			item := page.Items[work.offset]
 			if err := a.shipItem(ctx, g, stream, item, start, work.end); err != nil {
 				return start, err
@@ -520,6 +536,9 @@ func (a *EntraIDAdapter) collectionFailure(ctx context.Context, err error) bool 
 		return false
 	}
 	switch {
+	case errors.Is(err, uspclient.ErrorReceiptUnavailable):
+		a.notify(err)
+		return false
 	case errors.Is(err, errYield), errors.Is(err, errRetry), errors.Is(err, errVendor):
 		return true
 	case errors.Is(err, errPressure):
@@ -532,4 +551,48 @@ func (a *EntraIDAdapter) collectionFailure(ctx context.Context, err error) bool 
 		a.issue("collection_stalled")
 	}
 	return true
+}
+
+func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, stream entraStream, items []map[string]interface{}, start, end int64) error {
+	events := make([]utils.ReplayEvent, 0, len(items))
+	entries := make(map[[16]byte]liveID)
+	for _, item := range items {
+		stamp, _ := item[stream.tsField].(string)
+		sourceTime, err := time.Parse(time.RFC3339Nano, stamp)
+		id, _ := item["id"].(string)
+		if err != nil || id == "" {
+			return errPage
+		}
+		if sourceTime.UnixNano() < start || sourceTime.UnixNano() >= end {
+			continue
+		}
+
+		key := a.conf.Lookback.Key(sourceTime, "entraid", utils.LookbackSource(a.conf.graphEndpoint()), a.conf.TenantID, stream.path, stream.tsField, id)
+		digest := eventDigest(a.sourceFingerprint(), stream.name, id)
+		if _, confirmed := g.live[digest]; confirmed {
+			continue
+		}
+		entries[digest] = liveID{expiry: sourceTime.UnixNano() + int64(historyHorizon), stream: streamCode(stream.name)}
+		events = append(events, utils.ReplayEvent{Key: key, Message: &protocol.DataMessage{JsonPayload: item, TimestampMs: uint64(time.Now().UnixMilli())}})
+	}
+	if len(g.live)+len(entries) > liveIDLimit {
+		a.reclaimExpiredHistory(g)
+	}
+	if start < g.position[stream.name].Coverage || len(g.live)+len(entries) > liveIDLimit {
+		return errPressure
+	}
+	observer, ok := a.uspClient.(utils.ReceiptObserver)
+	if !ok {
+		return uspclient.ErrorReceiptUnavailable
+	}
+	err := utils.DeliverLookback(ctx, a.conf.Lookback, observer, events, func(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+		_, receipt, err := a.tracker.ShipWithReceipt(m, d)
+		return receipt, err
+	}, a.conf.ClientOptions.OnWarning)
+	if err == nil {
+		for digest, entry := range entries {
+			g.live[digest] = entry
+		}
+	}
+	return err
 }

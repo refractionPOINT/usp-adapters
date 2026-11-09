@@ -88,9 +88,15 @@ func (a *EntraIDAdapter) initialPosition() entraPosition {
 		start = a.runtime.now().UTC().UnixNano()
 	}
 	start -= start % int64(graphTimeQuantum)
+	coverage := a.conf.Lookback.Start(time.Unix(0, start)).UnixNano()
+	coverage -= coverage % int64(graphTimeQuantum)
 	p := make(entraPosition)
 	for _, s := range a.streams {
-		p[s.name] = streamPosition{Boundary: start, WindowEnd: start + int64(a.runtime.window), Coverage: start}
+		position := streamPosition{Boundary: start, WindowEnd: start + int64(a.runtime.window), Coverage: coverage}
+		if a.conf.Lookback != nil {
+			position.Replay, position.ReplayEnd = coverage, start
+		}
+		p[s.name] = position
 	}
 	return p
 }

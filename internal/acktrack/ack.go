@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	uspclient "github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 )
 
@@ -105,6 +106,27 @@ const ackSequenceHalf = uint64(1) << 63
 // within one unambiguous half-range; checking pairs alone would not prove that.
 // Reaching the bound stops observation; callers cannot rebase retained dependencies.
 func (t *ACKTracker) Ship(message *protocol.DataMessage, timeout time.Duration) (ACKDependency, error) {
+	return t.ship(message, timeout, t.client.Ship)
+}
+
+// ShipWithReceipt uses the same serialized sequence validation as ordinary Ship.
+func (t *ACKTracker) ShipWithReceipt(message *protocol.DataMessage, timeout time.Duration) (ACKDependency, uspclient.AdmissionReceipt, error) {
+	var receipt uspclient.AdmissionReceipt
+	client, ok := t.client.(interface {
+		ShipWithReceipt(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error)
+	})
+	if !ok {
+		return ACKDependency{}, receipt, uspclient.ErrorReceiptUnavailable
+	}
+	dep, err := t.ship(message, timeout, func(m *protocol.DataMessage, d time.Duration) error {
+		var err error
+		receipt, err = client.ShipWithReceipt(m, d)
+		return err
+	})
+	return dep, receipt, err
+}
+
+func (t *ACKTracker) ship(message *protocol.DataMessage, timeout time.Duration, admit func(*protocol.DataMessage, time.Duration) error) (ACKDependency, error) {
 	if message == nil {
 		return ACKDependency{}, ErrDependency
 	}
@@ -117,7 +139,7 @@ func (t *ACKTracker) Ship(message *protocol.DataMessage, timeout time.Duration) 
 	}
 	t.inFlight = true
 	t.mu.Unlock()
-	if err := t.client.Ship(message, timeout); err != nil {
+	if err := admit(message, timeout); err != nil {
 		t.mu.Lock()
 		t.inFlight = false
 		t.mu.Unlock()
