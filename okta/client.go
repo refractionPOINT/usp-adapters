@@ -14,6 +14,7 @@ import (
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/internal/vendorerr"
+	"github.com/refractionPOINT/usp-adapters/resume"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -35,6 +36,13 @@ type uspSink interface {
 }
 
 type OktaConfig struct {
+	// Optional embedding hooks; never serialized as customer configuration.
+	ResumeState     resume.State   `json:"-" yaml:"-"`
+	ResumeDeduper   resume.Deduper `json:"-" yaml:"-"`
+	ResumeNamespace string         `json:"-" yaml:"-"`
+	ResumeStats     resume.Stats   `json:"-" yaml:"-"`
+	prepared        *preparedResume
+
 	// ClientOptions.OnError is delivered asynchronously from a single goroutine,
 	// after the failure was observed and possibly out of step with the adapter's
 	// other activity. It may call Close; reports are dropped if the callback
@@ -84,6 +92,7 @@ type OktaAdapter struct {
 	failureLimit time.Duration
 	// Only the worker writes generation. Close reads it after joining worker.
 	generation *oktaGeneration
+	confirmMu  sync.Mutex
 	closeOnce  sync.Once
 	notifier   vendorerr.Notifier // delivers OnError; see notify
 	closeErr   error
@@ -94,6 +103,9 @@ func NewOktaAdapter(ctx context.Context, conf OktaConfig) (*OktaAdapter, chan st
 }
 
 func newOktaAdapter(ctx context.Context, conf OktaConfig, sink uspSink) (*OktaAdapter, chan struct{}, error) {
+	if conf.ResumeState != nil && (conf.prepared == nil || !conf.prepared.ready) {
+		return nil, nil, errors.New("resume state must be prepared before construction")
+	}
 	endpoint, err := oktaEndpoint(conf.URL)
 	if err != nil {
 		return nil, nil, err
@@ -106,7 +118,7 @@ func newOktaAdapter(ctx context.Context, conf OktaConfig, sink uspSink) (*OktaAd
 		sink = client
 	}
 	workerCtx, cancel := context.WithCancel(ctx)
-	tracker, err := acktrack.NewACKTracker(sink, 1, 16)
+	tracker, err := acktrack.NewACKTracker(sink, 1, 16+maxResumeBytes)
 	if err != nil {
 		cancel()
 		_, _ = sink.Close()
@@ -140,6 +152,12 @@ func (a *OktaAdapter) Close() error {
 		}
 		a.wgSenders.Wait()
 		err1 := a.uspClient.Drain(time.Minute)
+		if a.generation != nil && a.conf.ResumeState != nil {
+			_ = a.confirm(a.generation)
+			finalCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			a.flushDedup(finalCtx, a.generation)
+			cancel()
+		}
 		_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 		a.httpClient.CloseIdleConnections()
 		a.closeErr = errors.Join(err1, err2)
@@ -192,13 +210,16 @@ func (a *OktaAdapter) issue(code string) {
 }
 
 func (a *OktaAdapter) initialPosition() oktaPosition {
+	if a.conf.ResumeState != nil {
+		return a.conf.prepared.position
+	}
 	u := *a.endpoint
 	q := u.Query()
 	// Fix the ordinary first-worker baseline once; never rewind an expired cursor.
 	q.Set("since", time.Now().UTC().Format(time.RFC3339))
 	q.Set("sortOrder", "ASCENDING")
 	u.RawQuery = q.Encode()
-	return oktaPosition{Next: u.String()}
+	return oktaPosition{Next: u.String(), Since: time.Now().UTC()}
 }
 
 func (a *OktaAdapter) run() {
@@ -228,7 +249,9 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 	next := g.position.Next
 	backoff := time.Second
 	var episode failureEpisode
+	replay := a.conf.ResumeState != nil && a.conf.prepared.replay
 	for ctx.Err() == nil {
+		a.flushDedup(ctx, g)
 		if !g.makeRoom(time.Now()) {
 			a.issue("live_history_pressure")
 			if !acktrack.Wait(ctx, a.pollInterval) {
@@ -242,6 +265,27 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				return
 			}
 			if errors.Is(err, errInvalidContinuation) {
+				// Optional saved progress has a safe inclusive timestamp fallback.
+				if a.conf.ResumeState != nil {
+					since := g.position.Since
+					if since.IsZero() {
+						since = time.Now().UTC().Add(-overlapPeriod)
+					}
+					cutoff := time.Now().UTC().Add(-recoveryHorizon)
+					if since.Before(cutoff) {
+						a.conf.stat("skipped", uint64(cutoff.Sub(since)/time.Minute))
+						since = cutoff
+					}
+					u := *a.endpoint
+					u.RawQuery = baselineQuery(since)
+					next = u.String()
+					g.position.Since = since
+					a.conf.stat("unknown", 1)
+					if !acktrack.Wait(ctx, max(a.pollInterval, page.delay)) {
+						return
+					}
+					continue
+				}
 				// Keep retrying the exact opaque cursor. Rewinding could duplicate
 				// earlier pages; replacing it with now could skip source records.
 				a.issue("continuation_stalled")
@@ -285,6 +329,14 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 		if invalid > 0 && a.conf.ClientOptions.OnWarning != nil {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("okta collection: skipped %d event(s) with missing or invalid uuid", invalid))
 		}
+		shared := a.sharedDuplicates(ctx, page.items)
+		if replay {
+			valid := len(page.items) - invalid
+			a.conf.stat("replayed", uint64(valid))
+			if len(page.items) == 0 {
+				replay = false
+			}
+		}
 		g.page++
 		for _, item := range page.items {
 			if ctx.Err() != nil {
@@ -296,6 +348,10 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 			digest := eventDigest(id)
 			entry, exists := g.live[digest]
+			if !exists && shared[digest] {
+				a.conf.stat("deduped", 1)
+				continue
+			}
 			if !exists {
 				// A page may straddle the live bound. Retain its exact offset
 				// while completed ACKed pages yield; never drop a current/pending ID.
@@ -340,17 +396,25 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 		}
 		g.position.Next = page.next
-		var candidateErr error
+		marker, candidateErr := a.resumeCandidate(g)
+		if candidateErr != nil {
+			a.issue("candidate_rejected")
+			return
+		}
 		if g.hasDependency {
-			candidateErr = a.tracker.Candidate("logs", candidateBytes(g.id, g.page), g.dependency)
+			candidateErr = a.tracker.Candidate("logs", marker, g.dependency)
 		} else {
-			candidateErr = a.tracker.Candidate("logs", candidateBytes(g.id, g.page))
+			candidateErr = a.tracker.Candidate("logs", marker)
 		}
 		if candidateErr != nil {
 			a.issue("candidate_rejected")
 			return
 		}
 
+		if a.conf.ResumeState != nil {
+			_ = a.confirm(g)
+			a.flushDedup(ctx, g)
+		}
 		next = page.next
 		delay := page.delay
 		if len(page.items) == 0 && delay < a.pollInterval {

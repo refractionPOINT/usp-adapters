@@ -15,8 +15,12 @@ type liveID struct {
 	dependency acktrack.ACKDependency
 	page       uint64
 	expiry     int64
+	shared     bool
 }
-type oktaPosition struct{ Next string }
+type oktaPosition struct {
+	Next  string
+	Since time.Time
+}
 type oktaGeneration struct {
 	id, page      uint64
 	position      oktaPosition
@@ -52,13 +56,18 @@ func candidateBytes(generation, page uint64) []byte {
 	return binary.BigEndian.AppendUint64(b, page)
 }
 func (a *OktaAdapter) confirm(g *oktaGeneration) error {
+	a.confirmMu.Lock()
+	defer a.confirmMu.Unlock()
 	positions, err := a.tracker.Confirm()
 	if err != nil {
 		a.issue("ack_observation_failed")
 		return err
 	}
-	if raw := positions["logs"]; len(raw) == 16 && binary.BigEndian.Uint64(raw) == g.id {
-		g.confirmed.Store(binary.BigEndian.Uint64(raw[8:]))
+	if raw := positions["logs"]; len(raw) >= 16 && binary.BigEndian.Uint64(raw) == g.id {
+		g.confirmed.Store(binary.BigEndian.Uint64(raw[8:16]))
+		if a.conf.ResumeState != nil && len(raw) > 16 {
+			a.conf.ResumeState.Confirm(append([]byte(nil), raw[16:]...))
+		}
 	}
 	return nil
 }
