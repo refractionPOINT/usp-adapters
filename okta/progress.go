@@ -12,14 +12,16 @@ import (
 const liveIDLimit = 65536
 
 type liveID struct {
-	dependency acktrack.ACKDependency
-	page       uint64
-	expiry     int64
-	shared     bool
+	dependency      acktrack.ACKDependency
+	page            uint64
+	expiry          int64
+	sharedAttempted bool
+	sharedDigest    [32]byte
 }
 type oktaPosition struct {
-	Next  string
-	Since time.Time
+	Next     string
+	Since    time.Time
+	Observed time.Time
 }
 type oktaGeneration struct {
 	id, page      uint64
@@ -28,13 +30,20 @@ type oktaGeneration struct {
 	dependency    acktrack.ACKDependency
 	hasDependency bool
 	confirmed     atomic.Uint64
+	dedupFrontier uint64
 }
 
 func newOktaGeneration(id uint64, p oktaPosition) *oktaGeneration {
 	return &oktaGeneration{id: id, position: p, live: make(map[[16]byte]liveID)}
 }
+
+// sharedEventDigest includes the feed and retains all SHA-256 bits. Only the
+// in-process bounded cache uses a truncated digest.
+func sharedEventDigest(id string) [32]byte {
+	return sha256.Sum256([]byte("okta/system-log\x00" + id))
+}
 func eventDigest(id string) [16]byte {
-	sum := sha256.Sum256([]byte("okta/system-log\x00" + id))
+	sum := sharedEventDigest(id)
 	var d [16]byte
 	copy(d[:], sum[:16])
 	return d

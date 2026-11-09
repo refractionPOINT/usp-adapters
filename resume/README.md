@@ -29,16 +29,28 @@ leaving overhead for an 8 KiB enclosing identity/version envelope. A stale saved
 observation beyond three hours starts at that recovery boundary, counting omitted
 minutes. Rejected cursors fall back inclusively to the stored boundary, capped at
 three hours; absent safe timestamps use a thirty-minute overlap and count unknown
-history. Historical completeness remains bounded by vendor availability, retention
+history. A startup timestamp more than thirty minutes behind the last successful
+page observation is no longer a recent cursor fallback. If that cursor expires,
+use the same short unknown-history overlap; do not count previously collected
+startup history as skipped. Neither event publication times nor page observation
+times establish a new source completeness boundary. Historical completeness
+remains bounded by vendor availability, retention
 and late publication. An opaque cursor's source age cannot be inferred from event
 publication timestamps.
 
 Optional `ResumeDeduper` checks batches before admission and adds hashed feed/UUID
-markers only after validated ACK. Provide a stable **hashed** creation/source
+markers only after validated ACK. Shared keys are exactly 64 lowercase hex
+characters from the full SHA-256 digest of feed and vendor UUID. Each newly
+confirmed local ID gets at most one bounded Add attempt; neither repeat
+confirmation nor a failed Add renews its marker TTL. Provide a stable **hashed**
+creation/source
 identity in `ResumeNamespace`; never use credentials or raw customer identifiers.
 Use a versioned namespace isolated from any admission-time markers. Bound marker
 retention to the thirty-minute overlap and budget backend capacity before use.
-Dedup failure permits duplicates. Pending duplicates retain the original local
+Dedup failure permits duplicates. Backend operations have a 250 ms budget and
+failures enter a shared thirty-second cooldown. The adapter scans pending markers
+only when the confirmed page frontier advances, not on every timer tick. Pending
+duplicates retain the original local
 admission dependency; they are never shared as delivery evidence. Local history
 and page dependency tracking are bounded; checkpoints do not retain event lists.
 

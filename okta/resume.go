@@ -14,6 +14,8 @@ import (
 // Leave room for the embedder's identity, fencing and version envelope.
 const maxResumeBytes = 6 * 1024
 const recoveryHorizon = 3 * time.Hour
+const dedupTimeout = 250 * time.Millisecond
+const dedupBackoff = 30 * time.Second
 
 type savedPosition struct {
 	Version  int       `json:"v"`
@@ -73,7 +75,7 @@ func (c *OktaConfig) Prepare(ctx context.Context) error {
 	if a.validateContinuation(u.String()) != nil {
 		return errors.New("invalid saved continuation")
 	}
-	c.prepared.position = oktaPosition{Next: u.String(), Since: p.Since}
+	c.prepared.position = oktaPosition{Next: u.String(), Since: p.Since, Observed: p.Observed}
 	c.prepared.replay = string(raw) != string(c.prepared.initial)
 	c.prepared.ready = true
 	return nil
@@ -116,7 +118,7 @@ func (a *OktaAdapter) resumeCandidate(g *oktaGeneration) ([]byte, error) {
 	return append(marker, raw...), nil
 }
 
-func dedupKey(id [16]byte) string { return "okta/system-log/v1/" + hex.EncodeToString(id[:]) }
+func dedupKey(id [32]byte) string { return hex.EncodeToString(id[:]) }
 
 // Called only by the producer, or after it has joined. Pending reservations
 // remain local dependencies and are never shared as evidence of delivery.
@@ -124,26 +126,30 @@ func (a *OktaAdapter) flushDedup(ctx context.Context, g *oktaGeneration) {
 	if a.conf.ResumeState == nil || a.conf.ResumeDeduper == nil {
 		return
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	confirmed := g.confirmed.Load()
+	if confirmed <= g.dedupFrontier {
+		return
+	}
+	g.dedupFrontier = confirmed
+	ctx, cancel := context.WithTimeout(ctx, dedupTimeout)
 	defer cancel()
 	keys := make([]string, 0, 1000)
-	ids := make([][16]byte, 0, 1000)
 	flush := func() {
-		err := a.conf.ResumeDeduper.Add(ctx, a.conf.ResumeNamespace, keys)
-		if err == nil {
-			for _, id := range ids {
-				entry := g.live[id]
-				entry.shared = true
-				g.live[id] = entry
+		// A failed attempt permits replay. Never retry this reservation or renew a
+		// shared marker's TTL merely because confirmation is observed again.
+		if !time.Now().Before(a.dedupRetryAfter) {
+			if err := a.conf.ResumeDeduper.Add(ctx, a.conf.ResumeNamespace, keys); err != nil {
+				a.dedupRetryAfter = time.Now().Add(dedupBackoff)
 			}
 		}
-		keys, ids = keys[:0], ids[:0]
+		keys = keys[:0]
 	}
-	confirmed := g.confirmed.Load()
+
 	for id, entry := range g.live {
-		if entry.page <= confirmed && !entry.shared {
-			keys = append(keys, dedupKey(id))
-			ids = append(ids, id)
+		if entry.page <= confirmed && !entry.sharedAttempted {
+			entry.sharedAttempted = true
+			g.live[id] = entry
+			keys = append(keys, dedupKey(entry.sharedDigest))
 			if len(keys) == cap(keys) {
 				flush()
 				if ctx.Err() != nil {
@@ -159,7 +165,7 @@ func (a *OktaAdapter) flushDedup(ctx context.Context, g *oktaGeneration) {
 
 func (a *OktaAdapter) sharedDuplicates(ctx context.Context, items []utils.Dict) map[[16]byte]bool {
 	out := make(map[[16]byte]bool)
-	if a.conf.ResumeState == nil || a.conf.ResumeDeduper == nil {
+	if a.conf.ResumeState == nil || a.conf.ResumeDeduper == nil || time.Now().Before(a.dedupRetryAfter) {
 		return out
 	}
 	keys := make([]string, 0, len(items))
@@ -167,17 +173,18 @@ func (a *OktaAdapter) sharedDuplicates(ctx context.Context, items []utils.Dict) 
 	for _, item := range items {
 		if id, _ := item["uuid"].(string); id != "" {
 			digest := eventDigest(id)
-			keys = append(keys, dedupKey(digest))
+			keys = append(keys, dedupKey(sharedEventDigest(id)))
 			ids = append(ids, digest)
 		}
 	}
 	if len(keys) == 0 {
 		return out
 	}
-	opCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	opCtx, cancel := context.WithTimeout(ctx, dedupTimeout)
 	defer cancel()
 	seen, err := a.conf.ResumeDeduper.Check(opCtx, a.conf.ResumeNamespace, keys)
 	if err != nil || len(seen) != len(keys) {
+		a.dedupRetryAfter = time.Now().Add(dedupBackoff)
 		return out
 	}
 	for i, ok := range seen {

@@ -91,11 +91,12 @@ type OktaAdapter struct {
 	// before one is reported through OnError; zero means defaultFailureLimit.
 	failureLimit time.Duration
 	// Only the worker writes generation. Close reads it after joining worker.
-	generation *oktaGeneration
-	confirmMu  sync.Mutex
-	closeOnce  sync.Once
-	notifier   vendorerr.Notifier // delivers OnError; see notify
-	closeErr   error
+	generation      *oktaGeneration
+	confirmMu       sync.Mutex
+	dedupRetryAfter time.Time // producer-owned, then Close after join
+	closeOnce       sync.Once
+	notifier        vendorerr.Notifier // delivers OnError; see notify
+	closeErr        error
 }
 
 func NewOktaAdapter(ctx context.Context, conf OktaConfig) (*OktaAdapter, chan struct{}, error) {
@@ -219,7 +220,7 @@ func (a *OktaAdapter) initialPosition() oktaPosition {
 	q.Set("since", time.Now().UTC().Format(time.RFC3339))
 	q.Set("sortOrder", "ASCENDING")
 	u.RawQuery = q.Encode()
-	return oktaPosition{Next: u.String(), Since: time.Now().UTC()}
+	return oktaPosition{Next: u.String(), Since: time.Now().UTC(), Observed: time.Now().UTC()}
 }
 
 func (a *OktaAdapter) run() {
@@ -251,7 +252,9 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 	var episode failureEpisode
 	replay := a.conf.ResumeState != nil && a.conf.prepared.replay
 	for ctx.Err() == nil {
-		a.flushDedup(ctx, g)
+		if len(g.live) >= liveIDLimit {
+			a.flushDedup(ctx, g)
+		}
 		if !g.makeRoom(time.Now()) {
 			a.issue("live_history_pressure")
 			if !acktrack.Wait(ctx, a.pollInterval) {
@@ -268,7 +271,9 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				// Optional saved progress has a safe inclusive timestamp fallback.
 				if a.conf.ResumeState != nil {
 					since := g.position.Since
-					if since.IsZero() {
+					// A stale startup timestamp is not a recent cursor boundary. Do
+					// not replay hours of already collected history or count it as lost.
+					if since.IsZero() || (!g.position.Observed.IsZero() && since.Before(g.position.Observed.Add(-overlapPeriod))) {
 						since = time.Now().UTC().Add(-overlapPeriod)
 					}
 					cutoff := time.Now().UTC().Add(-recoveryHorizon)
@@ -376,7 +381,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 					}
 					return
 				}
-				entry = liveID{dependency: admission, page: g.page, expiry: time.Now().Add(overlapPeriod).Unix()}
+				entry = liveID{dependency: admission, page: g.page, expiry: time.Now().Add(overlapPeriod).Unix(), sharedDigest: sharedEventDigest(id)}
 				g.live[digest] = entry // A failed/in-flight Ship is never suppression.
 			}
 			// A referenced prior-page ID also protects duplicates later in this
@@ -396,6 +401,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 		}
 		g.position.Next = page.next
+		g.position.Observed = time.Now().UTC()
 		marker, candidateErr := a.resumeCandidate(g)
 		if candidateErr != nil {
 			a.issue("candidate_rejected")

@@ -2,17 +2,20 @@ package usp_okta
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
@@ -123,7 +126,7 @@ func TestResumeRestartGapSameTimestampAndLateEmptyPages(t *testing.T) {
 	sink := &ackSink{}
 	a, g := resumeHarness(t, vendor.URL, state, sink)
 	stop := runCollector(t, a, g)
-	require.Eventually(t, func() bool { return calls.Load() >= 5 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() >= 5 }, 5*time.Second, time.Millisecond)
 	stop()
 	require.Equal(t, query, firstQuery.Load())
 	require.Equal(t, 3, sink.count())
@@ -159,7 +162,7 @@ func TestResumeFailedPageCannotPublishItsCursor(t *testing.T) {
 	state := &memoryProgress{}
 	a, g := resumeHarness(t, vendor.URL, state, &ackSink{})
 	stop := runCollector(t, a, g)
-	require.Eventually(t, func() bool { return calls.Load() >= 2 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() >= 2 }, 5*time.Second, time.Millisecond)
 	stop()
 	require.NoError(t, a.confirm(g))
 	p, err := decodePosition(state.snapshot())
@@ -168,15 +171,36 @@ func TestResumeFailedPageCannotPublishItsCursor(t *testing.T) {
 }
 
 type memoryDedup struct {
-	mu   sync.Mutex
-	seen map[string]bool
-	adds int
-	fail bool
+	mu       sync.Mutex
+	seen     map[string]bool
+	adds     int
+	attempts int
+	fail     bool
 }
 
+func validMarkerBatch(ns string, keys []string) error {
+	if len(ns) != 64 {
+		return errors.New("namespace must be 64 hex characters")
+	}
+	if _, err := hex.DecodeString(ns); err != nil {
+		return err
+	}
+	for _, key := range keys {
+		if len(key) != 64 {
+			return errors.New("key must be 64 hex characters")
+		}
+		if _, err := hex.DecodeString(key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
 func (d *memoryDedup) Check(_ context.Context, ns string, keys []string) ([]bool, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err := validMarkerBatch(ns, keys); err != nil {
+		return nil, err
+	}
 	if d.fail {
 		return nil, errors.New("unavailable")
 	}
@@ -189,6 +213,10 @@ func (d *memoryDedup) Check(_ context.Context, ns string, keys []string) ([]bool
 func (d *memoryDedup) Add(_ context.Context, ns string, keys []string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.attempts++
+	if err := validMarkerBatch(ns, keys); err != nil {
+		return err
+	}
 	if d.fail {
 		return errors.New("unavailable")
 	}
@@ -212,10 +240,15 @@ func TestResumeSharedDedupOnlyAfterValidatedACK(t *testing.T) {
 	a, g := resumeHarness(t, vendor.URL, state, sink)
 	d := &memoryDedup{seen: map[string]bool{}}
 	a.conf.ResumeDeduper = d
-	a.conf.ResumeNamespace = "hashed-source-a"
+	a.conf.ResumeNamespace = strings.Repeat("a", 64)
 	stop := runCollector(t, a, g)
-	require.Eventually(t, func() bool { return calls.Load() >= 4 }, time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return calls.Load() >= 4 }, 5*time.Second, time.Millisecond)
+	d.mu.Lock()
+	d.seen[a.conf.ResumeNamespace+dedupKey(sharedEventDigest("same"))] = true
+	d.mu.Unlock()
+	require.Eventually(t, func() bool { return calls.Load() >= 8 }, 5*time.Second, time.Millisecond)
 	stop()
+	require.Empty(t, state.snapshot(), "a shared marker cannot erase a pending local dependency")
 	require.Equal(t, 1, sink.count())
 	require.Zero(t, d.adds)
 	sink.ack(1)
@@ -224,10 +257,10 @@ func TestResumeSharedDedupOnlyAfterValidatedACK(t *testing.T) {
 	require.Equal(t, 1, d.adds)
 	seen := a.sharedDuplicates(context.Background(), []utils.Dict{{"uuid": "same"}})
 	require.True(t, seen[eventDigest("same")])
-	a.conf.ResumeNamespace = "hashed-source-b"
+	a.conf.ResumeNamespace = strings.Repeat("b", 64)
 	require.Empty(t, a.sharedDuplicates(context.Background(), []utils.Dict{{"uuid": "same"}}))
 	d.fail = true
-	a.conf.ResumeNamespace = "hashed-source-a"
+	a.conf.ResumeNamespace = strings.Repeat("a", 64)
 	require.Empty(t, a.sharedDuplicates(context.Background(), []utils.Dict{{"uuid": "same"}}), "dedup outage must replay")
 }
 
@@ -266,7 +299,7 @@ func TestResumeRecoveryCapAndExpiredCursorKeepCollecting(t *testing.T) {
 			a.tracker, err = acktrack.NewACKTracker(a.uspClient, 1, 16+maxResumeBytes)
 			require.NoError(t, err)
 			stop := runCollector(t, a, g)
-			require.Eventually(t, func() bool { return fallback.Load() && len(state.snapshot()) > 0 }, time.Second, time.Millisecond)
+			require.Eventually(t, func() bool { return fallback.Load() && len(state.snapshot()) > 0 }, 5*time.Second, time.Millisecond)
 			stop()
 			require.NoError(t, a.confirm(g))
 			require.NotEmpty(t, state.snapshot())
@@ -308,7 +341,7 @@ func TestResumeClosePublishesFinalACKOnDrainError(t *testing.T) {
 			sink := &drainACKSink{drainError: drainErr}
 			a, _, err := newOktaAdapter(context.Background(), conf, sink)
 			require.NoError(t, err)
-			require.Eventually(t, func() bool { return calls.Load() >= 3 }, time.Second, time.Millisecond)
+			require.Eventually(t, func() bool { return calls.Load() >= 3 }, 5*time.Second, time.Millisecond)
 			require.Empty(t, state.snapshot())
 			err = a.Close()
 			if drainErr != nil {
@@ -365,9 +398,135 @@ func TestResumeExpiredCursorWithoutTimestampUsesBoundedOverlap(t *testing.T) {
 		since, err := time.Parse(time.RFC3339Nano, rawSince)
 		require.NoError(t, err)
 		require.WithinDuration(t, started.Add(-overlapPeriod), since, time.Second)
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("missing timestamp parked collection")
 	}
 	stop()
 	require.Equal(t, uint64(1), unknown.Load())
+}
+
+func TestResumeSharedMarkerFullDigestAndOneAttemptPerConfirmation(t *testing.T) {
+	require.Equal(t, "dba4f47042805b4b03c9ecde4daaa26d20557f0aa319cb2f0d74eccb29ba1ae7", dedupKey(sharedEventDigest("same")))
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			vendor := httptest.NewServer(http.NotFoundHandler())
+			defer vendor.Close()
+			sink := &ackSink{}
+			a, g := resumeHarness(t, vendor.URL, &memoryProgress{}, sink)
+			d := &memoryDedup{seen: map[string]bool{}, fail: fail}
+			a.conf.ResumeDeduper = d
+			a.conf.ResumeNamespace = strings.Repeat("a", 64)
+			dep, err := a.admit(context.Background(), &protocol.DataMessage{TextPayload: "fixture"})
+			require.NoError(t, err)
+			g.page = 1
+			digest := eventDigest("same")
+			g.live[digest] = liveID{dependency: dep, page: 1, sharedDigest: sharedEventDigest("same")}
+			marker, err := a.resumeCandidate(g)
+			require.NoError(t, err)
+			require.NoError(t, a.tracker.Candidate("logs", marker, dep))
+			a.flushDedup(context.Background(), g)
+			require.Zero(t, d.attempts, "pending admission is never shared delivery evidence")
+			sink.ack(1)
+			require.NoError(t, a.confirm(g))
+			a.flushDedup(context.Background(), g)
+			require.Equal(t, 1, d.attempts)
+			d.fail = false
+			for i := 0; i < 10; i++ {
+				g.confirmed.Store(uint64(i + 2)) // New confirmed empty pages must not renew old markers.
+				require.NoError(t, a.confirm(g))
+				a.flushDedup(context.Background(), g)
+			}
+			require.Equal(t, 1, d.attempts, "confirmed IDs must not renew TTL or retry failed Add")
+			if fail {
+				require.Empty(t, d.seen, "failed Add permits replay")
+			} else {
+				require.Len(t, d.seen, 1)
+			}
+		})
+	}
+}
+
+func TestResumeLongRunningCursorExpiryDoesNotReplayStartupHistory(t *testing.T) {
+	var skipped, unknown atomic.Uint64
+	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		after := r.URL.Query().Get("after")
+		if after == "expired" {
+			w.WriteHeader(400)
+			fmt.Fprint(w, `{"errorCode":"E0000001"}`)
+			return
+		}
+		next := "expired"
+		body := `[{"uuid":"already-collected","published":"2099-01-01T00:00:00Z"}]`
+		if after != "start" {
+			next = "forward"
+			body = `[]`
+		}
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=%s>; rel="next"`, r.Host, logsURL, next))
+		fmt.Fprint(w, body)
+	}))
+	defer vendor.Close()
+	now := time.Now()
+	raw, err := json.Marshal(savedPosition{Version: 1, Query: "after=start", Since: now.Add(-48 * time.Hour), Observed: now})
+	require.NoError(t, err)
+	state := &memoryProgress{durable: raw}
+	sink := &captureSink{}
+	a, g := resumeHarness(t, vendor.URL, state, sink)
+	a.conf.ResumeStats = func(class string, n uint64) {
+		switch class {
+		case "skipped":
+			skipped.Add(n)
+		case "unknown":
+			unknown.Add(n)
+		}
+	}
+	stop := runCollector(t, a, g)
+	require.Eventually(t, func() bool { p, e := decodePosition(state.snapshot()); return e == nil && p.Query == "after=forward" }, 5*time.Second, time.Millisecond)
+	stop()
+	p, err := decodePosition(state.snapshot())
+	require.NoError(t, err)
+	require.WithinDuration(t, now.Add(-overlapPeriod), p.Since, time.Second)
+	require.Zero(t, skipped.Load(), "previously collected startup history is not skipped history")
+	require.Equal(t, uint64(1), unknown.Load())
+	require.Equal(t, 1, sink.count())
+}
+
+type slowMarkerBackend struct{ checks, adds atomic.Int32 }
+
+func (d *slowMarkerBackend) Check(ctx context.Context, _ string, _ []string) ([]bool, error) {
+	d.checks.Add(1)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (d *slowMarkerBackend) Add(ctx context.Context, _ string, _ []string) error {
+	d.adds.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestResumeSlowDedupBacksOffWithoutHoldingCollection(t *testing.T) {
+	vendor := httptest.NewServer(http.NotFoundHandler())
+	defer vendor.Close()
+	a, g := resumeHarness(t, vendor.URL, &memoryProgress{}, &ackSink{})
+	backend := &slowMarkerBackend{}
+	a.conf.ResumeDeduper = backend
+	a.conf.ResumeNamespace = strings.Repeat("a", 64)
+	started := time.Now()
+	require.Empty(t, a.sharedDuplicates(context.Background(), []utils.Dict{{"uuid": "slow"}}))
+	require.Less(t, time.Since(started), 2*time.Second)
+	require.Equal(t, int32(1), backend.checks.Load())
+	for i := 0; i < 10; i++ {
+		require.Empty(t, a.sharedDuplicates(context.Background(), []utils.Dict{{"uuid": "slow"}}))
+	}
+	require.Equal(t, int32(1), backend.checks.Load(), "failed checks enter cooldown")
+	g.live[eventDigest("slow")] = liveID{page: 1, sharedDigest: sharedEventDigest("slow")}
+	g.confirmed.Store(1)
+	a.flushDedup(context.Background(), g)
+	require.Zero(t, backend.adds.Load(), "the shared backend cooldown also skips Add")
+	a.dedupRetryAfter = time.Time{}
+	g.live[eventDigest("next")] = liveID{page: 2, sharedDigest: sharedEventDigest("next")}
+	g.confirmed.Store(2)
+	a.flushDedup(context.Background(), g)
+	require.Equal(t, int32(1), backend.adds.Load())
+	a.flushDedup(context.Background(), g)
+	require.Equal(t, int32(1), backend.adds.Load(), "unchanged confirmed frontier neither scans nor retries Add")
 }

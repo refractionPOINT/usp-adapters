@@ -20,6 +20,8 @@ type State interface {
 
 // Deduper stores only confirmed delivery markers. Check returns one result per
 // key, in order. Add is invoked after validated confirmation, never admission.
+// Adapters attempt Add at most once per newly confirmed local reservation;
+// a failed attempt is not retried and repeated confirmation does not renew TTL.
 // Failures permit duplicates. Implementations must bound retention and obey ctx.
 // Methods finish using key slices before returning; retain only copied keys.
 // namespace is a stable hashed creation/source identity; keys include feed and
