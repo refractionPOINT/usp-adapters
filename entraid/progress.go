@@ -87,6 +87,7 @@ func (a *EntraIDAdapter) initialPosition() entraPosition {
 	if start == 0 {
 		start = a.runtime.now().UTC().UnixNano()
 	}
+	start = a.conf.Lookback.Start(time.Unix(0, start)).UnixNano()
 	start -= start % int64(graphTimeQuantum)
 	p := make(entraPosition)
 	for _, s := range a.streams {

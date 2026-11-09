@@ -9,7 +9,7 @@ import (
 )
 
 func TestExternalEntraConfigLiteralCompatibility(t *testing.T) {
-	cfg := entraid.EntraIDConfig{uspclient.ClientOptions{}, "fixture-tenant", "fixture-client", "fixture-secret", "risk_detections", "enterprise", "", "", time.Second}
+	cfg := entraid.EntraIDConfig{nil, uspclient.ClientOptions{}, "fixture-tenant", "fixture-client", "fixture-secret", "risk_detections", "enterprise", "", "", time.Second}
 	if cfg.TenantID != "fixture-tenant" {
 		t.Fatal("configuration fields changed")
 	}
