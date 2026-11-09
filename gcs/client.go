@@ -17,14 +17,23 @@ import (
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/credguard"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type GCSAdapter struct {
-	conf      GCSConfig
-	uspClient *uspclient.Client
+	conf           GCSConfig
+	uspClient      acktrack.SDKClient
+	tracker        *acktrack.ACKTracker
+	pendingDeletes []pendingObjectDelete
+	admitted       uint64
+	lastDependency acktrack.ACKDependency
+	ackView        *objectACKView
+	deleteErr      error
+	closeOnce      sync.Once
+	closeErr       error
 
 	ctx context.Context
 
@@ -94,7 +103,7 @@ func NewGCSAdapter(ctx context.Context, conf GCSConfig) (*GCSAdapter, chan struc
 
 	a.bucket = a.client.Bucket(conf.BucketName)
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = acktrack.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -131,25 +140,55 @@ func NewGCSAdapter(ctx context.Context, conf GCSConfig) (*GCSAdapter, chan struc
 }
 
 func (a *GCSAdapter) Close() error {
-	defer utils.StopBlockedProducers(a.uspClient)()
-	a.conf.ClientOptions.DebugLog("closing")
-	atomic.StoreUint32(&a.isStop, 1)
-	a.wg.Wait()
-	a.client.Close()
-	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
-
-	if err1 != nil {
-		return err1
-	}
-
-	return err2
+	a.closeOnce.Do(func() {
+		atomic.StoreUint32(&a.isStop, 1)
+		a.uspClient.BeginDrain()
+		a.wg.Wait()
+		drainErr := a.uspClient.Drain(time.Minute)
+		// Observe while the SDK is still live. Close is never delivery evidence.
+		deleteErr := a.confirmDelete()
+		_, closeErr := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
+		if a.client != nil {
+			_ = a.client.Close()
+		}
+		a.closeErr = errors.Join(drainErr, deleteErr, closeErr)
+	})
+	return a.closeErr
 }
 
 func (a *GCSAdapter) lookForFiles() (bool, error) {
-	query := &storage.Query{Prefix: a.conf.Prefix}
 
-	it := a.bucket.Objects(a.ctx, query)
+	it := a.bucket.Objects(a.ctx, &storage.Query{Prefix: a.conf.Prefix})
+	found := false
+	for atomic.LoadUint32(&a.isStop) == 0 {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			return found, nil
+		}
+		if err != nil {
+			return found, err
+		}
+		page := []*storage.ObjectAttrs{attrs}
+		// Consume only the already-buffered SDK page. Fetching the next page
+		// waits until this page's admitted objects have been confirmed/deleted.
+		for it.PageInfo().Remaining() > 0 {
+			attrs, err = it.Next()
+			if err != nil {
+				return found, err
+			}
+			page = append(page, attrs)
+		}
+		pageFound, err := a.processListing(page)
+		found = found || pageFound
+		if err != nil {
+			return found, err
+		}
+	}
+	return found, nil
+}
+
+func (a *GCSAdapter) processListing(page []*storage.ObjectAttrs) (bool, error) {
+	next := 0
 
 	// We pipeline the downloading of files from GCS to support
 	// high throughputs. It is important we keep file ordering
@@ -162,18 +201,16 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 		filesMutex.Lock()
 		defer filesMutex.Unlock()
 
-		attrs, err := it.Next()
-		if err == iterator.Done {
+		if next >= len(page) {
 			return nil, nil
 		}
-		if err != nil {
-			return nil, err
-		}
+		attrs := page[next]
+		next++
 
 		return attrs, nil
 	}, a.conf.ParallelFetch, func(e utils.Element) utils.Element {
 		attrs := e.(*storage.ObjectAttrs)
-		obj := a.bucket.Object(attrs.Name).ReadCompressed(true)
+		obj := a.bucket.Object(attrs.Name).Generation(attrs.Generation).ReadCompressed(true)
 
 		if attrs.Size > maxObjectSize {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("file %s too large (%d)", attrs.Name, attrs.Size))
@@ -198,7 +235,7 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 		}
 
 		objData, err := io.ReadAll(r)
-		r.Close()
+		err = errors.Join(err, r.Close())
 
 		if err != nil {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("gcs.Download(): %v", err))
@@ -239,12 +276,18 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 
 	isDataFound := false
 	for {
+		if err = a.waitForDelivery(maxPendingObjectDeletes); err != nil || atomic.LoadUint32(&a.isStop) == 1 {
+			break
+		}
 		var newFile interface{}
 		newFile, err = genNewFile()
 		if err != nil {
 			break
 		}
 		if newFile == nil {
+			break
+		}
+		if atomic.LoadUint32(&a.isStop) == 1 {
 			break
 		}
 		localFile := newFile.(*gcsLocalFile)
@@ -270,18 +313,19 @@ func (a *GCSAdapter) lookForFiles() (bool, error) {
 			continue
 		}
 
-		if err := localFile.Obj.Delete(a.ctx); err != nil {
-			a.conf.ClientOptions.OnError(fmt.Errorf("gcs.DeleteObject(): %v", err))
-			// Since we rely on object deletion to prevent re-ingesting
-			// the same files over and over again, we need to abort
-			// if we cannot delete a file.
-			a.conf.ClientOptions.OnWarning("aborting because files cannot be deleted")
-			break
-		}
-
+		key, generation := localFile.Attrs.Name, localFile.Attrs.Generation
+		// Condition deletion of the live object; a generation-targeted delete
+		// would permanently remove that version from versioned buckets.
+		a.pendingDeletes = append(a.pendingDeletes, pendingObjectDelete{marker: a.admitted, dependency: a.lastDependency, remove: func() error {
+			return a.bucket.Object(key).If(storage.Conditions{GenerationMatch: generation}).Delete(a.ctx)
+		}})
 		isDataFound = true
 	}
 
+	// Flush this listing before another pass can list pending objects again.
+	if err == nil {
+		err = a.waitForDelivery(1)
+	}
 	return isDataFound, err
 }
 
@@ -302,17 +346,30 @@ func (a *GCSAdapter) processEvent(data []byte, isCompressed bool) bool {
 		}
 	}
 
-	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-		if err == uspclient.ErrorBufferFull {
-			a.conf.ClientOptions.OnWarning("stream falling behind")
-			err = a.uspClient.Ship(msg, 1*time.Hour)
-		}
+	// Every object is one bundle frame, including all decoded parquet rows.
+	// Keep its admission dependency until the entire frame is acknowledged.
+	if a.tracker == nil {
+		var err error
+		a.ackView = &objectACKView{client: a.uspClient}
+		a.tracker, err = acktrack.NewACKTracker(a.ackView, 1, 16)
 		if err != nil {
-			if err != uspclient.ErrorClosed {
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-			}
+			a.conf.ClientOptions.OnError(err)
 			return false
 		}
 	}
+	dep, err := a.tracker.Ship(msg, 10*time.Second)
+	if errors.Is(err, uspclient.ErrorBufferFull) {
+		a.conf.ClientOptions.OnWarning("stream falling behind")
+		dep, err = a.tracker.Ship(msg, time.Hour)
+	}
+	if err != nil {
+		if !errors.Is(err, uspclient.ErrorClosed) {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %w", err))
+		}
+		return false
+	}
+	a.admitted++
+	a.lastDependency = dep
+
 	return true
 }

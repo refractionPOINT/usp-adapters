@@ -21,6 +21,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -59,8 +60,18 @@ func (r connResetRetryer) ShouldRetry(req *request.Request) bool {
 const maxObjectSize = 1024 * 1024 * 100 // 100 MB
 
 type S3Adapter struct {
-	conf      S3Config
-	uspClient *uspclient.Client
+	conf                       S3Config
+	uspClient                  acktrack.SDKClient
+	tracker                    *acktrack.ACKTracker
+	pendingDeletes             []pendingObjectDelete
+	admitted                   uint64
+	lastDependency             acktrack.ACKDependency
+	ackView                    *objectACKView
+	deleteErr                  error
+	closeOnce                  sync.Once
+	closeErr                   error
+	conditionalDeleteFallbacks atomic.Uint64
+	warnedDeleteFallbacks      uint64 // collector-owned; cleanup workers only increment the atomic counter
 
 	ctx context.Context
 
@@ -103,6 +114,7 @@ func (c *S3Config) Validate() error {
 }
 
 type s3LocalFile struct {
+	Identity     s3ObjectIdentity
 	Obj          *s3Record
 	Data         []byte
 	IsCompressed bool
@@ -110,8 +122,9 @@ type s3LocalFile struct {
 }
 
 type s3Record struct {
-	Key  string
-	Size int64
+	Key        string
+	Size       int64
+	ListedETag string
 }
 
 func NewS3Adapter(ctx context.Context, conf S3Config) (*S3Adapter, chan struct{}, error) {
@@ -175,7 +188,7 @@ func NewS3Adapter(ctx context.Context, conf S3Config) (*S3Adapter, chan struct{}
 	a.awsS3 = s3.New(a.awsSession)
 	a.awsDownloader = s3manager.NewDownloader(a.awsSession)
 
-	a.uspClient, err = uspclient.NewClient(ctx, conf.ClientOptions)
+	a.uspClient, err = acktrack.NewClient(ctx, conf.ClientOptions)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -266,18 +279,18 @@ func isNotFound(err error) bool {
 }
 
 func (a *S3Adapter) Close() error {
-	defer utils.StopBlockedProducers(a.uspClient)()
-	a.conf.ClientOptions.DebugLog("closing")
-	atomic.StoreUint32(&a.isStop, 1)
-	a.wg.Wait()
-	err1 := a.uspClient.Drain(1 * time.Minute)
-	_, err2 := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
+	a.closeOnce.Do(func() {
+		atomic.StoreUint32(&a.isStop, 1)
+		a.uspClient.BeginDrain()
+		a.wg.Wait()
+		drainErr := a.uspClient.Drain(time.Minute)
+		// Observe while the SDK is still live. Close is never delivery evidence.
+		deleteErr := a.confirmDelete()
+		_, closeErr := utils.CloseUSP(a.uspClient, a.conf.ClientOptions)
 
-	if err1 != nil {
-		return err1
-	}
-
-	return err2
+		a.closeErr = errors.Join(drainErr, deleteErr, closeErr)
+	})
+	return a.closeErr
 }
 
 func (a *S3Adapter) lookForFiles() (bool, error) {
@@ -340,7 +353,7 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 		}
 		e := resp.Contents[nextFileIndex]
 		nextFileIndex++
-		return &s3Record{Key: *e.Key, Size: *e.Size}, nil
+		return &s3Record{Key: *e.Key, Size: *e.Size, ListedETag: aws.StringValue(e.ETag)}, nil
 	}, a.conf.ParallelFetch, func(e utils.Element) utils.Element {
 		item := e.(*s3Record)
 
@@ -357,11 +370,55 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("downloading file %s (%d)", item.Key, item.Size))
 
 		writerAt := aws.NewWriteAtBuffer([]byte{})
+		// The downloader can issue parallel ranged GETs. Validate that every
+		// response belongs to the same object before admitting the bundle.
+		var identity s3ObjectIdentity
+		var identityMu sync.Mutex
+		var identityRejected, emptyRange bool
+		observeIdentity := func(r *request.Request) {
+			r.Handlers.Complete.PushBack(func(r *request.Request) {
+				if r.HTTPResponse != nil && r.HTTPResponse.StatusCode == http.StatusRequestedRangeNotSatisfiable {
+					identityMu.Lock()
+					emptyRange = true
+					identityMu.Unlock()
+				}
+			})
+			r.Handlers.Unmarshal.PushBack(func(r *request.Request) {
+				output, ok := r.Data.(*s3.GetObjectOutput)
+				if !ok || r.Error != nil {
+					return
+				}
+				current := s3ObjectIdentity{ETag: aws.StringValue(output.ETag), VersionID: aws.StringValue(output.VersionId)}
+				identityMu.Lock()
+				defer identityMu.Unlock()
+				if current.ETag == "" || (identity.ETag != "" && identity != current) {
+					identityRejected = true
+					r.Error = errors.New("downloaded object identity missing or changed")
+					return
+				}
+				identity = current
+			})
+		}
 
-		if _, err := a.awsDownloader.Download(writerAt, &s3.GetObjectInput{
-			Bucket: aws.String(a.conf.BucketName),
-			Key:    aws.String(item.Key),
-		}); err != nil {
+		input := &s3.GetObjectInput{Bucket: aws.String(a.conf.BucketName), Key: aws.String(item.Key)}
+		if item.Size == 0 && item.ListedETag != "" {
+			input.IfMatch = aws.String(item.ListedETag)
+		}
+		n, err := a.awsDownloader.Download(writerAt, input, s3manager.WithDownloaderRequestOptions(observeIdentity))
+		if err == nil {
+			identityMu.Lock()
+			// The downloader turns ranged 416 into success for empty objects.
+			// Only a validated zero-byte read may borrow the listed identity;
+			// GET If-Match also protects replacement between listing and read.
+			if !identityRejected && identity.ETag == "" && emptyRange && item.Size == 0 && n == 0 && len(writerAt.Bytes()) == 0 && item.ListedETag != "" {
+				identity.ETag = item.ListedETag
+			}
+			if identityRejected || identity.ETag == "" {
+				err = errors.New("downloaded object identity missing or changed")
+			}
+			identityMu.Unlock()
+		}
+		if err != nil {
 			a.conf.ClientOptions.OnError(fmt.Errorf("s3.Download() @ %s: %v", a.region, err))
 			return &s3LocalFile{
 				Obj:  item,
@@ -387,6 +444,7 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 		a.conf.ClientOptions.DebugLog(fmt.Sprintf("file %s downloaded in %v (%d)", item.Key, time.Since(startTime), item.Size))
 
 		return &s3LocalFile{
+			Identity:     identity,
 			Obj:          item,
 			Data:         rawData,
 			IsCompressed: isCompressed,
@@ -400,20 +458,19 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 
 	isDataFound := false
 
-	// We will delete the files as
-	// we go asynchronously so that
-	// we can get higher throughput.
-	errMutex := sync.Mutex{}
-	var delErr error
-	delWg := sync.WaitGroup{}
-
 	for {
+		if err = a.waitForDelivery(maxPendingObjectDeletes); err != nil || atomic.LoadUint32(&a.isStop) == 1 {
+			break
+		}
 		var newFile interface{}
 		newFile, err = genNewFile()
 		if err != nil {
 			break
 		}
 		if newFile == nil {
+			break
+		}
+		if atomic.LoadUint32(&a.isStop) == 1 {
 			break
 		}
 		localFile := newFile.(*s3LocalFile)
@@ -439,46 +496,15 @@ func (a *S3Adapter) processListing(resp *s3.ListObjectsV2Output) (bool, error) {
 			continue
 		}
 
-		delWg.Add(1)
-		go func() {
-			defer delWg.Done()
-			if _, err = a.awsS3.DeleteObject(&s3.DeleteObjectInput{
-				Bucket: aws.String(a.conf.BucketName),
-				Key:    aws.String(localFile.Obj.Key),
-			}); err != nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("s3.DeleteObject(): %v", err))
-				// Since we rely on object deletion to prevent re-ingesting
-				// the same files over and over again, we need to abort
-				// if we cannot delete a file.
-				a.conf.ClientOptions.OnWarning("aborting because files cannot be deleted")
-				errMutex.Lock()
-				delErr = err
-				errMutex.Unlock()
-			}
-		}()
-
-		// Take the opportunity to check if a delete failed.
-		errMutex.Lock()
-		if delErr != nil {
-			err = delErr
-		}
-		errMutex.Unlock()
-
-		if err != nil {
-			break
-		}
-
+		key, identity := localFile.Obj.Key, localFile.Identity
+		a.pendingDeletes = append(a.pendingDeletes, pendingObjectDelete{marker: a.admitted, dependency: a.lastDependency, remove: func() error { return a.deleteDeliveredObject(key, identity) }})
 		isDataFound = true
 	}
 
-	// Wait for all file deletes and confirm they did not error.
-	delWg.Wait()
-	errMutex.Lock()
-	if delErr != nil {
-		err = delErr
+	// Flush this listing before another pass can list pending objects again.
+	if err == nil {
+		err = a.waitForDelivery(1)
 	}
-	errMutex.Unlock()
-
 	return isDataFound, err
 }
 
@@ -499,17 +525,54 @@ func (a *S3Adapter) processEvent(data []byte, isCompressed bool) bool {
 		}
 	}
 
-	if err := a.uspClient.Ship(msg, 10*time.Second); err != nil {
-		if err == uspclient.ErrorBufferFull {
-			a.conf.ClientOptions.OnWarning("stream falling behind")
-			err = a.uspClient.Ship(msg, 1*time.Hour)
-		}
+	// Every object is one bundle frame, including all decoded parquet rows.
+	// Keep its admission dependency until the entire frame is acknowledged.
+	if a.tracker == nil {
+		var err error
+		a.ackView = &objectACKView{client: a.uspClient}
+		a.tracker, err = acktrack.NewACKTracker(a.ackView, 1, 16)
 		if err != nil {
-			if err != uspclient.ErrorClosed {
-				a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %v", err))
-			}
+			a.conf.ClientOptions.OnError(err)
 			return false
 		}
 	}
+	dep, err := a.tracker.Ship(msg, 10*time.Second)
+	if errors.Is(err, uspclient.ErrorBufferFull) {
+		a.conf.ClientOptions.OnWarning("stream falling behind")
+		dep, err = a.tracker.Ship(msg, time.Hour)
+	}
+	if err != nil {
+		if !errors.Is(err, uspclient.ErrorClosed) {
+			a.conf.ClientOptions.OnError(fmt.Errorf("Ship(): %w", err))
+		}
+		return false
+	}
+	a.admitted++
+	a.lastDependency = dep
+
 	return true
+}
+
+// AWS SDK v1 predates conditional DeleteObject inputs. Its request option adds
+// If-Match before signing; never emulate this with a racy HEAD-then-DELETE.
+// Explicitly unsupported conditional DELETEs use the legacy key-delete path
+// only after this identity's delivery receipt, with a counted degraded-protection warning.
+// Always delete the key (creating a delete marker on versioned buckets), never
+// an individual version. Identical-ETag replacements cannot be distinguished.
+type s3ObjectIdentity struct {
+	ETag      string
+	VersionID string
+}
+
+func (a *S3Adapter) deleteDeliveredObject(key string, identity s3ObjectIdentity) error {
+	input := &s3.DeleteObjectInput{Bucket: aws.String(a.conf.BucketName), Key: aws.String(key)}
+	if identity.ETag == "" {
+		return errors.New("cannot delete object without downloaded identity")
+	}
+	_, err := a.awsS3.DeleteObjectWithContext(a.ctx, input, request.WithSetRequestHeaders(map[string]string{"If-Match": identity.ETag}))
+	if unsupportedConditionalDelete(err) {
+		a.conditionalDeleteFallbacks.Add(1)
+		_, err = a.awsS3.DeleteObjectWithContext(a.ctx, input)
+	}
+	return err
 }
