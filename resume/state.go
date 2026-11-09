@@ -2,7 +2,10 @@
 // hooks for embedders. Adapters without injected state retain their defaults.
 package resume
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // State owns compatible, fenced progress for one source incarnation. Restore
 // must durably initialize initial if no compatible position exists, before it
@@ -16,6 +19,21 @@ import "context"
 type State interface {
 	Restore(context.Context, []byte) ([]byte, error)
 	Confirm([]byte)
+}
+
+// ErrInvalidPosition identifies invalid/incompatible position data after a
+// successful authoritative storage read. Never wrap a transport, storage-read,
+// cancellation or ownership error with this sentinel.
+var ErrInvalidPosition = errors.New("invalid resume position")
+
+// Recoverer optionally supports atomic durable rebaselining of invalid position
+// data. Recover runs only after a known successful storage read (or Restore's
+// ErrInvalidPosition), under that read's revision and ownership fence. It must
+// durably establish baseline before returning valid position bytes. Retry IO
+// internally; a caller retry supplies the same baseline. Do not retain slices
+// without copying. Recovery must not bypass source identity or ownership checks.
+type Recoverer interface {
+	Recover(ctx context.Context, baseline []byte) ([]byte, error)
 }
 
 // Deduper stores only confirmed delivery markers. Check returns one result per

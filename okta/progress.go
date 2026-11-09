@@ -24,13 +24,15 @@ type oktaPosition struct {
 	Observed time.Time
 }
 type oktaGeneration struct {
-	id, page      uint64
-	position      oktaPosition
-	live          map[[16]byte]liveID
-	dependency    acktrack.ACKDependency
-	hasDependency bool
-	confirmed     atomic.Uint64
-	dedupFrontier uint64
+	id, page         uint64
+	position         oktaPosition
+	live             map[[16]byte]liveID
+	dependency       acktrack.ACKDependency
+	hasDependency    bool
+	confirmed        atomic.Uint64
+	dedupFrontier    uint64
+	persistable      []byte
+	oversizedEpisode bool
 }
 
 func newOktaGeneration(id uint64, p oktaPosition) *oktaGeneration {

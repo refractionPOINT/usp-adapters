@@ -5,9 +5,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/refractionPOINT/usp-adapters/resume"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -26,10 +29,12 @@ type savedPosition struct {
 }
 
 type preparedResume struct {
-	initial  []byte
-	position oktaPosition
-	ready    bool
-	replay   bool
+	initial       []byte
+	recovery      []byte
+	positionBytes []byte
+	position      oktaPosition
+	ready         bool
+	replay        bool
 }
 
 // Prepare restores progress before construction. Call outside any short client
@@ -43,61 +48,97 @@ func (c *OktaConfig) Prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if c.ResumeDeduper != nil && c.ResumeNamespace == "" {
-		return errors.New("resume dedup namespace required")
+	if c.ResumeDeduper != nil || c.ResumeNamespace != "" {
+		decoded, err := hex.DecodeString(c.ResumeNamespace)
+		if err != nil || len(decoded) != 32 || c.ResumeNamespace != strings.ToLower(c.ResumeNamespace) {
+			return errors.New("resume namespace must be 64 lowercase hex characters")
+		}
 	}
 	if c.prepared == nil {
 		now := time.Now().UTC()
-		q := url.Values{"since": {now.Format(time.RFC3339Nano)}, "sortOrder": {"ASCENDING"}}
-		raw, _ := json.Marshal(savedPosition{1, q.Encode(), now, now})
-		c.prepared = &preparedResume{initial: raw}
+		initial, _ := json.Marshal(savedPosition{1, baselineQuery(now), now, now})
+		c.prepared = &preparedResume{initial: initial}
 	}
 	if c.prepared.ready {
 		return nil
 	}
-	raw, err := c.ResumeState.Restore(ctx, append([]byte(nil), c.prepared.initial...))
+	var raw []byte
+	if c.prepared.recovery == nil {
+		raw, err = c.ResumeState.Restore(ctx, append([]byte(nil), c.prepared.initial...))
+		if err != nil && !errors.Is(err, resume.ErrInvalidPosition) {
+			return err
+		}
+		if err != nil || !validSavedPosition(raw, endpoint) {
+			now := time.Now().UTC()
+			since := now.Add(-overlapPeriod)
+			c.prepared.recovery, _ = json.Marshal(savedPosition{1, baselineQuery(since), since, now})
+		}
+	}
+	recovering := c.prepared.recovery != nil
+	if recovering {
+		recoverer, ok := c.ResumeState.(resume.Recoverer)
+		if !ok {
+			return fmt.Errorf("%w: state provider must implement Recoverer", resume.ErrInvalidPosition)
+		}
+		raw, err = recoverer.Recover(ctx, append([]byte(nil), c.prepared.recovery...))
+		if err != nil {
+			return err
+		}
+		if !validSavedPosition(raw, endpoint) {
+			return resume.ErrInvalidPosition
+		}
+	}
+	p, err := decodePosition(raw)
 	if err != nil {
 		return err
 	}
-	// Accept a valid older bounded envelope for fallback, never emit its
-	// oversized cursor. The ordinary decoder/output budget stays at 4 KiB.
-	p, err := decodePositionLimit(raw, 8*1024)
-	if err != nil {
-		return err
-	}
+	// Accumulate preparation counters only after all reads/recovery/validation
+	// succeed. Retrying bad state or failed recovery never inflates them.
+	var skipped uint64
 	cutoff := time.Now().UTC().Add(-recoveryHorizon)
 	if p.Observed.Before(cutoff) {
-		c.stat("skipped", uint64(cutoff.Sub(p.Observed)/time.Minute))
+		skipped = uint64(cutoff.Sub(p.Observed) / time.Minute)
 		p.Query = baselineQuery(cutoff)
 		p.Since = cutoff
-		// Do not Confirm this cap: a successful page must establish its frontier.
 	}
-	if len(raw) > maxResumeBytes {
-		p.Since = c.fallbackSince(p.Since, p.Observed, time.Now().UTC())
-		p.Query = baselineQuery(p.Since)
+	u := *endpoint
+	u.RawQuery = p.Query
+	c.prepared.position = oktaPosition{Next: u.String(), Since: p.Since, Observed: p.Observed}
+	c.prepared.positionBytes, err = json.Marshal(p)
+	if err != nil || len(c.prepared.positionBytes) > maxResumeBytes {
+		return resume.ErrInvalidPosition
+	}
+	c.prepared.replay = recovering || string(raw) != string(c.prepared.initial)
+	c.prepared.ready = true
+	c.stat("skipped", skipped)
+	if recovering {
+		c.stat("unknown", 1)
+	}
+	return nil
+}
+
+func validSavedPosition(raw []byte, endpoint *url.URL) bool {
+	p, err := decodePosition(raw)
+	if err != nil {
+		return false
+	}
+	canonical, err := json.Marshal(p)
+	if err != nil || len(canonical) > maxResumeBytes {
+		return false
 	}
 	u := *endpoint
 	u.RawQuery = p.Query
 	a := OktaAdapter{endpoint: endpoint}
-	if a.validateContinuation(u.String()) != nil {
-		return errors.New("invalid saved continuation")
-	}
-	c.prepared.position = oktaPosition{Next: u.String(), Since: p.Since, Observed: p.Observed}
-	c.prepared.replay = string(raw) != string(c.prepared.initial)
-	c.prepared.ready = true
-	return nil
+	return a.validateContinuation(u.String()) == nil
 }
 
 func decodePosition(raw []byte) (savedPosition, error) {
-	return decodePositionLimit(raw, maxResumeBytes)
-}
-func decodePositionLimit(raw []byte, limit int) (savedPosition, error) {
 	var p savedPosition
-	if len(raw) > limit || json.Unmarshal(raw, &p) != nil || p.Version != 1 || p.Observed.IsZero() || len(p.Query) == 0 {
-		return p, errors.New("invalid resume position")
+	if len(raw) > maxResumeBytes || json.Unmarshal(raw, &p) != nil || p.Version != 1 || p.Observed.IsZero() || len(p.Query) == 0 {
+		return p, resume.ErrInvalidPosition
 	}
 	if _, err := url.ParseQuery(p.Query); err != nil {
-		return p, errors.New("invalid resume query")
+		return p, resume.ErrInvalidPosition
 	}
 	return p, nil
 }
@@ -146,17 +187,24 @@ func (a *OktaAdapter) resumeCandidate(g *oktaGeneration) ([]byte, error) {
 		return nil, err
 	}
 	if len(raw) > maxResumeBytes {
-		// Keep the whole page's dependencies while replacing only its unpersistable
-		// continuation. No cursor truncation and no confirmation before its ACKs.
-		g.position.Since = a.conf.fallbackSince(g.position.Since, g.position.Observed, time.Now().UTC())
-		u := *a.endpoint
-		u.RawQuery = baselineQuery(g.position.Since)
-		g.position.Next = u.String()
-		raw, err = json.Marshal(savedPosition{1, u.RawQuery, g.position.Since, time.Now().UTC()})
-		if err != nil || len(raw) > maxResumeBytes {
-			return nil, errors.New("resume fallback exceeds bound")
+		// The vendor cursor remains valid for live traversal. Only the durable
+		// candidate falls back, without advancing its prior safe source boundary.
+		if !g.oversizedEpisode {
+			a.conf.stat("unknown", 1)
+			g.oversizedEpisode = true
 		}
+		raw = g.persistable
+		if len(raw) == 0 {
+			raw = a.conf.prepared.positionBytes
+		}
+		if len(raw) == 0 || len(raw) > maxResumeBytes {
+			return nil, resume.ErrInvalidPosition
+		}
+	} else {
+		g.persistable = append(g.persistable[:0], raw...)
+		g.oversizedEpisode = false
 	}
+
 	return append(marker, raw...), nil
 }
 

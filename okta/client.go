@@ -410,9 +410,10 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			_ = a.confirm(g)
 			a.flushDedup(ctx, g)
 		}
-		next = g.position.Next
+		sameContinuation := next == page.next
+		next = page.next
 		delay := page.delay
-		if next != page.next && delay < a.pollInterval {
+		if a.conf.ResumeState != nil && sameContinuation && delay < a.pollInterval {
 			delay = a.pollInterval
 		}
 		if len(page.items) == 0 && delay < a.pollInterval {

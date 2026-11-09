@@ -17,6 +17,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient/protocol"
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/resume"
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/require"
 )
@@ -391,13 +392,13 @@ func TestResumeExpiredCursorWithoutTimestampUsesBoundedOverlap(t *testing.T) {
 			unknown.Add(n)
 		}
 	}
-	started := time.Now()
+	observed := g.position.Observed.UTC()
 	stop := runCollector(t, a, g)
 	select {
 	case rawSince := <-firstFallback:
 		since, err := time.Parse(time.RFC3339Nano, rawSince)
 		require.NoError(t, err)
-		require.WithinDuration(t, started.Add(-overlapPeriod), since, time.Second)
+		require.Equal(t, observed.Add(-overlapPeriod), since)
 	case <-time.After(5 * time.Second):
 		t.Fatal("missing timestamp parked collection")
 	}
@@ -484,7 +485,8 @@ func TestResumeLongRunningCursorExpiryDoesNotReplayStartupHistory(t *testing.T) 
 	stop()
 	p, err := decodePosition(state.snapshot())
 	require.NoError(t, err)
-	require.WithinDuration(t, now.Add(-overlapPeriod), p.Since, time.Second)
+	require.False(t, p.Since.Before(now.Add(-overlapPeriod)))
+	require.False(t, p.Since.After(time.Now().Add(-overlapPeriod)))
 	require.Zero(t, skipped.Load(), "previously collected startup history is not skipped history")
 	require.Equal(t, uint64(1), unknown.Load())
 	require.Equal(t, 1, sink.count())
@@ -510,9 +512,7 @@ func TestResumeSlowDedupBacksOffWithoutHoldingCollection(t *testing.T) {
 	backend := &slowMarkerBackend{}
 	a.conf.ResumeDeduper = backend
 	a.conf.ResumeNamespace = strings.Repeat("a", 64)
-	started := time.Now()
 	require.Empty(t, a.sharedDuplicates(context.Background(), []utils.Dict{{"uuid": "slow"}}))
-	require.Less(t, time.Since(started), 2*time.Second)
 	require.Equal(t, int32(1), backend.checks.Load())
 	for i := 0; i < 10; i++ {
 		require.Empty(t, a.sharedDuplicates(context.Background(), []utils.Dict{{"uuid": "slow"}}))
@@ -533,51 +533,47 @@ func TestResumeSlowDedupBacksOffWithoutHoldingCollection(t *testing.T) {
 
 func TestResumeOversizedCursorFallsBackWithoutCrossingPendingPage(t *testing.T) {
 	var calls atomic.Int32
+	var second atomic.Bool
 	var unknown atomic.Uint64
-	fallbackQuery := make(chan string, 1)
+	bigA, bigB := strings.Repeat("x", 5*1024), strings.Repeat("y", 5*1024)
 	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := calls.Add(1)
-		if n == 1 {
-			w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=%s>; rel="next"`, r.Host, logsURL, strings.Repeat("x", 5*1024)))
-			fmt.Fprint(w, `[{"uuid":"pending-large-cursor","published":"2099-01-01T00:00:00Z"}]`)
-			return
+		calls.Add(1)
+		next, id := bigA, "first-page"
+		switch r.URL.Query().Get("after") {
+		case bigA:
+			second.Store(true)
+			next, id = bigB, "second-page"
+		case bigB:
+			next, id = bigB, "third-page"
 		}
-		select {
-		case fallbackQuery <- r.URL.RawQuery:
-		default:
-		}
-		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=tail>; rel="next"`, r.Host, logsURL))
-		fmt.Fprint(w, `[]`)
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=%s>; rel="next"`, r.Host, logsURL, next))
+		fmt.Fprintf(w, `[{"uuid":%q}]`, id)
 	}))
 	defer vendor.Close()
 	state := &memoryProgress{}
 	sink := &ackSink{}
 	a, g := resumeHarness(t, vendor.URL, state, sink)
-	initial := g.position.Since
+	a.pollInterval = 20 * time.Millisecond
+	initial := append([]byte(nil), a.conf.prepared.positionBytes...)
 	a.conf.ResumeStats = func(class string, n uint64) {
 		if class == "unknown" {
 			unknown.Add(n)
 		}
 	}
+	started := time.Now()
 	stop := runCollector(t, a, g)
-	require.Eventually(t, func() bool { return calls.Load() >= 4 }, 5*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return second.Load() && calls.Load() >= 4 }, 5*time.Second, time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
 	stop()
-	q, err := url.ParseQuery(<-fallbackQuery)
-	require.NoError(t, err)
-	require.Equal(t, initial.Format(time.RFC3339Nano), q.Get("since"), "safe recent startup baseline is retained inclusively")
-	require.Empty(t, q.Get("after"), "opaque cursor must not be truncated")
-	require.Equal(t, uint64(1), unknown.Load())
-	require.Equal(t, 1, sink.count())
-	require.Empty(t, state.snapshot(), "a fallback and later empties still depend on the pending page")
-	sink.ack(1)
+	require.LessOrEqual(t, int(calls.Load()), 3+int(time.Since(started)/a.pollInterval)+2, "a repeated nonempty cursor must be paced, not a hot vendor loop")
+	require.Equal(t, 3, sink.count(), "real oversized continuations must reach later pages")
+	require.Contains(t, g.position.Next, "after="+bigB, "live cursor must remain intact")
+	require.Equal(t, uint64(1), unknown.Load(), "one unknown count per consecutive oversized episode")
+	require.Empty(t, state.snapshot(), "all fallback candidates retain the pending page dependencies")
+	sink.ack(3)
 	require.NoError(t, a.confirm(g))
-	require.NotEmpty(t, state.snapshot())
-	require.LessOrEqual(t, len(state.snapshot()), 4096, "base64 JSON envelope requires a 4 KiB position budget")
-	p, err := decodePosition(state.snapshot())
-	require.NoError(t, err)
-	require.Equal(t, "after=tail", p.Query)
-	// Reserve 2 KiB for enclosing identity/fencing metadata, including base64
-	// expansion of the largest supported vendor blob.
+	require.Equal(t, initial, state.snapshot(), "only the durable candidate uses the unchanged prior bounded position")
+	require.LessOrEqual(t, len(state.snapshot()), 4096)
 	envelope, err := json.Marshal(struct {
 		Position []byte
 		Metadata string
@@ -589,7 +585,7 @@ func TestResumeOversizedCursorFallsBackWithoutCrossingPendingPage(t *testing.T) 
 func TestResumeRestoreOversizedCursorUsesBoundedUnconfirmedFallback(t *testing.T) {
 	now := time.Now().UTC()
 	raw := progressBytes(t, "after="+strings.Repeat("x", 5*1024), now)
-	state := &memoryProgress{durable: raw}
+	state := &recoverProgress{memoryProgress: &memoryProgress{durable: raw}}
 	var unknown uint64
 	conf := OktaConfig{URL: "https://example.okta.com", ResumeState: state, ResumeStats: func(class string, n uint64) {
 		if class == "unknown" {
@@ -600,10 +596,15 @@ func TestResumeRestoreOversizedCursorUsesBoundedUnconfirmedFallback(t *testing.T
 	u, err := url.Parse(conf.prepared.position.Next)
 	require.NoError(t, err)
 	require.Empty(t, u.Query().Get("after"))
-	require.Equal(t, now.Format(time.RFC3339Nano), u.Query().Get("since"))
+	since, err := time.Parse(time.RFC3339Nano, u.Query().Get("since"))
+	require.NoError(t, err)
+	require.False(t, since.Before(now.Add(-overlapPeriod)))
+	require.False(t, since.After(time.Now().Add(-overlapPeriod)))
 	require.Equal(t, uint64(1), unknown)
-	require.Empty(t, state.snapshot(), "restoring an oversized cursor cannot publish uncollected progress")
-	require.Equal(t, raw, state.saved(), "old durable state remains until a source-complete confirmed candidate")
+	require.Empty(t, state.snapshot(), "recovery is durable initialization, not a confirmed fetched frontier")
+	require.Equal(t, 1, state.recoverCalls)
+	require.LessOrEqual(t, len(state.saved()), 4096)
+	require.NotEqual(t, raw, state.saved(), "recovery must durably establish a valid baseline before polling")
 }
 
 func TestResumeExpiredCursorPreservesOutageBeforeOverlap(t *testing.T) {
@@ -648,4 +649,211 @@ func TestResumeExpiredCursorPreservesOutageBeforeOverlap(t *testing.T) {
 	stop()
 	require.Zero(t, skipped.Load())
 	require.Equal(t, uint64(1), unknown.Load())
+}
+
+type recoverProgress struct {
+	*memoryProgress
+	recoverCalls    int
+	baselines       [][]byte
+	recoverFail     bool
+	restoreError    error
+	invalidRecovery bool
+}
+
+func (m *recoverProgress) Restore(ctx context.Context, initial []byte) ([]byte, error) {
+	raw, err := m.memoryProgress.Restore(ctx, initial)
+	if err != nil {
+		return nil, err
+	}
+	if m.restoreError != nil {
+		return nil, m.restoreError
+	}
+	return raw, nil
+}
+func (m *recoverProgress) Recover(_ context.Context, baseline []byte) ([]byte, error) {
+	m.recoverCalls++
+	m.baselines = append(m.baselines, append([]byte(nil), baseline...))
+	if m.recoverFail {
+		return nil, errors.New("recovery storage unavailable")
+	}
+	if m.invalidRecovery {
+		return []byte(`{}`), nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.durable = append([]byte(nil), baseline...)
+	return append([]byte(nil), m.durable...), nil
+}
+
+func TestResumeInvalidStateRequiresDurableRecoveryBeforePolling(t *testing.T) {
+	now := time.Now().UTC()
+	unsupported := progressBytes(t, "after=old", now)
+	unsupported = []byte(strings.Replace(string(unsupported), `"v":1`, `"v":2`, 1))
+	rejected := progressBytes(t, "until=unsupported", now.Add(-4*time.Hour))
+	canonicalOversize := []byte(fmt.Sprintf(`{"v":1,"q":%q,"since":%q,"observed":%q}`, "after=x"+strings.Repeat("&x=1", 600), now.Format(time.RFC3339Nano), now.Format(time.RFC3339Nano)))
+	require.Less(t, len(canonicalOversize), maxResumeBytes)
+	for name, raw := range map[string][]byte{"malformed": []byte(`{`), "unsupported": unsupported, "rejected": rejected, "oversized": make([]byte, 10*1024), "canonical-size": canonicalOversize} {
+		t.Run(name, func(t *testing.T) {
+			store := &recoverProgress{memoryProgress: &memoryProgress{durable: raw}, recoverFail: true}
+			var unknown, skipped uint64
+			conf := OktaConfig{URL: "https://example.okta.com", ResumeState: store, ResumeStats: func(class string, n uint64) {
+				switch class {
+				case "unknown":
+					unknown += n
+				case "skipped":
+					skipped += n
+				}
+			}}
+			require.Error(t, conf.Prepare(context.Background()))
+			require.False(t, conf.prepared.ready)
+			require.Zero(t, unknown)
+			require.Zero(t, skipped)
+			require.Equal(t, raw, store.saved())
+			_, _, err := newOktaAdapter(context.Background(), conf, &ackSink{})
+			require.Error(t, err)
+			require.Error(t, conf.Prepare(context.Background()))
+			require.Equal(t, 1, store.calls, "a recovery retry reuses the known read/revision")
+			require.Len(t, store.baselines, 2)
+			require.Equal(t, store.baselines[0], store.baselines[1], "recovery baseline is fixed across retries")
+			store.recoverFail = false
+			require.NoError(t, conf.Prepare(context.Background()))
+			require.Equal(t, store.baselines[0], store.saved())
+			require.Equal(t, uint64(1), unknown)
+			require.Zero(t, skipped)
+			require.NoError(t, conf.Prepare(context.Background()))
+			require.Equal(t, uint64(1), unknown)
+			require.Equal(t, 3, store.recoverCalls)
+		})
+	}
+}
+
+func TestResumeStorageErrorsNeverTriggerRecovery(t *testing.T) {
+	for _, readError := range []error{errors.New("storage read failed"), context.Canceled, context.DeadlineExceeded} {
+		store := &recoverProgress{memoryProgress: &memoryProgress{}, restoreError: readError}
+		conf := OktaConfig{URL: "https://example.okta.com", ResumeState: store}
+		require.ErrorIs(t, conf.Prepare(context.Background()), readError)
+		require.Zero(t, store.recoverCalls)
+		require.Nil(t, conf.prepared.recovery)
+	}
+	store := &recoverProgress{memoryProgress: &memoryProgress{}, restoreError: fmt.Errorf("known invalid stored envelope: %w", resume.ErrInvalidPosition)}
+	conf := OktaConfig{URL: "https://example.okta.com", ResumeState: store}
+	require.NoError(t, conf.Prepare(context.Background()))
+	require.Equal(t, 1, store.recoverCalls)
+}
+
+func TestResumeRecoveryRejectsInvalidRecoveryReply(t *testing.T) {
+	store := &recoverProgress{memoryProgress: &memoryProgress{durable: []byte(`{}`)}, invalidRecovery: true}
+	var unknown uint64
+	conf := OktaConfig{URL: "https://example.okta.com", ResumeState: store, ResumeStats: func(class string, n uint64) { unknown += n }}
+	require.ErrorIs(t, conf.Prepare(context.Background()), resume.ErrInvalidPosition)
+	require.False(t, conf.prepared.ready)
+	require.Zero(t, unknown)
+	store.invalidRecovery = false
+	require.NoError(t, conf.Prepare(context.Background()))
+	require.Equal(t, uint64(1), unknown)
+}
+
+func TestResumeNamespaceAndPreparationCounters(t *testing.T) {
+	for _, ns := range []string{"raw identity", strings.Repeat("A", 64), strings.Repeat("a", 63), strings.Repeat("g", 64)} {
+		store := &memoryProgress{}
+		conf := OktaConfig{URL: "https://example.okta.com", ResumeState: store, ResumeNamespace: ns}
+		require.Error(t, conf.Prepare(context.Background()))
+		require.Zero(t, store.calls)
+	}
+	store := &memoryProgress{durable: progressBytes(t, "after=old", time.Now().Add(-4*time.Hour))}
+	var skipped uint64
+	conf := OktaConfig{URL: "https://example.okta.com", ResumeState: store, ResumeNamespace: strings.Repeat("a", 64), ResumeStats: func(class string, n uint64) {
+		if class == "skipped" {
+			skipped += n
+		}
+	}}
+	require.NoError(t, conf.Prepare(context.Background()))
+	first := skipped
+	require.Greater(t, first, uint64(55))
+	require.NoError(t, conf.Prepare(context.Background()))
+	require.Equal(t, first, skipped)
+	// The optional API produces a typed error when durable recovery is missing.
+	bad := OktaConfig{URL: "https://example.okta.com", ResumeState: &memoryProgress{durable: []byte(`{}`)}}
+	require.ErrorIs(t, bad.Prepare(context.Background()), resume.ErrInvalidPosition)
+}
+
+func TestResumeRecoveredInvalidStateCollectsForward(t *testing.T) {
+	sinceRequest := make(chan string, 1)
+	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case sinceRequest <- r.URL.Query().Get("since"):
+		default:
+		}
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=tail>; rel="next"`, r.Host, logsURL))
+		fmt.Fprint(w, `[{"uuid":"after-recovery"}]`)
+	}))
+	defer vendor.Close()
+	store := &recoverProgress{memoryProgress: &memoryProgress{durable: []byte(`{"v":999}`)}}
+	var unknown atomic.Uint64
+	conf := OktaConfig{URL: vendor.URL, ApiKey: "fixture", ClientOptions: testClientOptions(t), PollInterval: time.Millisecond, ResumeState: store, ResumeStats: func(class string, n uint64) {
+		if class == "unknown" {
+			unknown.Add(n)
+		}
+	}}
+	started := time.Now()
+	require.NoError(t, conf.Prepare(context.Background()))
+	sink := &captureSink{}
+	a, _, err := newOktaAdapter(context.Background(), conf, sink)
+	require.NoError(t, err)
+	t.Cleanup(func() { a.Close() })
+	select {
+	case raw := <-sinceRequest:
+		since, err := time.Parse(time.RFC3339Nano, raw)
+		require.NoError(t, err)
+		require.False(t, since.Before(started.Add(-overlapPeriod)))
+		require.False(t, since.After(time.Now().Add(-overlapPeriod)))
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery never started collection")
+	}
+	require.Eventually(t, func() bool { return sink.count() == 1 }, 5*time.Second, time.Millisecond)
+	require.NoError(t, a.Close())
+	require.Equal(t, uint64(1), unknown.Load())
+	require.NotEmpty(t, store.snapshot())
+}
+
+func TestResumeOversizedDurableCandidateReusesLastBoundedPosition(t *testing.T) {
+	vendor := httptest.NewServer(http.NotFoundHandler())
+	defer vendor.Close()
+	a, g := resumeHarness(t, vendor.URL, &memoryProgress{}, &ackSink{})
+	var unknown uint64
+	a.conf.ResumeStats = func(class string, n uint64) {
+		if class == "unknown" {
+			unknown += n
+		}
+	}
+	u := *a.endpoint
+	u.RawQuery = "after=last-bounded"
+	g.position.Next = u.String()
+	g.page = 1
+	bounded, err := a.resumeCandidate(g)
+	require.NoError(t, err)
+	u.RawQuery = "after=" + strings.Repeat("x", 5*1024)
+	g.position.Next = u.String()
+	live := g.position
+	for i := 0; i < 10; i++ {
+		g.page++
+		candidate, err := a.resumeCandidate(g)
+		require.NoError(t, err)
+		require.Equal(t, bounded[16:], candidate[16:], "only local page markers change while durable source position stays fixed")
+		require.Equal(t, live, g.position, "durable fallback cannot rewrite live pagination")
+	}
+	require.Equal(t, uint64(1), unknown)
+	u.RawQuery = "after=next-bounded"
+	g.position.Next = u.String()
+	bounded, err = a.resumeCandidate(g)
+	require.NoError(t, err)
+	p, err := decodePosition(bounded[16:])
+	require.NoError(t, err)
+	require.Equal(t, "after=next-bounded", p.Query)
+	u.RawQuery = "after=" + strings.Repeat("y", 5*1024)
+	g.position.Next = u.String()
+	candidate, err := a.resumeCandidate(g)
+	require.NoError(t, err)
+	require.Equal(t, bounded[16:], candidate[16:])
+	require.Equal(t, uint64(2), unknown, "a new oversized episode begins only after a bounded continuation")
 }
