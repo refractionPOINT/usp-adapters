@@ -1,7 +1,6 @@
 package usp_entraid
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -146,20 +145,8 @@ func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer s
 		return delay, vendorerr.Kind(errPage, "response body exceeds 16 MiB", nil)
 	}
 	received := func() string { return vendorerr.HTTPText(resp, data, false, secrets...) }
-
-	var decodeErr error
-	if a.conf.Lookback == nil {
-		decodeErr = json.Unmarshal(data, out)
-	} else {
-		decoder := json.NewDecoder(bytes.NewReader(data))
-		decoder.UseNumber()
-		decodeErr = decoder.Decode(out)
-		if decodeErr == nil && decoder.Decode(new(interface{})) != io.EOF {
-			decodeErr = errors.New("trailing JSON response")
-		}
-	}
-	if decodeErr != nil {
-		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+decodeErr.Error()+"; received "+received(), decodeErr, secrets...)
+	if err := json.Unmarshal(data, out); err != nil {
+		return delay, vendorerr.Kind(errPage, "decoding JSON response: "+err.Error()+"; received "+received(), err, secrets...)
 	}
 
 	for _, check := range validate {
@@ -549,6 +536,9 @@ func (a *EntraIDAdapter) collectionFailure(ctx context.Context, err error) bool 
 		return false
 	}
 	switch {
+	case errors.Is(err, uspclient.ErrorReceiptUnavailable):
+		a.notify(err)
+		return false
 	case errors.Is(err, errYield), errors.Is(err, errRetry), errors.Is(err, errVendor):
 		return true
 	case errors.Is(err, errPressure):
@@ -576,24 +566,14 @@ func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, s
 		if sourceTime.UnixNano() < start || sourceTime.UnixNano() >= end {
 			continue
 		}
-		revision, err := json.Marshal(item)
-		if err != nil {
-			return err
-		}
-		sum := sha256.Sum256(revision)
-		key := a.conf.Lookback.Key(sourceTime, "entraid", utils.LookbackSource(a.conf.graphEndpoint()), a.conf.TenantID, stream.path, stream.tsField, id, fmt.Sprintf("%x", sum))
-		digest := eventDigest([32]byte{}, stream.name, key.Key)
+
+		key := a.conf.Lookback.Key(sourceTime, "entraid", utils.LookbackSource(a.conf.graphEndpoint()), a.conf.TenantID, stream.path, stream.tsField, id)
+		digest := eventDigest(a.sourceFingerprint(), stream.name, id)
 		if _, confirmed := g.live[digest]; confirmed {
 			continue
 		}
 		entries[digest] = liveID{expiry: sourceTime.UnixNano() + int64(historyHorizon), stream: streamCode(stream.name)}
-		// Keep the existing numeric wire representation; json.Number is only for
-		// the exact revision hash (msgpack would otherwise encode it as a string).
-		var payload map[string]interface{}
-		if err := json.Unmarshal(revision, &payload); err != nil {
-			return err
-		}
-		events = append(events, utils.ReplayEvent{Key: key, Message: &protocol.DataMessage{JsonPayload: payload, TimestampMs: uint64(time.Now().UnixMilli())}})
+		events = append(events, utils.ReplayEvent{Key: key, Message: &protocol.DataMessage{JsonPayload: item, TimestampMs: uint64(time.Now().UnixMilli())}})
 	}
 	if len(g.live)+len(entries) > liveIDLimit {
 		a.reclaimExpiredHistory(g)
@@ -608,7 +588,7 @@ func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, s
 	err := utils.DeliverLookback(ctx, a.conf.Lookback, observer, events, func(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
 		_, receipt, err := a.tracker.ShipWithReceipt(m, d)
 		return receipt, err
-	})
+	}, a.conf.ClientOptions.OnWarning)
 	if err == nil {
 		for digest, entry := range entries {
 			g.live[digest] = entry

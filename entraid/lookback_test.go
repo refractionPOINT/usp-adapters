@@ -2,7 +2,6 @@ package usp_entraid
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"sync/atomic"
 	"testing"
@@ -13,15 +12,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLookbackRestartGapRevisionAndStreamIdentity(t *testing.T) {
-	stamp := fixtureBaseTime().Add(-time.Hour)
-	var revision atomic.Int64
-	revision.Store(9007199254740992)
+func TestLookbackStartupLanesAndConfirmedIDs(t *testing.T) {
+	base := fixtureBaseTime()
+	stamp := base.Add(-3*time.Hour + 7*time.Second)
+	var updated atomic.Bool
 	vendor := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
 		start, end := bounds(t, r)
-		require.False(t, stamp.Before(start))
-		require.True(t, stamp.Before(end))
-		fmt.Fprintf(w, `{"value":[{"id":"one","activityDateTime":%q,"version":%d},{"id":"two","activityDateTime":%q}]}`, stamp.Format(time.RFC3339Nano), revision.Load(), stamp.Format(time.RFC3339Nano))
+		records := []map[string]interface{}{}
+		if !base.Add(time.Second).Before(start) && base.Add(time.Second).Before(end) {
+			records = append(records, item("live", base.Add(time.Second)))
+		}
+		if !stamp.Before(start) && stamp.Before(end) {
+			one := item("one", stamp)
+			one["dismissed"] = updated.Load()
+			records = append(records, one, item("two", stamp))
+		}
+		sendPage(w, records, "")
 	})
 	deduper, err := utils.NewLocalDeduper(time.Hour, 6*time.Hour)
 	require.NoError(t, err)
@@ -29,29 +35,37 @@ func TestLookbackRestartGapRevisionAndStreamIdentity(t *testing.T) {
 	gate := make(chan struct{})
 	client, received := lookbacktest.Client(t, gate)
 	a, _ := harness(t, vendor, client)
+	a.streams = a.streams[:1]
 	a.conf.Lookback = &utils.LookbackConfig{Window: 3 * time.Hour, Namespace: "record", Deduper: deduper.(utils.CheckingDeduper)}
-	a.runtime.window = 4 * time.Hour
+	a.runtime.window = 30 * time.Second
+	a.startedAt = base.UnixNano()
+	a.runtime.now = func() time.Time { return base.Add(31 * time.Second) }
 	g := newGeneration(1, a.initialPosition())
-	run := func() {
-		s := g.position[a.streams[0].name]
-		require.Equal(t, fixtureBaseTime().Add(-3*time.Hour).UnixNano(), s.Boundary)
-		require.Equal(t, s.Boundary, s.Coverage)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		end, err := a.scanWindow(ctx, g, a.streams[0], s.Boundary, s.WindowEnd, false, &graphRequests{})
-		require.NoError(t, err)
-		require.Equal(t, s.WindowEnd, end)
-	}
-	done := make(chan struct{})
-	go func() { defer close(done); run() }()
-	require.IsType(t, float64(0), lookbacktest.Receive(t, received).JsonPayload["version"])
-	lookbacktest.Receive(t, received)
+	stream := a.streams[0]
+	s := g.position[stream.name]
+	require.Equal(t, base.UnixNano(), s.Boundary)
+	require.Equal(t, base.Add(30*time.Second).UnixNano(), s.WindowEnd)
+	require.Equal(t, base.Add(-3*time.Hour).UnixNano(), s.Coverage)
+	require.Equal(t, s.Coverage, s.Replay)
+	require.Equal(t, s.Boundary, s.ReplayEnd)
+	done := make(chan error, 1)
+	go func() {
+		done <- a.liveStep(context.Background(), g, stream, &graphRequests{}, map[string]time.Time{}, map[string]bool{})
+	}()
+	require.Equal(t, "live", lookbacktest.Receive(t, received).JsonPayload["id"])
 	require.Empty(t, g.live, "unconfirmed receipts cannot populate local history")
 	close(gate)
-	<-done
-	a.streams = a.streams[:1]
-	a.conf.ClientID = "rotated"
+	require.NoError(t, <-done)
+	run := func() {
+		end, err := a.scanWindow(context.Background(), g, stream, s.Replay, s.Replay+int64(a.runtime.replayWindow), true, &graphRequests{})
+		require.NoError(t, err)
+		require.Equal(t, s.Replay+int64(15*time.Minute), end)
+	}
+	run()
+	lookbacktest.Receive(t, received)
+	lookbacktest.Receive(t, received)
 	g = newGeneration(2, a.initialPosition())
+	a.conf.ClientID = "rotated"
 	run()
 	for _, entry := range g.live {
 		require.Zero(t, entry.serial)
@@ -59,41 +73,47 @@ func TestLookbackRestartGapRevisionAndStreamIdentity(t *testing.T) {
 	}
 	outage := &lookbackMiss{}
 	a.conf.Lookback.Deduper = outage
+	updated.Store(true)
 	run()
-	require.Zero(t, outage.checks, "shared hits must become local confirmed history")
+	require.Zero(t, outage.checks, "shared hits must become local confirmed ID history")
+	require.Len(t, g.live, 2)
 	select {
 	case <-received:
-		t.Fatal("confirmed version replayed")
+		t.Fatal("existing ID redelivered")
 	default:
 	}
-	revision.Add(1) // Above float64's exact range; UseNumber must preserve the update.
+	// Local suppression is ID-only; a restart also preserves the shared ID marker.
+	g = newGeneration(3, a.initialPosition())
+	a.conf.Lookback.Deduper = deduper.(utils.CheckingDeduper)
 	run()
-	lookbacktest.Receive(t, received)
 	select {
 	case <-received:
-		t.Fatal("unchanged sibling replayed")
+		t.Fatal("updated shared ID redelivered")
 	default:
 	}
-	require.Equal(t, 3, len(g.live), "revisions retained separately from entity counts")
 	a.conf.Lookback.Namespace = "different-record"
+	g = newGeneration(4, a.initialPosition())
 	run()
 	lookbacktest.Receive(t, received)
 	lookbacktest.Receive(t, received)
-	fillHistory(g, a.streams[0], g.position[a.streams[0].name].Boundary)
-	revision.Add(1)
-	s := g.position[a.streams[0].name]
+	a.conf.Lookback.Deduper = outage
+	g.live = make(map[[16]byte]liveID)
+	fillHistory(g, stream, g.position[stream.name].Boundary)
 	before := outage.checks
-	_, err = a.scanWindow(context.Background(), g, a.streams[0], s.Boundary, s.WindowEnd, false, &graphRequests{})
+	// A new ID needs room; an existing ID never needs an extra slot.
+	a.conf.TenantID = "different-source"
+	_, err = a.scanWindow(context.Background(), g, stream, s.Replay, s.Replay+int64(a.runtime.replayWindow), true, &graphRequests{})
 	require.ErrorIs(t, err, errPressure)
-	require.Equal(t, before, outage.checks, "capacity must be checked before shared lookup or admission")
+	require.Equal(t, before, outage.checks)
 	require.Len(t, g.live, liveIDLimit)
-	s.Boundary = s.WindowEnd
-	g.position[a.streams[0].name] = s
+	position := g.position[stream.name]
+	position.Boundary = position.WindowEnd
+	g.position[stream.name] = position
 	g.maintenance = historyMaintenance{}
-	_, err = a.scanWindow(context.Background(), g, a.streams[0], s.Coverage, s.WindowEnd, false, &graphRequests{})
+	_, err = a.scanWindow(context.Background(), g, stream, s.Replay, s.Replay+int64(a.runtime.replayWindow), true, &graphRequests{})
 	require.ErrorIs(t, err, errPressure)
-	require.Greater(t, g.position[a.streams[0].name].Coverage, s.Coverage)
-	require.Equal(t, before, outage.checks, "reclamation must not admit outside retained coverage")
+	require.Greater(t, g.position[stream.name].Coverage, s.Coverage)
+	require.Equal(t, before, outage.checks)
 }
 
 type lookbackMiss struct{ checks int }
@@ -103,7 +123,7 @@ func (*lookbackMiss) CheckAndAdd(string) bool { return false }
 func (*lookbackMiss) Close()                  {}
 
 func TestLookbackKeepsLateArrivalReconciliation(t *testing.T) {
-	stamp := fixtureBaseTime().Add(-4 * time.Hour)
+	stamp := fixtureBaseTime().Add(-20 * time.Hour)
 	vendor := vendorServer(t, func(w http.ResponseWriter, r *http.Request) {
 		start, end := bounds(t, r)
 		items := []map[string]interface{}{}
@@ -116,14 +136,15 @@ func TestLookbackKeepsLateArrivalReconciliation(t *testing.T) {
 	a, _ := harness(t, vendor, client)
 	a.conf.Lookback = &utils.LookbackConfig{Window: 3 * time.Hour, Namespace: "record", Deduper: &lookbackMiss{}}
 	a.runtime.reconcileInterval = time.Millisecond
+	a.runtime.window = 30 * time.Second
 	g := newGeneration(1, a.initialPosition())
 	s := g.position[a.streams[0].name]
-	s.Coverage = fixtureBaseTime().Add(-6 * time.Hour).UnixNano()
+	s.Coverage = fixtureBaseTime().Add(-24 * time.Hour).UnixNano()
 	s.Boundary = fixtureBaseTime().UnixNano()
 	s.WindowEnd = a.runtime.now().Add(time.Hour).UnixNano()
 	g.position = entraPosition{a.streams[0].name: s}
 	a.streams = a.streams[:1]
-	a.runtime.replayWindow = 24 * time.Hour
+	require.Equal(t, 15*time.Minute, a.runtime.replayWindow)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	done := make(chan struct{})
 	go func() { defer close(done); a.collect(ctx, g) }()

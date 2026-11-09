@@ -312,13 +312,13 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 			observer, ok := a.uspClient.(utils.ReceiptObserver)
 			if !ok {
-				a.issue("receipt_unavailable")
+				a.notify(uspclient.ErrorReceiptUnavailable)
 				return
 			}
 			if err := utils.DeliverLookback(ctx, a.conf.Lookback, observer, events, func(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
 				_, receipt, err := a.tracker.ShipWithReceipt(m, d)
 				return receipt, err
-			}); err != nil {
+			}, a.conf.ClientOptions.OnWarning); err != nil {
 				if errors.Is(err, acktrack.ErrSequence) || errors.Is(err, acktrack.ErrDependency) || errors.Is(err, acktrack.ErrLimit) {
 					a.issue("admission_tracking_failed")
 				} else if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {

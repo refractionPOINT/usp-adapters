@@ -35,7 +35,7 @@ func (c *LookbackConfig) Start(now time.Time) time.Time {
 	return now.UTC().Add(-c.Window)
 }
 
-// Key namespaces adapter/source/collection/ID/revision, with stable source time.
+// Key namespaces adapter/source/collection/ID, with stable source time.
 func (c *LookbackConfig) Key(sourceTime time.Time, fields ...string) DedupeKey {
 	raw, _ := json.Marshal(append([]string{c.Namespace}, fields...))
 	sum := sha256.Sum256(raw)
@@ -55,7 +55,14 @@ const LookbackChunkSize = 256
 
 // DeliverLookback confirms chunks (256 events / 1 MiB; one larger event alone).
 // Callers bound pages. Errors never mark unconfirmed data or advance progress.
-func DeliverLookback(ctx context.Context, c *LookbackConfig, observer ReceiptObserver, events []ReplayEvent, admit ReceiptAdmit) error {
+func DeliverLookback(ctx context.Context, c *LookbackConfig, observer ReceiptObserver, events []ReplayEvent, admit ReceiptAdmit, warning ...func(string)) error {
+	nextWarning := time.Now().Add(10 * time.Second)
+	warn := func() {
+		if len(warning) > 0 && warning[0] != nil && !time.Now().Before(nextWarning) {
+			warning[0]("stream falling behind")
+			nextWarning = time.Now().Add(time.Minute)
+		}
+	}
 	for len(events) > 0 {
 		n, size := 0, 0
 		for n < len(events) && n < LookbackChunkSize {
@@ -69,14 +76,14 @@ func DeliverLookback(ctx context.Context, c *LookbackConfig, observer ReceiptObs
 			size += len(raw)
 			n++
 		}
-		if err := deliverChunk(ctx, c, observer, events[:n], admit); err != nil {
+		if err := deliverChunk(ctx, c, observer, events[:n], admit, warn); err != nil {
 			return err
 		}
 		events = events[n:]
 	}
 	return nil
 }
-func deliverChunk(ctx context.Context, c *LookbackConfig, observer ReceiptObserver, events []ReplayEvent, admit ReceiptAdmit) error {
+func deliverChunk(ctx context.Context, c *LookbackConfig, observer ReceiptObserver, events []ReplayEvent, admit ReceiptAdmit, warn func()) error {
 	keys := make([]DedupeKey, len(events))
 	for i, event := range events {
 		keys[i] = event.Key
@@ -130,6 +137,7 @@ func deliverChunk(ctx context.Context, c *LookbackConfig, observer ReceiptObserv
 			}
 			receipt, err := admit(&msg, 250*time.Millisecond)
 			if errors.Is(err, uspclient.ErrorBufferFull) {
+				warn()
 				acktrack.Wait(ctx, 10*time.Millisecond)
 				continue
 			}
@@ -155,6 +163,7 @@ func deliverChunk(ctx context.Context, c *LookbackConfig, observer ReceiptObserv
 		if all {
 			return nil
 		}
+		warn()
 		acktrack.Wait(ctx, 10*time.Millisecond)
 	}
 	return nil

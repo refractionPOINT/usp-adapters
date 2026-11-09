@@ -90,8 +90,11 @@ func TestLookbackAdmissionErrorClassification(t *testing.T) {
 		fmt.Fprint(w, `[{"uuid":"one"}]`)
 	}))
 	defer vendor.Close()
-	for _, err := range []error{uspclient.ErrorClosed, acktrack.ErrSequence, acktrack.ErrDependency, acktrack.ErrLimit, errors.New("admission failure")} {
-		sink := &lookbackErrorSink{err: err}
+	for _, err := range []error{uspclient.ErrorClosed, acktrack.ErrSequence, acktrack.ErrDependency, acktrack.ErrLimit, uspclient.ErrorReceiptUnavailable, errors.New("admission failure")} {
+		var sink uspSink = &lookbackErrorSink{err: err}
+		if errors.Is(err, uspclient.ErrorReceiptUnavailable) {
+			sink = &ackSink{}
+		}
 		a, g := localHarness(t, vendor.URL, sink)
 		d, e := utils.NewLocalDeduper(time.Hour, 2*time.Hour)
 		require.NoError(t, e)

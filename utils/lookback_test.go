@@ -80,24 +80,51 @@ func TestLookbackReceiptChunksAndReplay(t *testing.T) {
 	require.Equal(t, 4, calls)
 }
 func TestLookbackUnconfirmedCrashDoesNotMark(t *testing.T) {
-	gate := make(chan struct{})
-	client, received := lookbacktest.Client(t, gate)
-	c, d := config()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- utils.DeliverLookback(ctx, c, client, events(c, 257), client.ShipWithReceipt) }()
-	for i := 0; i < 256; i++ {
-		lookbacktest.Receive(t, received)
+	for _, bufferFull := range []bool{true, false} {
+		t.Run(fmt.Sprint(bufferFull), func(t *testing.T) {
+			gate := make(chan struct{})
+			client, received := lookbacktest.Client(t, gate)
+			c, d := config()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			warnings := make(chan string, 100)
+			done := make(chan error, 1)
+			admit := client.ShipWithReceipt
+			if bufferFull {
+				admit = func(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error) {
+					return uspclient.AdmissionReceipt{}, uspclient.ErrorBufferFull
+				}
+			}
+			go func() {
+				done <- utils.DeliverLookback(ctx, c, client, events(c, 257), admit, func(warning string) { warnings <- warning })
+			}()
+			if !bufferFull {
+				for i := 0; i < 256; i++ {
+					lookbacktest.Receive(t, received)
+				}
+				select {
+				case <-received:
+					t.Fatal("advanced beyond unconfirmed chunk")
+				case <-time.After(30 * time.Millisecond):
+				}
+			}
+			select {
+			case warning := <-warnings:
+				require.Equal(t, "stream falling behind", warning)
+			case <-time.After(12 * time.Second):
+				t.Fatal("blocked delivery never warned")
+			}
+			select {
+			case <-warnings:
+				t.Fatal("warning cadence unbounded")
+			case <-time.After(100 * time.Millisecond):
+			}
+			cancel()
+			require.ErrorIs(t, <-done, context.Canceled)
+			require.Zero(t, d.writes)
+			close(gate)
+		})
 	}
-	select {
-	case <-received:
-		t.Fatal("advanced beyond unconfirmed chunk")
-	case <-time.After(30 * time.Millisecond):
-	}
-	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
-	require.Zero(t, d.writes)
-	close(gate)
 }
 
 type observation struct{ value uspclient.ReceiptObservation }
