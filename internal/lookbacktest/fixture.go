@@ -1,4 +1,3 @@
-// Package lookbacktest supplies a local USP peer for receipt integration tests.
 package lookbacktest
 
 import (
@@ -29,15 +28,12 @@ func Client(t *testing.T, gate <-chan struct{}) (*uspclient.Client, <-chan *prot
 			return
 		}
 		defer socket.Close()
-		if socket.ReadJSON(&protocol.ConnectionHeader{}) != nil {
+		if socket.ReadJSON(&protocol.ConnectionHeader{}) != nil ||
+			socket.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageREADY}) != nil ||
+			socket.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageFLOW, WindowSize: 1024}) != nil {
 			return
 		}
-		if socket.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageREADY}) != nil {
-			return
-		}
-		if socket.WriteJSON(protocol.ControlMessage{Verb: protocol.ControlMessageFLOW, WindowSize: 1024}) != nil {
-			return
-		}
+
 		for {
 			_, raw, err := socket.ReadMessage()
 			if err != nil {

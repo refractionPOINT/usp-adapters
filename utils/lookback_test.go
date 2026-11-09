@@ -74,7 +74,6 @@ func TestLookbackReceiptChunksAndReplay(t *testing.T) {
 	d.outage = true
 	require.NoError(t, utils.DeliverLookback(ctx, c, client, input[:2], admit))
 	require.Equal(t, 2, calls)
-	// A marker write outage loses no delivery; a fresh process must replay.
 	require.Empty(t, d.values)
 	d.outage = false
 	require.NoError(t, utils.DeliverLookback(ctx, c, client, input[:2], admit))

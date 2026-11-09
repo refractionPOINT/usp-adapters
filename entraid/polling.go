@@ -563,13 +563,9 @@ func (a *EntraIDAdapter) collectionFailure(ctx context.Context, err error) bool 
 	return true
 }
 
-// Shared suppression replaces the local ID cache in hosted mode: mutable records
-// must be compared by revision, and every actual send passes through the tracker.
 func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, stream entraStream, items []map[string]interface{}, start, end int64) error {
-	if start < g.position[stream.name].Coverage {
-		return errPressure
-	}
 	events := make([]utils.ReplayEvent, 0, len(items))
+	entries := make(map[[16]byte]liveID)
 	for _, item := range items {
 		stamp, _ := item[stream.tsField].(string)
 		sourceTime, err := time.Parse(time.RFC3339Nano, stamp)
@@ -586,6 +582,11 @@ func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, s
 		}
 		sum := sha256.Sum256(revision)
 		key := a.conf.Lookback.Key(sourceTime, "entraid", utils.LookbackSource(a.conf.graphEndpoint()), a.conf.TenantID, stream.path, stream.tsField, id, fmt.Sprintf("%x", sum))
+		digest := eventDigest([32]byte{}, stream.name, key.Key)
+		if _, confirmed := g.live[digest]; confirmed {
+			continue
+		}
+		entries[digest] = liveID{expiry: sourceTime.UnixNano() + int64(historyHorizon), stream: streamCode(stream.name)}
 		// Keep the existing numeric wire representation; json.Number is only for
 		// the exact revision hash (msgpack would otherwise encode it as a string).
 		var payload map[string]interface{}
@@ -594,12 +595,24 @@ func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, s
 		}
 		events = append(events, utils.ReplayEvent{Key: key, Message: &protocol.DataMessage{JsonPayload: payload, TimestampMs: uint64(time.Now().UnixMilli())}})
 	}
+	if len(g.live)+len(entries) > liveIDLimit {
+		a.reclaimExpiredHistory(g)
+	}
+	if start < g.position[stream.name].Coverage || len(g.live)+len(entries) > liveIDLimit {
+		return errPressure
+	}
 	observer, ok := a.uspClient.(utils.ReceiptObserver)
 	if !ok {
 		return uspclient.ErrorReceiptUnavailable
 	}
-	return utils.DeliverLookback(ctx, a.conf.Lookback, observer, events, func(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
+	err := utils.DeliverLookback(ctx, a.conf.Lookback, observer, events, func(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
 		_, receipt, err := a.tracker.ShipWithReceipt(m, d)
 		return receipt, err
 	})
+	if err == nil {
+		for digest, entry := range entries {
+			g.live[digest] = entry
+		}
+	}
+	return err
 }

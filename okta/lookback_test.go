@@ -1,9 +1,15 @@
 package usp_okta
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	uspclient "github.com/refractionPOINT/go-uspclient"
+	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -53,7 +59,6 @@ func TestLookbackRestartGapSameTimestampAndConfirmedReplay(t *testing.T) {
 	require.Eventually(t, func() bool { return calls.Load() > 2 }, 5*time.Second, time.Millisecond)
 	stop()
 	require.WithinDuration(t, now.Add(-time.Hour), <-since, 2*time.Second)
-	// New generation/client keeps only shared confirmed markers, not local IDs.
 	client2, received2 := lookbacktest.Client(t, nil)
 	b, _ := localHarness(t, server.URL, client2)
 	b.conf.Lookback = a.conf.Lookback
@@ -65,5 +70,45 @@ func TestLookbackRestartGapSameTimestampAndConfirmedReplay(t *testing.T) {
 	case <-received2:
 		t.Fatal("confirmed restart event replayed")
 	default:
+	}
+}
+
+type lookbackErrorSink struct {
+	ackSink
+	err error
+}
+
+func (s *lookbackErrorSink) ShipWithReceipt(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error) {
+	return uspclient.AdmissionReceipt{}, s.err
+}
+func (*lookbackErrorSink) ObserveReceipt(uspclient.AdmissionReceipt) uspclient.ReceiptObservation {
+	return uspclient.ReceiptObservation{}
+}
+func TestLookbackAdmissionErrorClassification(t *testing.T) {
+	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s>; rel="next"`, r.Host, r.URL.RequestURI()))
+		fmt.Fprint(w, `[{"uuid":"one"}]`)
+	}))
+	defer vendor.Close()
+	for _, err := range []error{uspclient.ErrorClosed, acktrack.ErrSequence, acktrack.ErrDependency, acktrack.ErrLimit, errors.New("admission failure")} {
+		sink := &lookbackErrorSink{err: err}
+		a, g := localHarness(t, vendor.URL, sink)
+		d, e := utils.NewLocalDeduper(time.Hour, 2*time.Hour)
+		require.NoError(t, e)
+		a.conf.Lookback = &utils.LookbackConfig{Window: time.Hour, Namespace: "record", Deduper: d.(utils.CheckingDeduper)}
+		reports, issues := 0, 0
+		a.conf.ClientOptions.OnError = func(error) { reports++ }
+		a.conf.ClientOptions.DebugLog = func(code string) {
+			if strings.Contains(code, "admission_tracking_failed") {
+				issues++
+			}
+		}
+		a.collect(context.Background(), g)
+		a.flushNotifications()
+		a.notifier.Close()
+		d.Close()
+		tracking := errors.Is(err, acktrack.ErrSequence) || errors.Is(err, acktrack.ErrDependency) || errors.Is(err, acktrack.ErrLimit)
+		require.Equal(t, tracking, issues == 1)
+		require.Equal(t, !tracking && !errors.Is(err, uspclient.ErrorClosed), reports == 1)
 	}
 }

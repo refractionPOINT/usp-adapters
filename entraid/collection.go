@@ -285,11 +285,7 @@ func (a *EntraIDAdapter) collect(ctx context.Context, g *entraGeneration) {
 			index := (liveStart + i) % len(a.streams)
 			stream := a.streams[index]
 			s := g.position[stream.name]
-			horizon := historyHorizon
-			if a.conf.Lookback != nil {
-				horizon = a.conf.Lookback.Window
-			}
-			floor := now.Add(-horizon).UnixNano()
+			floor := now.Add(-historyHorizon).UnixNano()
 			floor -= floor % int64(graphTimeQuantum)
 			if floor > s.Coverage && s.Replay == 0 {
 				if floor > s.Boundary {

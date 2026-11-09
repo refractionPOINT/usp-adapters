@@ -319,7 +319,9 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 				_, receipt, err := a.tracker.ShipWithReceipt(m, d)
 				return receipt, err
 			}); err != nil {
-				if ctx.Err() == nil {
+				if errors.Is(err, acktrack.ErrSequence) || errors.Is(err, acktrack.ErrDependency) || errors.Is(err, acktrack.ErrLimit) {
+					a.issue("admission_tracking_failed")
+				} else if ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
 					a.notify(err)
 				}
 				return
