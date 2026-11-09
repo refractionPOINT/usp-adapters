@@ -11,8 +11,9 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-// Leave room for the embedder's identity, fencing and version envelope.
-const maxResumeBytes = 6 * 1024
+// Position is base64-encoded inside a JSON envelope: leave room for that
+// expansion plus the embedder's identity, fencing and revision metadata.
+const maxResumeBytes = 4 * 1024
 const recoveryHorizon = 3 * time.Hour
 const dedupTimeout = 250 * time.Millisecond
 const dedupBackoff = 30 * time.Second
@@ -58,7 +59,9 @@ func (c *OktaConfig) Prepare(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	p, err := decodePosition(raw)
+	// Accept a valid older bounded envelope for fallback, never emit its
+	// oversized cursor. The ordinary decoder/output budget stays at 4 KiB.
+	p, err := decodePositionLimit(raw, 8*1024)
 	if err != nil {
 		return err
 	}
@@ -68,6 +71,10 @@ func (c *OktaConfig) Prepare(ctx context.Context) error {
 		p.Query = baselineQuery(cutoff)
 		p.Since = cutoff
 		// Do not Confirm this cap: a successful page must establish its frontier.
+	}
+	if len(raw) > maxResumeBytes {
+		p.Since = c.fallbackSince(p.Since, p.Observed, time.Now().UTC())
+		p.Query = baselineQuery(p.Since)
 	}
 	u := *endpoint
 	u.RawQuery = p.Query
@@ -82,8 +89,11 @@ func (c *OktaConfig) Prepare(ctx context.Context) error {
 }
 
 func decodePosition(raw []byte) (savedPosition, error) {
+	return decodePositionLimit(raw, maxResumeBytes)
+}
+func decodePositionLimit(raw []byte, limit int) (savedPosition, error) {
 	var p savedPosition
-	if len(raw) > maxResumeBytes || json.Unmarshal(raw, &p) != nil || p.Version != 1 || p.Observed.IsZero() || len(p.Query) == 0 {
+	if len(raw) > limit || json.Unmarshal(raw, &p) != nil || p.Version != 1 || p.Observed.IsZero() || len(p.Query) == 0 {
 		return p, errors.New("invalid resume position")
 	}
 	if _, err := url.ParseQuery(p.Query); err != nil {
@@ -102,6 +112,26 @@ func (c *OktaConfig) stat(class string, n uint64) {
 	}
 }
 
+// fallbackSince chooses a bounded inclusive recovery request, never a proven
+// completeness watermark. Unknown/skipped counters describe the limitation.
+// Publishing this request as a checkpoint still requires all page dependencies.
+func (c *OktaConfig) fallbackSince(since, observed, now time.Time) time.Time {
+	if since.IsZero() || (!observed.IsZero() && since.Before(observed.Add(-overlapPeriod))) {
+		reference := observed
+		if reference.IsZero() || reference.After(now) {
+			reference = now
+		}
+		since = reference.Add(-overlapPeriod)
+	}
+	cutoff := now.Add(-recoveryHorizon)
+	if since.Before(cutoff) {
+		c.stat("skipped", uint64(cutoff.Sub(since)/time.Minute))
+		since = cutoff
+	}
+	c.stat("unknown", 1)
+	return since
+}
+
 func (a *OktaAdapter) resumeCandidate(g *oktaGeneration) ([]byte, error) {
 	marker := candidateBytes(g.id, g.page)
 	if a.conf.ResumeState == nil {
@@ -112,8 +142,20 @@ func (a *OktaAdapter) resumeCandidate(g *oktaGeneration) ([]byte, error) {
 		return nil, err
 	}
 	raw, err := json.Marshal(savedPosition{1, u.RawQuery, g.position.Since, time.Now().UTC()})
-	if err != nil || len(raw) > maxResumeBytes {
-		return nil, errors.New("resume position exceeds bound")
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxResumeBytes {
+		// Keep the whole page's dependencies while replacing only its unpersistable
+		// continuation. No cursor truncation and no confirmation before its ACKs.
+		g.position.Since = a.conf.fallbackSince(g.position.Since, g.position.Observed, time.Now().UTC())
+		u := *a.endpoint
+		u.RawQuery = baselineQuery(g.position.Since)
+		g.position.Next = u.String()
+		raw, err = json.Marshal(savedPosition{1, u.RawQuery, g.position.Since, time.Now().UTC()})
+		if err != nil || len(raw) > maxResumeBytes {
+			return nil, errors.New("resume fallback exceeds bound")
+		}
 	}
 	return append(marker, raw...), nil
 }

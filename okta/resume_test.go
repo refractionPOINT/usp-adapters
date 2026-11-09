@@ -530,3 +530,122 @@ func TestResumeSlowDedupBacksOffWithoutHoldingCollection(t *testing.T) {
 	a.flushDedup(context.Background(), g)
 	require.Equal(t, int32(1), backend.adds.Load(), "unchanged confirmed frontier neither scans nor retries Add")
 }
+
+func TestResumeOversizedCursorFallsBackWithoutCrossingPendingPage(t *testing.T) {
+	var calls atomic.Int32
+	var unknown atomic.Uint64
+	fallbackQuery := make(chan string, 1)
+	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if n == 1 {
+			w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=%s>; rel="next"`, r.Host, logsURL, strings.Repeat("x", 5*1024)))
+			fmt.Fprint(w, `[{"uuid":"pending-large-cursor","published":"2099-01-01T00:00:00Z"}]`)
+			return
+		}
+		select {
+		case fallbackQuery <- r.URL.RawQuery:
+		default:
+		}
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=tail>; rel="next"`, r.Host, logsURL))
+		fmt.Fprint(w, `[]`)
+	}))
+	defer vendor.Close()
+	state := &memoryProgress{}
+	sink := &ackSink{}
+	a, g := resumeHarness(t, vendor.URL, state, sink)
+	initial := g.position.Since
+	a.conf.ResumeStats = func(class string, n uint64) {
+		if class == "unknown" {
+			unknown.Add(n)
+		}
+	}
+	stop := runCollector(t, a, g)
+	require.Eventually(t, func() bool { return calls.Load() >= 4 }, 5*time.Second, time.Millisecond)
+	stop()
+	q, err := url.ParseQuery(<-fallbackQuery)
+	require.NoError(t, err)
+	require.Equal(t, initial.Format(time.RFC3339Nano), q.Get("since"), "safe recent startup baseline is retained inclusively")
+	require.Empty(t, q.Get("after"), "opaque cursor must not be truncated")
+	require.Equal(t, uint64(1), unknown.Load())
+	require.Equal(t, 1, sink.count())
+	require.Empty(t, state.snapshot(), "a fallback and later empties still depend on the pending page")
+	sink.ack(1)
+	require.NoError(t, a.confirm(g))
+	require.NotEmpty(t, state.snapshot())
+	require.LessOrEqual(t, len(state.snapshot()), 4096, "base64 JSON envelope requires a 4 KiB position budget")
+	p, err := decodePosition(state.snapshot())
+	require.NoError(t, err)
+	require.Equal(t, "after=tail", p.Query)
+	// Reserve 2 KiB for enclosing identity/fencing metadata, including base64
+	// expansion of the largest supported vendor blob.
+	envelope, err := json.Marshal(struct {
+		Position []byte
+		Metadata string
+	}{make([]byte, maxResumeBytes), strings.Repeat("m", 2048)})
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(envelope), 8192)
+}
+
+func TestResumeRestoreOversizedCursorUsesBoundedUnconfirmedFallback(t *testing.T) {
+	now := time.Now().UTC()
+	raw := progressBytes(t, "after="+strings.Repeat("x", 5*1024), now)
+	state := &memoryProgress{durable: raw}
+	var unknown uint64
+	conf := OktaConfig{URL: "https://example.okta.com", ResumeState: state, ResumeStats: func(class string, n uint64) {
+		if class == "unknown" {
+			unknown += n
+		}
+	}}
+	require.NoError(t, conf.Prepare(context.Background()))
+	u, err := url.Parse(conf.prepared.position.Next)
+	require.NoError(t, err)
+	require.Empty(t, u.Query().Get("after"))
+	require.Equal(t, now.Format(time.RFC3339Nano), u.Query().Get("since"))
+	require.Equal(t, uint64(1), unknown)
+	require.Empty(t, state.snapshot(), "restoring an oversized cursor cannot publish uncollected progress")
+	require.Equal(t, raw, state.saved(), "old durable state remains until a source-complete confirmed candidate")
+}
+
+func TestResumeExpiredCursorPreservesOutageBeforeOverlap(t *testing.T) {
+	now := time.Now().UTC()
+	observed := now.Add(-2 * time.Hour)
+	requested := make(chan string, 1)
+	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("after") == "expired" {
+			w.WriteHeader(400)
+			fmt.Fprint(w, `{"errorCode":"E0000001"}`)
+			return
+		}
+		select {
+		case requested <- r.URL.Query().Get("since"):
+		default:
+		}
+		w.Header().Set("Link", fmt.Sprintf(`<http://%s%s?after=forward>; rel="next"`, r.Host, logsURL))
+		fmt.Fprint(w, `[]`)
+	}))
+	defer vendor.Close()
+	raw, err := json.Marshal(savedPosition{Version: 1, Query: "after=expired", Since: now.Add(-48 * time.Hour), Observed: observed})
+	require.NoError(t, err)
+	a, g := resumeHarness(t, vendor.URL, &memoryProgress{durable: raw}, &ackSink{})
+	var skipped, unknown atomic.Uint64
+	a.conf.ResumeStats = func(class string, n uint64) {
+		switch class {
+		case "skipped":
+			skipped.Add(n)
+		case "unknown":
+			unknown.Add(n)
+		}
+	}
+	stop := runCollector(t, a, g)
+	select {
+	case rawSince := <-requested:
+		since, err := time.Parse(time.RFC3339Nano, rawSince)
+		require.NoError(t, err)
+		require.Equal(t, observed.Add(-overlapPeriod), since)
+	case <-time.After(5 * time.Second):
+		t.Fatal("expired cursor did not fall back")
+	}
+	stop()
+	require.Zero(t, skipped.Load())
+	require.Equal(t, uint64(1), unknown.Load())
+}

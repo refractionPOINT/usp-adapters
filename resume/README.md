@@ -24,14 +24,20 @@ Okta's polling continuation is preserved, including after empty pages. Event
 publication timestamps are not used as a source completeness watermark.
 
 Positions contain bounded opaque continuation query state and timestamp fallback,
-not payloads, credentials or event-ID lists. The vendor blob is limited to 6 KiB,
-leaving overhead for an 8 KiB enclosing identity/version envelope. A stale saved
+not payloads, credentials or event-ID lists. The vendor blob is limited to 4 KiB,
+leaving room for base64 expansion and identity/revision metadata in an 8 KiB JSON
+envelope. Oversized continuations use the bounded inclusive fallback policy and
+fixed unknown/skipped counters, without truncation. Fallback page candidates retain
+all admissions and pending-duplicate dependencies; no checkpoint crosses an
+unconfirmed record. Collection continues from the fallback with polling pacing. A stale saved
 observation beyond three hours starts at that recovery boundary, counting omitted
 minutes. Rejected cursors fall back inclusively to the stored boundary, capped at
 three hours; absent safe timestamps use a thirty-minute overlap and count unknown
 history. A startup timestamp more than thirty minutes behind the last successful
 page observation is no longer a recent cursor fallback. If that cursor expires,
-use the same short unknown-history overlap; do not count previously collected
+use the short unknown-history overlap anchored before the last successful page
+observation (or current time if none exists), capped at three hours; do not count
+previously collected
 startup history as skipped. Neither event publication times nor page observation
 times establish a new source completeness boundary. Historical completeness
 remains bounded by vendor availability, retention

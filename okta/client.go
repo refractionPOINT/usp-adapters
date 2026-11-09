@@ -270,22 +270,11 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			if errors.Is(err, errInvalidContinuation) {
 				// Optional saved progress has a safe inclusive timestamp fallback.
 				if a.conf.ResumeState != nil {
-					since := g.position.Since
-					// A stale startup timestamp is not a recent cursor boundary. Do
-					// not replay hours of already collected history or count it as lost.
-					if since.IsZero() || (!g.position.Observed.IsZero() && since.Before(g.position.Observed.Add(-overlapPeriod))) {
-						since = time.Now().UTC().Add(-overlapPeriod)
-					}
-					cutoff := time.Now().UTC().Add(-recoveryHorizon)
-					if since.Before(cutoff) {
-						a.conf.stat("skipped", uint64(cutoff.Sub(since)/time.Minute))
-						since = cutoff
-					}
+					since := a.conf.fallbackSince(g.position.Since, g.position.Observed, time.Now().UTC())
 					u := *a.endpoint
 					u.RawQuery = baselineQuery(since)
 					next = u.String()
 					g.position.Since = since
-					a.conf.stat("unknown", 1)
 					if !acktrack.Wait(ctx, max(a.pollInterval, page.delay)) {
 						return
 					}
@@ -401,8 +390,8 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 		}
 		g.position.Next = page.next
-		g.position.Observed = time.Now().UTC()
 		marker, candidateErr := a.resumeCandidate(g)
+		g.position.Observed = time.Now().UTC()
 		if candidateErr != nil {
 			a.issue("candidate_rejected")
 			return
@@ -421,8 +410,11 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			_ = a.confirm(g)
 			a.flushDedup(ctx, g)
 		}
-		next = page.next
+		next = g.position.Next
 		delay := page.delay
+		if next != page.next && delay < a.pollInterval {
+			delay = a.pollInterval
+		}
 		if len(page.items) == 0 && delay < a.pollInterval {
 			delay = a.pollInterval
 		}
