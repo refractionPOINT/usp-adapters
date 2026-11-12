@@ -101,24 +101,31 @@ func (s *captureSink) snapshot() []*protocol.DataMessage {
 //     grant_type/scope exactly as the adapter sends them and returns an
 //     access_token.
 //   - GET /v1.0/security/alerts_v2 -- the MS Graph security alerts endpoint.
-//     It validates the bearer token, honors the adapter's
-//     `$filter=createdDateTime ge <ts>` query parameter against an in-memory
-//     dataset, and returns the Graph envelope ({"@odata.context", "value",
-//     and "@odata.nextLink" when the page is truncated}).
+//     It validates the bearer token, honors the adapter's half-open
+//     `$filter=createdDateTime ge <start> and createdDateTime lt <end>`
+//     against an in-memory dataset, honors `$top` and `$count=true`, and
+//     returns the Graph envelope ({"@odata.context", "value", "@odata.count"
+//     when asked, and "@odata.nextLink" when the page is truncated}).
 //
-// Ordering caveat: the mock serves alerts in ascending createdDateTime order
-// because the adapter's watermark logic (take the createdDateTime of the last
-// item processed as the next `since`) only makes forward progress under that
-// ordering. The official docs do NOT promise it: the List alerts_v2 page says
+// Ordering caveat: the mock serves alerts in ascending createdDateTime order.
+// The official docs do NOT promise any order: the List alerts_v2 page says
 // "The most recent alerts are displayed at the top of the list" (newest
 // first) and $orderby is not among the supported query parameters ($count,
-// $filter, $skip, $top). These tests pin the adapter's behavior, not a Graph
-// ordering guarantee.
+// $filter, $skip, $top). The adapter collects fixed creation-time windows and
+// does not depend on the order within one; these tests pin its behavior, not a
+// Graph ordering guarantee.
 type mockMicrosoft struct {
 	mu sync.Mutex
 
 	alerts   []map[string]interface{} // ascending createdDateTime
-	pageSize int                      // 0 = no truncation
+	pageSize int                      // server-side page cap, even above $top; 0 = no cap
+
+	// defaultPageSize is the page served when the request carries no $top.
+	// Graph documents neither alerts_v2's default nor its maximum page size.
+	defaultPageSize int
+	// omitNextLink serves truncated pages with no @odata.nextLink, a behaviour
+	// reported for live alerts_v2 calls but not documented by Microsoft.
+	omitNextLink bool
 
 	// expectedScope is the OAuth2 scope the token endpoint requires. It varies
 	// by Microsoft cloud (commercial vs. gov), so tests set it to match the
@@ -132,6 +139,8 @@ type mockMicrosoft struct {
 	lastTokenForm  url.Values
 	lastAuthHeader string
 	lastFilter     string
+	lastTop        string
+	lastCount      string
 }
 
 func newMockMicrosoft() *mockMicrosoft {
@@ -183,6 +192,12 @@ func (m *mockMicrosoft) lastSeenFilter() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.lastFilter
+}
+
+func (m *mockMicrosoft) lastSeenPaging() (top, count string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastTop, m.lastCount
 }
 
 func (m *mockMicrosoft) handler(t *testing.T) http.Handler {
@@ -293,9 +308,12 @@ func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *htt
 		return
 	}
 
-	filter := r.URL.Query().Get("$filter")
+	query := r.URL.Query()
+	filter := query.Get("$filter")
 	m.mu.Lock()
 	m.lastFilter = filter
+	m.lastTop = query.Get("$top")
+	m.lastCount = query.Get("$count")
 	m.mu.Unlock()
 
 	const prefix = "createdDateTime ge "
@@ -336,25 +354,47 @@ func (m *mockMicrosoft) handleAlerts(t *testing.T, w http.ResponseWriter, r *htt
 			matching = append(matching, alert)
 		}
 	}
-	pageSize := m.pageSize
+	pageSize := m.defaultPageSize
+	if top := query.Get("$top"); top != "" {
+		n, terr := strconv.Atoi(top)
+		if !assert.NoError(t, terr, "unparseable $top %q", top) || !assert.Positive(t, n, "$top must be positive") {
+			m.mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		pageSize = n
+	}
+	if m.pageSize > 0 && (pageSize == 0 || pageSize > m.pageSize) {
+		pageSize = m.pageSize
+	}
+	omitNextLink := m.omitNextLink
 	m.mu.Unlock()
 
 	envelope := map[string]interface{}{
 		"@odata.context": "https://graph.microsoft.com/v1.0/$metadata#security/alerts_v2",
 	}
-	offset, _ := strconv.Atoi(r.URL.Query().Get("$skiptoken"))
+	if query.Get("$count") == "true" {
+		envelope["@odata.count"] = len(matching)
+	}
+	offset, _ := strconv.Atoi(query.Get("$skiptoken"))
 	if offset > len(matching) {
 		offset = len(matching)
 	}
 	matching = matching[offset:]
 	if pageSize > 0 && len(matching) > pageSize {
 		matching = matching[:pageSize]
-		envelope["@odata.nextLink"] = fmt.Sprintf(
-			"http://%s/v1.0/security/alerts_v2?$filter=%s&$skiptoken=%d",
-			r.Host, url.QueryEscape(filter), offset+pageSize)
-		m.mu.Lock()
-		m.nextLinks++
-		m.mu.Unlock()
+		if !omitNextLink {
+			next := url.Values{"$filter": {filter}, "$skiptoken": {strconv.Itoa(offset + pageSize)}}
+			for _, k := range []string{"$top", "$count"} {
+				if v := query.Get(k); v != "" {
+					next.Set(k, v)
+				}
+			}
+			envelope["@odata.nextLink"] = fmt.Sprintf("http://%s/v1.0/security/alerts_v2?%s", r.Host, next.Encode())
+			m.mu.Lock()
+			m.nextLinks++
+			m.mu.Unlock()
+		}
 	}
 	if matching == nil {
 		matching = []map[string]interface{}{}
@@ -711,6 +751,80 @@ func TestMockPaginatedDatasetFullyConsumed(t *testing.T) {
 		"the mock must actually have truncated (served @odata.nextLink) for this test to be meaningful")
 	assert.GreaterOrEqual(t, mock.alertRequestCount(), 3,
 		"consuming 12 alerts at page size 5 requires at least 3 pages")
+}
+
+// shipsEveryAlertOnce asserts that each id ships exactly once.
+func shipsEveryAlertOnce(t *testing.T, sink *captureSink, wantIDs []string) {
+	t.Helper()
+	require.Eventually(t, func() bool { return sink.count() >= len(wantIDs) },
+		10*time.Second, 10*time.Millisecond, "every alert in the window should ship")
+	require.Never(t, func() bool { return sink.count() != len(wantIDs) },
+		300*time.Millisecond, 20*time.Millisecond, "no alert may ship twice")
+	shipped := map[string]int{}
+	for _, msg := range sink.snapshot() {
+		shipped[msg.JsonPayload["id"].(string)]++
+	}
+	for _, id := range wantIDs {
+		assert.Equal(t, 1, shipped[id], "alert %s must ship exactly once", id)
+	}
+}
+
+func appendAlertBurst(mock *mockMicrosoft, total int, prefix string, base time.Time) []string {
+	ids := make([]string, 0, total)
+	for i := 0; i < total; i++ {
+		id := fmt.Sprintf("%s%04d", prefix, i)
+		ids = append(ids, id)
+		mock.appendAlert(realisticAlert(id, base.Add(time.Duration(i)*100*time.Millisecond)))
+	}
+	return ids
+}
+
+// TestMockShortDefaultPageWithoutNextLink: Graph documents neither alerts_v2's
+// default page size nor its maximum, and a truncated page has been reported
+// with no @odata.nextLink. The completeness check treats a page under 1000
+// alerts with no nextLink as the end of the window, so the request must ask
+// for that page size itself. Here the server's default page is 50 and it
+// drops the nextLink: a request without $top would end the window after 50
+// of its 120 alerts.
+func TestMockShortDefaultPageWithoutNextLink(t *testing.T) {
+	mock := newMockMicrosoft()
+	mock.defaultPageSize = 50
+	mock.omitNextLink = true
+	wantIDs := appendAlertBurst(mock, 120, "da637551227677560813_-44444444", time.Now().Add(1*time.Hour))
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _ := startMockAdapter(t, server.URL, sink, mockClientSecret)
+	defer adapter.Close()
+
+	shipsEveryAlertOnce(t, sink, wantIDs)
+	top, count := mock.lastSeenPaging()
+	assert.Equal(t, "1000", top, "every window request must ask for the page size the completeness check assumes")
+	assert.Equal(t, "true", count, "every window request must ask for the window's total")
+	assert.Zero(t, mock.nextLinkCount(), "the mock must not have served a nextLink for this test to be meaningful")
+}
+
+// TestMockCappedPageWithoutNextLinkIsSplit: the server caps pages below the
+// requested $top and drops the nextLink. Only @odata.count reveals that the
+// short page is not the whole window; the adapter must then narrow the window
+// until every piece fits in one page.
+func TestMockCappedPageWithoutNextLinkIsSplit(t *testing.T) {
+	mock := newMockMicrosoft()
+	mock.pageSize = 50
+	mock.omitNextLink = true
+	wantIDs := appendAlertBurst(mock, 120, "da637551227677560813_-55555555", time.Now().Add(1*time.Hour))
+	server := httptest.NewServer(mock.handler(t))
+	defer server.Close()
+
+	sink := &captureSink{}
+	adapter, _ := startMockAdapter(t, server.URL, sink, mockClientSecret)
+	defer adapter.Close()
+
+	shipsEveryAlertOnce(t, sink, wantIDs)
+	assert.Zero(t, mock.nextLinkCount(), "the mock must not have served a nextLink for this test to be meaningful")
+	assert.GreaterOrEqual(t, mock.alertRequestCount(), 3,
+		"120 alerts in pages of at most 50 need at least 3 narrower requests")
 }
 
 // TestMockBadCredentialsShipNothing verifies the adapter's error handling for
