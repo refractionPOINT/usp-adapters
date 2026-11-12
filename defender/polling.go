@@ -24,6 +24,15 @@ import (
 const graphTimeQuantum = 100 * time.Nanosecond
 const graphTimeLayout = "2006-01-02T15:04:05.0000000Z"
 
+// graphPageSize is the page size every window request asks for ($top). The
+// completeness checks below treat a page shorter than this with no nextLink as
+// the end of the window, and a full page with no nextLink as a reason to narrow
+// it, so the request must not leave the page size to an undocumented server
+// default. $count is not requested: an @odata.count above what the same filter
+// returns would keep a window incomplete on every poll, and Graph does not
+// document alerts_v2 counts as exact.
+const graphPageSize = 1000
+
 var (
 	errRetry      = errors.New("Defender request temporarily unavailable")
 	errThrottle   = fmt.Errorf("Defender request throttled: %w", errRetry)
@@ -75,6 +84,7 @@ func (a *DefenderAdapter) windowURL(start, end int64) string {
 	u := *a.collectionURL
 	q := u.Query()
 	q.Set("$filter", fmt.Sprintf("createdDateTime ge %s and createdDateTime lt %s", time.Unix(0, start).UTC().Format(graphTimeLayout), time.Unix(0, end).UTC().Format(graphTimeLayout)))
+	q.Set("$top", strconv.Itoa(graphPageSize))
 	u.RawQuery = q.Encode()
 	return u.String()
 }
@@ -159,7 +169,7 @@ func (a *DefenderAdapter) doJSON(ctx context.Context, method, raw, body, bearer 
 // the failure episode, so a persistently malformed item is reported rather than
 // retried silently.
 func (a *DefenderAdapter) validateAlertPage(page *graphPage) error {
-	if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
+	if page.Items == nil || len(page.Items) > graphPageSize || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next) != nil) {
 		return errors.New("response is not a valid alert page (missing value array, more than 1000 items, negative count or rejected nextLink)")
 	}
 	for i, item := range page.Items {
@@ -676,7 +686,7 @@ func (a *DefenderAdapter) scanPages(ctx context.Context, g *defenderGeneration, 
 			}
 			work.links[key] = struct{}{}
 			work.page = nil
-			if len(work.retained) > 0 && len(page.Items) == 1000 && page.Next == "" {
+			if len(work.retained) > 0 && len(page.Items) == graphPageSize && page.Next == "" {
 				stamp, _ := page.Items[0]["createdDateTime"].(string)
 				work.terminalTie = true
 				for _, item := range page.Items {
@@ -690,7 +700,7 @@ func (a *DefenderAdapter) scanPages(ctx context.Context, g *defenderGeneration, 
 				work.next = page.Next
 				continue
 			}
-			if len(page.Items) < 1000 && int64(len(work.ids)+work.seenRetained) >= work.expected {
+			if len(page.Items) < graphPageSize && int64(len(work.ids)+work.seenRetained) >= work.expected {
 				if mode == scanLive && len(work.retained) > 0 {
 					work.finished = true
 				} else {
