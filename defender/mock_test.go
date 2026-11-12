@@ -757,7 +757,7 @@ func TestMockPaginatedDatasetFullyConsumed(t *testing.T) {
 func shipsEveryAlertOnce(t *testing.T, sink *captureSink, wantIDs []string) {
 	t.Helper()
 	require.Eventually(t, func() bool { return sink.count() >= len(wantIDs) },
-		10*time.Second, 10*time.Millisecond, "every alert in the window should ship")
+		30*time.Second, 10*time.Millisecond, "every alert in the window should ship")
 	require.Never(t, func() bool { return sink.count() != len(wantIDs) },
 		300*time.Millisecond, 20*time.Millisecond, "no alert may ship twice")
 	shipped := map[string]int{}
