@@ -799,21 +799,23 @@ func TestMockShortDefaultPageWithoutNextLink(t *testing.T) {
 	defer adapter.Close()
 
 	shipsEveryAlertOnce(t, sink, wantIDs)
-	top, count := mock.lastSeenPaging()
+	top, _ := mock.lastSeenPaging()
 	assert.Equal(t, "1000", top, "every window request must ask for the page size the completeness check assumes")
-	assert.Equal(t, "true", count, "every window request must ask for the window's total")
 	assert.Zero(t, mock.nextLinkCount(), "the mock must not have served a nextLink for this test to be meaningful")
 }
 
-// TestMockCappedPageWithoutNextLinkIsSplit: the server caps pages below the
-// requested $top and drops the nextLink. Only @odata.count reveals that the
-// short page is not the whole window; the adapter must then narrow the window
-// until every piece fits in one page.
-func TestMockCappedPageWithoutNextLinkIsSplit(t *testing.T) {
+// TestMockFullPageWithoutNextLinkIsSplit: the reported live behaviour is a page
+// cut at 1000 alerts with no @odata.nextLink. A full page with no nextLink is
+// not proof that the window ended, so the adapter must narrow the window until
+// each piece fits in one page. The server's default page is 100, so without
+// $top the first short page would end the window instead.
+func TestMockFullPageWithoutNextLinkIsSplit(t *testing.T) {
+	const total = 1500
 	mock := newMockMicrosoft()
-	mock.pageSize = 50
+	mock.defaultPageSize = 100
+	mock.pageSize = 1000
 	mock.omitNextLink = true
-	wantIDs := appendAlertBurst(mock, 120, "da637551227677560813_-55555555", time.Now().Add(1*time.Hour))
+	wantIDs := appendAlertBurst(mock, total, "da637551227677560813_-55555555", time.Now().Add(1*time.Hour))
 	server := httptest.NewServer(mock.handler(t))
 	defer server.Close()
 
@@ -824,7 +826,7 @@ func TestMockCappedPageWithoutNextLinkIsSplit(t *testing.T) {
 	shipsEveryAlertOnce(t, sink, wantIDs)
 	assert.Zero(t, mock.nextLinkCount(), "the mock must not have served a nextLink for this test to be meaningful")
 	assert.GreaterOrEqual(t, mock.alertRequestCount(), 3,
-		"120 alerts in pages of at most 50 need at least 3 narrower requests")
+		"1500 alerts in pages of at most 1000 need a full page and at least two narrower requests")
 }
 
 // TestMockBadCredentialsShipNothing verifies the adapter's error handling for

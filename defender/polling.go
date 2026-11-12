@@ -26,9 +26,11 @@ const graphTimeLayout = "2006-01-02T15:04:05.0000000Z"
 
 // graphPageSize is the page size every window request asks for ($top). The
 // completeness checks below treat a page shorter than this with no nextLink as
-// the end of the window, so the request must not leave the page size to an
-// undocumented server default. $count=true also asks Graph for the window's
-// total, which exposes a short page that carries no nextLink.
+// the end of the window, and a full page with no nextLink as a reason to narrow
+// it, so the request must not leave the page size to an undocumented server
+// default. $count is not requested: an @odata.count above what the same filter
+// returns would keep a window incomplete on every poll, and Graph does not
+// document alerts_v2 counts as exact.
 const graphPageSize = 1000
 
 var (
@@ -83,7 +85,6 @@ func (a *DefenderAdapter) windowURL(start, end int64) string {
 	q := u.Query()
 	q.Set("$filter", fmt.Sprintf("createdDateTime ge %s and createdDateTime lt %s", time.Unix(0, start).UTC().Format(graphTimeLayout), time.Unix(0, end).UTC().Format(graphTimeLayout)))
 	q.Set("$top", strconv.Itoa(graphPageSize))
-	q.Set("$count", "true")
 	u.RawQuery = q.Encode()
 	return u.String()
 }
