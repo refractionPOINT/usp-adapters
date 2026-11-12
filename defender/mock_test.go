@@ -756,6 +756,8 @@ func TestMockPaginatedDatasetFullyConsumed(t *testing.T) {
 // shipsEveryAlertOnce asserts that each id ships exactly once.
 func shipsEveryAlertOnce(t *testing.T, sink *captureSink, wantIDs []string) {
 	t.Helper()
+	// The 1500-alert split test takes about 8s under -race; 30s leaves headroom
+	// on a loaded machine. Eventually returns as soon as everything ships.
 	require.Eventually(t, func() bool { return sink.count() >= len(wantIDs) },
 		30*time.Second, 10*time.Millisecond, "every alert in the window should ship")
 	require.Never(t, func() bool { return sink.count() != len(wantIDs) },
