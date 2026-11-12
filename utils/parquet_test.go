@@ -178,6 +178,77 @@ func TestPrepareBundleData_PlainGzipPassthrough(t *testing.T) {
 	}
 }
 
+func TestPrepareBundleData_GzipWithoutExtension(t *testing.T) {
+	// Some producers (e.g. Zscaler) write gzip objects without a .gz
+	// extension. Detect them from the magic bytes so the proxy still
+	// gunzips instead of ingesting compressed bytes as text.
+	payload := []byte("{\"a\":1}\n{\"a\":2}\n")
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	gw.Write(payload)
+	gw.Close()
+	gzBytes := gzBuf.Bytes()
+
+	for _, key := range []string{"logs/2026/09/29/events", "logs/events.json", "logs/events.log.gzip"} {
+		t.Run(key, func(t *testing.T) {
+			data, isCompressed, err := PrepareBundleData(key, gzBytes)
+			if err != nil {
+				t.Fatalf("PrepareBundleData: %v", err)
+			}
+			if !isCompressed {
+				t.Fatal("gzip magic bytes should flag isCompressed=true")
+			}
+			if !bytes.Equal(data, gzBytes) {
+				t.Fatal("gzip object must be returned untouched")
+			}
+		})
+	}
+}
+
+func TestPrepareBundleData_GzippedParquetWithoutExtension(t *testing.T) {
+	pq := buildTestParquet(t, 2)
+	var gzBuf bytes.Buffer
+	gw := gzip.NewWriter(&gzBuf)
+	if _, err := gw.Write(pq); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+
+	data, isCompressed, err := PrepareBundleData("logs/part-00000", gzBuf.Bytes())
+	if err != nil {
+		t.Fatalf("PrepareBundleData: %v", err)
+	}
+	if isCompressed {
+		t.Fatal("gzipped parquet must be returned uncompressed: adapter peels both layers")
+	}
+	rows := decodeJSONLines(t, data)
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+}
+
+func TestIsGzipData(t *testing.T) {
+	cases := []struct {
+		name string
+		data []byte
+		want bool
+	}{
+		{"gzip-magic", []byte{0x1f, 0x8b, 0x08, 0x00}, true},
+		{"text", []byte("plain text"), false},
+		{"one-byte", []byte{0x1f}, false},
+		{"empty", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsGzipData(c.data); got != c.want {
+				t.Fatalf("IsGzipData(%v)=%v, want %v", c.data, got, c.want)
+			}
+		})
+	}
+}
+
 func TestPrepareBundleData_PlainText(t *testing.T) {
 	in := []byte("plain log content\n")
 	data, isCompressed, err := PrepareBundleData("events.log", in)
