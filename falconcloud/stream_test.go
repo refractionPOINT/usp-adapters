@@ -28,7 +28,7 @@ func (r *refreshRecorder) RefreshActiveStreamSession(p *event_streams.RefreshAct
 	return &event_streams.RefreshActiveStreamSessionOK{}, nil
 }
 func descriptor(feed string, partition int64) *models.MainAvailableStreamV2 {
-	interval := int64(1)
+	interval := int64(2)
 	refresh := fmt.Sprintf("https://api.crowdstrike.com/sensors/entities/datafeed-actions/v1/%d", partition)
 	return &models.MainAvailableStreamV2{
 		DataFeedURL: &feed, RefreshActiveSessionInterval: &interval,
@@ -52,7 +52,7 @@ func TestFeedFailureIsVisibleAndStops(t *testing.T) {
 				w.WriteHeader(status)
 				// Empty successful response is EOF. Error bodies must never be events.
 				if status != http.StatusOK {
-					fmt.Fprint(w, `{"errors":[{"message":"feed refused"}]}`)
+					fmt.Fprint(w, `feed refused`)
 				}
 			}))
 			defer server.Close()
