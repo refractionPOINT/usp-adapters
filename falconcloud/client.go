@@ -251,9 +251,14 @@ func (a *FalconCloudAdapter) consumeStream(streamHandle *falcon.StreamingHandle,
 			if !ok {
 				return
 			}
-			if a.ctx.Err() == nil {
-				a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
+			if a.ctx.Err() != nil {
+				return
 			}
+			if !err.Fatal {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("stream error: %v", err))
+				continue
+			}
+			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
 			return
 		case event, ok := <-events:
 			if !ok {

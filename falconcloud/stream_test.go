@@ -166,3 +166,52 @@ func TestCancelledStreamDoesNotReportFailure(t *testing.T) {
 		}
 	}
 }
+
+func TestNonFatalStreamErrorKeepsConsuming(t *testing.T) {
+	a, errs := testAdapter(t)
+	stream := &falcon.StreamingHandle{Errors: make(chan falcon.StreamingError, 1), Events: make(chan *streaming_models.EventItem, 1)}
+	stream.Errors <- falcon.StreamingError{Err: fmt.Errorf("unusable event")}
+	warnings := 0
+	a.conf.ClientOptions.OnWarning = func(string) { warnings++; stream.Events <- &streaming_models.EventItem{} }
+	shipped := false
+	a.consumeStream(stream, time.Time{}, func(*protocol.DataMessage, time.Duration) error { shipped = true; a.cancel(); return nil })
+	if !shipped || warnings != 1 {
+		t.Fatalf("shipped=%v warnings=%d", shipped, warnings)
+	}
+	select {
+	case err := <-errs:
+		t.Fatalf("nonfatal error ended stream: %v", err)
+	default:
+	}
+}
+func TestFailedFeedStopsOpenSibling(t *testing.T) {
+	a, _ := testAdapter(t)
+	started := make(chan struct{})
+	sibling := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer sibling.Close()
+	defer a.cancel()
+	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-started; w.WriteHeader(http.StatusUnauthorized) }))
+	defer failed.Close()
+	done := make(chan struct{}, 2)
+	for _, feed := range []string{sibling.URL, failed.URL} {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			info := descriptor(feed+"?appId=app", 0)
+			lifetime := int64(3600)
+			info.RefreshActiveSessionInterval = &lifetime
+			a.handleStream(&client.CrowdStrikeAPISpecification{}, "app", info)
+		}()
+	}
+	for range 2 {
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("failed feed left a sibling running")
+		}
+	}
+}
