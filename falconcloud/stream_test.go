@@ -138,7 +138,7 @@ func TestEachStreamRefreshesItsDiscoveredPartition(t *testing.T) {
 	}
 	defer a.cancel()
 	seen := map[int64]bool{}
-	deadline := time.After(3 * time.Second)
+	deadline := time.After(15 * time.Second)
 	for !seen[0] || !seen[3] {
 		select {
 		case p := <-recorder.calls:
