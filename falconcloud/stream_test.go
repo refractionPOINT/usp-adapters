@@ -74,6 +74,9 @@ func TestFeedFailureIsVisibleAndStops(t *testing.T) {
 			}
 			select {
 			case <-done:
+				if a.ctx.Err() == nil {
+					t.Error("failed feed did not stop sibling streams for restart")
+				}
 			case <-time.After(time.Second):
 				t.Fatal("stream did not stop for restart")
 			}

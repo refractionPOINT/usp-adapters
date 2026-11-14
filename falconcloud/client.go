@@ -178,6 +178,8 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 }
 
 func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecification, appName string, streamInfo *models.MainAvailableStreamV2) {
+	// A failed or ended feed stops sibling feeds too, allowing rediscovery.
+	defer a.cancel()
 	// If IsUsingOffset is true, use the offset, otherwise use 0
 	// and drop all events where the timestamp is before the start
 	// time of the stream.
@@ -199,8 +201,6 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 		return
 	}
 	defer streamHandle.Close()
-	// A stopped feed ends this adapter instance so its owner can rediscover streams.
-	defer a.cancel()
 
 	a.consumeStream(streamHandle, notBefore, a.uspClient.Ship)
 }
