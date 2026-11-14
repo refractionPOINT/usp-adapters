@@ -197,7 +197,9 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 	}
 	streamHandle, err := a.newStream(client, appName, streamInfo, offset)
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewStream(): %v", err))
+		if a.ctx.Err() == nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewStream(): %v", err))
+		}
 		return
 	}
 	defer streamHandle.Close()
@@ -249,7 +251,9 @@ func (a *FalconCloudAdapter) consumeStream(streamHandle *falcon.StreamingHandle,
 			if !ok {
 				return
 			}
-			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
+			if a.ctx.Err() == nil {
+				a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
+			}
 			return
 		case event, ok := <-events:
 			if !ok {

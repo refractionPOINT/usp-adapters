@@ -151,3 +151,18 @@ func TestEachStreamRefreshesItsDiscoveredPartition(t *testing.T) {
 		t.Fatal("shared API client changed")
 	}
 }
+
+func TestCancelledStreamDoesNotReportFailure(t *testing.T) {
+	for range 100 {
+		a, errs := testAdapter(t)
+		a.cancel()
+		stream := &falcon.StreamingHandle{Errors: make(chan falcon.StreamingError, 1)}
+		stream.Errors <- falcon.StreamingError{Fatal: true, Err: fmt.Errorf("streaming connection closed")}
+		a.consumeStream(stream, time.Time{}, nil)
+		select {
+		case err := <-errs:
+			t.Fatalf("normal cancellation reported failure: %v", err)
+		default:
+		}
+	}
+}
