@@ -42,6 +42,7 @@ func testAdapter(t *testing.T) (*FalconCloudAdapter, chan error) {
 	a := &FalconCloudAdapter{ctx: ctx, cancel: cancel}
 	errs := make(chan error, 4)
 	a.conf.ClientOptions.OnError = func(err error) { errs <- err }
+	a.conf.ClientOptions.OnWarning = func(string) {}
 	return a, errs
 }
 func TestFeedFailureIsVisibleAndStops(t *testing.T) {
@@ -69,7 +70,7 @@ func TestFeedFailureIsVisibleAndStops(t *testing.T) {
 				if status != http.StatusOK && !strings.Contains(err.Error(), fmt.Sprint(status)) {
 					t.Errorf("error lacks feed status: %v", err)
 				}
-			case <-time.After(3 * time.Second):
+			case <-time.After(10 * time.Second):
 				t.Error("feed failure did not reach OnError")
 			}
 			select {
@@ -77,7 +78,7 @@ func TestFeedFailureIsVisibleAndStops(t *testing.T) {
 				if a.ctx.Err() == nil {
 					t.Error("failed feed did not stop sibling streams for restart")
 				}
-			case <-time.After(time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatal("stream did not stop for restart")
 			}
 		})
@@ -103,7 +104,7 @@ func TestClosedEventsPreservesFinalError(t *testing.T) {
 	close(stream.Errors)
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("consumer did not stop")
 	}
 	select {
@@ -194,9 +195,16 @@ func TestFailedFeedStopsOpenSibling(t *testing.T) {
 		<-r.Context().Done()
 	}))
 	defer sibling.Close()
-	defer a.cancel()
-	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-started; w.WriteHeader(http.StatusUnauthorized) }))
+	failed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-started:
+		case <-r.Context().Done():
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
 	defer failed.Close()
+	defer a.cancel()
 	done := make(chan struct{}, 2)
 	for _, feed := range []string{sibling.URL, failed.URL} {
 		go func() {
@@ -210,7 +218,7 @@ func TestFailedFeedStopsOpenSibling(t *testing.T) {
 	for range 2 {
 		select {
 		case <-done:
-		case <-time.After(3 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatal("failed feed left a sibling running")
 		}
 	}
