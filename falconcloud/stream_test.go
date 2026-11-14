@@ -59,7 +59,10 @@ func TestFeedFailureIsVisibleAndStops(t *testing.T) {
 			done := make(chan struct{})
 			go func() {
 				defer close(done)
-				a.handleStream(&client.CrowdStrikeAPISpecification{}, "app", descriptor(server.URL+"?appId=app", 0))
+				info := descriptor(server.URL+"?appId=app", 0)
+				lifetime := int64(3600)
+				info.RefreshActiveSessionInterval = &lifetime
+				a.handleStream(&client.CrowdStrikeAPISpecification{}, "app", info)
 			}()
 			select {
 			case err := <-errs:
