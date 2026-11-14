@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"path"
+	"strconv"
 	"sync"
 	"time"
 
@@ -141,7 +144,7 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 	}
 
 	jsonFormat := "json"
-	appName := fmt.Sprintf("lc-adapter-%s", uuid.New().String()[:8])
+	appName := newAppID()
 	response, err := client.EventStreams.ListAvailableStreamsOAuth2(&event_streams.ListAvailableStreamsOAuth2Params{
 		AppID:   appName,
 		Format:  &jsonFormat,
@@ -175,6 +178,8 @@ func (a *FalconCloudAdapter) handleEvent(clientId string, clientSecret string) {
 }
 
 func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecification, appName string, streamInfo *models.MainAvailableStreamV2) {
+	// A failed or ended feed stops sibling feeds too, allowing rediscovery.
+	defer a.cancel()
 	// If IsUsingOffset is true, use the offset, otherwise use 0
 	// and drop all events where the timestamp is before the start
 	// time of the stream.
@@ -190,9 +195,11 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 			notBefore = time.Now()
 		}
 	}
-	streamHandle, err := falcon.NewStream(a.ctx, client, appName, streamInfo, offset)
+	streamHandle, err := a.newStream(client, appName, streamInfo, offset)
 	if err != nil {
-		a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewStream(): %v", err))
+		if a.ctx.Err() == nil {
+			a.conf.ClientOptions.OnError(fmt.Errorf("falcon.NewStream(): %v", err))
+		}
 		return
 	}
 	defer streamHandle.Close()
@@ -200,7 +207,42 @@ func (a *FalconCloudAdapter) handleStream(client *client.CrowdStrikeAPISpecifica
 	a.consumeStream(streamHandle, notBefore, a.uspClient.Ship)
 }
 
+func newAppID() string {
+	return "lcadapter" + uuid.New().String()[:8]
+}
+
+// The SDK refreshes partition zero by default. Bind the discovered partition
+// to a private client copy so concurrent streams cannot change each other.
+type partitionStreams struct {
+	event_streams.ClientService
+	partition int64
+}
+
+func (p *partitionStreams) RefreshActiveStreamSession(params *event_streams.RefreshActiveStreamSessionParams, opts ...event_streams.ClientOption) (*event_streams.RefreshActiveStreamSessionOK, error) {
+	copy := *params
+	copy.Partition = p.partition
+	return p.ClientService.RefreshActiveStreamSession(&copy, opts...)
+}
+
+func (a *FalconCloudAdapter) newStream(api *client.CrowdStrikeAPISpecification, appName string, info *models.MainAvailableStreamV2, offset uint64) (*falcon.StreamingHandle, error) {
+	if info == nil || info.RefreshActiveSessionURL == nil {
+		return nil, errors.New("missing stream refresh URL")
+	}
+	refreshURL, err := url.Parse(*info.RefreshActiveSessionURL)
+	if err != nil {
+		return nil, errors.New("invalid stream refresh URL")
+	}
+	partition, err := strconv.ParseInt(path.Base(refreshURL.Path), 10, 64)
+	if err != nil || partition < 0 {
+		return nil, errors.New("invalid stream refresh partition")
+	}
+	scoped := *api
+	scoped.EventStreams = &partitionStreams{ClientService: api.EventStreams, partition: partition}
+	return falcon.NewStream(a.ctx, &scoped, appName, info, offset)
+}
+
 func (a *FalconCloudAdapter) consumeStream(streamHandle *falcon.StreamingHandle, notBefore time.Time, ship func(*protocol.DataMessage, time.Duration) error) {
+	events := streamHandle.Events
 	for {
 		select {
 		case <-a.ctx.Done():
@@ -209,11 +251,24 @@ func (a *FalconCloudAdapter) consumeStream(streamHandle *falcon.StreamingHandle,
 			if !ok {
 				return
 			}
+			if a.ctx.Err() != nil {
+				return
+			}
+			if !err.Fatal {
+				a.conf.ClientOptions.OnWarning(fmt.Sprintf("stream error: %v", err))
+				continue
+			}
 			a.conf.ClientOptions.OnError(fmt.Errorf("stream error: %v", err))
 			return
-		case event, ok := <-streamHandle.Events:
-			if !ok || event == nil {
-				return
+		case event, ok := <-events:
+			if !ok {
+				// The SDK queues the final error before closing Events. Keep reading
+				// Errors so a closed feed cannot disappear without OnError.
+				events = nil
+				continue
+			}
+			if event == nil {
+				continue
 			}
 			if !notBefore.IsZero() && notBefore.After(time.UnixMilli(int64(event.Metadata.EventCreationTime))) {
 				// This is a very ugly hack for what is a bad API design.
