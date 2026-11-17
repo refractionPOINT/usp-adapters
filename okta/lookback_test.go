@@ -114,7 +114,11 @@ func TestLookbackAdmissionErrorClassification(t *testing.T) {
 			}
 		}
 		a.collect(context.Background(), g)
-		require.EqualValues(t, 1, failures)
+		wantFailures := 1
+		if errors.Is(err, uspclient.ErrorClosed) {
+			wantFailures = 0 // shutdown, not a delivery failure
+		}
+		require.EqualValues(t, wantFailures, failures)
 		a.flushNotifications()
 		a.notifier.Close()
 		d.Close()

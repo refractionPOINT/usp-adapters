@@ -230,6 +230,10 @@ func TestLookbackObserverDelivery(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, utils.DeliverLookback(ctx, c, ack, input[:1], admit), context.Canceled)
 	require.EqualValues(t, 1, failures, "shutdown is not a delivery failure")
+	require.ErrorIs(t, utils.DeliverLookback(context.Background(), c, ack, input[:1], func(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error) {
+		return uspclient.AdmissionReceipt{}, uspclient.ErrorClosed
+	}), uspclient.ErrorClosed)
+	require.EqualValues(t, 1, failures, "a closed client is shutdown, not a delivery failure")
 	// A partial admission still reports only its acknowledged prefix.
 	calls := 0
 	require.Error(t, utils.DeliverLookback(context.Background(), c, ack, input[:2], func(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error) {

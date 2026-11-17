@@ -90,7 +90,7 @@ const LookbackChunkSize = 256
 // Callers bound pages. Errors never mark unconfirmed data or advance progress.
 func DeliverLookback(ctx context.Context, c *LookbackConfig, observer ReceiptObserver, events []ReplayEvent, admit ReceiptAdmit, warning ...func(string)) (err error) {
 	defer func() {
-		if err != nil && ctx.Err() == nil {
+		if err != nil && ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
 			c.Observe(LookbackObservation{Failures: 1, Failure: LookbackFailureDelivery})
 		}
 	}()

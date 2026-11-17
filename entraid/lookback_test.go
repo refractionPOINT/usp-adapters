@@ -209,3 +209,30 @@ func TestLookbackObserverInitialCompletion(t *testing.T) {
 	require.True(t, a.collectionFailure(context.Background(), errYield))
 	require.False(t, yielded)
 }
+
+func TestLookbackObserverHistoryPressureCountedOncePerAttempt(t *testing.T) {
+	server := vendorServer(t, func(w http.ResponseWriter, r *http.Request) { sendPage(w, nil, "") })
+	a, g := harness(t, server, &captureSink{})
+	var failures uint64
+	a.conf.Lookback = &utils.LookbackConfig{Window: 3 * time.Hour, Observer: func(o utils.LookbackObservation) {
+		failures += o.Failures
+		if o.Failures > 0 {
+			require.Equal(t, utils.LookbackFailureHistoryPressure, o.Failure)
+		}
+	}}
+	stream := a.streams[0]
+	base := fixtureBaseTime()
+	s := g.position[stream.name]
+	s.Boundary = base.Add(time.Hour).UnixNano()
+	s.WindowEnd = s.Boundary + int64(time.Minute)
+	g.position = entraPosition{stream.name: s}
+	fillHistory(g, stream, base.Add(10*time.Minute).UnixNano())
+	a.runtime.now = func() time.Time { return base.Add(100 * time.Hour) }
+	// The reclaim inside shipLookback shortens coverage, so this attempt fails
+	// with errPressure. It must be counted once, not by the reclaim as well.
+	err := a.shipLookback(context.Background(), g, stream, []map[string]interface{}{item("new", base.Add(30*time.Minute))}, s.Coverage, s.WindowEnd)
+	require.ErrorIs(t, err, errPressure)
+	require.Greater(t, g.position[stream.name].Coverage, s.Coverage)
+	require.True(t, a.collectionFailure(context.Background(), err))
+	require.EqualValues(t, 1, failures)
+}

@@ -159,7 +159,8 @@ func (a *EntraIDAdapter) maintainHistory(g *entraGeneration, pressure bool) {
 		m.maxVisited = visits
 	}
 	if reduced {
-		a.conf.Lookback.Observe(utils.LookbackObservation{Failures: 1, Failure: utils.LookbackFailureHistoryPressure})
+		// Not counted here: an interrupted attempt returns errPressure, which
+		// collectionFailure counts once.
 		a.issue("history_coverage_reduced")
 	}
 	if removed > 0 {
