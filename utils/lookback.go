@@ -20,6 +20,39 @@ type LookbackConfig struct {
 	Window    time.Duration
 	Deduper   CheckingDeduper
 	Namespace string
+	Observer  func(LookbackObservation)
+}
+
+// LookbackFailure is a bounded failure category, never vendor error text.
+type LookbackFailure uint8
+
+const (
+	LookbackFailureNone LookbackFailure = iota
+	LookbackFailureRequest
+	LookbackFailureInvalidPage
+	LookbackFailureContinuation
+	LookbackFailureDelivery
+	LookbackFailureHistoryPressure
+)
+
+// LookbackObservation contains deltas, including ongoing collection after startup.
+// Starts and Completed count initial collection streams, not adapter instances.
+// InvalidIDs counts skipped IDs (Okta) or rejected IDs (Entra, which retries the
+// whole page). Fetched counts decoded page items, including repeats and rejects.
+// Confirmed counts receipt ACKs, not durable dedup marker writes. Failures counts
+// failed attempts by Failure; retries may count the same failure again.
+type LookbackObservation struct {
+	Starts, Completed, Fetched, Confirmed, InvalidIDs, Duplicates, Failures uint64
+	Failure                                                                 LookbackFailure
+}
+
+// Observe emits a count delta if enabled. The callback must return promptly and
+// be safe for concurrent calls when shared between adapter instances. Configure
+// it before starting collection; it must not change collection state.
+func (c *LookbackConfig) Observe(delta LookbackObservation) {
+	if c != nil && c.Observer != nil {
+		c.Observer(delta)
+	}
 }
 
 func (c *LookbackConfig) Validate() error {
@@ -55,7 +88,12 @@ const LookbackChunkSize = 256
 
 // DeliverLookback confirms chunks (256 events / 1 MiB; one larger event alone).
 // Callers bound pages. Errors never mark unconfirmed data or advance progress.
-func DeliverLookback(ctx context.Context, c *LookbackConfig, observer ReceiptObserver, events []ReplayEvent, admit ReceiptAdmit, warning ...func(string)) error {
+func DeliverLookback(ctx context.Context, c *LookbackConfig, observer ReceiptObserver, events []ReplayEvent, admit ReceiptAdmit, warning ...func(string)) (err error) {
+	defer func() {
+		if err != nil && ctx.Err() == nil && !errors.Is(err, uspclient.ErrorClosed) {
+			c.Observe(LookbackObservation{Failures: 1, Failure: LookbackFailureDelivery})
+		}
+	}()
 	nextWarning := time.Now().Add(10 * time.Second)
 	warn := func() {
 		if len(warning) > 0 && warning[0] != nil && !time.Now().Before(nextWarning) {
@@ -103,6 +141,7 @@ func deliverChunk(ctx context.Context, c *LookbackConfig, observer ReceiptObserv
 	seen := make(map[string]bool)
 	for i, key := range keys {
 		if key.Key != "" && (hits[i] || seen[key.Key]) {
+			c.Observe(LookbackObservation{Duplicates: 1})
 			continue
 		}
 		selected = append(selected, i)
@@ -117,6 +156,9 @@ func deliverChunk(ctx context.Context, c *LookbackConfig, observer ReceiptObserv
 			if key.Key != "" && o.Lifetime == uspclient.ReceiptLive && o.Frame == uspclient.ReceiptAcknowledged {
 				confirmed = append(confirmed, key)
 			}
+		}
+		if len(confirmed) > 0 {
+			c.Observe(LookbackObservation{Confirmed: uint64(len(confirmed))})
 		}
 		if batched && len(confirmed) > 0 {
 			batch.AddMany(confirmed)

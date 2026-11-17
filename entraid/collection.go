@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const settleLookback = 5 * time.Minute
@@ -158,6 +159,8 @@ func (a *EntraIDAdapter) maintainHistory(g *entraGeneration, pressure bool) {
 		m.maxVisited = visits
 	}
 	if reduced {
+		// Not counted here: an interrupted attempt returns errPressure, which
+		// collectionFailure counts once.
 		a.issue("history_coverage_reduced")
 	}
 	if removed > 0 {
@@ -263,6 +266,7 @@ func (a *EntraIDAdapter) clampReplay(g *entraGeneration, stream entraStream) {
 }
 
 func (a *EntraIDAdapter) collect(ctx context.Context, g *entraGeneration) {
+	a.conf.Lookback.Observe(utils.LookbackObservation{Starts: uint64(len(a.streams))})
 	if !acktrack.Wait(ctx, a.pollInterval) {
 		return
 	}

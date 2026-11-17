@@ -197,3 +197,52 @@ func TestLookbackSourceAliasesAndConfiguration(t *testing.T) {
 	now := time.Now()
 	require.True(t, disabled.Start(now).Equal(now))
 }
+
+func TestLookbackObserverDelivery(t *testing.T) {
+	c, d := config()
+	var confirmed, duplicates, failures uint64
+	c.Observer = func(o utils.LookbackObservation) {
+		confirmed += o.Confirmed
+		duplicates += o.Duplicates
+		failures += o.Failures
+		if o.Failures > 0 {
+			require.Equal(t, utils.LookbackFailureDelivery, o.Failure)
+		}
+	}
+	input := events(c, 2)
+	d.values[input[1].Key.Key] = true
+	input = append(input, input[0])
+	ack := observation{uspclient.ReceiptObservation{Lifetime: uspclient.ReceiptLive, Frame: uspclient.ReceiptAcknowledged}}
+	admit := func(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error) {
+		return uspclient.AdmissionReceipt{}, nil
+	}
+	require.NoError(t, utils.DeliverLookback(context.Background(), c, ack, input, admit))
+	require.EqualValues(t, 1, confirmed)
+	require.EqualValues(t, 2, duplicates)
+	require.NoError(t, utils.DeliverLookback(context.Background(), c, ack, input, admit))
+	require.EqualValues(t, 1, confirmed)
+	require.EqualValues(t, 5, duplicates)
+	d.values = map[string]bool{}
+	require.Error(t, utils.DeliverLookback(context.Background(), c, observation{}, input[:1], admit))
+	require.EqualValues(t, 1, failures)
+	require.EqualValues(t, 1, confirmed)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, utils.DeliverLookback(ctx, c, ack, input[:1], admit), context.Canceled)
+	require.EqualValues(t, 1, failures, "shutdown is not a delivery failure")
+	require.ErrorIs(t, utils.DeliverLookback(context.Background(), c, ack, input[:1], func(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error) {
+		return uspclient.AdmissionReceipt{}, uspclient.ErrorClosed
+	}), uspclient.ErrorClosed)
+	require.EqualValues(t, 1, failures, "a closed client is shutdown, not a delivery failure")
+	// A partial admission still reports only its acknowledged prefix.
+	calls := 0
+	require.Error(t, utils.DeliverLookback(context.Background(), c, ack, input[:2], func(*protocol.DataMessage, time.Duration) (uspclient.AdmissionReceipt, error) {
+		calls++
+		if calls == 2 {
+			return uspclient.AdmissionReceipt{}, errors.New("tail failed")
+		}
+		return uspclient.AdmissionReceipt{}, nil
+	}))
+	require.EqualValues(t, 2, confirmed)
+	require.EqualValues(t, 2, failures)
+}

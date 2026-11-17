@@ -162,6 +162,16 @@ func (a *EntraIDAdapter) doJSON(ctx context.Context, method, raw, body, bearer s
 // validateGraphPage rejects a page the collector could not process, including
 // items without a usable id or timestamp, before the page counts as a success.
 func (a *EntraIDAdapter) validateGraphPage(page *graphPage, stream entraStream) error {
+	a.conf.Lookback.Observe(utils.LookbackObservation{Fetched: uint64(len(page.Items))})
+	invalid := uint64(0)
+	for _, item := range page.Items {
+		if id, _ := item["id"].(string); id == "" {
+			invalid++
+		}
+	}
+	if invalid > 0 {
+		a.conf.Lookback.Observe(utils.LookbackObservation{InvalidIDs: invalid})
+	}
 	if page.Items == nil || len(page.Items) > 1000 || (page.Count != nil && *page.Count < 0) || (page.Next != "" && a.validateContinuation(page.Next, stream) != nil) {
 		return errors.New("response is not a valid page (missing value array, more than 1000 items, negative count or rejected nextLink)")
 	}
@@ -514,6 +524,12 @@ func (a *EntraIDAdapter) scanLane(ctx context.Context, g *entraGeneration, strea
 }
 func (a *EntraIDAdapter) complete(g *entraGeneration, stream entraStream, end int64, replay bool) error {
 	s := g.position[stream.name]
+	if replay && s.initialEnd != 0 && end >= s.initialEnd {
+		if s.Unverified == 0 && s.Coverage <= s.initialCoverage {
+			a.conf.Lookback.Observe(utils.LookbackObservation{Completed: 1})
+		}
+		s.initialEnd = 0
+	}
 	if replay {
 		s.Replay = end
 		if end >= s.ReplayEnd {
@@ -534,6 +550,20 @@ func (a *EntraIDAdapter) complete(g *entraGeneration, stream entraStream, end in
 func (a *EntraIDAdapter) collectionFailure(ctx context.Context, err error) bool {
 	if ctx.Err() != nil || errors.Is(err, uspclient.ErrorClosed) {
 		return false
+	}
+	if !errors.Is(err, errYield) {
+		failure := utils.LookbackFailureNone
+		switch {
+		case errors.Is(err, errRetry), errors.Is(err, errVendor):
+			failure = utils.LookbackFailureRequest
+		case errors.Is(err, errIncomplete), errors.Is(err, errPage):
+			failure = utils.LookbackFailureInvalidPage
+		case errors.Is(err, errPressure):
+			failure = utils.LookbackFailureHistoryPressure
+		}
+		if failure != utils.LookbackFailureNone {
+			a.conf.Lookback.Observe(utils.LookbackObservation{Failures: 1, Failure: failure})
+		}
 	}
 	switch {
 	case errors.Is(err, uspclient.ErrorReceiptUnavailable):
@@ -570,6 +600,7 @@ func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, s
 		key := a.conf.Lookback.Key(sourceTime, "entraid", utils.LookbackSource(a.conf.graphEndpoint()), a.conf.TenantID, stream.path, stream.tsField, id)
 		digest := eventDigest(a.sourceFingerprint(), stream.name, id)
 		if _, confirmed := g.live[digest]; confirmed {
+			a.conf.Lookback.Observe(utils.LookbackObservation{Duplicates: 1})
 			continue
 		}
 		entries[digest] = liveID{expiry: sourceTime.UnixNano() + int64(historyHorizon), stream: streamCode(stream.name)}
@@ -583,6 +614,7 @@ func (a *EntraIDAdapter) shipLookback(ctx context.Context, g *entraGeneration, s
 	}
 	observer, ok := a.uspClient.(utils.ReceiptObserver)
 	if !ok {
+		a.conf.Lookback.Observe(utils.LookbackObservation{Failures: 1, Failure: utils.LookbackFailureDelivery})
 		return uspclient.ErrorReceiptUnavailable
 	}
 	err := utils.DeliverLookback(ctx, a.conf.Lookback, observer, events, func(m *protocol.DataMessage, d time.Duration) (uspclient.AdmissionReceipt, error) {
