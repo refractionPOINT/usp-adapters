@@ -71,11 +71,14 @@ func TestLookbackStartupLanesAndConfirmedIDs(t *testing.T) {
 		require.Zero(t, entry.serial)
 		require.Equal(t, stamp.Add(historyHorizon).UnixNano(), entry.expiry)
 	}
+	var duplicates uint64
+	a.conf.Lookback.Observer = func(o utils.LookbackObservation) { duplicates += o.Duplicates }
 	outage := &lookbackMiss{}
 	a.conf.Lookback.Deduper = outage
 	updated.Store(true)
 	run()
 	require.Zero(t, outage.checks, "shared hits must become local confirmed ID history")
+	require.EqualValues(t, 2, duplicates)
 	require.Len(t, g.live, 2)
 	select {
 	case <-received:
@@ -150,4 +153,59 @@ func TestLookbackKeepsLateArrivalReconciliation(t *testing.T) {
 	go func() { defer close(done); a.collect(ctx, g) }()
 	defer func() { cancel(); <-done }()
 	require.Equal(t, "late", lookbacktest.Receive(t, received).JsonPayload["id"])
+}
+
+func TestLookbackObserverInitialCompletion(t *testing.T) {
+	vendor := vendorServer(t, func(w http.ResponseWriter, r *http.Request) { sendPage(w, nil, "") })
+	a, _ := harness(t, vendor, &captureSink{})
+	var starts, completed, fetched, invalid uint64
+	a.conf.Lookback = &utils.LookbackConfig{Window: 3 * time.Hour, Observer: func(o utils.LookbackObservation) {
+		starts += o.Starts
+		completed += o.Completed
+		fetched += o.Fetched
+		invalid += o.InvalidIDs
+	}}
+	g := newGeneration(1, a.initialPosition())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.collect(ctx, g)
+	require.EqualValues(t, len(a.streams), starts)
+	stream := a.streams[0]
+	end := g.position[stream.name].ReplayEnd
+	require.NoError(t, a.complete(g, stream, end-int64(time.Second), true))
+	require.Zero(t, completed)
+	require.NoError(t, a.complete(g, stream, end, true))
+	require.EqualValues(t, 1, completed)
+	require.NoError(t, a.complete(g, stream, end, true))
+	require.EqualValues(t, 1, completed)
+	// A truncated initial interval must never report success.
+	g = newGeneration(2, a.initialPosition())
+	s := g.position[stream.name]
+	s.Coverage++
+	g.position[stream.name] = s
+	require.NoError(t, a.complete(g, stream, s.ReplayEnd, true))
+	require.EqualValues(t, 1, completed)
+	bad := graphPage{Items: []map[string]interface{}{{"id": ""}, {"id": ""}}}
+	require.Error(t, a.validateGraphPage(&bad, stream))
+	require.EqualValues(t, 2, fetched)
+	require.EqualValues(t, 2, invalid)
+	classes := []struct {
+		err   error
+		class utils.LookbackFailure
+	}{
+		{errRetry, utils.LookbackFailureRequest}, {errVendor, utils.LookbackFailureRequest},
+		{errPage, utils.LookbackFailureInvalidPage}, {errIncomplete, utils.LookbackFailureInvalidPage},
+		{errPressure, utils.LookbackFailureHistoryPressure},
+	}
+	for _, tt := range classes {
+		var got utils.LookbackObservation
+		a.conf.Lookback.Observer = func(o utils.LookbackObservation) { got = o }
+		require.True(t, a.collectionFailure(context.Background(), tt.err))
+		require.Equal(t, tt.class, got.Failure)
+		require.EqualValues(t, 1, got.Failures)
+	}
+	var yielded bool
+	a.conf.Lookback.Observer = func(utils.LookbackObservation) { yielded = true }
+	require.True(t, a.collectionFailure(context.Background(), errYield))
+	require.False(t, yielded)
 }

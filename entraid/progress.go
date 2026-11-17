@@ -29,6 +29,7 @@ type liveID struct {
 // Coverage describes local retained IDs, not vendor retention.
 type streamPosition struct {
 	Boundary, WindowEnd, Coverage, Replay, ReplayEnd, Unverified int64
+	initialEnd, initialCoverage                                  int64
 	Deep                                                         bool
 }
 type entraPosition map[string]streamPosition
@@ -95,6 +96,7 @@ func (a *EntraIDAdapter) initialPosition() entraPosition {
 		position := streamPosition{Boundary: start, WindowEnd: start + int64(a.runtime.window), Coverage: coverage}
 		if a.conf.Lookback != nil {
 			position.Replay, position.ReplayEnd = coverage, start
+			position.initialEnd, position.initialCoverage = start, coverage
 		}
 		p[s.name] = position
 	}

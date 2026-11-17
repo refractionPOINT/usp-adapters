@@ -229,6 +229,9 @@ func (a *OktaAdapter) run() {
 }
 
 func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
+	a.conf.Lookback.Observe(utils.LookbackObservation{Starts: 1})
+	initialComplete := false
+	initialEnd := time.Now()
 	if !waitExact(ctx, a.pollInterval) {
 		return
 	}
@@ -237,6 +240,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 	var episode failureEpisode
 	for ctx.Err() == nil {
 		if !g.makeRoom(time.Now()) {
+			a.conf.Lookback.Observe(utils.LookbackObservation{Failures: 1, Failure: utils.LookbackFailureHistoryPressure})
 			a.issue("live_history_pressure")
 			if !acktrack.Wait(ctx, a.pollInterval) {
 				return
@@ -248,11 +252,20 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			if ctx.Err() != nil {
 				return
 			}
+			failure := utils.LookbackFailureRequest
+			if errors.Is(err, errInvalidContinuation) {
+				failure = utils.LookbackFailureContinuation
+			} else if errors.Is(err, errInvalidPage) {
+				failure = utils.LookbackFailureInvalidPage
+			}
+			a.conf.Lookback.Observe(utils.LookbackObservation{Failures: 1, Failure: failure})
 			if errors.Is(err, errInvalidContinuation) {
 				// Ordinary mode retains the cursor. Hosted mode can safely re-read
 				// its fixed recent window, but cannot promise recovery of older gaps.
 				a.issue("continuation_stalled")
 				if a.conf.Lookback != nil {
+					// The replacement window cannot prove the original one completed.
+					initialComplete = true
 					next = a.initialPosition().Next
 					if a.conf.ClientOptions.OnWarning != nil {
 						a.conf.ClientOptions.OnWarning("okta continuation expired; replaying configured lookback; older gaps may not be recovered")
@@ -285,15 +298,24 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 			continue
 		}
+		a.conf.Lookback.Observe(utils.LookbackObservation{Fetched: uint64(len(page.items))})
 		backoff = time.Second
 		episode = failureEpisode{}
 		// Count malformed events before admission, which may block on delivery.
 		// Keep the warning bounded and never include vendor payloads or IDs.
+		initialDrained := len(page.items) == 0
 		invalid := 0
 		for _, item := range page.items {
 			if id, _ := item["uuid"].(string); id == "" {
 				invalid++
+			} else if stamp, _ := item["published"].(string); a.conf.Lookback != nil && !initialComplete && stamp != "" {
+				if sourceTime, err := time.Parse(time.RFC3339Nano, stamp); err == nil && !sourceTime.Before(initialEnd) {
+					initialDrained = true
+				}
 			}
+		}
+		if invalid > 0 {
+			a.conf.Lookback.Observe(utils.LookbackObservation{InvalidIDs: uint64(invalid)})
 		}
 		if invalid > 0 && a.conf.ClientOptions.OnWarning != nil {
 			a.conf.ClientOptions.OnWarning(fmt.Sprintf("okta collection: skipped %d event(s) with missing or invalid uuid", invalid))
@@ -312,6 +334,7 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			}
 			observer, ok := a.uspClient.(utils.ReceiptObserver)
 			if !ok {
+				a.conf.Lookback.Observe(utils.LookbackObservation{Failures: 1, Failure: utils.LookbackFailureDelivery})
 				a.notify(uspclient.ErrorReceiptUnavailable)
 				return
 			}
@@ -395,6 +418,10 @@ func (a *OktaAdapter) collect(ctx context.Context, g *oktaGeneration) {
 			return
 		}
 
+		if !initialComplete && initialDrained {
+			a.conf.Lookback.Observe(utils.LookbackObservation{Completed: 1})
+			initialComplete = true
+		}
 		next = page.next
 		delay := page.delay
 		if len(page.items) == 0 && delay < a.pollInterval {
