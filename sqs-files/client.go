@@ -244,19 +244,18 @@ func (a *SQSFilesAdapter) getDownloader(bucket string) (*s3manager.Downloader, e
 // getBucketRegion resolves which region a bucket lives in so the downloader
 // talks to the right endpoint.
 //
-// It signs with a.awsConfig.Credentials, which is the assumed-role provider
-// when role_arn is configured and the static keys otherwise. An empty
-// aws.Config would instead fall through to the SDK's default chain --
-// environment, shared config, instance profile, web identity -- so on a host
-// whose ambient AWS config points at a role, this lookup attempts its own STS
-// AssumeRole and fails with "unable to assume role" even though the adapter's
-// configured credentials can read the bucket. It is the one call in this
-// adapter that did not use the configured credentials.
+// The lookup itself is unsigned: s3manager.GetBucketRegion sends a HeadBucket
+// with credentials.AnonymousCredentials and reads the x-amz-bucket-region
+// response header, so it needs no IAM permission and never calls STS. The
+// session is still built from the adapter's configuration rather than an
+// empty aws.Config so that it does not load the host's ambient AWS config
+// (environment, shared config, instance profile), which session.Must would
+// panic on if it were invalid.
 //
-// A lookup failure is not fatal: the configured region is a reasonable
-// fallback and keeps the adapter running when the credentials are not allowed
-// s3:GetBucketLocation. A wrong fallback surfaces as a per-file S3 error
-// rather than the adapter refusing to start.
+// A lookup failure (network, proxy, or a missing bucket) is not fatal: the
+// configured region is a reasonable fallback and keeps the adapter running.
+// A wrong fallback surfaces as a per-file S3 error rather than the adapter
+// refusing to start.
 func (a *SQSFilesAdapter) getBucketRegion(bucket string) (string, error) {
 	sess, err := session.NewSession(&aws.Config{
 		Region:      aws.String(a.conf.Region),
@@ -495,8 +494,8 @@ func (a *SQSFilesAdapter) splitCloudTrailRecords(data []byte) ([][]byte, error) 
 	}
 
 	// Extract routing and timestamp from wrapper if present
-	routing, _ := wrapper["routing"]
-	ts, _ := wrapper["ts"]
+	routing := wrapper["routing"]
+	ts := wrapper["ts"]
 
 	// Split each record into individual messages
 	for _, record := range records {
