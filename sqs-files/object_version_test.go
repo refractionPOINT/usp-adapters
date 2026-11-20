@@ -28,11 +28,7 @@ func TestNotificationObjectVersion(t *testing.T) {
 		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"null"}}},
 		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":null}}}
 	]}`
-	const mixedPermissions = `{"Records":[
-		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"denied"}}},
-		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"allowed"}}},
-		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"denied"}}}
-	]}`
+	const otherBucket = `{"Records":[{"s3":{"bucket":{"name":"other"},"object":{"key":"events.txt","versionId":"other-version"}}}]}`
 	wrapped, err := json.Marshal(map[string]string{"Type": "Notification", "Message": native})
 	if err != nil {
 		t.Fatal(err)
@@ -43,11 +39,12 @@ func TestNotificationObjectVersion(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		name, body            string
+		moreBodies            []string
 		filePath, bucketPath  string
 		bucketOverride        string
 		versionStatus         int
 		versionError          string
-		rejectVersion         string
+		retryInterval         time.Duration
 		versionIsDeleteMarker bool
 		currentAccessDenied   bool
 		currentIsDeleteMarker bool
@@ -108,10 +105,16 @@ func TestNotificationObjectVersion(t *testing.T) {
 			wantGets: []get{{"test", "old+/="}}, wantWarnings: 1,
 		},
 		{
-			name: "version_permissions_can_differ_for_the_same_key", body: mixedPermissions,
-			versionStatus: http.StatusForbidden, versionError: "AccessDenied", rejectVersion: "denied",
-			wantGets:     []get{{"test", "denied"}, {"test", ""}, {"test", "allowed"}, {"test", "denied"}, {"test", ""}},
-			wantPayloads: []string{"current", "allowed", "current"}, wantWarnings: 1,
+			name: "remembers_denial_for_that_bucket", body: native, moreBodies: []string{native, otherBucket, native},
+			versionStatus: http.StatusForbidden, versionError: "AccessDenied",
+			wantGets:     []get{{"test", "old+/="}, {"test", ""}, {"test", ""}, {"other", "other-version"}, {"test", ""}},
+			wantPayloads: []string{"current", "current", "other-version", "current"}, wantWarnings: 1,
+		},
+		{
+			name: "resumes_version_reads_after_retry_interval", body: native, moreBodies: []string{native, native, native},
+			versionStatus: http.StatusForbidden, versionError: "AccessDenied", retryInterval: time.Second,
+			wantGets:     []get{{"test", "old+/="}, {"test", ""}, {"test", ""}, {"test", "old+/="}, {"test", "old+/="}},
+			wantPayloads: []string{"current", "current", "old+/=", "old+/="}, wantWarnings: 1,
 		},
 		{
 			name: "notified_delete_marker_completes_without_data", body: native, versionIsDeleteMarker: true,
@@ -142,8 +145,9 @@ func TestNotificationObjectVersion(t *testing.T) {
 			var mu sync.Mutex
 			var gets []get
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				bucket := tc.wantGets[0].bucket
-				if r.Method != http.MethodGet || r.URL.Path != "/"+bucket+"/events.txt" {
+				bucket, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+				if r.Method != http.MethodGet || r.URL.Path != "/"+bucket+"/events.txt" ||
+					(bucket != "test" && bucket != "other") {
 					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 					w.WriteHeader(http.StatusBadRequest)
 					return
@@ -154,10 +158,11 @@ func TestNotificationObjectVersion(t *testing.T) {
 					t.Error("sent an empty versionId")
 				}
 				mu.Lock()
+				firstGet := len(gets) == 0
 				gets = append(gets, get{bucket, version})
 				mu.Unlock()
 				switch {
-				case version != "" && tc.versionStatus != 0 && (tc.rejectVersion == "" || version == tc.rejectVersion):
+				case version != "" && bucket == "test" && tc.versionStatus != 0 && (tc.retryInterval == 0 || firstGet):
 					if tc.versionIsDeleteMarker {
 						w.Header().Set("x-amz-delete-marker", "true")
 					}
@@ -185,9 +190,10 @@ func TestNotificationObjectVersion(t *testing.T) {
 			downloader := s3manager.NewDownloader(session.Must(session.NewSession(cfg)))
 			client := &receiptClient{}
 			a := &SQSFilesAdapter{
-				uspClient:         client,
-				chFiles:           make(chan fileInfo),
-				bucketDownloaders: map[string]*s3manager.Downloader{"test": downloader, "other": downloader},
+				uspClient:            client,
+				chFiles:              make(chan fileInfo),
+				bucketDownloaders:    map[string]*s3manager.Downloader{"test": downloader, "other": downloader},
+				versionRetryInterval: tc.retryInterval,
 			}
 			a.conf.FilePath = tc.filePath
 			if a.conf.FilePath == "" {
@@ -208,6 +214,15 @@ func TestNotificationObjectVersion(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, _, err := a.processNotification(ctx, &sqs.Message{Body: aws.String(tc.body)})
+			for i, body := range tc.moreBodies {
+				if err != nil {
+					break
+				}
+				if i == 1 && tc.retryInterval != 0 {
+					time.Sleep(tc.retryInterval)
+				}
+				_, _, err = a.processNotification(ctx, &sqs.Message{Body: aws.String(body)})
+			}
 			close(a.chFiles)
 			<-workerDone
 			if (err != nil) != tc.wantError {

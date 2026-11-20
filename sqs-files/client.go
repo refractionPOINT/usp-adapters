@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	defaultWriteTimeout = 60 * 10
+	defaultWriteTimeout         = 60 * 10
+	defaultVersionRetryInterval = time.Hour
 )
 
 type SQSFilesAdapter struct {
@@ -53,7 +54,11 @@ type SQSFilesAdapter struct {
 
 	// Captured downloaders are immutable and safe for concurrent workers.
 	bucketDownloaders map[string]*s3manager.Downloader
-	warnVersionDenied sync.Once
+
+	versionRetryInterval time.Duration
+	versionBackoffMu     sync.Mutex
+	versionBackoff       map[string]versionReadBackoff
+	warnVersionDenied    sync.Once
 
 	ctx    context.Context
 	isStop atomic.Bool
@@ -94,6 +99,11 @@ type fileInfo struct {
 type notifiedObject struct {
 	key       string
 	versionID string
+}
+
+type versionReadBackoff struct {
+	retryAt time.Time
+	probing bool
 }
 
 func (c *SQSFilesConfig) Validate() error {
@@ -451,6 +461,44 @@ func (a *SQSFilesAdapter) processFiles() error {
 	return nil
 }
 
+func (a *SQSFilesAdapter) startVersionRead(bucket string) (attempt, probe bool) {
+	a.versionBackoffMu.Lock()
+	defer a.versionBackoffMu.Unlock()
+
+	backoff, denied := a.versionBackoff[bucket]
+	if !denied {
+		return true, false
+	}
+	if backoff.probing || time.Now().Before(backoff.retryAt) {
+		return false, false
+	}
+	backoff.probing = true
+	a.versionBackoff[bucket] = backoff
+	return true, true
+}
+
+func (a *SQSFilesAdapter) finishVersionRead(bucket string, probe, denied bool) {
+	a.versionBackoffMu.Lock()
+	defer a.versionBackoffMu.Unlock()
+
+	if !denied {
+		delete(a.versionBackoff, bucket)
+		return
+	}
+	if _, exists := a.versionBackoff[bucket]; exists && !probe {
+		// Another worker already recorded this denial.
+		return
+	}
+	interval := a.versionRetryInterval
+	if interval == 0 {
+		interval = defaultVersionRetryInterval
+	}
+	if a.versionBackoff == nil {
+		a.versionBackoff = make(map[string]versionReadBackoff)
+	}
+	a.versionBackoff[bucket] = versionReadBackoff{retryAt: time.Now().Add(interval)}
+}
+
 func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error) {
 	var empty acktrack.ACKDependency
 	if err := f.ctx.Err(); err != nil {
@@ -467,7 +515,11 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 	input := &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}
 	var deleteMarker atomic.Bool
 	var options []func(*s3manager.Downloader)
+	var attempt, probe bool
 	if f.object.versionID != "" {
+		attempt, probe = a.startVersionRead(f.bucket)
+	}
+	if attempt {
 		input.VersionId = aws.String(f.object.versionID)
 		// A requested delete marker returns 405 and has no data to deliver.
 		// The downloader can make parallel range requests and only returns the error.
@@ -482,10 +534,14 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 	}
 	writerAt := aws.NewWriteAtBuffer(nil)
 	_, err := f.downloader.DownloadWithContext(f.ctx, writerAt, input, options...)
-	if input.VersionId != nil && f.ctx.Err() == nil && s3AccessDenied(err) {
+	denied := attempt && s3AccessDenied(err)
+	if probe || denied {
+		a.finishVersionRead(f.bucket, probe, denied)
+	}
+	if denied && f.ctx.Err() == nil {
 		if a.conf.ClientOptions.OnWarning != nil {
 			a.warnVersionDenied.Do(func() {
-				a.conf.ClientOptions.OnWarning("S3 denied access to a notified object version. Retrying with the current object. Check s3:GetObjectVersion and any encryption key permissions.")
+				a.conf.ClientOptions.OnWarning("S3 denied access to a notified object version. Using current objects for that bucket until the adapter retries version access. Grant s3:GetObjectVersion to read notified versions and check any encryption key permissions.")
 			})
 		}
 		input.VersionId = nil
