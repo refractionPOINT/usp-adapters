@@ -28,6 +28,11 @@ func TestNotificationObjectVersion(t *testing.T) {
 		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"null"}}},
 		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":null}}}
 	]}`
+	const mixedPermissions = `{"Records":[
+		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"denied"}}},
+		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"allowed"}}},
+		{"s3":{"bucket":{"name":"test"},"object":{"key":"events.txt","versionId":"denied"}}}
+	]}`
 	wrapped, err := json.Marshal(map[string]string{"Type": "Notification", "Message": native})
 	if err != nil {
 		t.Fatal(err)
@@ -42,6 +47,8 @@ func TestNotificationObjectVersion(t *testing.T) {
 		bucketOverride        string
 		versionStatus         int
 		versionError          string
+		rejectVersion         string
+		versionIsDeleteMarker bool
 		currentAccessDenied   bool
 		currentIsDeleteMarker bool
 		wantGets              []get
@@ -101,6 +108,22 @@ func TestNotificationObjectVersion(t *testing.T) {
 			wantGets: []get{{"test", "old+/="}}, wantWarnings: 1,
 		},
 		{
+			name: "version_permissions_can_differ_for_the_same_key", body: mixedPermissions,
+			versionStatus: http.StatusForbidden, versionError: "AccessDenied", rejectVersion: "denied",
+			wantGets:     []get{{"test", "denied"}, {"test", ""}, {"test", "allowed"}, {"test", "denied"}, {"test", ""}},
+			wantPayloads: []string{"current", "allowed", "current"}, wantWarnings: 1,
+		},
+		{
+			name: "notified_delete_marker_completes_without_data", body: native, versionIsDeleteMarker: true,
+			versionStatus: http.StatusMethodNotAllowed, versionError: "MethodNotAllowed",
+			wantGets: []get{{"test", "old+/="}}, wantWarnings: 1,
+		},
+		{
+			name: "method_not_allowed_without_delete_marker_remains_an_error", body: native,
+			versionStatus: http.StatusMethodNotAllowed, versionError: "MethodNotAllowed",
+			wantGets: []get{{"test", "old+/="}}, wantError: true,
+		},
+		{
 			name: "signature_error_does_not_fall_back", body: native,
 			versionStatus: http.StatusForbidden, versionError: "SignatureDoesNotMatch",
 			wantGets: []get{{"test", "old+/="}}, wantError: true,
@@ -134,7 +157,10 @@ func TestNotificationObjectVersion(t *testing.T) {
 				gets = append(gets, get{bucket, version})
 				mu.Unlock()
 				switch {
-				case version != "" && tc.versionStatus != 0:
+				case version != "" && tc.versionStatus != 0 && (tc.rejectVersion == "" || version == tc.rejectVersion):
+					if tc.versionIsDeleteMarker {
+						w.Header().Set("x-amz-delete-marker", "true")
+					}
 					w.WriteHeader(tc.versionStatus)
 					if tc.versionError != "" {
 						fmt.Fprintf(w, "<Error><Code>%s</Code></Error>", tc.versionError)

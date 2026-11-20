@@ -1,5 +1,7 @@
 # SQS file delivery and retained notifications
 
+For S3 notifications with a version ID, the adapter reads that version using `s3:GetObjectVersion`. This applies to native S3 notifications, SNS-wrapped S3 notifications, and S3 events delivered by EventBridge when the configured paths select their S3 object keys. If S3 denies a version read, the adapter retries once for the current object using `s3:GetObject` and emits a warning once per adapter run. Permissions can differ across objects and versions, so later notifications still try their named versions. Notifications without a version ID read the current object.
+
 A notification is deleted from SQS only after all of its readable referenced files have been downloaded, decoded, and acknowledged by USP. Delivery is at least once: interrupted processing, uncertain visibility renewal, or incomplete cleanup can replay records that were already delivered.
 
 A definitively missing object in an existing bucket (404 / NoSuchKey / NotFound from the object read) produces a warning and counts as complete: there are no bytes left to deliver. If the notification also refers to existing files, those files still require USP delivery acknowledgement before deletion. An all-missing-object notification needs no delivery dependency, but deletion still requires known SQS lease ownership.
@@ -14,7 +16,7 @@ The S3 `s3:TestEvent` control notice contains no telemetry. It is recognized, wa
 
 A source redrive policy and dead-letter queue are required to quarantine retained invalid envelopes/configuration and control notices. The adapter does not create or change that policy. Without redrive, these notifications can be received repeatedly until the source queue's retention period expires.
 
-Transient download failures (network errors, throttling, or server failures) retain the entire notification for retry; already delivered readable files may replay on redelivery. Permission errors such as 403 remain fatal. Transport, source, admission, acknowledgement-observation, and visibility-ownership failures remain fatal: they use the error callback and stop collection conservatively. Graceful shutdown first stops intake and allows delivered notifications to be acknowledged and deleted within its shutdown budget; uncertain work remains available for source replay.
+Transient download failures (network errors, throttling, or server failures) retain the entire notification for retry. Already delivered readable files may replay on redelivery. Permission errors on the current-object read remain fatal. Transport, source, admission, acknowledgement-observation, and visibility-ownership failures use the error callback and stop collection conservatively. Graceful shutdown first stops intake and allows delivered notifications to be acknowledged and deleted within its shutdown budget. Uncertain work remains available for source replay.
 
 ## Optional visibility renewal
 

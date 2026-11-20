@@ -53,6 +53,7 @@ type SQSFilesAdapter struct {
 
 	// Captured downloaders are immutable and safe for concurrent workers.
 	bucketDownloaders map[string]*s3manager.Downloader
+	warnVersionDenied sync.Once
 
 	ctx    context.Context
 	isStop atomic.Bool
@@ -421,15 +422,22 @@ func notificationObjects(d utils.Dict, filePath, bucket string) []notifiedObject
 	var objects []notifiedObject
 	for _, source := range findSources(d) {
 		node := utils.Dict{"source": source}
-		keys := node.ExpandableFindString("source/object/key")
-		var versionID string
-		// The version belongs to the notification's bucket. A bucket override
-		// can point elsewhere, and only standard records name one object.
-		if len(keys) == 1 && node.ExpandableFindOneString("source/bucket/name") == bucket {
-			versionID = node.ExpandableFindOneString("source/object/" + versionField)
+		record, _ := node.GetDict("source")
+		object, _ := record.GetDict("object")
+		if key, ok := object.GetString("key"); ok {
+			ref := notifiedObject{key: key}
+			// A bucket override can point to a different object with the same key.
+			if sourceBucket, ok := record.GetDict("bucket"); ok {
+				if name, _ := sourceBucket.GetString("name"); name == bucket {
+					ref.versionID, _ = object.GetString(versionField)
+				}
+			}
+			objects = append(objects, ref)
+			continue
 		}
-		for _, key := range keys {
-			objects = append(objects, notifiedObject{key: key, versionID: versionID})
+		// Keep the existing extractor for nonstandard shapes.
+		for _, key := range node.ExpandableFindString("source/object/key") {
+			objects = append(objects, notifiedObject{key: key})
 		}
 	}
 	return objects
@@ -457,14 +465,28 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 		}
 	}
 	input := &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}
+	var deleteMarker atomic.Bool
+	var options []func(*s3manager.Downloader)
 	if f.object.versionID != "" {
 		input.VersionId = aws.String(f.object.versionID)
+		// A requested delete marker returns 405 and has no data to deliver.
+		// The downloader can make parallel range requests and only returns the error.
+		options = append(options, s3manager.WithDownloaderRequestOptions(func(r *request.Request) {
+			r.Handlers.Complete.PushBack(func(r *request.Request) {
+				if resp := r.HTTPResponse; resp != nil && resp.StatusCode == http.StatusMethodNotAllowed &&
+					resp.Header.Get("x-amz-delete-marker") == "true" {
+					deleteMarker.Store(true)
+				}
+			})
+		}))
 	}
 	writerAt := aws.NewWriteAtBuffer(nil)
-	_, err := f.downloader.DownloadWithContext(f.ctx, writerAt, input)
+	_, err := f.downloader.DownloadWithContext(f.ctx, writerAt, input, options...)
 	if input.VersionId != nil && f.ctx.Err() == nil && s3AccessDenied(err) {
 		if a.conf.ClientOptions.OnWarning != nil {
-			a.conf.ClientOptions.OnWarning("S3 denied access to the notified object version. Fetching the current object instead. Grant s3:GetObjectVersion to read notified versions.")
+			a.warnVersionDenied.Do(func() {
+				a.conf.ClientOptions.OnWarning("S3 denied access to a notified object version. Retrying with the current object. Check s3:GetObjectVersion and any encryption key permissions.")
+			})
 		}
 		input.VersionId = nil
 		writerAt = aws.NewWriteAtBuffer(nil)
@@ -474,7 +496,7 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 		if f.ctx.Err() != nil {
 			return empty, context.Cause(f.ctx)
 		}
-		if sourceIsAbsent(err, "NoSuchKey", "NotFound") {
+		if deleteMarker.Load() || sourceIsAbsent(err, "NoSuchKey", "NotFound") {
 			return empty, &absentSourceError{err}
 		}
 		return empty, err
