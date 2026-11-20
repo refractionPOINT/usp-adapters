@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -21,11 +23,13 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
 const (
-	defaultWriteTimeout = 60 * 10
+	defaultWriteTimeout         = 60 * 10
+	defaultVersionRetryInterval = time.Hour
 )
 
 type SQSFilesAdapter struct {
@@ -50,6 +54,11 @@ type SQSFilesAdapter struct {
 
 	// Captured downloaders are immutable and safe for concurrent workers.
 	bucketDownloaders map[string]*s3manager.Downloader
+
+	versionRetryInterval time.Duration
+	versionBackoffMu     sync.Mutex
+	versionBackoff       map[string]versionReadBackoff
+	warnVersionDenied    sync.Once
 
 	ctx    context.Context
 	isStop atomic.Bool
@@ -81,10 +90,20 @@ type fileResult struct {
 
 type fileInfo struct {
 	bucket     string
-	path       string
+	object     notifiedObject
 	done       chan fileResult
 	ctx        context.Context
 	downloader *s3manager.Downloader
+}
+
+type notifiedObject struct {
+	key       string
+	versionID string
+}
+
+type versionReadBackoff struct {
+	retryAt time.Time
+	probing bool
 }
 
 func (c *SQSFilesConfig) Validate() error {
@@ -333,8 +352,8 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	if bucket == "" {
 		bucket = d.ExpandableFindOneString(a.conf.BucketPath)
 	}
-	paths := d.ExpandableFindString(a.conf.FilePath)
-	if bucket == "" || len(paths) == 0 {
+	objects := notificationObjects(d, a.conf.FilePath, bucket)
+	if bucket == "" || len(objects) == 0 {
 		return dependency, hasDependency, permanent(errors.New("notification missing bucket or files"))
 	}
 	downloader, err := a.downloaderForBucket(ctx, bucket)
@@ -343,16 +362,16 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	}
 	fileCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan fileResult, len(paths))
-	for _, path := range paths {
+	results := make(chan fileResult, len(objects))
+	for _, object := range objects {
 		select {
-		case a.chFiles <- fileInfo{bucket: bucket, path: path, done: results, ctx: fileCtx, downloader: downloader}:
+		case a.chFiles <- fileInfo{bucket: bucket, object: object, done: results, ctx: fileCtx, downloader: downloader}:
 		case <-ctx.Done():
 			return dependency, hasDependency, context.Cause(ctx)
 		}
 	}
 	var permanentErr error
-	for range paths {
+	for range objects {
 		select {
 		case r := <-results:
 			if r.err != nil {
@@ -388,6 +407,52 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	return dependency, hasDependency, permanentErr
 }
 
+func notificationObjects(d utils.Dict, filePath, bucket string) []notifiedObject {
+	// Normalize separators just as the configured path extractor does.
+	path := "/" + strings.Join(strings.FieldsFunc(filePath, func(r rune) bool { return r == '/' }), "/")
+	var versionField string
+	switch {
+	case strings.HasSuffix(path, "/s3/object/key"):
+		versionField = "versionId"
+	case strings.HasSuffix(path, "/detail/object/key"):
+		versionField = "version-id"
+	default:
+		keys := d.ExpandableFindString(filePath)
+		objects := make([]notifiedObject, 0, len(keys))
+		for _, key := range keys {
+			objects = append(objects, notifiedObject{key: key})
+		}
+		return objects
+	}
+
+	// Read keys and versions from the same record. Flattening the version
+	// path separately would shift versions when a record omits its version.
+	sourcePath := strings.TrimSuffix(path, "/object/key")
+	findSources := utils.MakeExpandableExtractorForOpaque(sourcePath, true)
+	var objects []notifiedObject
+	for _, source := range findSources(d) {
+		node := utils.Dict{"source": source}
+		record, _ := node.GetDict("source")
+		object, _ := record.GetDict("object")
+		if key, ok := object.GetString("key"); ok {
+			ref := notifiedObject{key: key}
+			// A bucket override can point to a different object with the same key.
+			if sourceBucket, ok := record.GetDict("bucket"); ok {
+				if name, _ := sourceBucket.GetString("name"); name == bucket {
+					ref.versionID, _ = object.GetString(versionField)
+				}
+			}
+			objects = append(objects, ref)
+			continue
+		}
+		// Keep the existing extractor for nonstandard shapes.
+		for _, key := range node.ExpandableFindString("source/object/key") {
+			objects = append(objects, notifiedObject{key: key})
+		}
+	}
+	return objects
+}
+
 func (a *SQSFilesAdapter) processFiles() error {
 	for f := range a.chFiles {
 		dep, err := a.processFile(f)
@@ -396,12 +461,50 @@ func (a *SQSFilesAdapter) processFiles() error {
 	return nil
 }
 
+func (a *SQSFilesAdapter) startVersionRead(bucket string) (attempt, probe bool) {
+	a.versionBackoffMu.Lock()
+	defer a.versionBackoffMu.Unlock()
+
+	backoff, denied := a.versionBackoff[bucket]
+	if !denied {
+		return true, false
+	}
+	if backoff.probing || time.Now().Before(backoff.retryAt) {
+		return false, false
+	}
+	backoff.probing = true
+	a.versionBackoff[bucket] = backoff
+	return true, true
+}
+
+func (a *SQSFilesAdapter) finishVersionRead(bucket string, probe, denied bool) {
+	a.versionBackoffMu.Lock()
+	defer a.versionBackoffMu.Unlock()
+
+	if !denied {
+		delete(a.versionBackoff, bucket)
+		return
+	}
+	if _, exists := a.versionBackoff[bucket]; exists && !probe {
+		// Another worker already recorded this denial.
+		return
+	}
+	interval := a.versionRetryInterval
+	if interval == 0 {
+		interval = defaultVersionRetryInterval
+	}
+	if a.versionBackoff == nil {
+		a.versionBackoff = make(map[string]versionReadBackoff)
+	}
+	a.versionBackoff[bucket] = versionReadBackoff{retryAt: time.Now().Add(interval)}
+}
+
 func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error) {
 	var empty acktrack.ACKDependency
 	if err := f.ctx.Err(); err != nil {
 		return empty, err
 	}
-	path := f.path
+	path := f.object.key
 	if a.conf.IsDecodeObjectKey {
 		var err error
 		path, err = url.QueryUnescape(path)
@@ -409,12 +512,47 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 			return empty, permanent(err)
 		}
 	}
-	writerAt := aws.NewWriteAtBuffer([]byte{})
-	if _, err := f.downloader.DownloadWithContext(f.ctx, writerAt, &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}); err != nil {
+	input := &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}
+	var deleteMarker atomic.Bool
+	var options []func(*s3manager.Downloader)
+	var attempt, probe bool
+	if f.object.versionID != "" {
+		attempt, probe = a.startVersionRead(f.bucket)
+	}
+	if attempt {
+		input.VersionId = aws.String(f.object.versionID)
+		// A requested delete marker returns 405 and has no data to deliver.
+		// The downloader can make parallel range requests and only returns the error.
+		options = append(options, s3manager.WithDownloaderRequestOptions(func(r *request.Request) {
+			r.Handlers.Complete.PushBack(func(r *request.Request) {
+				if resp := r.HTTPResponse; resp != nil && resp.StatusCode == http.StatusMethodNotAllowed &&
+					resp.Header.Get("x-amz-delete-marker") == "true" {
+					deleteMarker.Store(true)
+				}
+			})
+		}))
+	}
+	writerAt := aws.NewWriteAtBuffer(nil)
+	_, err := f.downloader.DownloadWithContext(f.ctx, writerAt, input, options...)
+	denied := attempt && s3AccessDenied(err)
+	if probe || denied {
+		a.finishVersionRead(f.bucket, probe, denied)
+	}
+	if denied && f.ctx.Err() == nil {
+		if a.conf.ClientOptions.OnWarning != nil {
+			a.warnVersionDenied.Do(func() {
+				a.conf.ClientOptions.OnWarning("S3 denied access to a notified object version. Using current objects for that bucket until the adapter retries version access. Grant s3:GetObjectVersion to read notified versions and check any encryption key permissions.")
+			})
+		}
+		input.VersionId = nil
+		writerAt = aws.NewWriteAtBuffer(nil)
+		_, err = f.downloader.DownloadWithContext(f.ctx, writerAt, input)
+	}
+	if err != nil {
 		if f.ctx.Err() != nil {
 			return empty, context.Cause(f.ctx)
 		}
-		if sourceIsAbsent(err, "NoSuchKey", "NotFound") {
+		if deleteMarker.Load() || sourceIsAbsent(err, "NoSuchKey", "NotFound") {
 			return empty, &absentSourceError{err}
 		}
 		return empty, err
@@ -459,6 +597,23 @@ func (a *SQSFilesAdapter) shipEventContext(ctx context.Context, data []byte, isC
 // malformed data, it is complete rather than retained for DLQ. Authorization, server, transport,
 // and cancellation failures must never be mistaken for absence.
 type absentSourceError struct{ error }
+
+func s3AccessDenied(err error) bool {
+	var api awserr.Error
+	if !errors.As(err, &api) {
+		return false
+	}
+	switch api.Code() {
+	case "AccessDenied", "Forbidden":
+		return true
+	case request.ErrCodeSerialization:
+		// The SDK reports a decoding error when a 403 has no S3 error body.
+		var failure awserr.RequestFailure
+		return errors.As(err, &failure) && failure.StatusCode() == http.StatusForbidden
+	default:
+		return false
+	}
+}
 
 func sourceIsAbsent(err error, codes ...string) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
