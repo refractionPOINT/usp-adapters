@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -21,6 +23,7 @@ import (
 
 	"github.com/refractionPOINT/go-uspclient"
 	"github.com/refractionPOINT/go-uspclient/protocol"
+	"github.com/refractionPOINT/usp-adapters/internal/acktrack"
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
@@ -81,10 +84,15 @@ type fileResult struct {
 
 type fileInfo struct {
 	bucket     string
-	path       string
+	object     notifiedObject
 	done       chan fileResult
 	ctx        context.Context
 	downloader *s3manager.Downloader
+}
+
+type notifiedObject struct {
+	key       string
+	versionID string
 }
 
 func (c *SQSFilesConfig) Validate() error {
@@ -333,8 +341,8 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	if bucket == "" {
 		bucket = d.ExpandableFindOneString(a.conf.BucketPath)
 	}
-	paths := d.ExpandableFindString(a.conf.FilePath)
-	if bucket == "" || len(paths) == 0 {
+	objects := notificationObjects(d, a.conf.FilePath, bucket)
+	if bucket == "" || len(objects) == 0 {
 		return dependency, hasDependency, permanent(errors.New("notification missing bucket or files"))
 	}
 	downloader, err := a.downloaderForBucket(ctx, bucket)
@@ -343,16 +351,16 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	}
 	fileCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	results := make(chan fileResult, len(paths))
-	for _, path := range paths {
+	results := make(chan fileResult, len(objects))
+	for _, object := range objects {
 		select {
-		case a.chFiles <- fileInfo{bucket: bucket, path: path, done: results, ctx: fileCtx, downloader: downloader}:
+		case a.chFiles <- fileInfo{bucket: bucket, object: object, done: results, ctx: fileCtx, downloader: downloader}:
 		case <-ctx.Done():
 			return dependency, hasDependency, context.Cause(ctx)
 		}
 	}
 	var permanentErr error
-	for range paths {
+	for range objects {
 		select {
 		case r := <-results:
 			if r.err != nil {
@@ -388,6 +396,45 @@ func (a *SQSFilesAdapter) processNotification(ctx context.Context, message *sqs.
 	return dependency, hasDependency, permanentErr
 }
 
+func notificationObjects(d utils.Dict, filePath, bucket string) []notifiedObject {
+	// Normalize separators just as the configured path extractor does.
+	path := "/" + strings.Join(strings.FieldsFunc(filePath, func(r rune) bool { return r == '/' }), "/")
+	var versionField string
+	switch {
+	case strings.HasSuffix(path, "/s3/object/key"):
+		versionField = "versionId"
+	case strings.HasSuffix(path, "/detail/object/key"):
+		versionField = "version-id"
+	default:
+		keys := d.ExpandableFindString(filePath)
+		objects := make([]notifiedObject, 0, len(keys))
+		for _, key := range keys {
+			objects = append(objects, notifiedObject{key: key})
+		}
+		return objects
+	}
+
+	// Read keys and versions from the same record. Flattening the version
+	// path separately would shift versions when a record omits its version.
+	sourcePath := strings.TrimSuffix(path, "/object/key")
+	findSources := utils.MakeExpandableExtractorForOpaque(sourcePath, true)
+	var objects []notifiedObject
+	for _, source := range findSources(d) {
+		node := utils.Dict{"source": source}
+		keys := node.ExpandableFindString("source/object/key")
+		var versionID string
+		// The version belongs to the notification's bucket. A bucket override
+		// can point elsewhere, and only standard records name one object.
+		if len(keys) == 1 && node.ExpandableFindOneString("source/bucket/name") == bucket {
+			versionID = node.ExpandableFindOneString("source/object/" + versionField)
+		}
+		for _, key := range keys {
+			objects = append(objects, notifiedObject{key: key, versionID: versionID})
+		}
+	}
+	return objects
+}
+
 func (a *SQSFilesAdapter) processFiles() error {
 	for f := range a.chFiles {
 		dep, err := a.processFile(f)
@@ -401,7 +448,7 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 	if err := f.ctx.Err(); err != nil {
 		return empty, err
 	}
-	path := f.path
+	path := f.object.key
 	if a.conf.IsDecodeObjectKey {
 		var err error
 		path, err = url.QueryUnescape(path)
@@ -409,8 +456,21 @@ func (a *SQSFilesAdapter) processFile(f fileInfo) (acktrack.ACKDependency, error
 			return empty, permanent(err)
 		}
 	}
-	writerAt := aws.NewWriteAtBuffer([]byte{})
-	if _, err := f.downloader.DownloadWithContext(f.ctx, writerAt, &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}); err != nil {
+	input := &s3.GetObjectInput{Bucket: aws.String(f.bucket), Key: aws.String(path)}
+	if f.object.versionID != "" {
+		input.VersionId = aws.String(f.object.versionID)
+	}
+	writerAt := aws.NewWriteAtBuffer(nil)
+	_, err := f.downloader.DownloadWithContext(f.ctx, writerAt, input)
+	if input.VersionId != nil && f.ctx.Err() == nil && s3AccessDenied(err) {
+		if a.conf.ClientOptions.OnWarning != nil {
+			a.conf.ClientOptions.OnWarning("S3 denied access to the notified object version. Fetching the current object instead. Grant s3:GetObjectVersion to read notified versions.")
+		}
+		input.VersionId = nil
+		writerAt = aws.NewWriteAtBuffer(nil)
+		_, err = f.downloader.DownloadWithContext(f.ctx, writerAt, input)
+	}
+	if err != nil {
 		if f.ctx.Err() != nil {
 			return empty, context.Cause(f.ctx)
 		}
@@ -459,6 +519,23 @@ func (a *SQSFilesAdapter) shipEventContext(ctx context.Context, data []byte, isC
 // malformed data, it is complete rather than retained for DLQ. Authorization, server, transport,
 // and cancellation failures must never be mistaken for absence.
 type absentSourceError struct{ error }
+
+func s3AccessDenied(err error) bool {
+	var api awserr.Error
+	if !errors.As(err, &api) {
+		return false
+	}
+	switch api.Code() {
+	case "AccessDenied", "Forbidden":
+		return true
+	case request.ErrCodeSerialization:
+		// The SDK reports a decoding error when a 403 has no S3 error body.
+		var failure awserr.RequestFailure
+		return errors.As(err, &failure) && failure.StatusCode() == http.StatusForbidden
+	default:
+		return false
+	}
+}
 
 func sourceIsAbsent(err error, codes ...string) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
