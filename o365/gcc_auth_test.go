@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/refractionPOINT/usp-adapters/utils"
 	"github.com/stretchr/testify/assert"
@@ -55,7 +57,7 @@ func TestManagementCloudTokenRequests(t *testing.T) {
 }
 
 func TestGCCTokenAudienceFallback(t *testing.T) {
-	for _, rejection := range []string{"token endpoint", "feed body", "feed challenge"} {
+	for _, rejection := range []string{"token endpoint", "feed body", "generic 401"} {
 		t.Run(rejection, func(t *testing.T) {
 			var audiences, usedTokens, warnings []string
 			var legacyTokens int
@@ -95,9 +97,9 @@ func TestGCCTokenAudienceFallback(t *testing.T) {
 				auth := r.Header.Get("Authorization")
 				usedTokens = append(usedTokens, auth)
 				if auth == "Bearer "+testAccessToken {
-					if rejection == "feed challenge" {
-						w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token", error_description="The audience is invalid"`)
+					if rejection == "generic 401" {
 						w.WriteHeader(http.StatusUnauthorized)
+						_, _ = io.WriteString(w, "Unauthorized")
 					} else {
 						w.WriteHeader(http.StatusUnauthorized)
 						_, _ = io.WriteString(w, `{"error":{"message":"Access token validation failure. Invalid audience."}}`)
@@ -130,7 +132,7 @@ func TestGCCTokenAudienceFallback(t *testing.T) {
 			}
 			assert.Equal(t, wantTokens, usedTokens)
 			require.Len(t, warnings, 1)
-			assert.Contains(t, warnings[0], "GCC token audience rejected")
+			assert.Contains(t, warnings[0], "retrying with the commercial audience")
 		})
 	}
 }
@@ -138,10 +140,11 @@ func TestGCCTokenAudienceFallback(t *testing.T) {
 func TestGCCTokenAudienceDoesNotFallbackOnUnrelatedErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name, host, tokenError, feedError string
+		status                            int
 	}{
 		{name: "bad client", tokenError: "invalid_client"},
-		{name: "missing permission", host: "manage-gcc.office.com", feedError: `{"error":{"code":"AF10001","message":"ActivityFeed.Read missing"}}`},
-		{name: "different host", host: "example.com", feedError: `{"error":{"message":"Invalid audience"}}`},
+		{name: "bad request", host: "manage-gcc.office.com", status: http.StatusBadRequest, feedError: `{"error":{"message":"Invalid audience"}}`},
+		{name: "different host", host: "example.com", status: http.StatusUnauthorized, feedError: `{"error":{"message":"Invalid audience"}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var tokens int
@@ -158,7 +161,7 @@ func TestGCCTokenAudienceDoesNotFallbackOnUnrelatedErrors(t *testing.T) {
 					return
 				}
 				require.NotEmpty(t, tc.feedError)
-				w.WriteHeader(http.StatusUnauthorized)
+				w.WriteHeader(tc.status)
 				_, _ = io.WriteString(w, tc.feedError)
 			})
 			if tc.tokenError != "" {
@@ -171,6 +174,122 @@ func TestGCCTokenAudienceDoesNotFallbackOnUnrelatedErrors(t *testing.T) {
 			assert.Positive(t, tokens)
 		})
 	}
+}
+
+func TestGCCFeedCredentialError(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		establishedGCC bool
+	}{
+		{name: "both audiences forbidden"},
+		{name: "after GCC success", establishedGCC: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var audiences []string
+			var warnings int
+			a := mockManagementAuth(t, "gcc-gov", func(string) { warnings++ }, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Host == "login.windows.net" {
+					require.NoError(t, r.ParseForm())
+					audience := r.PostForm.Get("resource")
+					audiences = append(audiences, audience)
+					writeJSON(w, http.StatusOK, map[string]interface{}{
+						"access_token": audience, "token_type": "Bearer", "expires_in": 3600,
+					})
+					return
+				}
+				if r.URL.Path == "/accepted" {
+					assert.Equal(t, "Bearer https://manage-gcc.office.com", r.Header.Get("Authorization"))
+					_, _ = io.WriteString(w, "{}")
+					return
+				}
+				w.WriteHeader(http.StatusForbidden)
+				if r.Header.Get("Authorization") == "Bearer https://manage.office.com" {
+					_, _ = io.WriteString(w, "commercial request forbidden")
+				} else if tc.establishedGCC {
+					_, _ = io.WriteString(w, `{"error":{"message":"Invalid audience"}}`)
+				} else {
+					_, _ = io.WriteString(w, "GCC request forbidden")
+				}
+			})
+			if tc.establishedGCC {
+				_, _, err := a.get(a.stopCtx, "https://manage-gcc.office.com/accepted")
+				require.NoError(t, err)
+			}
+			_, _, err := a.getWithRetry("https://manage-gcc.office.com/denied", "content api", &failureState{}, 0)
+			var apiErr *apiError
+			require.ErrorAs(t, err, &apiErr)
+			assert.False(t, apiErr.transient)
+			assert.Contains(t, apiErr.Error(), "403 Forbidden")
+			if tc.establishedGCC {
+				assert.Contains(t, apiErr.Error(), "Invalid audience")
+				assert.Equal(t, []string{"https://manage-gcc.office.com"}, audiences)
+				assert.Zero(t, warnings)
+			} else {
+				assert.Contains(t, apiErr.Error(), "commercial request forbidden")
+				assert.Equal(t, []string{"https://manage-gcc.office.com", "https://manage.office.com"}, audiences)
+				assert.Equal(t, 1, warnings)
+			}
+		})
+	}
+}
+
+func TestGCCConcurrentFallbackSharesCommercialToken(t *testing.T) {
+	const collectors = 8
+	var gccRequests, legacyTokens, legacyRequests, warnings atomic.Int32
+	allCollectors := make(chan struct{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	a := mockManagementAuth(t, "gcc-gov", func(string) { warnings.Add(1) }, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Host == "login.windows.net" {
+			if err := r.ParseForm(); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			audience := r.PostForm.Get("resource")
+			if audience == "https://manage.office.com" {
+				legacyTokens.Add(1)
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"access_token": audience, "token_type": "Bearer", "expires_in": 3600,
+			})
+			return
+		}
+		if r.Header.Get("Authorization") == "Bearer https://manage-gcc.office.com" {
+			if gccRequests.Add(1) == collectors {
+				close(allCollectors)
+			}
+			select {
+			case <-allCollectors:
+				w.WriteHeader(http.StatusUnauthorized)
+			case <-r.Context().Done():
+				w.WriteHeader(http.StatusGatewayTimeout)
+			}
+			return
+		}
+		assert.Equal(t, "Bearer https://manage.office.com", r.Header.Get("Authorization"))
+		legacyRequests.Add(1)
+		_, _ = io.WriteString(w, "{}")
+	})
+	results := make(chan error, collectors)
+	for range collectors {
+		go func() {
+			_, _, err := a.get(ctx, "https://manage-gcc.office.com/content")
+			results <- err
+		}()
+	}
+	for range collectors {
+		select {
+		case err := <-results:
+			assert.NoError(t, err)
+		case <-ctx.Done():
+			t.Fatal("collectors timed out")
+		}
+	}
+	assert.EqualValues(t, collectors, gccRequests.Load())
+	assert.EqualValues(t, collectors, legacyRequests.Load())
+	assert.EqualValues(t, 1, legacyTokens.Load())
+	assert.EqualValues(t, 1, warnings.Load())
 }
 
 func mockManagementAuth(t *testing.T, cloud string, warn func(string), handler http.HandlerFunc) *Office365Adapter {

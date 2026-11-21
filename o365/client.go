@@ -1,7 +1,6 @@
 package usp_o365
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -15,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/refractionPOINT/gjson"
@@ -989,12 +989,15 @@ func (a *Office365Adapter) updateBearerToken() error {
 	// OAuth2's default transport refreshes tokens with a fixed context, so
 	// a content deadline would not interrupt a refresh. Share cached tokens,
 	// but refresh with the current request's context (including Close).
-	a.httpClient = &http.Client{Timeout: httpTimeout, Transport: &tokenTransport{
+	transport := &tokenTransport{
 		conf: conf, client: a.httpClient, lock: make(chan struct{}, 1),
-		endpoint:   tokenEndpointTransport{base: a.httpClient.Transport, maxRetryAfter: a.conf.maxRetryAfter},
-		gccPrimary: a.endpointType == "gcc-gov" && resourceScope == gccResource,
-		onWarning:  a.conf.ClientOptions.OnWarning,
-	}}
+		endpoint:  tokenEndpointTransport{base: a.httpClient.Transport, maxRetryAfter: a.conf.maxRetryAfter},
+		onWarning: a.conf.ClientOptions.OnWarning,
+	}
+	if a.endpointType == "gcc-gov" && resourceScope == gccResource {
+		transport.gccAudience.Store(gccAudienceUnproven)
+	}
+	a.httpClient = &http.Client{Timeout: httpTimeout, Transport: transport}
 
 	return nil
 }
@@ -1003,18 +1006,24 @@ func (a *Office365Adapter) updateBearerToken() error {
 // token to stop at their own deadline. The token endpoint uses the same base
 // client as API requests, preserving its proxy, timeout and TLS settings.
 type tokenTransport struct {
-	conf     *clientcredentials.Config
-	client   *http.Client
-	lock     chan struct{}
-	token    *oauth2.Token
-	endpoint tokenEndpointTransport // accessed only while lock is held
-	// gccPrimary is cleared under lock when switching to the legacy resource.
-	gccPrimary bool
-	onWarning  func(string)
+	conf        *clientcredentials.Config
+	client      *http.Client
+	lock        chan struct{}
+	token       *oauth2.Token
+	endpoint    tokenEndpointTransport // accessed only while lock is held
+	gccAudience atomic.Uint32          // first feed success and fallback compete to set this
+	onWarning   func(string)
 }
 
+const (
+	gccAudienceUnused uint32 = iota
+	gccAudienceUnproven
+	gccAudienceAccepted
+	gccAudienceCommercial
+)
+
 func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	token, gccPrimary, err := t.tokenFor(req.Context(), false)
+	token, testAudience, err := t.tokenFor(req.Context(), nil)
 	if err != nil {
 		if req.Body != nil {
 			req.Body.Close()
@@ -1025,16 +1034,26 @@ func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return (&oauth2.Transport{Base: t.client.Transport, Source: oauth2.StaticTokenSource(token)}).RoundTrip(req)
 	}
 	resp, err := send(req, token)
-	if err != nil || !gccPrimary || req.URL.Scheme != "https" || !strings.EqualFold(req.URL.Host, gccHost) ||
-		(req.Body != nil && req.Body != http.NoBody && req.GetBody == nil) || !rejectsAudience(resp) {
+	if err != nil || !testAudience || req.URL.Scheme != "https" || !strings.EqualFold(req.URL.Host, gccHost) {
 		return resp, err
 	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		t.gccAudience.CompareAndSwap(gccAudienceUnproven, gccAudienceAccepted)
+		return resp, nil
+	}
+	if (resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden) ||
+		(req.Body != nil && req.Body != http.NoBody && req.GetBody == nil) {
+		return resp, nil
+	}
 
-	// Replay the feed request once after explicitly confirmed audience rejection.
-	resp.Body.Close()
-	token, _, err = t.tokenFor(req.Context(), true)
+	// Before the first successful GCC request, the feed may reject the GCC
+	// token without saying why. Replay once with the commercial audience.
+	token, _, err = t.tokenFor(req.Context(), resp)
 	if err != nil {
 		return nil, err
+	}
+	if token == nil {
+		return resp, nil // Another request established that the GCC token works.
 	}
 	retry := req.Clone(req.Context())
 	if req.GetBody != nil {
@@ -1046,28 +1065,37 @@ func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return send(retry, token)
 }
 
-func (t *tokenTransport) tokenFor(ctx context.Context, audienceRejected bool) (*oauth2.Token, bool, error) {
+func (t *tokenTransport) tokenFor(ctx context.Context, rejected *http.Response) (*oauth2.Token, bool, error) {
 	select {
 	case t.lock <- struct{}{}:
 	case <-ctx.Done():
+		if rejected != nil {
+			rejected.Body.Close()
+		}
 		return nil, false, ctx.Err()
 	}
 	switched := false
 	defer func() {
 		<-t.lock
 		if switched && t.onWarning != nil {
-			t.onWarning("office365 GCC token audience rejected; retrying with the commercial audience")
+			t.onWarning("office365 GCC authentication failed before the first successful feed request; retrying with the commercial audience")
 		}
 	}()
 	if err := ctx.Err(); err != nil {
+		if rejected != nil {
+			rejected.Body.Close()
+		}
 		return nil, false, err
 	}
-	if audienceRejected && t.gccPrimary {
-		t.useCommercialResource()
-		switched = true
+	if rejected != nil {
+		switched = t.tryCommercialResource()
+		if !switched && t.gccAudience.Load() != gccAudienceCommercial {
+			return nil, false, nil
+		}
+		rejected.Body.Close()
 	}
 	if t.token.Valid() {
-		return t.token, t.gccPrimary, nil
+		return t.token, t.gccAudience.Load() == gccAudienceUnproven, nil
 	}
 
 	tokenClient := *t.client
@@ -1075,15 +1103,14 @@ func (t *tokenTransport) tokenFor(ctx context.Context, audienceRejected bool) (*
 	ctx = context.WithValue(ctx, oauth2.HTTPClient, &tokenClient)
 	token, err := t.conf.Token(ctx)
 	var rejection *oauth2.RetrieveError
-	if t.gccPrimary && ctx.Err() == nil && isCredentialError(err) &&
-		errors.As(err, &rejection) && rejection.ErrorCode == "invalid_resource" {
-		t.useCommercialResource()
+	if ctx.Err() == nil && errors.As(err, &rejection) && isCredentialError(rejection) &&
+		rejection.ErrorCode == "invalid_resource" && t.tryCommercialResource() {
 		switched = true
 		token, err = t.conf.Token(ctx)
 	}
 	if err == nil {
 		t.token = token
-		return token, t.gccPrimary, nil
+		return token, t.gccAudience.Load() == gccAudienceUnproven, nil
 	}
 
 	transient := !isCredentialError(err)
@@ -1097,41 +1124,15 @@ func (t *tokenTransport) tokenFor(ctx context.Context, audienceRejected bool) (*
 		retryAfter: max(0, time.Until(t.endpoint.notBefore))}
 }
 
-func (t *tokenTransport) useCommercialResource() {
-	t.conf.EndpointParams.Set("resource", commercialResource)
-	t.gccPrimary = false
-	t.token = nil
-}
-
-func rejectsAudience(resp *http.Response) bool {
-	switch resp.StatusCode {
-	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-	default:
+// tryCommercialResource is called with the token lock held. Once a GCC
+// request has succeeded, the audience is fixed for this adapter instance.
+func (t *tokenTransport) tryCommercialResource() bool {
+	if !t.gccAudience.CompareAndSwap(gccAudienceUnproven, gccAudienceCommercial) {
 		return false
 	}
-	for _, challenge := range resp.Header.Values("WWW-Authenticate") {
-		if hasAudienceRejection(challenge) {
-			return true
-		}
-	}
-	// Limit inspection of an error response and keep its body intact for the
-	// normal error path when the rejection is unrelated to the audience.
-	const maxErrorPrefix = 4096
-	body := bufio.NewReaderSize(resp.Body, maxErrorPrefix)
-	prefix, _ := body.Peek(maxErrorPrefix)
-	resp.Body = struct {
-		io.Reader
-		io.Closer
-	}{body, resp.Body}
-	return strings.EqualFold(gjson.GetBytes(prefix, "error.code").String(), "InvalidAudience") ||
-		hasAudienceRejection(gjson.GetBytes(prefix, "error.message").String())
-}
-
-func hasAudienceRejection(message string) bool {
-	message = strings.ToLower(message)
-	return strings.Contains(message, "invalid audience") ||
-		strings.Contains(message, "audience is invalid") ||
-		strings.Contains(message, "audience mismatch")
+	t.conf.EndpointParams.Set("resource", commercialResource)
+	t.token = nil
+	return true
 }
 
 // tokenEndpointTransport enforces one bounded cooldown across collectors and
