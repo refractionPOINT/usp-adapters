@@ -1,6 +1,7 @@
 package usp_o365
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -117,11 +118,17 @@ var TokenURL = map[string]string{
 	"dod-gov":      "https://login.microsoftonline.us/",
 }
 
+const (
+	commercialResource = "https://manage.office.com"
+	gccHost            = "manage-gcc.office.com"
+	gccResource        = "https://" + gccHost
+)
+
 // Resource scopes for OAuth2 authentication, must match the target API environment
-// Reference: https://docs.microsoft.com/en-us/office/office-365-management-api/get-started-with-office-365-management-apis#specify-the-permissions-your-app-requires-to-access-the-office-365-management-apis
+// Reference: https://learn.microsoft.com/en-us/office/office-365-management-api/troubleshooting-the-office-365-management-activity-api#get-an-access-token
 var ResourceScope = map[string]string{
-	"enterprise":   "https://manage.office.com",
-	"gcc-gov":      "https://manage.office.com",
+	"enterprise":   commercialResource,
+	"gcc-gov":      gccResource,
 	"gcc-high-gov": "https://manage.office365.us",
 	"dod-gov":      "https://manage.protection.apps.mil",
 }
@@ -935,7 +942,7 @@ func (a *Office365Adapter) updateBearerToken() error {
 	if a.endpointType == "custom" {
 		// For custom endpoints, default to enterprise settings
 		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
-		resourceScope = "https://manage.office.com"
+		resourceScope = commercialResource
 	} else if baseTokenURL, ok := TokenURL[a.endpointType]; ok {
 		// Use the correct OAuth2 endpoint for the cloud environment
 		if a.endpointType == "gcc-high-gov" || a.endpointType == "dod-gov" {
@@ -949,7 +956,7 @@ func (a *Office365Adapter) updateBearerToken() error {
 	} else {
 		// Fallback to enterprise settings
 		tokenURL = fmt.Sprintf("https://login.windows.net/%s/oauth2/token?api-version=1.0", a.conf.Domain)
-		resourceScope = "https://manage.office.com"
+		resourceScope = commercialResource
 	}
 
 	// An explicit token_url overrides whatever was derived above.
@@ -984,7 +991,9 @@ func (a *Office365Adapter) updateBearerToken() error {
 	// but refresh with the current request's context (including Close).
 	a.httpClient = &http.Client{Timeout: httpTimeout, Transport: &tokenTransport{
 		conf: conf, client: a.httpClient, lock: make(chan struct{}, 1),
-		endpoint: tokenEndpointTransport{base: a.httpClient.Transport, maxRetryAfter: a.conf.maxRetryAfter},
+		endpoint:   tokenEndpointTransport{base: a.httpClient.Transport, maxRetryAfter: a.conf.maxRetryAfter},
+		gccPrimary: a.endpointType == "gcc-gov" && resourceScope == gccResource,
+		onWarning:  a.conf.ClientOptions.OnWarning,
 	}}
 
 	return nil
@@ -999,52 +1008,130 @@ type tokenTransport struct {
 	lock     chan struct{}
 	token    *oauth2.Token
 	endpoint tokenEndpointTransport // accessed only while lock is held
+	// gccPrimary is cleared under lock when switching to the legacy resource.
+	gccPrimary bool
+	onWarning  func(string)
 }
 
 func (t *tokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if err := req.Context().Err(); err != nil {
-		if req.Body != nil {
-			req.Body.Close()
-		}
-		return nil, err
-	}
-	select {
-	case t.lock <- struct{}{}:
-	case <-req.Context().Done():
-		if req.Body != nil {
-			req.Body.Close()
-		}
-		return nil, req.Context().Err()
-	}
-	token := t.token
-	err := req.Context().Err()
-	if err == nil && !token.Valid() {
-		tokenClient := *t.client
-		tokenClient.Transport = &t.endpoint
-		token, err = t.conf.Token(context.WithValue(req.Context(), oauth2.HTTPClient, &tokenClient))
-		if err == nil {
-			t.token = token
-		} else {
-			transient := !isCredentialError(err)
-			// OAuth2 loses the response on a body read failure or when a
-			// cancelled auth-style probe replaces the first error. Classify
-			// using the last headers received, without retaining its body.
-			if resp := t.endpoint.lastFailure; resp != nil {
-				transient = !isCredentialStatus(resp.StatusCode)
-				err = fmt.Errorf("token endpoint %s: %w", resp.Status, err)
-			}
-			err = &apiError{err: err, transient: transient,
-				retryAfter: max(0, time.Until(t.endpoint.notBefore))}
-		}
-	}
-	<-t.lock
+	token, gccPrimary, err := t.tokenFor(req.Context(), false)
 	if err != nil {
 		if req.Body != nil {
 			req.Body.Close()
 		}
 		return nil, err
 	}
-	return (&oauth2.Transport{Base: t.client.Transport, Source: oauth2.StaticTokenSource(token)}).RoundTrip(req)
+	send := func(req *http.Request, token *oauth2.Token) (*http.Response, error) {
+		return (&oauth2.Transport{Base: t.client.Transport, Source: oauth2.StaticTokenSource(token)}).RoundTrip(req)
+	}
+	resp, err := send(req, token)
+	if err != nil || !gccPrimary || req.URL.Scheme != "https" || !strings.EqualFold(req.URL.Host, gccHost) ||
+		(req.Body != nil && req.Body != http.NoBody && req.GetBody == nil) || !rejectsAudience(resp) {
+		return resp, err
+	}
+
+	// Replay the feed request once after explicitly confirmed audience rejection.
+	resp.Body.Close()
+	token, _, err = t.tokenFor(req.Context(), true)
+	if err != nil {
+		return nil, err
+	}
+	retry := req.Clone(req.Context())
+	if req.GetBody != nil {
+		retry.Body, err = req.GetBody()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return send(retry, token)
+}
+
+func (t *tokenTransport) tokenFor(ctx context.Context, audienceRejected bool) (*oauth2.Token, bool, error) {
+	select {
+	case t.lock <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
+	}
+	switched := false
+	defer func() {
+		<-t.lock
+		if switched && t.onWarning != nil {
+			t.onWarning("office365 GCC token audience rejected; retrying with the commercial audience")
+		}
+	}()
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
+	if audienceRejected && t.gccPrimary {
+		t.useCommercialResource()
+		switched = true
+	}
+	if t.token.Valid() {
+		return t.token, t.gccPrimary, nil
+	}
+
+	tokenClient := *t.client
+	tokenClient.Transport = &t.endpoint
+	ctx = context.WithValue(ctx, oauth2.HTTPClient, &tokenClient)
+	token, err := t.conf.Token(ctx)
+	var rejection *oauth2.RetrieveError
+	if t.gccPrimary && ctx.Err() == nil && isCredentialError(err) &&
+		errors.As(err, &rejection) && rejection.ErrorCode == "invalid_resource" {
+		t.useCommercialResource()
+		switched = true
+		token, err = t.conf.Token(ctx)
+	}
+	if err == nil {
+		t.token = token
+		return token, t.gccPrimary, nil
+	}
+
+	transient := !isCredentialError(err)
+	// OAuth2 loses the response on a body read failure or when a cancelled
+	// auth-style probe replaces the first error. Use the last HTTP status.
+	if resp := t.endpoint.lastFailure; resp != nil {
+		transient = !isCredentialStatus(resp.StatusCode)
+		err = fmt.Errorf("token endpoint %s: %w", resp.Status, err)
+	}
+	return nil, false, &apiError{err: err, transient: transient,
+		retryAfter: max(0, time.Until(t.endpoint.notBefore))}
+}
+
+func (t *tokenTransport) useCommercialResource() {
+	t.conf.EndpointParams.Set("resource", commercialResource)
+	t.gccPrimary = false
+	t.token = nil
+}
+
+func rejectsAudience(resp *http.Response) bool {
+	switch resp.StatusCode {
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+	default:
+		return false
+	}
+	for _, challenge := range resp.Header.Values("WWW-Authenticate") {
+		if hasAudienceRejection(challenge) {
+			return true
+		}
+	}
+	// Limit inspection of an error response and keep its body intact for the
+	// normal error path when the rejection is unrelated to the audience.
+	const maxErrorPrefix = 4096
+	body := bufio.NewReaderSize(resp.Body, maxErrorPrefix)
+	prefix, _ := body.Peek(maxErrorPrefix)
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{body, resp.Body}
+	return strings.EqualFold(gjson.GetBytes(prefix, "error.code").String(), "InvalidAudience") ||
+		hasAudienceRejection(gjson.GetBytes(prefix, "error.message").String())
+}
+
+func hasAudienceRejection(message string) bool {
+	message = strings.ToLower(message)
+	return strings.Contains(message, "invalid audience") ||
+		strings.Contains(message, "audience is invalid") ||
+		strings.Contains(message, "audience mismatch")
 }
 
 // tokenEndpointTransport enforces one bounded cooldown across collectors and
