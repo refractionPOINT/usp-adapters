@@ -22,7 +22,7 @@ import (
 	"github.com/refractionPOINT/usp-adapters/utils"
 )
 
-const scope = "https://graph.microsoft.com/.default"
+const defaultGraphScope = "https://graph.microsoft.com/.default"
 const URLPrefix = "https://graph.microsoft.com/v1.0/"
 const defaultLoginEndpoint = "https://login.microsoftonline.com"
 const defaultPollInterval = 30 * time.Second
@@ -72,7 +72,8 @@ type MsGraphConfig struct {
 
 	// GraphEndpoint overrides the Microsoft Graph API root the relative URL
 	// is appended to. Empty means the public cloud v1.0 root
-	// (https://graph.microsoft.com/v1.0/).
+	// (https://graph.microsoft.com/v1.0/). Known national cloud hosts also
+	// select the corresponding OAuth2 token scope.
 	GraphEndpoint string `json:"graph_endpoint" yaml:"graph_endpoint"`
 
 	// TimestampField is the datetime property the polled collection is
@@ -282,9 +283,24 @@ func (a *MsGraphAdapter) request(method, raw, payload, bearer string) ([]byte, e
 	return body, nil
 }
 
+func graphTokenScope(graphEndpoint string) string {
+	endpoint, err := url.Parse(graphEndpoint)
+	if err != nil {
+		return defaultGraphScope
+	}
+	host := strings.ToLower(endpoint.Hostname())
+	switch host {
+	case "graph.microsoft.us", "dod-graph.microsoft.us", "microsoftgraph.chinacloudapi.cn":
+		return "https://" + host + "/.default"
+	default:
+		// Preserve the commercial scope for custom Graph gateways.
+		return defaultGraphScope
+	}
+}
+
 func (a *MsGraphAdapter) fetchToken() (string, error) {
 	tokenURL := fmt.Sprintf("%s/%s/oauth2/v2.0/token", a.loginEndpoint, a.conf.TenantID)
-	payload := url.Values{"client_id": {a.conf.ClientID}, "scope": {scope}, "grant_type": {"client_credentials"}, "client_secret": {a.conf.ClientSecret}}.Encode()
+	payload := url.Values{"client_id": {a.conf.ClientID}, "scope": {graphTokenScope(a.conf.GraphEndpoint)}, "grant_type": {"client_credentials"}, "client_secret": {a.conf.ClientSecret}}.Encode()
 	body, err := a.request(http.MethodPost, tokenURL, payload, "")
 	if err != nil {
 		return "", vendorerr.Wrap("fetching token", err, a.conf.ClientSecret)

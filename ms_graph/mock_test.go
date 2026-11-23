@@ -40,6 +40,7 @@ const (
 	testClientSecret = "fake-test-client-secret-0001"
 	testAccessToken  = "fake-test-access-token-0001"
 	testResource     = "security/alerts_v2"
+	testGlobalScope  = "https://graph.microsoft.com/.default"
 )
 
 // --- in-memory USP sink -------------------------------------------------------
@@ -97,6 +98,7 @@ type graphRecord struct {
 type mockMsGraph struct {
 	mu      sync.Mutex
 	baseURL string // set once the httptest server is up; used for nextLink
+	scope   string // expected OAuth resource scope, set before serving requests
 
 	records  []graphRecord // returned in insertion order
 	pageSize int           // 0 = unlimited
@@ -117,7 +119,7 @@ type mockMsGraph struct {
 }
 
 func newMockMsGraph() *mockMsGraph {
-	return &mockMsGraph{}
+	return &mockMsGraph{scope: testGlobalScope}
 }
 
 // start serves the mock and returns the httptest server (closed via t.Cleanup).
@@ -223,7 +225,7 @@ func (m *mockMsGraph) serveToken(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, aadError("unsupported_grant_type", 70003, "The app returned an unsupported grant type."))
 		return
 	}
-	if form.Get("scope") != scope {
+	if form.Get("scope") != m.scope {
 		// AADSTS70011: InvalidScope.
 		writeJSON(w, http.StatusBadRequest, aadError("invalid_scope", 70011, "The provided value for the input parameter 'scope' is not valid."))
 		return
@@ -505,6 +507,40 @@ func startAdapter(t *testing.T, conf MsGraphConfig) (*captureSink, *MsGraphAdapt
 
 // --- tests ----------------------------------------------------------------------
 
+func TestMsGraphTokenScope(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		graphEndpoint string
+		wantScope     string
+	}{
+		{"default", "", testGlobalScope},
+		{"commercial", "https://graph.microsoft.com/v1.0/", testGlobalScope},
+		{"gcc-high", "https://graph.microsoft.us/v1.0/", "https://graph.microsoft.us/.default"},
+		{"dod", "https://DOD-GRAPH.MICROSOFT.US:443/beta", "https://dod-graph.microsoft.us/.default"},
+		{"china", "https://microsoftgraph.chinacloudapi.cn/v1.0", "https://microsoftgraph.chinacloudapi.cn/.default"},
+		{"custom", "https://graph.microsoft.us.example.com/v1.0/", testGlobalScope},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := newMockMsGraph()
+			mock.scope = tc.wantScope
+			server := mock.start(t)
+			conf := testConfig(t, server)
+			conf.GraphEndpoint = tc.graphEndpoint
+			adapter := MsGraphAdapter{
+				conf:          conf,
+				ctx:           context.Background(),
+				httpClient:    server.Client(),
+				loginEndpoint: conf.LoginEndpoint,
+				runtime:       defaultGraphRuntime(),
+			}
+			token, err := adapter.fetchToken()
+			assert.Equal(t, tc.wantScope, mock.tokenForm().Get("scope"))
+			require.NoError(t, err)
+			assert.Equal(t, testAccessToken, token)
+		})
+	}
+}
+
 // TestMsGraphEndToEnd drives the adapter against the mock endpoints and pins
 // the full contract: the client_credentials token exchange, the Bearer-auth'd
 // GET with a createdDateTime filter against the configured resource (leading
@@ -550,7 +586,7 @@ func TestMsGraphEndToEnd(t *testing.T) {
 	form := mock.tokenForm()
 	require.NotNil(t, form)
 	assert.Equal(t, "client_credentials", form.Get("grant_type"))
-	assert.Equal(t, scope, form.Get("scope"))
+	assert.Equal(t, testGlobalScope, form.Get("scope"))
 	assert.Equal(t, testClientID, form.Get("client_id"))
 	assert.Equal(t, testClientSecret, form.Get("client_secret"))
 
