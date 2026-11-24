@@ -21,8 +21,8 @@
 # Usage: build_windows_legacy.sh <output.exe> <package>
 set -euo pipefail
 
-LEGACY_GO_VERSION='1.27.3-1'
-LEGACY_GO_SHA256='069ceddac4917c528be492e560bb71bcf5c8ed5ff5d952ce1c8519e9b169228e'
+LEGACY_GO_VERSION='1.27.4-1'
+LEGACY_GO_SHA256='ac19ede77803f1b7e1de6bd43fa01882c6b16e8efd06a78416392a08bca99bc2'
 
 if [ $# -ne 2 ]; then
   echo "usage: $0 <output.exe> <package>" >&2
