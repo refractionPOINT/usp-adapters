@@ -10,6 +10,10 @@ import (
 	"sync"
 )
 
+// log stream events can carry large payloads (eventMessage, backtraces),
+// well past bufio.Scanner's 64KB default line limit.
+const maxLogLineSize = 4 * 1024 * 1024
+
 type Log struct {
 	TraceID            int64       `json:"traceID"`
 	EventMessage       string      `json:"eventMessage"`
@@ -41,24 +45,26 @@ type Log struct {
 }
 
 type Logs struct {
-	m       sync.Mutex
-	Channel chan Log
-	exit    chan bool
+	m        sync.Mutex
+	Channel  chan Log
+	exit     chan struct{}
+	exitOnce sync.Once
 }
 
 func NewLogs() *Logs {
 	return &Logs{
 		Channel: make(chan Log),
-		exit:    make(chan bool),
+		exit:    make(chan struct{}),
 	}
 }
 
 func (logs *Logs) StartGathering(predicate string) error {
 
-	cmd := exec.Command("log", "stream", "--color=none", "--style=ndjson")
+	args := []string{"stream", "--color=none", "--style=ndjson"}
 	if predicate != "" {
-		cmd = exec.Command("log", "stream", "--color=none", "--style=ndjson", "--predicate", predicate)
+		args = append(args, "--predicate", predicate)
 	}
+	cmd := exec.Command("log", args...)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -70,42 +76,76 @@ func (logs *Logs) StartGathering(predicate string) error {
 		return err
 	}
 
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	// Kill the subprocess on StopGathering so a reader blocked in
+	// Scan() unblocks and the gathering goroutine can exit.
+	go func() {
+		<-logs.exit
+		cmd.Process.Kill()
+	}()
+
 	go func() {
 		logs.m.Lock()
 		defer logs.m.Unlock()
 
-		cmd.Start()
 		defer cmd.Process.Kill()
+		// Closing the channel lets consumers terminate instead of
+		// waiting forever on a stream that has ended.
+		defer close(logs.Channel)
 
-		// drop first message
-		bufio.NewReader(stdout).ReadLine()
+		// Parse the ndjson output line by line. A json.Decoder is
+		// unsuitable here: it never advances past a SyntaxError, so a
+		// single bad line (like the non-JSON "Filtering the log data"
+		// header) would wedge it in a permanent error loop while the
+		// pipe fills up and `log stream` blocks forever.
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), maxLogLineSize)
 
-		dec := json.NewDecoder(stdout)
-
-		for {
+		for scanner.Scan() {
 			select {
 			case <-logs.exit:
 				return
 			default:
-				log := Log{}
-
-				if err := dec.Decode(&log); err != nil {
-					fmt.Println("error decoding json")
-					fmt.Println(err.Error())
-				} else {
-					logs.Channel <- log
-				}
 			}
+
+			line := scanner.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+
+			log := Log{}
+			if err := json.Unmarshal(line, &log); err != nil {
+				// Skip non-JSON lines (e.g. the header line) without
+				// stalling the stream.
+				fmt.Printf("skipping non-json line from log stream: %v\n", err)
+				continue
+			}
+
+			select {
+			case logs.Channel <- log:
+			case <-logs.exit:
+				return
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			fmt.Printf("error reading log stream output: %v\n", err)
 		}
 	}()
 
 	go func() {
 		stderrBuf := bufio.NewReader(stderr)
 		for {
-			line, _, _ := stderrBuf.ReadLine()
+			line, _, err := stderrBuf.ReadLine()
 			if len(line) > 0 {
 				logs.StopGathering()
-				panic(err)
+				panic(fmt.Errorf("log stream error: %s", string(line)))
+			}
+			if err != nil {
+				return
 			}
 		}
 	}()
@@ -114,5 +154,7 @@ func (logs *Logs) StartGathering(predicate string) error {
 }
 
 func (logs *Logs) StopGathering() {
-	logs.exit <- true
+	logs.exitOnce.Do(func() {
+		close(logs.exit)
+	})
 }

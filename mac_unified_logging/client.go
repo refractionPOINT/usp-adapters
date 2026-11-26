@@ -103,7 +103,7 @@ func (a *MacUnifiedLoggingAdapter) handleEvent(predicate string) uintptr {
 
 	logs := NewLogs()
 
-	signalChannel := make(chan os.Signal)
+	signalChannel := make(chan os.Signal, 1)
 	signal.Notify(signalChannel, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-signalChannel
