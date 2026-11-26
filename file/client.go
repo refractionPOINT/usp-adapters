@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -132,16 +131,6 @@ type FileAdapter struct {
 	// staleCooldownOverride replaces staleHandleCooldown when non-zero, so
 	// tests need not wait it out.
 	staleCooldownOverride time.Duration
-}
-
-func (c *FileConfig) Validate() error {
-	if err := c.ClientOptions.Validate(); err != nil {
-		return fmt.Errorf("client_options: %v", err)
-	}
-	if c.FilePath == "" {
-		return errors.New("file_path missing")
-	}
-	return nil
 }
 
 func NewFileAdapter(ctx context.Context, conf FileConfig) (*FileAdapter, chan struct{}, error) {

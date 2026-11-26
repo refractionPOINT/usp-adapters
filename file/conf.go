@@ -1,6 +1,9 @@
 package usp_file
 
 import (
+	"errors"
+	"fmt"
+
 	"github.com/refractionPOINT/go-uspclient"
 )
 
@@ -15,4 +18,23 @@ type FileConfig struct {
 	SerializeFiles        bool                    `json:"serialize_files" yaml:"serialize_files"`
 	Poll                  bool                    `json:"poll" yaml:"poll"`
 	MultiLineJSON         bool                    `json:"multi_line_json" yaml:"multi_line_json"`
+}
+
+// Validate validates the File adapter configuration.
+//
+// Parameters:
+//
+//	None
+//
+// Returns:
+//
+//	error - Returns nil if validation passes, or an error describing the validation failure.
+func (c *FileConfig) Validate() error {
+	if err := c.ClientOptions.Validate(); err != nil {
+		return fmt.Errorf("client_options: %v", err)
+	}
+	if c.FilePath == "" {
+		return errors.New("file_path missing")
+	}
+	return nil
 }
